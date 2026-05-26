@@ -8,7 +8,7 @@ Gate 1 tests prove that the workspace, feature flags, RHI contract, and backend 
 
 | Feature | Test Case | Type | Expected Result (concrete) |
 |---|---|---|---|
-| G1-F01 Workspace Skeleton | `cargo metadata --no-deps` membership check | Contract | `packages[].name` set equals the 15-crate list in IT-G1-01 exactly |
+| G1-F01 Workspace Skeleton | `cargo metadata --no-deps` membership check | Contract | `packages[].name` set equals the 20-crate list in IT-G1-01 exactly |
 | G1-F01 Workspace Skeleton | `cargo check --workspace` with default features | Compile | Exit code 0, no `error:` lines in stderr |
 | G1-F02 Feature Flag Baseline | Independent `--features backend-{vulkan,opengl,dx12}` checks | Compile | Each: exit 0; `backend-dx12` builds only on Windows or behind cfg gate |
 | G1-F02 Feature Flag Baseline | Multi-feature `--features backend-vulkan,backend-opengl` | Compile | Exit 0; package set identical (modulo feature flags) to union of singles |
@@ -69,12 +69,12 @@ Steps:
    engine-renderer, engine-audio, engine-ui, engine-nav, engine-character,
    sandbox
    ```
-   (15 crates, order-insensitive). Extra or missing names are a failure.
+   (20 crates, order-insensitive). Extra or missing names are a failure.
 3. Run `cargo check --workspace` and capture stdout+stderr.
 
 Expected (concrete assertions):
 - `cargo metadata` exit code = `0`.
-- The 15-crate set above matches with zero deltas.
+- The 20-crate set above matches with zero deltas.
 - `cargo check --workspace` exit code = `0` and stderr contains no line matching the regex `error(\[E\d+\])?:` (warnings are allowed at Gate 1 but logged).
 - No line in stderr matches `(SDK|sdk).*not.*found` or `linking with .* failed` for default-features builds.
 
