@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/platform",
+    "crates/render-core",
+    "crates/render-vulkan",
+    "crates/render-opengl",
+    "crates/render-dx12",
+    "crates/engine-core",
+    "crates/engine-serialize",
+    "crates/engine-renderer",
+    "crates/engine-scene",
+    "crates/engine-asset",
+    "crates/engine-script",
+    "crates/engine-editor",
+    "crates/engine-hot-update",
+    "crates/engine-physics",
+    "crates/engine-animation",
+    "crates/engine-audio",
+    "crates/engine-ui",
+    "crates/engine-nav",
+    "crates/engine-character",
+    "crates/sandbox",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+bincode = "1.3"
+crossbeam-channel = "0.5"
+glam = { version = "0.27", features = ["serde"] }
+indexmap = { version = "2.2", features = ["serde"] }
+ron = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"

@@ -92,7 +92,7 @@ Each question below has an **owner**, a **decision deadline**, an **option list*
   - (b) **Typed newtype wrapper** over backend-specific handles. Couples public API to one backend's allocator.
   - (c) **`Arc<dyn ResourceTrait>`** — heap-allocated trait objects per resource. Costly and harder to make `Copy`.
 - **Downstream impact:** Every later renderer gate (2, 3, 6, 9, 17) and any subsystem that holds GPU resources.
-- **Status:** PENDING. The Rust skeleton below assumes option (a) with `// DECISION:` markers showing where the choice surfaces in code.
+- **Status:** RESOLVED at Gate 1 implementation. Option (a), **generational typed handles**, is frozen in `render-core` as `ResourceHandle<KindMarker> { index, generation }`.
 
 ### Q2: Backend feature flag naming
 
@@ -108,7 +108,7 @@ Each question below has an **owner**, a **decision deadline**, an **option list*
   - (a) `engine-core` re-exports `render_core::{Backend, Device, RhiError, ...}` so downstream crates depend only on `engine-core`.
   - (b) `engine-core` exposes only higher-level renderer APIs; renderer-touching crates depend on `render-core` directly.
 - **Downstream impact:** Affects dependency graph of `engine-scene`, `engine-editor`, `engine-asset`, `engine-hot-update`, and `sandbox` (canonical crate names per `FD-029`).
-- **Status:** PENDING.
+- **Status:** RESOLVED at Gate 1 implementation. Option (b) is frozen: `engine-core` exposes higher-level runtime/renderer flow, while renderer-touching crates depend on `render-core` directly.
 
 ## Detailed Design Proposal
 

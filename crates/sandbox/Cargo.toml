@@ -1,0 +1,26 @@
+[package]
+name = "sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+backend-vulkan = ["render-vulkan/backend-vulkan"]
+backend-opengl = ["render-opengl/backend-opengl"]
+backend-dx12 = ["render-dx12/backend-dx12"]
+tooling-editor = []
+tooling-hot-reload = []
+target-desktop = []
+target-mobile = []
+subsystem-scripting-csharp = []
+
+[dependencies]
+engine-core = { path = "../engine-core" }
+engine-scene = { path = "../engine-scene" }
+render-vulkan = { path = "../render-vulkan", optional = true }
+render-opengl = { path = "../render-opengl", optional = true }
+render-dx12 = { path = "../render-dx12", optional = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true

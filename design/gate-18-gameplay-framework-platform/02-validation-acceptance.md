@@ -26,8 +26,8 @@ Gate 18 is accepted only when the engine can run a complete gameplay loop using 
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp,mobile`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp,mobile`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp,target-mobile`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp,target-mobile`
 - Game state transition tests.
 - Input action map tests.
 - Event bus delivery tests.

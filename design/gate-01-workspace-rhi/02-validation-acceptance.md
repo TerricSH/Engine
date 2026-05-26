@@ -19,12 +19,12 @@ Gate 1 is accepted only when the workspace skeleton, crate ownership boundaries,
 
 ## Acceptance Checklist
 
-- [ ] Root `Cargo.toml` contains all planned workspace members.
-- [ ] Feature flags exist for `backend-vulkan`, `backend-opengl`, `backend-dx12`, `editor`, `scripting-csharp`, `hot-reload`, and `mobile`.
-- [ ] `render-core` has no Vulkan/OpenGL/DX12 concrete types in public engine-level APIs.
-- [ ] Backend stubs compile without implementing real rendering.
-- [ ] Future crates exist for ECS, serialization, assets, editor, scripting, hot update, physics, animation, and sandbox.
-- [ ] Ownership rules define who may edit root workspace files and `render-core`.
+- [x] Root `Cargo.toml` contains all planned workspace members.
+- [x] Feature flags exist for `backend-vulkan`, `backend-opengl`, `backend-dx12`, `tooling-editor`, `subsystem-scripting-csharp`, `tooling-hot-reload`, and `target-mobile`.
+- [x] `render-core` has no Vulkan/OpenGL/DX12 concrete types in public engine-level APIs.
+- [x] Backend stubs compile without implementing real rendering.
+- [x] Future crates exist for ECS, serialization, assets, editor, scripting, hot update, physics, animation, and sandbox.
+- [x] Ownership rules define who may edit root workspace files and `render-core`.
 
 ## Automated Checks
 
@@ -48,13 +48,21 @@ Gate 1 is accepted only when the workspace skeleton, crate ownership boundaries,
 
 ## Required Evidence
 
-- Command outputs from automated checks.
-- Short RHI contract review note.
-- List of frozen feature flags and workspace members.
+- Command outputs captured in the implementation session:
+	- `cargo metadata --no-deps --format-version=1` reported 20 packages.
+	- `cargo fmt --all --check` passed.
+	- `cargo check --workspace` passed.
+	- `cargo check --workspace --features backend-vulkan` passed.
+	- `cargo check --workspace --features backend-opengl` passed.
+	- `cargo check --workspace --features backend-dx12` passed on Windows without SDK linkage.
+	- `cargo test --workspace` passed.
+	- `cargo run -p sandbox -- gate04-scene` passed the ECS-to-renderer contract smoke path.
+- RHI contract review note: `render-core` exposes backend-neutral traits, descriptors, generational typed handles, and `RhiError::code()` mappings only; backend crates contain no native SDK dependency yet.
+- Frozen workspace members: `platform`, `render-core`, `render-vulkan`, `render-opengl`, `render-dx12`, `engine-core`, `engine-serialize`, `engine-renderer`, `engine-scene`, `engine-asset`, `engine-script`, `engine-editor`, `engine-hot-update`, `engine-physics`, `engine-animation`, `engine-audio`, `engine-ui`, `engine-nav`, `engine-character`, `sandbox`.
 
 ## Exit Decision
 
-- Gate owner:
-- Date:
-- Approved to proceed to Gate 2: yes/no
+- Gate owner: Copilot implementation session
+- Date: 2026-05-26
+- Approved to proceed to Gate 2: yes for contract/backend implementation work; Gate 2 still must replace the Vulkan stub with a real backend and collect its own performance evidence.
 

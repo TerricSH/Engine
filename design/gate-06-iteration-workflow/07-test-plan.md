@@ -34,9 +34,9 @@ Gate 6 tests prove hot reload works as a staged pipeline and never corrupts the 
 ## Required Commands
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp,hot-reload`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp,hot-reload`
-- `cargo run -p sandbox --features backend-vulkan,editor,scripting-csharp,hot-reload -- hot-reload-scene`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp,tooling-hot-reload`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp,tooling-hot-reload`
+- `cargo run -p sandbox --features backend-vulkan,tooling-editor,subsystem-scripting-csharp,tooling-hot-reload -- hot-reload-scene`
 
 ## Required Evidence
 

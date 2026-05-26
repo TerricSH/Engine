@@ -36,7 +36,7 @@ Do not overbuild:
 
 Required behavior:
 - Define additive feature flags for backend and optional system families.
-- Include at least `backend-vulkan`, `backend-opengl`, `backend-dx12`, `editor`, `scripting-csharp`, `hot-reload`, and `mobile`.
+- Include at least `backend-vulkan`, `backend-opengl`, `backend-dx12`, `tooling-editor`, `subsystem-scripting-csharp`, `tooling-hot-reload`, and `target-mobile`.
 - Keep default features minimal.
 
 Minimum output:

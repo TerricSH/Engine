@@ -1,0 +1,17 @@
+[package]
+name = "engine-hot-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+backend-vulkan = []
+backend-opengl = []
+backend-dx12 = []
+tooling-editor = []
+tooling-hot-reload = []
+target-desktop = []
+target-mobile = []
+subsystem-scripting-csharp = []

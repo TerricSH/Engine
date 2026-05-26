@@ -26,7 +26,7 @@ Gate 9 is accepted only when later subsystems can register components, assets, e
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
 - Extension registry unit tests.
 - Dummy subsystem integration tests.
 - Debug draw submission tests.

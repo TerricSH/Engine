@@ -27,8 +27,8 @@ Gate 17 is accepted only when the editor is practical for production authoring a
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
 - Editor command history tests.
 - Asset assignment tests.
 - Prefab editor workflow tests.

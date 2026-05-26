@@ -39,9 +39,9 @@ Gate 5 tests prove that asset registry, minimal editor, and C# scripting all wor
 ## Required Commands
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo run -p sandbox --features backend-vulkan,editor,scripting-csharp -- editor-scene`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo run -p sandbox --features backend-vulkan,tooling-editor,subsystem-scripting-csharp -- editor-scene`
 
 ## Required Evidence
 

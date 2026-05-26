@@ -24,8 +24,8 @@ Gate 12 is accepted only when a character can move through physics-safe controll
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
 - Controller state transition tests.
 - Scene save/load tests for controller components.
 - C# API binding tests.

@@ -25,8 +25,8 @@ Gate 16 is accepted only when audio assets can be cooked, loaded, played, spatia
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
 - Audio asset cook/load tests.
 - Mixer state tests.
 - Spatial attenuation tests.

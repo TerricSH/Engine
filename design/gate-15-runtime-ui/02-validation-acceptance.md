@@ -27,8 +27,8 @@ Gate 15 is accepted only when runtime UI can render, receive input, serialize, a
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,subsystem-scripting-csharp`
 - Layout calculation tests.
 - UI input hit-test tests.
 - UI scene serialization tests.

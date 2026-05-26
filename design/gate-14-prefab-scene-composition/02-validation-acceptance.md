@@ -25,8 +25,8 @@ Gate 14 is accepted only when prefabs can represent reusable gameplay compositio
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
 - Prefab save/load round-trip tests.
 - Override diff/apply/revert tests.
 - Pool lifecycle tests.

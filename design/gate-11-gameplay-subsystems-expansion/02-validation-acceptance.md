@@ -24,8 +24,8 @@ Gate 11 is accepted only when expanded physics and animation APIs are stable eno
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
 - Physics expansion tests.
 - Animation blending/state tests.
 - Scene round-trip tests including expanded components.

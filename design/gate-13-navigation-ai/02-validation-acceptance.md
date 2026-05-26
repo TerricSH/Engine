@@ -25,8 +25,8 @@ Gate 13 is accepted only when AI agents can navigate using cooked navmesh data a
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
 - Navmesh cook/load tests.
 - Pathfinding query tests.
 - Agent scene serialization tests.

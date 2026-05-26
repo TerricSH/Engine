@@ -26,8 +26,8 @@ Gate 10 is accepted only when physics and animation foundations are usable toget
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,editor,scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,editor,scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
 - Physics query and event tests.
 - Animation asset load and playback tests.
 - Scene round-trip tests for physics/animation components.

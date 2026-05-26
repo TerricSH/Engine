@@ -124,16 +124,23 @@ Two notation styles coexist and **must not** be mixed within one subsystem:
 | `RV0009` `CulledItemSubmitted` | warning (debug-only) | Gate 3 renderer | Debug-build consistency check: a submitted item lies fully outside one of the view's frustum planes (`FD-036`). |
 | `RV0010` `ParamBlockLayoutMismatch` | error | Gate 3 renderer | Runtime-supplied `ParamBlock.layout_hash` does not match the pipeline's expected layout (`FD-041`). |
 | `RV0011` `ShaderVariantMissing` | warning (one-shot per pipeline) | Gate 3 renderer | Requested `(pipeline_id, variant_key)` has no cooked variant; renderer falls back to `variant_key = 0` (`FD-040`). |
+| `RV0012` `RendererInputVersionInvalid` | error | Gate 3 renderer | `RenderFrameInput.contract_version` is not a `RendererInput-v0` version. |
+| `RV0013` `NoRenderViews` | error | Gate 3 renderer | `RenderFrameInput.views` is empty, so no camera/view can be rendered. |
+| `RV0014` `DuplicateViewId` | error | Gate 3 renderer | Two `RenderView` records in one frame share the same `view_id`. |
 
-`RV0001`–`RV0006` retired during contract drafting and not reused; `RV0012+` available for future Gate 3 / Gate 4 allocations.
+`RV0001`–`RV0006` retired during contract drafting and not reused; `RV0015+` available for future Gate 3 / Gate 4 allocations.
 
 #### Scene (`SC`)
 
 | Code | Severity | Emitter | Meaning |
 |---|---|---|---|
 | `SC0014` `RenderTargetNotInV0` | error | Gate 4 extraction | `engine.camera.render_target` is non-`None`, which is reserved for post-v0 (`OFQ-011`); the camera is treated as if it rendered to the swapchain (`FD-034`). |
+| `SC0015` `DuplicateEntityId` | error | Gate 4 scene validation | Two `EntityRecord` entries in one scene share the same `persistent_id`. |
+| `SC0016` `ParentMissing` | error | Gate 4 scene validation | An entity's `parent` reference does not point to an entity in the same scene. |
+| `SC0017` `ActiveCameraInvalid` | error | Gate 4 scene validation | `SceneSettings.active_camera` does not reference an enabled entity with an enabled `engine.camera` component. |
+| `SC0018` `SceneCameraMissing` | error | Gate 4 extraction / engine facade | Scene extraction or frame rendering was requested without a loaded scene or enabled active camera. |
 
-`SC0001`–`SC0013` retired during contract drafting and not reused; `SC0015+` available for future Gate 4 allocations.
+`SC0001`–`SC0013` retired during contract drafting and not reused; `SC0019+` available for future Gate 4 allocations.
 
 #### RHI (`rhi.*`)
 
