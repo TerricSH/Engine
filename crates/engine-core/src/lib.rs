@@ -38,7 +38,7 @@ impl EngineRuntime {
         self.scene = Some(scene);
     }
 
-    pub fn render_frame(&self, frame_index: u64) -> Result<FrameStats, Vec<Diagnostic>> {
+    pub fn render_frame(&mut self, frame_index: u64) -> Result<FrameStats, Vec<Diagnostic>> {
         let scene = self.scene.as_ref().ok_or_else(|| {
             vec![Diagnostic::new(
                 "SC0018",

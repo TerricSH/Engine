@@ -18,4 +18,6 @@ subsystem-scripting-csharp = []
 
 [dependencies]
 engine-serialize = { path = "../engine-serialize" }
+render-core = { path = "../render-core" }
 serde.workspace = true
+tracing.workspace = true

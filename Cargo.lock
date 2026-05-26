@@ -369,7 +369,9 @@ name = "engine-renderer"
 version = "0.1.0"
 dependencies = [
  "engine-serialize",
+ "render-core",
  "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -1228,9 +1230,11 @@ name = "sandbox"
 version = "0.1.0"
 dependencies = [
  "engine-core",
+ "engine-renderer",
  "engine-scene",
  "platform",
  "raw-window-handle",
+ "render-core",
  "render-dx12",
  "render-opengl",
  "render-vulkan",

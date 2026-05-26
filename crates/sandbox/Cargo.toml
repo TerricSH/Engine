@@ -18,7 +18,9 @@ subsystem-scripting-csharp = []
 
 [dependencies]
 engine-core = { path = "../engine-core" }
+engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
+render-core = { path = "../render-core" }
 platform = { path = "../platform" }
 raw-window-handle.workspace = true
 render-vulkan = { path = "../render-vulkan", optional = true }

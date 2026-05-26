@@ -100,6 +100,13 @@ pub enum PipelineKind {}
 pub enum BindGroupKind {}
 pub enum RenderPassKind {}
 pub enum SurfaceKind {}
+pub enum SwapchainKind {}
+pub enum FramebufferKind {}
+pub enum PipelineLayoutKind {}
+pub enum DescriptorSetLayoutKind {}
+pub enum DescriptorPoolKind {}
+pub enum DescriptorSetKind {}
+pub enum CommandBufferKind {}
 
 pub type BufferHandle = ResourceHandle<BufferKind>;
 pub type TextureHandle = ResourceHandle<TextureKind>;
@@ -108,6 +115,13 @@ pub type PipelineHandle = ResourceHandle<PipelineKind>;
 pub type BindGroupHandle = ResourceHandle<BindGroupKind>;
 pub type RenderPassHandle = ResourceHandle<RenderPassKind>;
 pub type SurfaceHandle = ResourceHandle<SurfaceKind>;
+pub type SwapchainHandle = ResourceHandle<SwapchainKind>;
+pub type FramebufferHandle = ResourceHandle<FramebufferKind>;
+pub type PipelineLayoutHandle = ResourceHandle<PipelineLayoutKind>;
+pub type DescriptorSetLayoutHandle = ResourceHandle<DescriptorSetLayoutKind>;
+pub type DescriptorPoolHandle = ResourceHandle<DescriptorPoolKind>;
+pub type DescriptorSetHandle = ResourceHandle<DescriptorSetKind>;
+pub type CommandBufferHandle = ResourceHandle<CommandBufferKind>;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -190,6 +204,12 @@ pub enum ShaderFormat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IndexFormat {
+    U16,
+    U32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TextureFormat {
     Rgba8Unorm,
@@ -261,6 +281,15 @@ pub struct SurfaceDescriptor {
     pub present_mode: PresentMode,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwapchainDescriptor {
+    pub surface: SurfaceHandle,
+    pub width: u32,
+    pub height: u32,
+    pub vsync: bool,
+    pub debug_label: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SurfaceTarget {
     RawWindowHandleToken(u64),
@@ -293,6 +322,266 @@ pub struct ShaderModuleDescriptor {
     pub entry_points: Vec<String>,
     pub source_hash: [u8; 32],
     pub debug_label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderPassDescriptor {
+    pub color_attachments: Vec<TextureFormat>,
+    pub depth_stencil_format: Option<TextureFormat>,
+    pub sample_count: u8,
+    pub debug_label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FramebufferDescriptor {
+    pub render_pass: RenderPassHandle,
+    pub color_attachments: Vec<TextureHandle>,
+    pub depth_stencil_attachment: Option<TextureHandle>,
+    pub width: u32,
+    pub height: u32,
+    pub debug_label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineLayoutDescriptor {
+    pub bind_group_layouts: Vec<BindGroupLayoutDescriptor>,
+    pub push_constant_ranges: Vec<PushConstantRange>,
+    pub debug_label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushConstantRange {
+    pub stage_flags: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineDescriptor {
+    pub shader_modules: Vec<ShaderModuleHandle>,
+    pub vertex_layout: VertexLayout,
+    pub bind_layouts: Vec<BindGroupLayoutDescriptor>,
+    pub pipeline_layout: Option<PipelineLayoutHandle>,
+    pub raster_state: RasterState,
+    pub depth_state: DepthState,
+    pub blend_state: BlendState,
+    pub render_targets: Vec<TextureFormat>,
+    pub debug_label: Option<String>,
+}
+
+/// Per-frame statistics populated by the renderer after end_frame.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RendererStatistics {
+    pub draw_calls: u32,
+    pub triangles: u64,
+    pub gpu_frame_ms: f32,
+}
+
+// ============================================================================
+// CommandEncoder trait – records draw calls into a backend command buffer.
+// ============================================================================
+
+pub trait CommandEncoder: Send {
+    fn begin_render_pass(
+        &mut self,
+        render_pass: RenderPassHandle,
+        framebuffer: FramebufferHandle,
+        area: (u32, u32, u32, u32),
+        clear_color: [f32; 4],
+        clear_depth: Option<f32>,
+    );
+    fn bind_pipeline(&mut self, pipeline: PipelineHandle);
+    fn bind_vertex_buffers(&mut self, buffers: &[BufferHandle], offsets: &[u64]);
+    fn bind_index_buffer(&mut self, buffer: BufferHandle, offset: u64, index_format: IndexFormat);
+    fn bind_descriptor_sets(
+        &mut self,
+        pipeline_layout: PipelineLayoutHandle,
+        first_set: u32,
+        sets: &[DescriptorSetHandle],
+        dynamic_offsets: &[u32],
+    );
+    fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min_depth: f32, max_depth: f32);
+    fn set_scissor(&mut self, x: i32, y: i32, w: u32, h: u32);
+    fn draw(
+        &mut self,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    );
+    fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        first_instance: u32,
+    );
+    fn push_constants(
+        &mut self,
+        layout: PipelineLayoutHandle,
+        stage_flags: u32,
+        offset: u32,
+        data: &[u8],
+    );
+    fn end_render_pass(&mut self);
+}
+
+// ============================================================================
+// Backend + Device traits (expanded for Gate 3)
+// ============================================================================
+
+pub trait Backend: Send + Sync {
+    fn kind(&self) -> BackendKind;
+    fn enumerate_adapters(&self) -> Result<Vec<AdapterInfo>, RhiError>;
+    fn create_device(&self, descriptor: &DeviceDescriptor) -> Result<Box<dyn Device>, RhiError>;
+}
+
+pub trait Device: Send + Sync {
+    fn adapter_info(&self) -> &AdapterInfo;
+
+    // --- Resource creation (all &mut self for safety) ---
+
+    fn create_surface(
+        &mut self,
+        _descriptor: &SurfaceDescriptor,
+    ) -> Result<SurfaceHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "surface creation is not implemented by this device".to_string(),
+        })
+    }
+
+    fn create_swapchain(
+        &mut self,
+        _descriptor: &SwapchainDescriptor,
+    ) -> Result<SwapchainHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "swapchain creation is not implemented by this device".to_string(),
+        })
+    }
+
+    fn create_buffer(&mut self, _descriptor: &BufferDescriptor) -> Result<BufferHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "buffer creation is not implemented by this device".to_string(),
+        })
+    }
+
+    fn write_buffer(
+        &mut self,
+        _buffer: BufferHandle,
+        _data: &[u8],
+        _offset: u64,
+    ) -> Result<(), RhiError> {
+        Err(RhiError::Backend {
+            detail: "buffer write is not implemented by this device".to_string(),
+        })
+    }
+
+    fn create_texture(
+        &mut self,
+        _descriptor: &TextureDescriptor,
+    ) -> Result<TextureHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "texture creation is not implemented by this device".to_string(),
+        })
+    }
+
+    fn create_shader_module(
+        &mut self,
+        _descriptor: &ShaderModuleDescriptor,
+    ) -> Result<ShaderModuleHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "shader module creation is not implemented by this device".to_string(),
+        })
+    }
+
+    fn create_render_pass(
+        &mut self,
+        _descriptor: &RenderPassDescriptor,
+    ) -> Result<RenderPassHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "render pass creation is not implemented by this device".to_string(),
+        })
+    }
+
+    fn create_framebuffer(
+        &mut self,
+        _descriptor: &FramebufferDescriptor,
+    ) -> Result<FramebufferHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "framebuffer creation is not implemented by this device".to_string(),
+        })
+    }
+
+    fn create_pipeline_layout(
+        &mut self,
+        _descriptor: &PipelineLayoutDescriptor,
+    ) -> Result<PipelineLayoutHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "pipeline layout creation is not implemented by this device".to_string(),
+        })
+    }
+
+    fn create_pipeline(
+        &mut self,
+        _descriptor: &PipelineDescriptor,
+    ) -> Result<PipelineHandle, RhiError> {
+        Err(RhiError::Backend {
+            detail: "pipeline creation is not implemented by this device".to_string(),
+        })
+    }
+
+    // --- Frame lifecycle ---
+
+    /// Begin a new frame. Returns the swapchain image index and a command encoder
+    /// that the caller uses to record commands for this frame.
+    fn begin_frame(
+        &mut self,
+        _swapchain: SwapchainHandle,
+    ) -> Result<(u32, Box<dyn CommandEncoder>), RhiError> {
+        Err(RhiError::Backend {
+            detail: "begin_frame is not implemented by this device".to_string(),
+        })
+    }
+
+    /// End the current frame: submit recorded commands and present.
+    fn end_frame(
+        &mut self,
+        _swapchain: SwapchainHandle,
+        _encoder: Box<dyn CommandEncoder>,
+        _image_index: u32,
+    ) -> Result<RendererStatistics, RhiError> {
+        Err(RhiError::Backend {
+            detail: "end_frame is not implemented by this device".to_string(),
+        })
+    }
+
+    /// Recreate a swapchain (typically after a resize).
+    fn recreate_swapchain(
+        &mut self,
+        _swapchain: SwapchainHandle,
+        _width: u32,
+        _height: u32,
+    ) -> Result<(), RhiError> {
+        Err(RhiError::Backend {
+            detail: "recreate_swapchain is not implemented by this device".to_string(),
+        })
+    }
+
+    // --- Resource destruction ---
+
+    fn destroy_buffer(&mut self, _buffer: BufferHandle) {}
+    fn destroy_texture(&mut self, _texture: TextureHandle) {}
+    fn destroy_shader_module(&mut self, _module: ShaderModuleHandle) {}
+    fn destroy_render_pass(&mut self, _pass: RenderPassHandle) {}
+    fn destroy_framebuffer(&mut self, _fb: FramebufferHandle) {}
+    fn destroy_pipeline_layout(&mut self, _layout: PipelineLayoutHandle) {}
+    fn destroy_pipeline(&mut self, _pipeline: PipelineHandle) {}
+    fn destroy_swapchain(&mut self, _swapchain: SwapchainHandle) {}
+    fn destroy_surface(&mut self, _surface: SurfaceHandle) {}
+
+    /// Wait for all pending GPU work to complete.
+    fn wait_idle(&self) {}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,64 +625,6 @@ pub struct DepthState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlendState {
     pub mode: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PipelineDescriptor {
-    pub shader_modules: Vec<ShaderModuleHandle>,
-    pub vertex_layout: VertexLayout,
-    pub bind_layouts: Vec<BindGroupLayoutDescriptor>,
-    pub raster_state: RasterState,
-    pub depth_state: DepthState,
-    pub blend_state: BlendState,
-    pub render_targets: Vec<TextureFormat>,
-    pub debug_label: Option<String>,
-}
-
-pub trait Backend: Send + Sync {
-    fn kind(&self) -> BackendKind;
-    fn enumerate_adapters(&self) -> Result<Vec<AdapterInfo>, RhiError>;
-    fn create_device(&self, descriptor: &DeviceDescriptor) -> Result<Box<dyn Device>, RhiError>;
-}
-
-pub trait Device: Send + Sync {
-    fn adapter_info(&self) -> &AdapterInfo;
-
-    fn create_surface(&self, _descriptor: &SurfaceDescriptor) -> Result<SurfaceHandle, RhiError> {
-        Err(RhiError::Backend {
-            detail: "surface creation is not implemented by this device".to_string(),
-        })
-    }
-
-    fn create_buffer(&self, _descriptor: &BufferDescriptor) -> Result<BufferHandle, RhiError> {
-        Err(RhiError::Backend {
-            detail: "buffer creation is not implemented by this device".to_string(),
-        })
-    }
-
-    fn create_texture(&self, _descriptor: &TextureDescriptor) -> Result<TextureHandle, RhiError> {
-        Err(RhiError::Backend {
-            detail: "texture creation is not implemented by this device".to_string(),
-        })
-    }
-
-    fn create_shader_module(
-        &self,
-        _descriptor: &ShaderModuleDescriptor,
-    ) -> Result<ShaderModuleHandle, RhiError> {
-        Err(RhiError::Backend {
-            detail: "shader module creation is not implemented by this device".to_string(),
-        })
-    }
-
-    fn create_pipeline(
-        &self,
-        _descriptor: &PipelineDescriptor,
-    ) -> Result<PipelineHandle, RhiError> {
-        Err(RhiError::Backend {
-            detail: "pipeline creation is not implemented by this device".to_string(),
-        })
-    }
 }
 
 #[cfg(test)]
