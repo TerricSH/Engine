@@ -13,6 +13,10 @@ pub enum VulkanError {
         op: &'static str,
         result: vk::Result,
     },
+    #[error("gpu allocation failed: {0}")]
+    Allocation(String),
+    #[error("allocation for `{0}` is not CPU mapped")]
+    MemoryNotMapped(&'static str),
     #[error("no physical device satisfies Gate 2 requirements")]
     NoSuitableAdapter,
     #[error("no queue family supports graphics + present on the chosen surface")]
@@ -43,6 +47,12 @@ impl VulkanError {
             },
             Self::Vk { op, result } => RhiError::Backend {
                 detail: format!("{op}: {result:?}"),
+            },
+            Self::Allocation(detail) => RhiError::Backend {
+                detail: format!("gpu allocation: {detail}"),
+            },
+            Self::MemoryNotMapped(name) => RhiError::Backend {
+                detail: format!("allocation is not CPU mapped: {name}"),
             },
             Self::NoSuitableAdapter | Self::NoSuitableQueue => RhiError::UnsupportedBackend,
             Self::MissingExtension(name) => RhiError::UnsupportedFeature {

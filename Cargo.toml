@@ -35,6 +35,7 @@ ash-window = "0.13"
 bincode = "1.3"
 crossbeam-channel = "0.5"
 glam = { version = "0.27", features = ["serde"] }
+gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 indexmap = { version = "2.2", features = ["serde"] }
 raw-window-handle = "0.6"
 ron = "0.8"

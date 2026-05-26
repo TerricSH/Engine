@@ -1,4 +1,4 @@
-//! Render pass, graphics pipeline, and framebuffers for the triangle scene.
+//! Render pass, graphics pipelines, and framebuffers for Gate 2 scenes.
 
 use ash::vk;
 use ash::Device as AshDevice;
@@ -14,10 +14,17 @@ pub struct Pipeline {
     device: AshDevice,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineKind {
+    Triangle,
+    TexturedQuad {
+        descriptor_set_layout: vk::DescriptorSetLayout,
+    },
+}
+
 impl Pipeline {
-    /// Build the render pass, single-stage graphics pipeline (no descriptor
-    /// sets, no vertex buffers — vertices come from `gl_VertexIndex`), and
-    /// per-image framebuffers for the supplied swapchain image views.
+    /// Build the render pass, graphics pipeline, and per-image
+    /// framebuffers for the supplied swapchain image views.
     ///
     /// # Safety
     /// `device`, `image_views`, and the SPIR-V byte slices must remain
@@ -27,14 +34,17 @@ impl Pipeline {
         format: vk::Format,
         extent: vk::Extent2D,
         image_views: &[vk::ImageView],
+        kind: PipelineKind,
         vert_spv: &[u8],
         frag_spv: &[u8],
+        vert_name: &'static str,
+        frag_name: &'static str,
     ) -> VkResult<Self> {
         if vert_spv.is_empty() {
-            return Err(VulkanError::MissingShader("triangle.vert.spv"));
+            return Err(VulkanError::MissingShader(vert_name));
         }
         if frag_spv.is_empty() {
-            return Err(VulkanError::MissingShader("triangle.frag.spv"));
+            return Err(VulkanError::MissingShader(frag_name));
         }
 
         // SAFETY: shader byte slices are valid; module retains its own copy.
@@ -55,7 +65,14 @@ impl Pipeline {
             }
         };
 
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let descriptor_set_layouts = match kind {
+            PipelineKind::Triangle => Vec::new(),
+            PipelineKind::TexturedQuad {
+                descriptor_set_layout,
+            } => vec![descriptor_set_layout],
+        };
+        let pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
         // SAFETY: layout info has no refs.
         let pipeline_layout =
             match unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) } {
@@ -83,7 +100,11 @@ impl Pipeline {
                 .name(main),
         ];
 
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let vertex_bindings = vertex_bindings(kind);
+        let vertex_attributes = vertex_attributes(kind);
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vertex_bindings)
+            .vertex_attribute_descriptions(&vertex_attributes);
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
             .primitive_restart_enable(false);
@@ -192,6 +213,37 @@ impl Pipeline {
             extent,
             device,
         })
+    }
+}
+
+fn vertex_bindings(kind: PipelineKind) -> Vec<vk::VertexInputBindingDescription> {
+    match kind {
+        PipelineKind::Triangle => Vec::new(),
+        PipelineKind::TexturedQuad { .. } => vec![vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: 16,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }],
+    }
+}
+
+fn vertex_attributes(kind: PipelineKind) -> Vec<vk::VertexInputAttributeDescription> {
+    match kind {
+        PipelineKind::Triangle => Vec::new(),
+        PipelineKind::TexturedQuad { .. } => vec![
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 8,
+            },
+        ],
     }
 }
 

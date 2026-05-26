@@ -9,8 +9,11 @@ use crate::device::Device;
 use crate::error::{VkResult, VulkanError};
 use crate::frame::FrameContext;
 use crate::instance::Instance;
-use crate::pipeline::Pipeline;
-use crate::shaders_embedded::{TRIANGLE_FRAG_SPV, TRIANGLE_VERT_SPV};
+use crate::pipeline::{Pipeline, PipelineKind};
+use crate::resource::TexturedQuadResources;
+use crate::shaders_embedded::{
+    TEXTURED_FRAG_SPV, TEXTURED_VERT_SPV, TRIANGLE_FRAG_SPV, TRIANGLE_VERT_SPV,
+};
 use crate::surface::Surface;
 use crate::swapchain::Swapchain;
 
@@ -21,11 +24,19 @@ pub struct VulkanRendererDescriptor {
     pub width: u32,
     pub height: u32,
     pub enable_validation: bool,
+    pub scene: VulkanSceneKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VulkanSceneKind {
+    Triangle,
+    TexturedQuad,
 }
 
 pub struct VulkanRenderer {
-    // Drop order: pipeline -> frames -> swapchain -> device -> surface -> instance.
+    // Drop order: pipeline -> textured resources -> frames -> swapchain -> device -> surface -> instance.
     pipeline: Option<Pipeline>,
+    textured_quad: Option<TexturedQuadResources>,
     frames: Option<FrameContext>,
     swapchain: Option<Swapchain>,
     adapter: AdapterSelection,
@@ -35,6 +46,7 @@ pub struct VulkanRenderer {
 
     requested_extent: vk::Extent2D,
     minimized: bool,
+    scene: VulkanSceneKind,
 }
 
 impl VulkanRenderer {
@@ -64,6 +76,11 @@ impl VulkanRenderer {
         // SAFETY: device + queue family valid.
         let frames =
             unsafe { FrameContext::new(device.device.clone(), device.queue_family_index) }?;
+        let textured_quad = match descriptor.scene {
+            VulkanSceneKind::Triangle => None,
+            // SAFETY: device, queue, and allocator are valid; upload waits before returning.
+            VulkanSceneKind::TexturedQuad => Some(unsafe { TexturedQuadResources::new(&device) }?),
+        };
 
         let requested_extent = vk::Extent2D {
             width: descriptor.width,
@@ -72,6 +89,7 @@ impl VulkanRenderer {
 
         let mut renderer = Self {
             pipeline: None,
+            textured_quad,
             frames: Some(frames),
             swapchain: None,
             adapter,
@@ -80,6 +98,7 @@ impl VulkanRenderer {
             instance,
             requested_extent,
             minimized: false,
+            scene: descriptor.scene,
         };
         // SAFETY: renderer state valid; build swapchain + pipeline now.
         unsafe { renderer.create_swapchain_chain()? };
@@ -96,15 +115,14 @@ impl VulkanRenderer {
             tracing::debug!(target: "vulkan", "window minimized; pausing rendering");
         }
         // Drop existing swapchain/pipeline so render() rebuilds them.
-        self.pipeline = None;
-        if let Some(swapchain) = &self.swapchain {
+        if self.pipeline.is_some() || self.swapchain.is_some() {
             // Wait for outstanding work tied to the old swapchain before dropping it.
             // SAFETY: device handle is valid.
             unsafe {
                 let _ = self.device.device.device_wait_idle();
             }
-            let _ = swapchain;
         }
+        self.pipeline = None;
         self.swapchain = None;
     }
 
@@ -137,6 +155,10 @@ impl VulkanRenderer {
             Ok(()) => Ok(()),
             Err(VulkanError::SwapchainOutOfDate) | Err(VulkanError::SurfaceMinimized) => {
                 tracing::debug!(target: "vulkan", "swapchain out of date; recreating");
+                // SAFETY: device handle is valid; resize/out-of-date is not routine frame flow.
+                unsafe {
+                    let _ = self.device.device.device_wait_idle();
+                }
                 self.pipeline = None;
                 self.swapchain = None;
                 Ok(())
@@ -159,6 +181,30 @@ impl VulkanRenderer {
                 self.requested_extent.height,
             )
         }?;
+        let (pipeline_kind, vert_spv, frag_spv, vert_name, frag_name) = match self.scene {
+            VulkanSceneKind::Triangle => (
+                PipelineKind::Triangle,
+                TRIANGLE_VERT_SPV,
+                TRIANGLE_FRAG_SPV,
+                "triangle.vert.spv",
+                "triangle.frag.spv",
+            ),
+            VulkanSceneKind::TexturedQuad => {
+                let textured_quad = self
+                    .textured_quad
+                    .as_ref()
+                    .expect("textured resources exist for textured scene");
+                (
+                    PipelineKind::TexturedQuad {
+                        descriptor_set_layout: textured_quad.descriptor_set_layout,
+                    },
+                    TEXTURED_VERT_SPV,
+                    TEXTURED_FRAG_SPV,
+                    "textured.vert.spv",
+                    "textured.frag.spv",
+                )
+            }
+        };
         // SAFETY: device + image views are valid.
         let pipeline = unsafe {
             Pipeline::new(
@@ -166,8 +212,11 @@ impl VulkanRenderer {
                 swapchain.format,
                 swapchain.extent,
                 &swapchain.image_views,
-                TRIANGLE_VERT_SPV,
-                TRIANGLE_FRAG_SPV,
+                pipeline_kind,
+                vert_spv,
+                frag_spv,
+                vert_name,
+                frag_name,
             )
         }?;
         self.swapchain = Some(swapchain);
@@ -276,7 +325,48 @@ impl VulkanRenderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 pipeline.pipeline,
             );
-            device.cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+            match self.scene {
+                VulkanSceneKind::Triangle => {
+                    device.cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+                }
+                VulkanSceneKind::TexturedQuad => {
+                    let textured_quad = self
+                        .textured_quad
+                        .as_ref()
+                        .expect("textured resources exist for textured scene");
+                    let vertex_buffers = [textured_quad.vertex_buffer.buffer];
+                    let offsets = [0_u64];
+                    let descriptor_sets = [textured_quad.descriptor_set];
+                    device.cmd_bind_vertex_buffers(
+                        frame.command_buffer,
+                        0,
+                        &vertex_buffers,
+                        &offsets,
+                    );
+                    device.cmd_bind_index_buffer(
+                        frame.command_buffer,
+                        textured_quad.index_buffer.buffer,
+                        0,
+                        vk::IndexType::UINT16,
+                    );
+                    device.cmd_bind_descriptor_sets(
+                        frame.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline.pipeline_layout,
+                        0,
+                        &descriptor_sets,
+                        &[],
+                    );
+                    device.cmd_draw_indexed(
+                        frame.command_buffer,
+                        textured_quad.index_count,
+                        1,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            }
             device.cmd_end_render_pass(frame.command_buffer);
             device
                 .end_command_buffer(frame.command_buffer)

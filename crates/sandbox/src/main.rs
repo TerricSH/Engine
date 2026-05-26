@@ -11,6 +11,8 @@ fn main() {
         "workspace" => tracing::info!("engine workspace initialized"),
         "gate04-scene" => run_gate04_scene(),
         "triangle" => run_triangle(),
+        "textured-object" => run_textured_object(),
+        "resize-smoke" => run_resize_smoke(),
         other => {
             tracing::error!(command = other, "unknown sandbox command");
             std::process::exit(2);
@@ -37,20 +39,49 @@ fn run_gate04_scene() {
 
 #[cfg(feature = "backend-vulkan")]
 fn run_triangle() {
+    run_vulkan_scene(
+        "Engine Sandbox - Triangle",
+        render_vulkan::VulkanSceneKind::Triangle,
+        false,
+    );
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn run_textured_object() {
+    run_vulkan_scene(
+        "Engine Sandbox - Textured Object",
+        render_vulkan::VulkanSceneKind::TexturedQuad,
+        false,
+    );
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn run_resize_smoke() {
+    run_vulkan_scene(
+        "Engine Sandbox - Resize Smoke",
+        render_vulkan::VulkanSceneKind::TexturedQuad,
+        true,
+    );
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn run_vulkan_scene(title: &str, scene: render_vulkan::VulkanSceneKind, auto_resize: bool) {
     use std::sync::Arc;
 
     use platform::winit::window::Window;
     use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-    use render_vulkan::{VulkanRenderer, VulkanRendererDescriptor};
+    use render_vulkan::{VulkanRenderer, VulkanRendererDescriptor, VulkanSceneKind};
 
-    struct TriangleApp {
+    struct VulkanSampleApp {
         renderer: Option<VulkanRenderer>,
         frames: u64,
         max_frames: Option<u64>,
+        scene: VulkanSceneKind,
+        auto_resize: bool,
     }
 
-    impl WindowApp for TriangleApp {
+    impl WindowApp for VulkanSampleApp {
         fn on_create(&mut self, window: Arc<Window>) {
             let size = window.inner_size();
             let display_handle = match window.display_handle() {
@@ -74,6 +105,7 @@ fn run_triangle() {
                 width: size.width.max(1),
                 height: size.height.max(1),
                 enable_validation,
+                scene: self.scene,
             }) {
                 Ok(renderer) => {
                     tracing::info!("vulkan renderer initialized");
@@ -81,11 +113,12 @@ fn run_triangle() {
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "vulkan renderer initialization failed");
+                    std::process::exit(1);
                 }
             }
         }
 
-        fn on_event(&mut self, _window: &Window, event: PlatformEvent) -> EventFlow {
+        fn on_event(&mut self, window: &Window, event: PlatformEvent) -> EventFlow {
             match event {
                 PlatformEvent::Resized { width, height } => {
                     if let Some(renderer) = self.renderer.as_mut() {
@@ -95,6 +128,9 @@ fn run_triangle() {
                 }
                 PlatformEvent::Redraw => {
                     if let Some(renderer) = self.renderer.as_mut() {
+                        if self.auto_resize {
+                            request_resize_step(window, self.frames);
+                        }
                         if let Err(err) = renderer.render() {
                             tracing::error!(error = %err, "frame render failed");
                             return EventFlow::Exit;
@@ -124,19 +160,18 @@ fn run_triangle() {
         }
     }
 
-    let max_frames = std::env::args()
-        .skip(2)
-        .find_map(|arg| arg.strip_prefix("--frames=").map(|v| v.to_string()))
-        .and_then(|v| v.parse::<u64>().ok());
+    let max_frames = parse_frame_limit();
 
-    let app = TriangleApp {
+    let app = VulkanSampleApp {
         renderer: None,
         frames: 0,
         max_frames,
+        scene,
+        auto_resize,
     };
     if let Err(err) = platform::run(
         WindowDescriptor {
-            title: "Engine Sandbox - Triangle".to_string(),
+            title: title.to_string(),
             width: 1280,
             height: 720,
         },
@@ -147,11 +182,57 @@ fn run_triangle() {
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
+fn parse_frame_limit() -> Option<u64> {
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        if arg == "--frames" {
+            return args.next().and_then(|value| value.parse::<u64>().ok());
+        }
+        if let Some(value) = arg.strip_prefix("--frames=") {
+            return value.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn request_resize_step(window: &platform::winit::window::Window, frame: u64) {
+    let size = match frame {
+        30 => Some((960, 540)),
+        60 => Some((320, 240)),
+        90 => Some((1280, 720)),
+        _ => None,
+    };
+    if let Some((width, height)) = size {
+        let _ = window.request_inner_size(platform::winit::dpi::PhysicalSize::new(width, height));
+        tracing::info!(width, height, "resize-smoke requested window size");
+    }
+}
+
 #[cfg(not(feature = "backend-vulkan"))]
 fn run_triangle() {
     tracing::error!(
         "the `triangle` command requires the `backend-vulkan` feature \
          (cargo run -p sandbox --features backend-vulkan -- triangle)"
+    );
+    std::process::exit(2);
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn run_textured_object() {
+    tracing::error!(
+        "the `textured-object` command requires the `backend-vulkan` feature \
+         (cargo run -p sandbox --features backend-vulkan -- textured-object)"
+    );
+    std::process::exit(2);
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn run_resize_smoke() {
+    tracing::error!(
+        "the `resize-smoke` command requires the `backend-vulkan` feature \
+         (cargo run -p sandbox --features backend-vulkan -- resize-smoke)"
     );
     std::process::exit(2);
 }
