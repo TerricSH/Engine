@@ -105,11 +105,26 @@ impl VulkanDevice {
         self.frame_ubos.get(frame_idx).copied()
     }
 
-    /// Write default per-frame UBO data (identity view-proj, a directional light) for the current frame.
+    /// Write default per-frame UBO data matching the new forward shader layout:
+    ///
+    /// | offset | field         | type   | bytes |
+    /// |--------|---------------|--------|-------|
+    /// |      0 | model         | mat4   |    64 |
+    /// |     64 | view_proj     | mat4   |    64 |
+    /// |    128 | light_dir     | vec4   |    16 |
+    /// |    144 | light_color   | vec4   |    16 |
+    /// |    160 | camera_pos    | vec4   |    16 |
+    ///
+    /// Total: 176 bytes (fits in 256 B UBO).
     pub fn write_default_ubo(&mut self) {
         let fi = self.current_frame;
-        let mut data = Vec::with_capacity(128);
-        // View-proj matrix (identity for clip-space rendering)
+        let mut data = Vec::with_capacity(176);
+        // Model matrix (identity for clip-space rendering)
+        for i in 0..16 {
+            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
+            data.extend_from_slice(&v.to_ne_bytes());
+        }
+        // View-proj matrix (identity as well)
         for i in 0..16 {
             let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
             data.extend_from_slice(&v.to_ne_bytes());
@@ -120,10 +135,6 @@ impl VulkanDevice {
         }
         // Light color (bright white, intensity 1.5)
         for v in &[1.5f32, 1.5f32, 1.5f32, 1.5f32] {
-            data.extend_from_slice(&v.to_ne_bytes());
-        }
-        // Ambient (0.15 intensity)
-        for v in &[0.15f32, 0.15f32, 0.15f32, 0.15f32] {
             data.extend_from_slice(&v.to_ne_bytes());
         }
         // Camera position (world space)

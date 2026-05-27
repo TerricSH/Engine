@@ -14,6 +14,7 @@
 //! - [`FileWatcher`] – directory watch via `notify`, events delivered over
 //!   a [`crossbeam_channel`] receiver.
 
+pub mod mesh;
 mod registry;
 mod loader;
 mod watcher;

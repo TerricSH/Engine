@@ -13,6 +13,7 @@ fn main() {
         "contract-triangle" => run_contract_triangle(),
         "static-lit-scene" => run_static_lit_scene(),
         "triangle" => run_triangle(),
+        "model-viewer" => run_model_viewer(),
         "textured-object" => run_textured_object(),
         "resize-smoke" => run_resize_smoke(),
         other => {
@@ -613,7 +614,8 @@ fn run_static_lit_scene() {
                         match renderer.draw_scene(&input) {
                             Ok(stats) => tracing::info!(
                                 draw_calls = stats.draw_calls,
-                                "static-lit-scene frame"
+                                triangles = stats.triangles,
+                                "model-viewer frame"
                             ),
                             Err(diags) => {
                                 for d in &diags {
@@ -659,6 +661,354 @@ fn run_static_lit_scene() {
 #[cfg(not(feature = "backend-vulkan"))]
 fn run_static_lit_scene() {
     tracing::error!("static-lit-scene requires backend-vulkan");
+    std::process::exit(2);
+}
+
+// ============================================================================
+// model-viewer: loads a glTF mesh and renders it with orbit camera + FORWARD
+// shaders through the VulkanDevice model rendering path.
+// ============================================================================
+
+#[cfg(feature = "backend-vulkan")]
+fn run_model_viewer() {
+    use engine_asset::mesh::load_mesh_from_gltf;
+    use engine_renderer::{
+        BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, RenderFrameInput, Renderer,
+    };
+    use glam::{Mat4, Vec3, Vec2};
+    use platform::winit::window::Window;
+    use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+    use render_core::{
+        BufferDescriptor, BufferHandle, Device, MemoryHint,
+    };
+    use render_vulkan::device_impl::VulkanDevice;
+    use std::sync::Arc;
+
+    // ── CLI ───────────────────────────────────────────────────────────────
+    // Parse model path (skip --frames / --frames=N flags).
+    let model_path = std::env::args().skip(2).find(|a| !a.starts_with("--"));
+    let mesh = match model_path.as_deref() {
+        Some(path) if !path.is_empty() => {
+            match load_mesh_from_gltf(std::path::Path::new(path)) {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(path, error = %err, "glTF load failed, using test cube");
+                    engine_asset::mesh::create_test_cube()
+                }
+            }
+        }
+        _ => {
+            tracing::info!("no model path provided, using test cube");
+            engine_asset::mesh::create_test_cube()
+        }
+    };
+    tracing::info!(
+        vertices = mesh.positions.len(),
+        indices = mesh.indices.len(),
+        "mesh loaded"
+    );
+
+    // ── BackendRenderer implementation ────────────────────────────────────
+    struct ModelViewerBackend {
+        device: VulkanDevice,
+        vertex_buf: BufferHandle,
+        index_buf: BufferHandle,
+        index_count: u32,
+        camera_angle: f32,
+        width: f32,
+        height: f32,
+    }
+
+    impl BackendRenderer for ModelViewerBackend {
+        fn render_frame(
+            &mut self,
+            _input: &RenderFrameInput,
+        ) -> Result<FrameStats, Vec<Diagnostic>> {
+            let width = self.width;
+            let height = self.height;
+
+            // ── Orbit camera ──────────────────────────────────────────
+            self.camera_angle += 0.015;
+            let radius = 3.0;
+            let eye = Vec3::new(
+                radius * self.camera_angle.sin(),
+                0.6,
+                radius * self.camera_angle.cos(),
+            );
+            let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+            let aspect = width / height;
+            let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, aspect, 0.1, 100.0);
+
+            // OpenGL NDC [-1,1] → Vulkan NDC [0,1] (flip Y + remap Z)
+            let vulkan_correction = Mat4::from_cols_array_2d(&[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.5, 0.0],
+                [0.0, 0.0, 0.5, 1.0],
+            ]);
+            let view_proj = vulkan_correction * proj * view;
+
+            // Model matrix = identity (mesh is at origin).
+            let model = Mat4::IDENTITY;
+
+            // ── Pack UBO (176 bytes matching forward shader layout) ───
+            let mut ubo = Vec::with_capacity(176);
+            // model (mat4, offset 0)
+            for v in model.to_cols_array_2d().iter().flatten() {
+                ubo.extend_from_slice(&v.to_ne_bytes());
+            }
+            // view_proj (mat4, offset 64)
+            for v in view_proj.to_cols_array_2d().iter().flatten() {
+                ubo.extend_from_slice(&v.to_ne_bytes());
+            }
+            // light_dir (vec4, offset 128) — normalized, pointing down-right
+            let light_dir = Vec3::new(0.5, -0.707, 0.5).normalize();
+            for v in &[light_dir.x, light_dir.y, light_dir.z, 0.0f32] {
+                ubo.extend_from_slice(&v.to_ne_bytes());
+            }
+            // light_color (vec4, offset 144) — bright white, intensity 1.5
+            for v in &[1.5f32, 1.5f32, 1.5f32, 1.5f32] {
+                ubo.extend_from_slice(&v.to_ne_bytes());
+            }
+            // camera_pos (vec4, offset 160)
+            for v in &[eye.x, eye.y, eye.z, 1.0f32] {
+                ubo.extend_from_slice(&v.to_ne_bytes());
+            }
+
+            self.device.write_ubo_current(&ubo, 0);
+
+            // ── Render ────────────────────────────────────────────────
+            let stats = match self.device.render_model_frame(
+                self.vertex_buf,
+                self.index_buf,
+                self.index_count,
+            ) {
+                Ok(s) => s,
+                Err(err) => {
+                    return Err(vec![Diagnostic::new(
+                        "RV0099",
+                        DiagnosticSeverity::Error,
+                        "sandbox",
+                        &format!("model frame failed: {err}"),
+                    )]);
+                }
+            };
+            Ok(FrameStats {
+                draw_calls: stats.draw_calls,
+                triangles: stats.triangles,
+                visible_drawables: 1,
+                ..FrameStats::default()
+            })
+        }
+    }
+
+    // ── WindowApp ─────────────────────────────────────────────────────────
+    struct ModelViewerApp {
+        renderer: Option<Renderer>,
+        frames: u64,
+        max_frames: Option<u64>,
+        mesh: Option<engine_asset::mesh::MeshData>,
+    }
+
+    impl WindowApp for ModelViewerApp {
+        fn on_create(&mut self, window: Arc<Window>) {
+            let size = window.inner_size();
+            let display_handle = match window.display_handle() {
+                Ok(h) => h.as_raw(),
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to acquire raw display handle");
+                    return;
+                }
+            };
+            let window_handle = match window.window_handle() {
+                Ok(h) => h.as_raw(),
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to acquire raw window handle");
+                    return;
+                }
+            };
+            let enable_validation = std::env::var("ENGINE_VK_VALIDATION").is_ok();
+
+            let mut device: VulkanDevice = match VulkanDevice::new(
+                display_handle,
+                window_handle,
+                size.width.max(1),
+                size.height.max(1),
+                enable_validation,
+            ) {
+                Ok(d) => d,
+                Err(err) => {
+                    tracing::error!(error = %err, "VulkanDevice creation failed");
+                    std::process::exit(1);
+                }
+            };
+
+            // Set FORWARD shaders.
+            device.set_mvp_shaders(
+                render_vulkan::shaders_embedded::FORWARD_VERT_SPV,
+                render_vulkan::shaders_embedded::FORWARD_FRAG_SPV,
+            );
+
+            // ── Build interleaved vertex buffer ───────────────────────
+            let mesh = self.mesh.take().expect("mesh loaded earlier");
+            let stride = 32u64; // position(12) + normal(12) + uv(8)
+
+            let mut vert_bytes: Vec<u8> =
+                Vec::with_capacity(mesh.positions.len() * stride as usize);
+            for i in 0..mesh.positions.len() {
+                let p = mesh.positions[i];
+                let n = mesh.normals[i];
+                let uv = mesh.uvs.get(i).copied().unwrap_or(Vec2::ZERO);
+                vert_bytes.extend_from_slice(&p.x.to_ne_bytes());
+                vert_bytes.extend_from_slice(&p.y.to_ne_bytes());
+                vert_bytes.extend_from_slice(&p.z.to_ne_bytes());
+                vert_bytes.extend_from_slice(&n.x.to_ne_bytes());
+                vert_bytes.extend_from_slice(&n.y.to_ne_bytes());
+                vert_bytes.extend_from_slice(&n.z.to_ne_bytes());
+                vert_bytes.extend_from_slice(&uv.x.to_ne_bytes());
+                vert_bytes.extend_from_slice(&uv.y.to_ne_bytes());
+            }
+
+            let vb_desc = BufferDescriptor {
+                size_bytes: vert_bytes.len() as u64,
+                usage_flags: render_core::BufferUsage(0),
+                memory_hint: MemoryHint::CpuToGpu,
+                debug_label: Some("model-vertices".into()),
+            };
+            let vertex_buf = match device.create_buffer(&vb_desc) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::error!(error = ?err, "failed to create vertex buffer");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(err) = device.write_buffer(vertex_buf, &vert_bytes, 0) {
+                tracing::error!(error = ?err, "failed to write vertex buffer");
+                std::process::exit(1);
+            }
+
+            // ── Build index buffer ────────────────────────────────────
+            let mut idx_bytes: Vec<u8> =
+                Vec::with_capacity(mesh.indices.len() * 4);
+            for i in &mesh.indices {
+                idx_bytes.extend_from_slice(&i.to_ne_bytes());
+            }
+            let ib_desc = BufferDescriptor {
+                size_bytes: idx_bytes.len() as u64,
+                usage_flags: render_core::BufferUsage(0),
+                memory_hint: MemoryHint::CpuToGpu,
+                debug_label: Some("model-indices".into()),
+            };
+            let index_buf = match device.create_buffer(&ib_desc) {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::error!(error = ?err, "failed to create index buffer");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(err) = device.write_buffer(index_buf, &idx_bytes, 0) {
+                tracing::error!(error = ?err, "failed to write index buffer");
+                std::process::exit(1);
+            }
+
+            let index_count = mesh.indices.len() as u32;
+
+            let backend = ModelViewerBackend {
+                device,
+                vertex_buf,
+                index_buf,
+                index_count,
+                camera_angle: 0.0,
+                width: size.width.max(1) as f32,
+                height: size.height.max(1) as f32,
+            };
+
+            let mut renderer = Renderer::new();
+            renderer.set_backend(Box::new(backend));
+            self.renderer = Some(renderer);
+            tracing::info!("model-viewer renderer initialized");
+        }
+
+        fn on_event(&mut self, _window: &Window, event: PlatformEvent) -> EventFlow {
+            match event {
+                PlatformEvent::Resized { .. } => EventFlow::Continue,
+                PlatformEvent::Redraw => {
+                    if let Some(ref mut renderer) = self.renderer {
+                        let mut input = RenderFrameInput::empty(self.frames);
+                        input.views.push(engine_renderer::RenderView {
+                            view_id: 0, camera_entity: None,
+                            viewport: engine_renderer::Rect::FULL,
+                            viewport_rect_normalized: engine_renderer::Rect::FULL,
+                            view_matrix: engine_renderer::IDENTITY_MAT4,
+                            projection_matrix: engine_renderer::IDENTITY_MAT4,
+                            clear_flags: engine_renderer::ClearFlags::ColorAndDepth,
+                            clear_color: [0.02, 0.02, 0.06, 1.0],
+                            render_layer_mask: u32::MAX, msaa_samples: 1,
+                            compose: engine_renderer::ViewCompose::Base {
+                                clear: engine_renderer::ClearFlags::ColorAndDepth,
+                                clear_color: [0.02, 0.02, 0.06, 1.0],
+                            },
+                            stack_order: 0, frustum: None,
+                        });
+                        match renderer.draw_scene(&input) {
+                            Ok(stats) => {
+                                tracing::info!(
+                                    draw_calls = stats.draw_calls,
+                                    triangles = stats.triangles,
+                                    "model-viewer frame"
+                                );
+                            }
+                            Err(diags) => {
+                                for d in &diags {
+                                    tracing::error!(code = d.code, message = d.message);
+                                }
+                                return EventFlow::Exit;
+                            }
+                        }
+                        self.frames += 1;
+                        if let Some(limit) = self.max_frames {
+                            if self.frames >= limit {
+                                tracing::info!(
+                                    frames = self.frames,
+                                    "frame limit reached; exiting"
+                                );
+                                return EventFlow::Exit;
+                            }
+                        }
+                    }
+                    EventFlow::Continue
+                }
+                PlatformEvent::CloseRequested => EventFlow::Exit,
+                PlatformEvent::Resumed | PlatformEvent::Suspended => EventFlow::Continue,
+            }
+        }
+    }
+
+    let max_frames = parse_frame_limit();
+
+    let app = ModelViewerApp {
+        renderer: None,
+        frames: 0,
+        max_frames,
+        mesh: Some(mesh),
+    };
+    if let Err(err) = platform::run(
+        WindowDescriptor {
+            title: "Engine Sandbox - Model Viewer".to_string(),
+            width: 1280,
+            height: 720,
+        },
+        app,
+    ) {
+        tracing::error!(error = %err, "platform run failed");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn run_model_viewer() {
+    tracing::error!("model-viewer requires `backend-vulkan` feature");
     std::process::exit(2);
 }
 

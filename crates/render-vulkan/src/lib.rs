@@ -18,6 +18,7 @@ mod instance;
 mod pipeline;
 mod renderer;
 mod resource;
+pub mod scene_renderer;
 mod surface;
 mod swapchain;
 

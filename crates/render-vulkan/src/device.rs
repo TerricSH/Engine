@@ -14,7 +14,7 @@ pub struct Device {
     pub device: AshDevice,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
-    allocator: Option<SharedAllocator>,
+    pub(crate) allocator: Option<SharedAllocator>,
 }
 
 impl Device {
