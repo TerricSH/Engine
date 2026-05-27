@@ -51,3 +51,66 @@ impl EngineRuntime {
         self.renderer.draw_scene(&input)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── EngineConfig tests ───────────────────────────────────────────────
+
+    #[test]
+    fn engine_config_defaults() {
+        let config = EngineConfig::default();
+        assert_eq!(config.application_name, "engine");
+    }
+
+    #[test]
+    fn engine_config_debug() {
+        let config = EngineConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("EngineConfig"));
+    }
+
+    #[test]
+    fn engine_config_partial_eq() {
+        let a = EngineConfig::default();
+        let b = EngineConfig::default();
+        let c = EngineConfig {
+            application_name: "custom".to_string(),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn engine_config_clone() {
+        let config = EngineConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config, cloned);
+    }
+
+    // ── EngineRuntime tests ──────────────────────────────────────────────
+
+    #[test]
+    fn engine_runtime_creation() {
+        let config = EngineConfig::default();
+        let runtime = EngineRuntime::new(config.clone());
+        assert_eq!(*runtime.config(), config);
+    }
+
+    #[test]
+    fn engine_runtime_config_accessor() {
+        let config = EngineConfig::default();
+        let runtime = EngineRuntime::new(config);
+        let retrieved = runtime.config();
+        assert_eq!(retrieved.application_name, "engine");
+    }
+
+    #[test]
+    fn engine_runtime_render_frame_without_scene_fails() {
+        let config = EngineConfig::default();
+        let mut runtime = EngineRuntime::new(config);
+        let result = runtime.render_frame(0);
+        assert!(result.is_err());
+    }
+}

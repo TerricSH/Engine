@@ -129,3 +129,6 @@ pub enum Value {
     List(Vec<Value>),
     Map(BTreeMap<String, Value>),
 }
+
+#[cfg(test)]
+mod tests;
