@@ -2,10 +2,10 @@
 
 use ash::vk;
 use ash::Device as AshDevice;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
-use gpu_allocator::MemoryLocation;
+use crate::allocator::{Allocation, AllocationCreateDesc, AllocationScheme, MemoryLocation};
 
-use crate::device::{Device, SharedAllocator};
+use crate::allocator::SharedAllocator;
+use crate::device::Device;
 use crate::error::{VkResult, VulkanError};
 
 const TEXTURE_WIDTH: u32 = 4;
@@ -141,7 +141,7 @@ impl BufferResource {
         // SAFETY: buffer is valid.
         let requirements = unsafe { device.device.get_buffer_memory_requirements(buffer) };
         let allocator = device.allocator();
-        let allocation = allocator
+        let mut allocation = allocator
             .borrow_mut()
             .allocate(&AllocationCreateDesc {
                 name,
@@ -158,7 +158,7 @@ impl BufferResource {
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
         };
         if let Err(result) = bind_result {
-            let _ = allocator.borrow_mut().free(allocation);
+            let _ = allocator.borrow_mut().free(&mut allocation);
             // SAFETY: buffer was created above and is not bound to live resources.
             unsafe { device.device.destroy_buffer(buffer, None) };
             return Err(VulkanError::vk("bind_buffer_memory", result));
@@ -209,8 +209,8 @@ impl Drop for BufferResource {
     fn drop(&mut self) {
         // SAFETY: VulkanRenderer waits for the device to be idle before dropping resources.
         unsafe { self.device.destroy_buffer(self.buffer, None) };
-        if let Some(allocation) = self.allocation.take() {
-            let _ = self.allocator.borrow_mut().free(allocation);
+        if let Some(mut allocation) = self.allocation.take() {
+            let _ = self.allocator.borrow_mut().free(&mut allocation);
         }
     }
 }
@@ -319,8 +319,8 @@ impl Drop for TextureResource {
             self.device.destroy_image_view(self.image_view, None);
             self.device.destroy_image(self.image, None);
         }
-        if let Some(allocation) = self.allocation.take() {
-            let _ = self.allocator.borrow_mut().free(allocation);
+        if let Some(mut allocation) = self.allocation.take() {
+            let _ = self.allocator.borrow_mut().free(&mut allocation);
         }
     }
 }

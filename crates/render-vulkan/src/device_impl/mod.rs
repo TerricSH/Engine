@@ -1,5 +1,10 @@
 //! VulkanDevice — implements `render_core::Device` plus MVP triangle path.
 
+pub(crate) mod depth;
+pub(crate) mod descriptor;
+pub(crate) mod encoder;
+pub(crate) mod slab;
+
 use std::collections::HashMap;
 use std::ffi::CStr;
 
@@ -8,7 +13,7 @@ use ash::Device as AshDevice;
 
 use render_core::{
     self, AdapterInfo, BackendKind, BufferDescriptor, BufferHandle,
-    CommandEncoder as CmdEncoderTrait, FramebufferDescriptor, FramebufferHandle, IndexFormat,
+    CommandEncoder as CmdEncoderTrait, FramebufferDescriptor, FramebufferHandle,
     PipelineDescriptor, PipelineHandle, PipelineLayoutDescriptor, PipelineLayoutHandle,
     RenderPassDescriptor, RenderPassHandle, RendererStatistics, ResourceLimits, ShaderFormat,
     ShaderModuleDescriptor, ShaderModuleHandle, SurfaceDescriptor, SurfaceHandle,
@@ -20,308 +25,63 @@ use crate::error::{VkResult, VulkanError};
 use crate::instance::Instance;
 use crate::surface::Surface;
 
+use self::encoder::VkCmdEncoder;
+use self::slab::{BufEntry, FrameSync, PipeEntry, PlEntry, Slab};
+
 unsafe impl Send for VulkanDevice {}
 unsafe impl Sync for VulkanDevice {}
-
-// ============================================================================
-// Handle slab
-// ============================================================================
-
-struct BufEntry {
-    buffer: vk::Buffer,
-    allocator: crate::device::SharedAllocator,
-    allocation: Option<gpu_allocator::vulkan::Allocation>,
-}
-
-impl Drop for BufEntry {
-    fn drop(&mut self) {
-        if let Some(a) = self.allocation.take() {
-            let _ = self.allocator.borrow_mut().free(a);
-        }
-    }
-}
-
-struct Slab<T> {
-    slots: Vec<Option<(u32, T)>>,
-}
-impl<T> Slab<T> {
-    fn new() -> Self {
-        Self { slots: Vec::new() }
-    }
-    fn insert(&mut self, v: T) -> (u32, u32) {
-        for (i, s) in self.slots.iter_mut().enumerate() {
-            if s.is_none() {
-                *s = Some((1, v));
-                return (i as u32, 1);
-            }
-        }
-        let i = self.slots.len();
-        self.slots.push(Some((1, v)));
-        (i as u32, 1)
-    }
-    fn get(&self, idx: u32, gen: u32) -> Option<&T> {
-        self.slots
-            .get(idx as usize)
-            .and_then(|s| s.as_ref().filter(|(g, _)| *g == gen).map(|(_, v)| v))
-    }
-    fn get_mut(&mut self, idx: u32, gen: u32) -> Option<&mut T> {
-        self.slots
-            .get_mut(idx as usize)
-            .and_then(|s| s.as_mut().filter(|(g, _)| *g == gen).map(|(_, v)| v))
-    }
-}
-
-// ============================================================================
-// Frame sync
-// ============================================================================
-
-struct FrameSync {
-    image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
-    in_flight_fence: vk::Fence,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-}
-
-// ============================================================================
-// VkCmdEncoder
-// ============================================================================
-
-struct PipeEntry {
-    pipeline: vk::Pipeline,
-}
-
-struct PlEntry {
-    layout: vk::PipelineLayout,
-    device: AshDevice,
-}
-
-pub struct VkCmdEncoder {
-    device: AshDevice,
-    cmd: vk::CommandBuffer,
-    pipelines: *const Slab<PipeEntry>,
-    buffers: *const Slab<BufEntry>,
-    render_passes: *const Slab<vk::RenderPass>,
-    framebuffers: *const Slab<vk::Framebuffer>,
-    pipeline_layouts: *const Slab<PlEntry>,
-    // Per-frame descriptor set (set=0 per FD-041), set by begin_frame
-    current_desc_set: vk::DescriptorSet,
-}
-unsafe impl Send for VkCmdEncoder {}
-
-impl CmdEncoderTrait for VkCmdEncoder {
-    fn begin_render_pass(
-        &mut self,
-        rp: RenderPassHandle,
-        fb: FramebufferHandle,
-        area: (u32, u32, u32, u32),
-        clear: [f32; 4],
-        _depth: Option<f32>,
-    ) {
-        let rp_entry = unsafe { &*self.render_passes }.get(rp.index, rp.generation);
-        let fb_entry = unsafe { &*self.framebuffers }.get(fb.index, fb.generation);
-        if let (Some(&rp_), Some(&fb_)) = (rp_entry, fb_entry) {
-            let cc = vk::ClearValue {
-                color: vk::ClearColorValue { float32: clear },
-            };
-            let cc_arr = [cc];
-            let rpbi = vk::RenderPassBeginInfo::default()
-                .render_pass(rp_)
-                .framebuffer(fb_)
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: area.0 as i32,
-                        y: area.1 as i32,
-                    },
-                    extent: vk::Extent2D {
-                        width: area.2,
-                        height: area.3,
-                    },
-                })
-                .clear_values(&cc_arr);
-            unsafe {
-                self.device
-                    .cmd_begin_render_pass(self.cmd, &rpbi, vk::SubpassContents::INLINE);
-            }
-        }
-    }
-    fn bind_pipeline(&mut self, p: PipelineHandle) {
-        let entry = unsafe { &*self.pipelines }.get(p.index, p.generation);
-        if let Some(e) = entry {
-            unsafe {
-                self.device.cmd_bind_pipeline(
-                    self.cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    e.pipeline,
-                );
-            }
-        }
-    }
-    fn bind_vertex_buffers(&mut self, bufs: &[BufferHandle], offs: &[u64]) {
-        let v: Vec<vk::Buffer> = bufs
-            .iter()
-            .filter_map(|h| {
-                unsafe { &*self.buffers }
-                    .get(h.index, h.generation)
-                    .map(|e| e.buffer)
-            })
-            .collect();
-        if !v.is_empty() {
-            unsafe {
-                self.device.cmd_bind_vertex_buffers(self.cmd, 0, &v, offs);
-            }
-        }
-    }
-    fn bind_index_buffer(&mut self, buf: BufferHandle, o: u64, f: IndexFormat) {
-        if let Some(e) = unsafe { &*self.buffers }.get(buf.index, buf.generation) {
-            unsafe {
-                self.device.cmd_bind_index_buffer(
-                    self.cmd,
-                    e.buffer,
-                    o,
-                    match f {
-                        IndexFormat::U16 => vk::IndexType::UINT16,
-                        IndexFormat::U32 => vk::IndexType::UINT32,
-                    },
-                );
-            }
-        }
-    }
-    fn bind_descriptor_sets(
-        &mut self,
-        pl: PipelineLayoutHandle,
-        fs: u32,
-        _: &[render_core::DescriptorSetHandle],
-        do_: &[u32],
-    ) {
-        if let Some(entry) = unsafe { &*self.pipeline_layouts }.get(pl.index, pl.generation) {
-            if self.current_desc_set != vk::DescriptorSet::null() {
-                let sets = [self.current_desc_set];
-                unsafe {
-                    self.device.cmd_bind_descriptor_sets(
-                        self.cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        entry.layout,
-                        fs,
-                        &sets,
-                        do_,
-                    );
-                }
-            }
-        }
-    }
-    fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, md: f32, mxd: f32) {
-        unsafe {
-            self.device.cmd_set_viewport(
-                self.cmd,
-                0,
-                &[vk::Viewport {
-                    x,
-                    y,
-                    width: w,
-                    height: h,
-                    min_depth: md,
-                    max_depth: mxd,
-                }],
-            );
-        }
-    }
-    fn set_scissor(&mut self, x: i32, y: i32, w: u32, h: u32) {
-        unsafe {
-            self.device.cmd_set_scissor(
-                self.cmd,
-                0,
-                &[vk::Rect2D {
-                    offset: vk::Offset2D { x, y },
-                    extent: vk::Extent2D {
-                        width: w,
-                        height: h,
-                    },
-                }],
-            );
-        }
-    }
-    fn draw(&mut self, vc: u32, ic: u32, fv: u32, fi: u32) {
-        unsafe {
-            self.device.cmd_draw(self.cmd, vc, ic, fv, fi);
-        }
-    }
-    fn draw_indexed(&mut self, ic: u32, ins: u32, fi: u32, vo: i32, fii: u32) {
-        unsafe {
-            self.device.cmd_draw_indexed(self.cmd, ic, ins, fi, vo, fii);
-        }
-    }
-    fn push_constants(&mut self, pl: PipelineLayoutHandle, sf: u32, off: u32, data: &[u8]) {
-        if let Some(e) = unsafe { &*self.pipeline_layouts }.get(pl.index, pl.generation) {
-            unsafe {
-                self.device.cmd_push_constants(
-                    self.cmd,
-                    e.layout,
-                    vk::ShaderStageFlags::from_raw(sf),
-                    off,
-                    data,
-                );
-            }
-        }
-    }
-    fn end_render_pass(&mut self) {
-        unsafe {
-            self.device.cmd_end_render_pass(self.cmd);
-        }
-    }
-}
 
 // ============================================================================
 // VulkanDevice
 // ============================================================================
 
 pub struct VulkanDevice {
-    instance: Option<Instance>,
-    surface: Option<Surface>,
-    adapter: crate::adapter::AdapterSelection,
-    logical_device: VkLogicalDevice,
+    pub(crate) instance: Option<Instance>,
+    pub(crate) surface: Option<Surface>,
+    pub(crate) adapter: crate::adapter::AdapterSelection,
+    pub(crate) logical_device: VkLogicalDevice,
 
-    swapchain: Option<crate::swapchain::Swapchain>,
-    swapchain_extent: vk::Extent2D,
-    window_width: u32,
-    window_height: u32,
-    minimized: bool,
+    pub(crate) swapchain: Option<crate::swapchain::Swapchain>,
+    pub(crate) swapchain_extent: vk::Extent2D,
+    pub(crate) window_width: u32,
+    pub(crate) window_height: u32,
+    pub(crate) minimized: bool,
 
     // MVP triangle
-    mvp_framebuffers: Vec<vk::Framebuffer>,
-    mvp_rp: Option<vk::RenderPass>,
-    mvp_pipeline_layout: Option<vk::PipelineLayout>,
-    mvp_pipeline: Option<vk::Pipeline>,
-    mvp_vert_spv: Option<&'static [u8]>,
-    mvp_frag_spv: Option<&'static [u8]>,
+    pub(crate) mvp_framebuffers: Vec<vk::Framebuffer>,
+    pub(crate) mvp_rp: Option<vk::RenderPass>,
+    pub(crate) mvp_pipeline_layout: Option<vk::PipelineLayout>,
+    pub(crate) mvp_pipeline: Option<vk::Pipeline>,
+    pub(crate) mvp_vert_spv: Option<&'static [u8]>,
+    pub(crate) mvp_frag_spv: Option<&'static [u8]>,
 
-    frame_sync: Vec<FrameSync>,
-    current_frame: usize,
-    cached_adapter_info: AdapterInfo,
+    pub(crate) frame_sync: Vec<FrameSync>,
+    pub(crate) current_frame: usize,
+    pub(crate) cached_adapter_info: AdapterInfo,
 
     // Phase 2: handle tables
-    buffers: Slab<BufEntry>,
-    pipelines: Slab<PipeEntry>,
-    render_passes: Slab<vk::RenderPass>,
-    framebuffers: Slab<vk::Framebuffer>,
-    pipeline_layouts: Slab<PlEntry>,
+    pub(crate) buffers: Slab<BufEntry>,
+    pub(crate) pipelines: Slab<PipeEntry>,
+    pub(crate) render_passes: Slab<vk::RenderPass>,
+    pub(crate) framebuffers: Slab<vk::Framebuffer>,
+    pub(crate) pipeline_layouts: Slab<PlEntry>,
 
     // Render pass metadata
-    rp_has_depth: HashMap<u32, bool>,
+    pub(crate) rp_has_depth: HashMap<u32, bool>,
 
     // Per-frame descriptor infrastructure (set=0 per FD-041)
-    desc_set_layout_0: Option<vk::DescriptorSetLayout>,
-    desc_pool: Option<vk::DescriptorPool>,
-    frame_desc_sets: Vec<vk::DescriptorSet>,
-    frame_ubos: Vec<vk::Buffer>,
-    ubo_size: vk::DeviceSize,
-    ubo_allocations: Vec<gpu_allocator::vulkan::Allocation>,
-    ubo_alignment: u64,
+    pub(crate) desc_set_layout_0: Option<vk::DescriptorSetLayout>,
+    pub(crate) desc_pool: Option<vk::DescriptorPool>,
+    pub(crate) frame_desc_sets: Vec<vk::DescriptorSet>,
+    pub(crate) frame_ubos: Vec<vk::Buffer>,
+    pub(crate) ubo_size: vk::DeviceSize,
+    pub(crate) ubo_allocations: Vec<crate::allocator::Allocation>,
+    pub(crate) ubo_alignment: u64,
 
     // Depth texture (matching swapchain size)
-    depth_image: Option<vk::Image>,
-    depth_image_view: Option<vk::ImageView>,
-    depth_allocation: Option<gpu_allocator::vulkan::Allocation>,
+    pub(crate) depth_image: Option<vk::Image>,
+    pub(crate) depth_image_view: Option<vk::ImageView>,
+    pub(crate) depth_allocation: Option<crate::allocator::Allocation>,
 }
 
 impl VulkanDevice {
@@ -774,251 +534,6 @@ impl VulkanDevice {
         Ok(())
     }
 
-    // --- Depth texture management ---
-
-    fn create_depth_texture(&mut self) -> VkResult<()> {
-        let d = &self.logical_device.device;
-        let extent = self
-            .swapchain
-            .as_ref()
-            .map(|s| s.extent)
-            .unwrap_or(self.swapchain_extent);
-        if extent.width == 0 || extent.height == 0 {
-            return Ok(());
-        }
-
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::D32_SFLOAT)
-            .extent(vk::Extent3D {
-                width: extent.width,
-                height: extent.height,
-                depth: 1,
-            })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let image = unsafe { d.create_image(&image_info, None) }
-            .map_err(|r| VulkanError::vk("create_depth_image", r))?;
-        let req = unsafe { d.get_image_memory_requirements(image) };
-        let allocator = self.logical_device.allocator();
-        let allocation = allocator
-            .borrow_mut()
-            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                name: "depth-buffer",
-                requirements: req,
-                location: gpu_allocator::MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-            })
-            .map_err(|e| VulkanError::Allocation(e.to_string()))?;
-        unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
-            .map_err(|r| VulkanError::vk("bind_depth_image", r))?;
-
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::D32_SFLOAT)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        let image_view = unsafe { d.create_image_view(&view_info, None) }
-            .map_err(|r| VulkanError::vk("create_depth_image_view", r))?;
-
-        self.depth_image = Some(image);
-        self.depth_image_view = Some(image_view);
-        self.depth_allocation = Some(allocation);
-        Ok(())
-    }
-
-    fn destroy_depth_texture(&mut self) {
-        let d = &self.logical_device.device;
-        if let Some(iv) = self.depth_image_view.take() {
-            unsafe {
-                d.destroy_image_view(iv, None);
-            }
-        }
-        if let Some(img) = self.depth_image.take() {
-            unsafe {
-                d.destroy_image(img, None);
-            }
-        }
-        if let Some(a) = self.depth_allocation.take() {
-            let _ = self.logical_device.allocator().borrow_mut().free(a);
-        }
-    }
-
-    fn depth_view(&self) -> Option<vk::ImageView> {
-        self.depth_image_view
-    }
-
-    // --- Descriptor infrastructure (set=0 per-frame UBO per FD-041) ---
-
-    fn create_descriptor_infra(&mut self) -> VkResult<()> {
-        if self.desc_set_layout_0.is_some() {
-            return Ok(());
-        } // already created
-        let d = &self.logical_device.device;
-
-        // Descriptor set layout: binding 0 = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER at set=0
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-        let ds_layout = unsafe { d.create_descriptor_set_layout(&layout_info, None) }
-            .map_err(|r| VulkanError::vk("create_ds_layout", r))?;
-
-        // Descriptor pool: 2 sets (double buffering), 2 UBO descriptors
-        let pool_sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: 2,
-        }];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(2)
-            .pool_sizes(&pool_sizes);
-        let pool = unsafe { d.create_descriptor_pool(&pool_info, None) }
-            .map_err(|r| VulkanError::vk("create_ds_pool", r))?;
-
-        // Allocate 2 descriptor sets
-        let layouts = [ds_layout, ds_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(pool)
-            .set_layouts(&layouts);
-        let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
-            .map_err(|r| VulkanError::vk("alloc_ds", r))?;
-
-        // Create 2 UBO buffers (CpuToGpu, sized to ubo_size)
-        let mut ubos = Vec::with_capacity(2);
-        let mut allocs = Vec::with_capacity(2);
-        let allocator = self.logical_device.allocator();
-        for i in 0..2 {
-            let bi = vk::BufferCreateInfo::default()
-                .size(self.ubo_size)
-                .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let buf = unsafe { d.create_buffer(&bi, None) }
-                .map_err(|r| VulkanError::vk("create_ubo", r))?;
-            let req = unsafe { d.get_buffer_memory_requirements(buf) };
-            self.ubo_alignment = req.alignment as u64;
-            let allocation = allocator
-                .borrow_mut()
-                .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                    name: &format!("frame-ubo-{i}"),
-                    requirements: req,
-                    location: gpu_allocator::MemoryLocation::CpuToGpu,
-                    linear: true,
-                    allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-                })
-                .map_err(|e| VulkanError::Allocation(e.to_string()))?;
-            unsafe { d.bind_buffer_memory(buf, allocation.memory(), allocation.offset()) }
-                .map_err(|r| VulkanError::vk("bind_ubo", r))?;
-            ubos.push(buf);
-            allocs.push(allocation);
-        }
-
-        // Write descriptor sets
-        for (i, ds) in desc_sets.iter().enumerate() {
-            let buf_info = [vk::DescriptorBufferInfo::default()
-                .buffer(ubos[i])
-                .offset(0)
-                .range(self.ubo_size)];
-            let writes = [vk::WriteDescriptorSet::default()
-                .dst_set(*ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(&buf_info)];
-            unsafe {
-                d.update_descriptor_sets(&writes, &[]);
-            }
-        }
-
-        self.desc_set_layout_0 = Some(ds_layout);
-        self.desc_pool = Some(pool);
-        self.frame_desc_sets = desc_sets;
-        self.frame_ubos = ubos;
-        self.ubo_allocations = allocs;
-        Ok(())
-    }
-
-    /// Get the per-frame descriptor set for the current frame index.
-    pub fn frame_descriptor_set(&self, frame_idx: usize) -> Option<vk::DescriptorSet> {
-        self.frame_desc_sets.get(frame_idx).copied()
-    }
-
-    /// Get the per-frame UBO for the current frame index.
-    pub fn frame_ubo(&self, frame_idx: usize) -> Option<vk::Buffer> {
-        self.frame_ubos.get(frame_idx).copied()
-    }
-
-    /// Write default per-frame UBO data (identity view-proj, a directional light) for the current frame.
-    pub fn write_default_ubo(&mut self) {
-        let fi = self.current_frame;
-        let mut data = Vec::with_capacity(128);
-        // View-proj matrix (identity for clip-space rendering)
-        for i in 0..16 {
-            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
-            data.extend_from_slice(&v.to_ne_bytes());
-        }
-        // Light direction (normalized, pointing down-left)
-        for v in &[0.5f32, -0.707f32, 0.5f32, 0.0f32] {
-            data.extend_from_slice(&v.to_ne_bytes());
-        }
-        // Light color (bright white, intensity 1.5)
-        for v in &[1.5f32, 1.5f32, 1.5f32, 1.5f32] {
-            data.extend_from_slice(&v.to_ne_bytes());
-        }
-        // Ambient (0.15 intensity)
-        for v in &[0.15f32, 0.15f32, 0.15f32, 0.15f32] {
-            data.extend_from_slice(&v.to_ne_bytes());
-        }
-        // Camera position (world space)
-        for v in &[0.0f32, 0.0f32, 2.0f32, 1.0f32] {
-            data.extend_from_slice(&v.to_ne_bytes());
-        }
-        self.write_ubo(fi, &data, 0);
-    }
-    /// SAFETY: data must not exceed ubo_size - offset.
-    pub fn write_ubo(&mut self, frame_idx: usize, data: &[u8], offset: u64) {
-        if let Some(allocation) = self.ubo_allocations.get_mut(frame_idx) {
-            if let Some(slice) = allocation.mapped_slice_mut() {
-                let start = offset as usize;
-                let end = (start + data.len()).min(slice.len());
-                slice[start..end].copy_from_slice(&data[..end - start]);
-            }
-        }
-    }
-
-    fn destroy_descriptor_infra(&mut self) {
-        let d = &self.logical_device.device;
-        for a in self.ubo_allocations.drain(..) {
-            let _ = self.logical_device.allocator().borrow_mut().free(a);
-        }
-        for buf in self.frame_ubos.drain(..) {
-            unsafe {
-                d.destroy_buffer(buf, None);
-            }
-        }
-        if let Some(pool) = self.desc_pool.take() {
-            unsafe {
-                d.destroy_descriptor_pool(pool, None);
-            }
-        }
-        if let Some(layout) = self.desc_set_layout_0.take() {
-            unsafe {
-                d.destroy_descriptor_set_layout(layout, None);
-            }
-        }
-    }
-
     fn build_frames(&mut self) -> VkResult<()> {
         let d = &self.logical_device.device;
         for _ in 0..2 {
@@ -1105,15 +620,15 @@ impl render_core::Device for VulkanDevice {
         })?;
         let req = unsafe { d.device.get_buffer_memory_requirements(buffer) };
         let alloc_handle = d.allocator();
-        let location = gpu_allocator::MemoryLocation::CpuToGpu;
-        let allocation = alloc_handle
+        let location = crate::allocator::MemoryLocation::CpuToGpu;
+        let mut allocation = alloc_handle
             .borrow_mut()
-            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                name: desc.debug_label.as_deref().unwrap_or("buf"),
+            .allocate(&crate::allocator::AllocationCreateDesc {
+                name: "device-buffer",
                 requirements: req,
                 location,
                 linear: true,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| render_core::RhiError::Backend {
                 detail: format!("{e}"),
@@ -1122,7 +637,7 @@ impl render_core::Device for VulkanDevice {
             d.device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
         } {
-            let _ = alloc_handle.borrow_mut().free(allocation);
+            let _ = alloc_handle.borrow_mut().free(&mut allocation);
             unsafe {
                 d.device.destroy_buffer(buffer, None);
             }
@@ -1605,6 +1120,345 @@ impl render_core::Device for VulkanDevice {
     fn wait_idle(&self) {
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
     }
+
+    fn read_pixels(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, render_core::RhiError> {
+        // Flush all pending GPU work so the swapchain images are in a
+        // deterministic layout (PRESENT_SRC_KHR after the last render pass).
+        let _ = unsafe { self.logical_device.device.device_wait_idle() };
+
+        let sc = self
+            .swapchain
+            .as_ref()
+            .ok_or_else(|| render_core::RhiError::Backend {
+                detail: "no swapchain".into(),
+            })?;
+
+        // Validate the requested region against the swapchain extent.
+        if x + width > sc.extent.width || y + height > sc.extent.height || width == 0 || height == 0
+        {
+            return Err(render_core::RhiError::Backend {
+                detail: format!(
+                    "readback region ({x},{y}) {width}×{height} exceeds swapchain {}×{}",
+                    sc.extent.width, sc.extent.height
+                ),
+            });
+        }
+
+        // Pixel buffer: 4 bytes per pixel (RGBA return format).
+        let pixel_size: vk::DeviceSize = 4;
+        let buffer_size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * pixel_size;
+
+        let d = &self.logical_device;
+        let device = &d.device;
+
+        // -----------------------------------------------------------------
+        // 1. Create a staging buffer (GPU write → CPU read).
+        //    NOTE: The swapchain images MUST have been created with
+        //    VK_IMAGE_USAGE_TRANSFER_SRC_BIT for vkCmdCopyImageToBuffer to
+        //    work.  Add this to the usage flags in swapchain::new().
+        // -----------------------------------------------------------------
+        let staging_buffer = unsafe {
+            device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(buffer_size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+        }
+        .map_err(|r| render_core::RhiError::Backend {
+            detail: format!("create staging buffer: {r:?}"),
+        })?;
+
+        let req = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
+        let alloc_handle = d.allocator();
+        let mut staging_alloc =
+            match alloc_handle
+                .borrow_mut()
+                .allocate(&crate::allocator::AllocationCreateDesc {
+                    name: "read_pixels staging",
+                    requirements: req,
+                    location: crate::allocator::MemoryLocation::GpuToCpu,
+                    linear: true,
+                    allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
+                }) {
+                Ok(a) => a,
+                Err(e) => {
+                    // SAFETY: buffer was just created and is not in use.
+                    unsafe { device.destroy_buffer(staging_buffer, None) };
+                    return Err(render_core::RhiError::Backend {
+                        detail: format!("alloc staging: {e}"),
+                    });
+                }
+            };
+
+        // SAFETY: allocation was created for this buffer's requirements.
+        if let Err(r) = unsafe {
+            device.bind_buffer_memory(
+                staging_buffer,
+                staging_alloc.memory(),
+                staging_alloc.offset(),
+            )
+        } {
+            // SAFETY: buffer/allocation were just created and are not in use.
+            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            unsafe { device.destroy_buffer(staging_buffer, None) };
+            return Err(render_core::RhiError::Backend {
+                detail: format!("bind staging: {r:?}"),
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // 2. One-shot command pool + command buffer.
+        // -----------------------------------------------------------------
+        let cmd_pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(d.queue_family_index)
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
+            )
+        }
+        .map_err(|r| {
+            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            unsafe { device.destroy_buffer(staging_buffer, None) };
+            render_core::RhiError::Backend {
+                detail: format!("create pool: {r:?}"),
+            }
+        })?;
+
+        let cmd_buffer = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(|r| {
+            unsafe { device.destroy_command_pool(cmd_pool, None) };
+            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            unsafe { device.destroy_buffer(staging_buffer, None) };
+            render_core::RhiError::Backend {
+                detail: format!("alloc cb: {r:?}"),
+            }
+        })?[0];
+
+        // -----------------------------------------------------------------
+        // 3. Record the copy command buffer.
+        // -----------------------------------------------------------------
+        // SAFETY: command buffer is in the initial state (just allocated from
+        // a transient pool).
+        unsafe {
+            device.begin_command_buffer(
+                cmd_buffer,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .map_err(|r| {
+            unsafe { device.destroy_command_pool(cmd_pool, None) };
+            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            unsafe { device.destroy_buffer(staging_buffer, None) };
+            render_core::RhiError::Backend {
+                detail: format!("begin cb: {r:?}"),
+            }
+        })?;
+
+        // After device_wait_idle the swapchain image is in PRESENT_SRC_KHR.
+        // Use the first image (all are consistent after idle).
+        let swapchain_image = sc.images[0];
+
+        // 3a. PRESENT_SRC_KHR → TRANSFER_SRC_OPTIMAL
+        let to_transfer_barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(swapchain_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        // SAFETY: command buffer is recording; barrier references a live
+        // swapchain image.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_transfer_barrier],
+            );
+        }
+
+        // 3b. Copy the requested region from image → staging buffer.
+        let copy_region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D {
+                x: x as i32,
+                y: y as i32,
+                z: 0,
+            })
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+        // SAFETY: both image and buffer are valid, image is in the
+        // TRANSFER_SRC_OPTIMAL layout.
+        unsafe {
+            device.cmd_copy_image_to_buffer(
+                cmd_buffer,
+                swapchain_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                staging_buffer,
+                &[copy_region],
+            );
+        }
+
+        // 3c. TRANSFER_SRC_OPTIMAL → PRESENT_SRC_KHR (restore).
+        let to_present_barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(swapchain_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::empty());
+        // SAFETY: command buffer is still recording; image is live.
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present_barrier],
+            );
+        }
+
+        // SAFETY: recording is complete.
+        unsafe { device.end_command_buffer(cmd_buffer) }.map_err(|r| {
+            unsafe { device.destroy_command_pool(cmd_pool, None) };
+            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            unsafe { device.destroy_buffer(staging_buffer, None) };
+            render_core::RhiError::Backend {
+                detail: format!("end cb: {r:?}"),
+            }
+        })?;
+
+        // -----------------------------------------------------------------
+        // 4. Submit and wait for completion.
+        // -----------------------------------------------------------------
+        // SAFETY: fence is created fresh for this one-shot submit.
+        let fence =
+            unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|r| {
+                unsafe { device.destroy_command_pool(cmd_pool, None) };
+                let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+                unsafe { device.destroy_buffer(staging_buffer, None) };
+                render_core::RhiError::Backend {
+                    detail: format!("create fence: {r:?}"),
+                }
+            })?;
+
+        let cmd_buffers = [cmd_buffer];
+        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
+        // SAFETY: queue, command buffer, and fence are all valid.
+        unsafe { device.queue_submit(d.queue, &[submit_info], fence) }.map_err(|r| {
+            unsafe { device.destroy_fence(fence, None) };
+            unsafe { device.destroy_command_pool(cmd_pool, None) };
+            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            unsafe { device.destroy_buffer(staging_buffer, None) };
+            render_core::RhiError::Backend {
+                detail: format!("queue submit: {r:?}"),
+            }
+        })?;
+
+        // SAFETY: fence is valid and associated with the submitted work.
+        unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|r| {
+            unsafe { device.destroy_fence(fence, None) };
+            unsafe { device.destroy_command_pool(cmd_pool, None) };
+            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            unsafe { device.destroy_buffer(staging_buffer, None) };
+            render_core::RhiError::Backend {
+                detail: format!("wait fence: {r:?}"),
+            }
+        })?;
+
+        // SAFETY: fence has been waited on and is no longer needed.
+        unsafe { device.destroy_fence(fence, None) };
+
+        // -----------------------------------------------------------------
+        // 5. Map staging buffer and copy pixel data to a Vec<u8>.
+        // -----------------------------------------------------------------
+        let raw_pixels = match staging_alloc.mapped_slice_mut() {
+            Some(slice) => slice[..buffer_size as usize].to_vec(),
+            None => {
+                unsafe { device.destroy_command_pool(cmd_pool, None) };
+                let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+                unsafe { device.destroy_buffer(staging_buffer, None) };
+                return Err(render_core::RhiError::Backend {
+                    detail: "staging buffer is not CPU mapped".into(),
+                });
+            }
+        };
+
+        // -----------------------------------------------------------------
+        // 6. Convert BGRA → RGBA if the swapchain uses a B8G8R8A8 format.
+        //    The custom allocator's GpuToCpu allocations are host-mapped, so the
+        //    raw data is available immediately after fence wait.
+        // -----------------------------------------------------------------
+        let result: Vec<u8> =
+            if sc.format == vk::Format::B8G8R8A8_UNORM || sc.format == vk::Format::B8G8R8A8_SRGB {
+                raw_pixels
+                    .chunks_exact(4)
+                    .flat_map(|p| [p[2], p[1], p[0], p[3]])
+                    .collect()
+            } else {
+                raw_pixels
+            };
+
+        // -----------------------------------------------------------------
+        // 7. Clean up temporary resources.
+        // -----------------------------------------------------------------
+        // SAFETY: objects were created from this device and are no longer in
+        // use after fence wait.
+        unsafe { device.destroy_command_pool(cmd_pool, None) };
+        let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+        unsafe { device.destroy_buffer(staging_buffer, None) };
+
+        Ok(result)
+    }
 }
 
 // ============================================================================
@@ -1655,8 +1509,8 @@ impl Drop for VulkanDevice {
                 unsafe {
                     d.destroy_buffer(e.buffer, None);
                 }
-                if let Some(a) = e.allocation.take() {
-                    let _ = e.allocator.borrow_mut().free(a);
+                if let Some(mut a) = e.allocation.take() {
+                    let _ = e.allocator.borrow_mut().free(&mut a);
                 }
             }
         }
