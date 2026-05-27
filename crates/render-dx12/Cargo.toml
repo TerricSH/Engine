@@ -18,3 +18,5 @@ subsystem-scripting-csharp = []
 
 [dependencies]
 render-core = { path = "../render-core" }
+thiserror.workspace = true
+tracing.workspace = true

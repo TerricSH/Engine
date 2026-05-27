@@ -17,4 +17,7 @@ target-mobile = []
 subsystem-scripting-csharp = []
 
 [dependencies]
+glow.workspace = true
 render-core = { path = "../render-core" }
+thiserror.workspace = true
+tracing.workspace = true
