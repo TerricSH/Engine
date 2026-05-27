@@ -15,3 +15,10 @@ tooling-hot-reload = []
 target-desktop = []
 target-mobile = []
 subsystem-scripting-csharp = []
+
+[dependencies]
+crossbeam-channel.workspace = true
+glam.workspace = true
+rapier3d.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

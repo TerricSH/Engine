@@ -15,3 +15,10 @@ tooling-hot-reload = []
 target-desktop = []
 target-mobile = []
 subsystem-scripting-csharp = []
+
+[dependencies]
+engine-serialize = { path = "../engine-serialize" }
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
