@@ -1,0 +1,191 @@
+//! VkCmdEncoder — implements render_core::CommandEncoder.
+
+use ash::vk;
+use ash::Device as AshDevice;
+
+use render_core::{
+    BufferHandle, CommandEncoder as CmdEncoderTrait, FramebufferHandle, IndexFormat,
+    PipelineHandle, PipelineLayoutHandle, RenderPassHandle,
+};
+
+use super::slab::{BufEntry, PipeEntry, PlEntry, Slab};
+
+// ============================================================================
+// VkCmdEncoder
+// ============================================================================
+
+pub(crate) struct VkCmdEncoder {
+    pub(crate) device: AshDevice,
+    pub(crate) cmd: vk::CommandBuffer,
+    pub(crate) pipelines: *const Slab<PipeEntry>,
+    pub(crate) buffers: *const Slab<BufEntry>,
+    pub(crate) render_passes: *const Slab<vk::RenderPass>,
+    pub(crate) framebuffers: *const Slab<vk::Framebuffer>,
+    pub(crate) pipeline_layouts: *const Slab<PlEntry>,
+    // Per-frame descriptor set (set=0 per FD-041), set by begin_frame
+    pub(crate) current_desc_set: vk::DescriptorSet,
+}
+unsafe impl Send for VkCmdEncoder {}
+
+impl CmdEncoderTrait for VkCmdEncoder {
+    fn begin_render_pass(
+        &mut self,
+        rp: RenderPassHandle,
+        fb: FramebufferHandle,
+        area: (u32, u32, u32, u32),
+        clear: [f32; 4],
+        _depth: Option<f32>,
+    ) {
+        let rp_entry = unsafe { &*self.render_passes }.get(rp.index, rp.generation);
+        let fb_entry = unsafe { &*self.framebuffers }.get(fb.index, fb.generation);
+        if let (Some(&rp_), Some(&fb_)) = (rp_entry, fb_entry) {
+            let cc = vk::ClearValue {
+                color: vk::ClearColorValue { float32: clear },
+            };
+            let cc_arr = [cc];
+            let rpbi = vk::RenderPassBeginInfo::default()
+                .render_pass(rp_)
+                .framebuffer(fb_)
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: area.0 as i32,
+                        y: area.1 as i32,
+                    },
+                    extent: vk::Extent2D {
+                        width: area.2,
+                        height: area.3,
+                    },
+                })
+                .clear_values(&cc_arr);
+            unsafe {
+                self.device
+                    .cmd_begin_render_pass(self.cmd, &rpbi, vk::SubpassContents::INLINE);
+            }
+        }
+    }
+    fn bind_pipeline(&mut self, p: PipelineHandle) {
+        let entry = unsafe { &*self.pipelines }.get(p.index, p.generation);
+        if let Some(e) = entry {
+            unsafe {
+                self.device.cmd_bind_pipeline(
+                    self.cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    e.pipeline,
+                );
+            }
+        }
+    }
+    fn bind_vertex_buffers(&mut self, bufs: &[BufferHandle], offs: &[u64]) {
+        let v: Vec<vk::Buffer> = bufs
+            .iter()
+            .filter_map(|h| {
+                unsafe { &*self.buffers }
+                    .get(h.index, h.generation)
+                    .map(|e| e.buffer)
+            })
+            .collect();
+        if !v.is_empty() {
+            unsafe {
+                self.device.cmd_bind_vertex_buffers(self.cmd, 0, &v, offs);
+            }
+        }
+    }
+    fn bind_index_buffer(&mut self, buf: BufferHandle, o: u64, f: IndexFormat) {
+        if let Some(e) = unsafe { &*self.buffers }.get(buf.index, buf.generation) {
+            unsafe {
+                self.device.cmd_bind_index_buffer(
+                    self.cmd,
+                    e.buffer,
+                    o,
+                    match f {
+                        IndexFormat::U16 => vk::IndexType::UINT16,
+                        IndexFormat::U32 => vk::IndexType::UINT32,
+                    },
+                );
+            }
+        }
+    }
+    fn bind_descriptor_sets(
+        &mut self,
+        pl: PipelineLayoutHandle,
+        fs: u32,
+        _: &[render_core::DescriptorSetHandle],
+        do_: &[u32],
+    ) {
+        if let Some(entry) = unsafe { &*self.pipeline_layouts }.get(pl.index, pl.generation) {
+            let set = self.current_desc_set;
+            if set != vk::DescriptorSet::null() {
+                let sets = [set];
+                unsafe {
+                    self.device.cmd_bind_descriptor_sets(
+                        self.cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        entry.layout,
+                        fs,
+                        &sets,
+                        do_,
+                    );
+                }
+            }
+        }
+    }
+    fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, md: f32, mxd: f32) {
+        unsafe {
+            self.device.cmd_set_viewport(
+                self.cmd,
+                0,
+                &[vk::Viewport {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                    min_depth: md,
+                    max_depth: mxd,
+                }],
+            );
+        }
+    }
+    fn set_scissor(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        unsafe {
+            self.device.cmd_set_scissor(
+                self.cmd,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x, y },
+                    extent: vk::Extent2D {
+                        width: w,
+                        height: h,
+                    },
+                }],
+            );
+        }
+    }
+    fn draw(&mut self, vc: u32, ic: u32, fv: u32, fi: u32) {
+        unsafe {
+            self.device.cmd_draw(self.cmd, vc, ic, fv, fi);
+        }
+    }
+    fn draw_indexed(&mut self, ic: u32, ins: u32, fi: u32, vo: i32, fii: u32) {
+        unsafe {
+            self.device.cmd_draw_indexed(self.cmd, ic, ins, fi, vo, fii);
+        }
+    }
+    fn push_constants(&mut self, pl: PipelineLayoutHandle, sf: u32, off: u32, data: &[u8]) {
+        if let Some(e) = unsafe { &*self.pipeline_layouts }.get(pl.index, pl.generation) {
+            unsafe {
+                self.device.cmd_push_constants(
+                    self.cmd,
+                    e.layout,
+                    vk::ShaderStageFlags::from_raw(sf),
+                    off,
+                    data,
+                );
+            }
+        }
+    }
+    fn end_render_pass(&mut self) {
+        unsafe {
+            self.device.cmd_end_render_pass(self.cmd);
+        }
+    }
+}

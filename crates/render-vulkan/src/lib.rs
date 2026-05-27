@@ -9,6 +9,7 @@
 //! design so RHI-v0 does not have to model the frame loop yet.
 
 mod adapter;
+pub(crate) mod allocator;
 mod device;
 pub mod device_impl;
 mod error;

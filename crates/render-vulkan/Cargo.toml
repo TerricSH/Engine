@@ -20,7 +20,6 @@ subsystem-scripting-csharp = []
 [dependencies]
 ash.workspace = true
 ash-window.workspace = true
-gpu-allocator.workspace = true
 raw-window-handle.workspace = true
 render-core = { path = "../render-core" }
 thiserror.workspace = true
