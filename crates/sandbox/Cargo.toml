@@ -17,9 +17,11 @@ target-mobile = []
 subsystem-scripting-csharp = []
 
 [dependencies]
+engine-asset = { path = "../engine-asset" }
 engine-core = { path = "../engine-core" }
 engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
+glam.workspace = true
 render-core = { path = "../render-core" }
 platform = { path = "../platform" }
 raw-window-handle.workspace = true

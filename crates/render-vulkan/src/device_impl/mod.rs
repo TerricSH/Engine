@@ -7,6 +7,7 @@ pub(crate) mod slab;
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::mem::ManuallyDrop;
 
 use ash::vk;
 use ash::Device as AshDevice;
@@ -36,10 +37,13 @@ unsafe impl Sync for VulkanDevice {}
 // ============================================================================
 
 pub struct VulkanDevice {
+    // IMPORTANT: Drop order follows field declaration order.
+    // logical_device MUST be dropped BEFORE instance/surface
+    // (Vulkan spec: VkDevice destroyed before VkInstance).
+    pub(crate) logical_device: ManuallyDrop<VkLogicalDevice>,
     pub(crate) instance: Option<Instance>,
     pub(crate) surface: Option<Surface>,
     pub(crate) adapter: crate::adapter::AdapterSelection,
-    pub(crate) logical_device: VkLogicalDevice,
 
     pub(crate) swapchain: Option<crate::swapchain::Swapchain>,
     pub(crate) swapchain_extent: vk::Extent2D,
@@ -54,6 +58,12 @@ pub struct VulkanDevice {
     pub(crate) mvp_pipeline: Option<vk::Pipeline>,
     pub(crate) mvp_vert_spv: Option<&'static [u8]>,
     pub(crate) mvp_frag_spv: Option<&'static [u8]>,
+
+    // Model rendering pipeline (forward shaders + vertex input state)
+    pub(crate) model_pipeline: Option<vk::Pipeline>,
+    pub(crate) model_pipeline_layout: Option<vk::PipelineLayout>,
+    pub(crate) model_rp: Option<vk::RenderPass>,
+    pub(crate) model_framebuffers: Vec<vk::Framebuffer>,
 
     pub(crate) frame_sync: Vec<FrameSync>,
     pub(crate) current_frame: usize,
@@ -136,7 +146,7 @@ impl VulkanDevice {
             instance: Some(instance),
             surface: Some(surface),
             adapter,
-            logical_device: ld,
+            logical_device: ManuallyDrop::new(ld),
             swapchain: None,
             swapchain_extent: vk::Extent2D {
                 width: width.max(1),
@@ -151,6 +161,10 @@ impl VulkanDevice {
             mvp_pipeline: None,
             mvp_vert_spv: None,
             mvp_frag_spv: None,
+            model_pipeline: None,
+            model_pipeline_layout: None,
+            model_rp: None,
+            model_framebuffers: Vec::new(),
             frame_sync: Vec::new(),
             current_frame: 0,
             cached_adapter_info: info,
@@ -177,6 +191,24 @@ impl VulkanDevice {
         self.mvp_vert_spv = Some(vert);
         self.mvp_frag_spv = Some(frag);
     }
+
+    /// Returns the index of the current in-flight frame (0 or 1 for double
+    /// buffering).  Used by sandbox code that writes per-frame UBO data via
+    /// [`write_ubo`](Self::write_ubo).
+    pub fn current_frame_index(&self) -> usize {
+        self.current_frame
+    }
+
+    /// Convenience wrapper: write UBO data for the current in-flight frame.
+    /// Delegates to [`write_ubo`](Self::write_ubo).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data` exceeds `ubo_size - offset`.
+    pub fn write_ubo_current(&mut self, data: &[u8], offset: u64) {
+        self.write_ubo(self.current_frame, data, offset);
+    }
+
     pub fn resize(&mut self, w: u32, h: u32) {
         self.window_width = w.max(1);
         self.window_height = h.max(1);
@@ -214,6 +246,350 @@ impl VulkanDevice {
             triangles: 1,
             gpu_frame_ms: 0.0,
         })
+    }
+
+    // --- Model rendering (forward shaders + vertex buffers) ---
+
+    /// Render one frame using the forward model pipeline.
+    ///
+    /// Requires that [`set_mvp_shaders`](Self::set_mvp_shaders) has been
+    /// called beforehand with the FORWARD vertex/fragment SPIR-V.
+    ///
+    /// `vertex_buf` / `index_buf` must have been created via
+    /// [`create_buffer`](render_core::Device::create_buffer).  The vertex
+    /// layout expected by the pipeline is:
+    ///
+    /// | location | semantic  | format       | offset |
+    /// |----------|-----------|--------------|--------|
+    /// | 0        | position  | `float32x3`  | 0      |
+    /// | 1        | normal    | `float32x3`  | 12     |
+    /// | 2        | UV        | `float32x2`  | 24     |
+    ///
+    /// Stride: 32 bytes.
+    pub fn render_model_frame(
+        &mut self,
+        vertex_buf: render_core::BufferHandle,
+        index_buf: render_core::BufferHandle,
+        index_count: u32,
+    ) -> VkResult<RendererStatistics> {
+        if self.minimized {
+            return Ok(RendererStatistics::default());
+        }
+        self.ensure_sc()?;
+        if self.mvp_pipeline.is_none() {
+            self.build_mvp()?;
+        }
+        if self.model_pipeline.is_none() {
+            self.build_model_pipeline()?;
+        }
+        if self.frame_sync.is_empty() {
+            self.build_frames()?;
+        }
+        let fi = self.current_frame;
+        let (ii, subopt) = self.acquire(fi)?;
+        self.record_model(fi, ii, vertex_buf, index_buf, index_count)?;
+        self.submit_and_present(fi, ii)?;
+        if subopt {
+            self.destroy_mvp();
+        }
+        self.current_frame = (fi + 1) % 2;
+        Ok(RendererStatistics {
+            draw_calls: 1,
+            triangles: index_count as u64 / 3,
+            gpu_frame_ms: 0.0,
+        })
+    }
+
+    fn build_model_pipeline(&mut self) -> VkResult<()> {
+        let vert = self
+            .mvp_vert_spv
+            .ok_or(VulkanError::MissingShader("model.vert"))?;
+        let frag = self
+            .mvp_frag_spv
+            .ok_or(VulkanError::MissingShader("model.frag"))?;
+        let fmt = self.swapchain.as_ref().unwrap().format;
+        let ext = self.swapchain_extent;
+        let d = &self.logical_device.device;
+        let vm = unsafe { mk_sm(d, vert)? };
+        let fm = unsafe { mk_sm(d, frag)? };
+
+        // --- Pipeline layout: set=0 (UBO) + no push constants ---
+        let set_layouts = if let Some(dsl) = self.desc_set_layout_0 {
+            vec![dsl]
+        } else {
+            Vec::new()
+        };
+        let pli = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        let pl = unsafe { d.create_pipeline_layout(&pli, None) }
+            .map_err(|r| VulkanError::vk("cpl_model", r))?;
+
+        // --- Render pass: color + depth ---
+        let color_at = vk::AttachmentDescription::default()
+            .format(fmt)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        let depth_at = vk::AttachmentDescription::default()
+            .format(vk::Format::D32_SFLOAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        let color_ref = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(1)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_ref)
+            .depth_stencil_attachment(&depth_ref);
+        let dep = vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            )
+            .dst_stage_mask(
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            );
+        let atts = [color_at, depth_at];
+        let subpasses = [subpass];
+        let deps = [dep];
+        let rp_info = vk::RenderPassCreateInfo::default()
+            .attachments(&atts)
+            .subpasses(&subpasses)
+            .dependencies(&deps);
+        let rp = unsafe { d.create_render_pass(&rp_info, None) }
+            .map_err(|r| VulkanError::vk("crp_model", r))?;
+
+        // --- Framebuffers (one per swapchain image, color + depth) ---
+        let depth_view = self
+            .depth_image_view
+            .unwrap_or(vk::ImageView::null());
+        let mut fbs = Vec::new();
+        for iv in &self.swapchain.as_ref().unwrap().image_views {
+            let att_views = [*iv, depth_view];
+            fbs.push(
+                unsafe {
+                    d.create_framebuffer(
+                        &vk::FramebufferCreateInfo::default()
+                            .render_pass(rp)
+                            .attachments(&att_views)
+                            .width(ext.width)
+                            .height(ext.height)
+                            .layers(1),
+                        None,
+                    )
+                }
+                .map_err(|r| VulkanError::vk("cfb_model", r))?,
+            );
+        }
+
+        // --- Vertex input: position(loc=0), normal(loc=1), UV(loc=2) ---
+        let stride = 32u32; // 3 + 3 + 2 floats = 8 * 4 = 32 bytes
+        let vb = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(stride)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let va = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 12,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 24,
+            },
+        ];
+        let vi = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vb)
+            .vertex_attribute_descriptions(&va);
+
+        let main = c"main";
+        let sr = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vm)
+                .name(main),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fm)
+                .name(main),
+        ];
+        let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let vs2 = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rs = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let ms = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let cba = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false)];
+        let cb = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&cba);
+        let ds = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let dyns = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let ds2 = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyns);
+        let pinfo = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&sr)
+            .vertex_input_state(&vi)
+            .input_assembly_state(&ia)
+            .viewport_state(&vs2)
+            .rasterization_state(&rs)
+            .multisample_state(&ms)
+            .depth_stencil_state(&ds)
+            .color_blend_state(&cb)
+            .dynamic_state(&ds2)
+            .layout(pl)
+            .render_pass(rp)
+            .subpass(0);
+        let p = unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[pinfo], None) }
+            .map_err(|(_, r)| VulkanError::vk("cgp_model", r))?[0];
+        unsafe {
+            d.destroy_shader_module(vm, None);
+            d.destroy_shader_module(fm, None);
+        }
+        self.model_pipeline_layout = Some(pl);
+        self.model_pipeline = Some(p);
+        self.model_rp = Some(rp);
+        self.model_framebuffers = fbs;
+        Ok(())
+    }
+
+    fn record_model(
+        &self,
+        fi: usize,
+        ii: u32,
+        vertex_buf: render_core::BufferHandle,
+        index_buf: render_core::BufferHandle,
+        index_count: u32,
+    ) -> VkResult<()> {
+        self.begin_cb(fi)?;
+        let d = &self.logical_device.device;
+        let f = &self.frame_sync[fi];
+        let sc = self.swapchain.as_ref().unwrap();
+        let rp = self.model_rp.unwrap();
+        let pl = self.model_pipeline.unwrap();
+        let pll = self.model_pipeline_layout.unwrap();
+
+        // Look up Vulkan buffer handles from the slab
+        let vk_vb = self
+            .buffers
+            .get(vertex_buf.index, vertex_buf.generation)
+            .map(|e| e.buffer)
+            .ok_or(VulkanError::Loader("vertex buffer not found".into()))?;
+        let vk_ib = self
+            .buffers
+            .get(index_buf.index, index_buf.generation)
+            .map(|e| e.buffer)
+            .ok_or(VulkanError::Loader("index buffer not found".into()))?;
+
+        // Descriptor set for the current frame
+        let desc_set = self
+            .frame_desc_sets
+            .get(fi)
+            .copied()
+            .unwrap_or(vk::DescriptorSet::null());
+
+        let cc_color = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.02, 0.02, 0.06, 1.0],
+            },
+        };
+        let cc_depth = vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        };
+        let cc_both = [cc_color, cc_depth];
+
+        let rpbi = vk::RenderPassBeginInfo::default()
+            .render_pass(rp)
+            .framebuffer(self.model_framebuffers[ii as usize])
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: sc.extent,
+            })
+            .clear_values(&cc_both);
+        unsafe {
+            d.cmd_begin_render_pass(f.command_buffer, &rpbi, vk::SubpassContents::INLINE);
+        }
+        let vp = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: sc.extent.width as f32,
+            height: sc.extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        unsafe {
+            d.cmd_set_viewport(f.command_buffer, 0, &[vp]);
+            d.cmd_set_scissor(
+                f.command_buffer,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: sc.extent,
+                }],
+            );
+            d.cmd_bind_pipeline(f.command_buffer, vk::PipelineBindPoint::GRAPHICS, pl);
+            // Bind descriptor set (set=0, UBO)
+            if desc_set != vk::DescriptorSet::null() {
+                let sets = [desc_set];
+                d.cmd_bind_descriptor_sets(
+                    f.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pll,
+                    0,
+                    &sets,
+                    &[],
+                );
+            }
+            // Bind vertex + index buffers
+            let vbs = [vk_vb];
+            let offsets = [0u64];
+            d.cmd_bind_vertex_buffers(f.command_buffer, 0, &vbs, &offsets);
+            d.cmd_bind_index_buffer(f.command_buffer, vk_ib, 0, vk::IndexType::UINT32);
+            d.cmd_draw_indexed(f.command_buffer, index_count, 1, 0, 0, 0);
+            d.cmd_end_render_pass(f.command_buffer);
+        }
+        Ok(())
     }
 
     // --- Phase 2 helpers ---
@@ -400,6 +776,11 @@ impl VulkanDevice {
                 d.destroy_framebuffer(fb, None);
             }
         }
+        for fb in self.model_framebuffers.drain(..) {
+            unsafe {
+                d.destroy_framebuffer(fb, None);
+            }
+        }
         if let Some(p) = self.mvp_pipeline.take() {
             unsafe {
                 d.destroy_pipeline(p, None);
@@ -410,7 +791,22 @@ impl VulkanDevice {
                 d.destroy_pipeline_layout(l, None);
             }
         }
+        if let Some(p) = self.model_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(l) = self.model_pipeline_layout.take() {
+            unsafe {
+                d.destroy_pipeline_layout(l, None);
+            }
+        }
         if let Some(rp) = self.mvp_rp.take() {
+            unsafe {
+                d.destroy_render_pass(rp, None);
+            }
+        }
+        if let Some(rp) = self.model_rp.take() {
             unsafe {
                 d.destroy_render_pass(rp, None);
             }
@@ -1474,6 +1870,11 @@ impl Drop for VulkanDevice {
                 d.destroy_framebuffer(fb, None);
             }
         }
+        for fb in self.model_framebuffers.drain(..) {
+            unsafe {
+                d.destroy_framebuffer(fb, None);
+            }
+        }
         if let Some(p) = self.mvp_pipeline.take() {
             unsafe {
                 d.destroy_pipeline(p, None);
@@ -1484,7 +1885,22 @@ impl Drop for VulkanDevice {
                 d.destroy_pipeline_layout(l, None);
             }
         }
+        if let Some(p) = self.model_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(l) = self.model_pipeline_layout.take() {
+            unsafe {
+                d.destroy_pipeline_layout(l, None);
+            }
+        }
         if let Some(rp) = self.mvp_rp.take() {
+            unsafe {
+                d.destroy_render_pass(rp, None);
+            }
+        }
+        if let Some(rp) = self.model_rp.take() {
             unsafe {
                 d.destroy_render_pass(rp, None);
             }
@@ -1538,6 +1954,12 @@ impl Drop for VulkanDevice {
         self.destroy_descriptor_infra();
         self.destroy_depth_texture();
         drop(self.swapchain.take());
+        // SAFETY: all device-child objects have been destroyed above.
+        // Destroy VkDevice before VkInstance per Vulkan spec.
+        unsafe { self.logical_device.device.destroy_device(None) };
+        // Drop the allocator (Device::drop would do this, but we use
+        // ManuallyDrop so it won't run automatically).
+        drop(self.logical_device.allocator.take());
         drop(self.surface.take());
         drop(self.instance.take());
     }

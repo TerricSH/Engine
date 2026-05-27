@@ -38,6 +38,7 @@ crossbeam-channel = "0.5"
 glam = { version = "0.27", features = ["serde"] }
 glow = "0.16"
 # gpu-allocator removed — using custom allocator in render-vulkan
+gltf = "1.4"
 image = "0.25"
 indexmap = { version = "2.2", features = ["serde"] }
 notify = "7.0"
