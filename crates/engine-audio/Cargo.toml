@@ -15,3 +15,12 @@ tooling-hot-reload = []
 target-desktop = []
 target-mobile = []
 subsystem-scripting-csharp = []
+subsystem-audio-cpal = []
+
+[dependencies]
+cpal.workspace = true
+crossbeam-channel.workspace = true
+glam.workspace = true
+symphonia.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
