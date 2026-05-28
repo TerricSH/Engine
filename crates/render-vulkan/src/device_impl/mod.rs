@@ -7,6 +7,7 @@ pub(crate) mod drop;
 pub(crate) mod encoder;
 pub(crate) mod frame;
 pub(crate) mod pipeline;
+pub(crate) mod reload;
 pub(crate) mod rendering;
 pub(crate) mod shadow;
 pub(crate) mod slab;
