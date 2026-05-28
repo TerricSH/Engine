@@ -19,11 +19,13 @@ mod registry;
 mod loader;
 mod watcher;
 mod path;
+pub mod hot_reload;
 
 pub use registry::{AssetRegistry, AssetState, AssetInfo};
 pub use loader::{AssetLoader, AssetHandle, BincodeLoader, RawLoader, AssetError, CachedEntry};
 pub use watcher::FileWatcher;
 pub use path::asset_path;
+pub use hot_reload::HotReload;
 
 #[cfg(test)]
 mod tests {
