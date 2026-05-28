@@ -68,6 +68,9 @@ pub struct VulkanDevice {
     pub(crate) frame_sync: Vec<FrameSync>,
     pub(crate) current_frame: usize,
     pub(crate) cached_adapter_info: AdapterInfo,
+    /// Last swapchain image index acquired (used by read_pixels).
+    last_image_index: u32,
+
 
     // Phase 2: handle tables
     pub(crate) buffers: Slab<BufEntry>,
@@ -184,6 +187,7 @@ impl VulkanDevice {
             frame_sync: Vec::new(),
             current_frame: 0,
             cached_adapter_info: info,
+            last_image_index: 0,
             buffers: Slab::new(),
             pipelines: Slab::new(),
             render_passes: Slab::new(),
@@ -265,6 +269,7 @@ impl VulkanDevice {
         }
         let fi = self.current_frame;
         let (ii, subopt) = self.acquire(fi)?;
+        self.last_image_index = ii;
         self.record_triangle(fi, ii)?;
         self.submit_and_present(fi, ii)?;
         if subopt {
@@ -317,11 +322,11 @@ impl VulkanDevice {
         }
         let fi = self.current_frame;
         let (ii, subopt) = self.acquire(fi)?;
+        self.last_image_index = ii;
 
         // ── Shadow mapping ──────────────────────────────────────────────
         self.ensure_shadow()?;
         let light_mvp = self.compute_light_mvp();
-        // Write light_view_proj to UBO at offset 176 (after camera_pos)
         let mvp_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 &light_mvp as *const _ as *const u8,
@@ -2229,9 +2234,9 @@ impl render_core::Device for VulkanDevice {
             }
         })?;
 
-        // After device_wait_idle the swapchain image is in PRESENT_SRC_KHR.
-        // Use the first image (all are consistent after idle).
-        let swapchain_image = sc.images[0];
+        // Use the last acquired image index (tracked from render_model_frame).
+        let img_idx = self.last_image_index.min(sc.images.len() as u32 - 1);
+        let swapchain_image = sc.images[img_idx as usize];
 
         // 3a. PRESENT_SRC_KHR → TRANSFER_SRC_OPTIMAL
         let to_transfer_barrier = vk::ImageMemoryBarrier::default()
