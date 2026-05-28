@@ -32,18 +32,26 @@ const float SHADOW_BIAS = 0.005;
 /// Compute PCF shadow factor in [0, 1] (1 = fully lit, 0 = fully shadowed).
 float shadow_factor(vec3 world_pos) {
     vec4 light_space = ubo.light_view_proj * vec4(world_pos, 1.0);
-    vec3 proj_coords = light_space.xyz / light_space.w;
-    // Map from [-1, 1] to [0, 1] for texture sampling.
-    proj_coords = proj_coords * 0.5 + 0.5;
-    proj_coords.z -= SHADOW_BIAS;
+    if (light_space.w <= 0.0) {
+        return 1.0;
+    }
+    vec3 ndc = light_space.xyz / light_space.w;
+    vec2 shadow_uv = ndc.xy * 0.5 + 0.5;
+    float shadow_depth = ndc.z;
+    if (shadow_uv.x < 0.0 || shadow_uv.x > 1.0 ||
+        shadow_uv.y < 0.0 || shadow_uv.y > 1.0 ||
+        shadow_depth < 0.0 || shadow_depth > 1.0) {
+        return 1.0;
+    }
+    shadow_depth -= SHADOW_BIAS;
     // sampler2DShadow automatically compares proj_coords.z against the stored
     // depth value using the sampler's COMPARE_OP; returns PCF-weighted average.
-    return texture(u_shadow_map, proj_coords);
+    return texture(u_shadow_map, vec3(shadow_uv, shadow_depth));
 }
 
 void main() {
     vec3 N = normalize(in_normal);
-    vec3 L = normalize(ubo.light_dir.xyz);
+    vec3 L = normalize(-ubo.light_dir.xyz);
 
     // Diffuse lighting (NdotL clamped to [0, 1]).
     float ndotl = max(dot(N, L), 0.0);

@@ -115,11 +115,12 @@ impl VulkanDevice {
     /// |    128 | light_dir     | vec4   |    16 |
     /// |    144 | light_color   | vec4   |    16 |
     /// |    160 | camera_pos    | vec4   |    16 |
+    /// |    176 | light_view_proj | mat4 |    64 |
     ///
-    /// Total: 176 bytes (fits in 256 B UBO).
+    /// Total: 240 bytes (fits in 256 B UBO).
     pub fn write_default_ubo(&mut self) {
         let fi = self.current_frame;
-        let mut data = Vec::with_capacity(176);
+        let mut data = Vec::with_capacity(240);
         // Model matrix (identity for clip-space rendering)
         for i in 0..16 {
             let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
@@ -142,10 +143,18 @@ impl VulkanDevice {
         for v in &[0.0f32, 0.0f32, 2.0f32, 1.0f32] {
             data.extend_from_slice(&v.to_ne_bytes());
         }
+        // Light view-projection (identity until a real shadow pass writes it)
+        for i in 0..16 {
+            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
+            data.extend_from_slice(&v.to_ne_bytes());
+        }
         self.write_ubo(fi, &data, 0);
     }
     /// SAFETY: data must not exceed ubo_size - offset.
     pub fn write_ubo(&mut self, frame_idx: usize, data: &[u8], offset: u64) {
+        if frame_idx >= self.ubo_allocations.len() {
+            let _ = self.ensure_sc();
+        }
         if let Some(allocation) = self.ubo_allocations.get_mut(frame_idx) {
             if let Some(slice) = allocation.mapped_slice_mut() {
                 let start = offset as usize;
