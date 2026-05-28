@@ -1,11 +1,17 @@
 use engine_renderer::ToneMapping;
 use engine_serialize::{
-    AssetId, ComponentTypeId, EngineVersion, PersistentId, SchemaVersion, Value,
+    AssetId, ComponentTypeId, Diagnostic, DiagnosticSeverity, EngineVersion, PersistentId,
+    SchemaVersion, Value,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 pub const ECS_SCENE_CONTRACT: &str = "ECSScene-v0.1.0";
+
+/// Current scene schema version.  Any major bump or minor > this indicates
+/// incompatibility.
+pub const SCENE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 1, 0);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
@@ -64,6 +70,112 @@ impl Default for SceneSettings {
 pub enum DiagnosticsPolicy {
     Strict,
     EditorRepair,
+}
+
+// ── Scene serialization / validation helpers ────────────────────────────────
+
+impl Scene {
+    /// Save this scene to a RON file at the given path.
+    ///
+    /// Creates parent directories if they don't exist.  The file is written in
+    /// a human-readable RON format.
+    pub fn save_to_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let ron_string = ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?;
+        std::fs::write(path, ron_string)?;
+        Ok(())
+    }
+
+    /// Load a scene from a RON file.
+    ///
+    /// Returns an error if the file cannot be read or parsed.
+    pub fn load_from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let ron_string = std::fs::read_to_string(path)?;
+        let scene: Scene = ron::de::from_str(&ron_string)?;
+        Ok(scene)
+    }
+
+    /// Validate schema version compatibility.
+    ///
+    /// Returns a list of [`Diagnostic`] items describing any version
+    /// incompatibilities.  An empty `Vec` means the version is fully compatible.
+    ///
+    /// - **Error** if `schema_version.major` differs from the expected major.
+    /// - **Warning** if `schema_version.minor` is greater than the expected minor
+    ///   (newer features may not be understood).
+    pub fn check_version(&self) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let expected = SCENE_SCHEMA_VERSION;
+
+        if self.schema_version.major != expected.major {
+            diagnostics.push(
+                Diagnostic::new(
+                    "SC0020",
+                    DiagnosticSeverity::Error,
+                    "engine-scene",
+                    format!(
+                        "Scene schema version {}.{}.{} is not compatible with \
+                         expected {}.{}.{}",
+                        self.schema_version.major,
+                        self.schema_version.minor,
+                        self.schema_version.patch,
+                        expected.major,
+                        expected.minor,
+                        expected.patch,
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .path("schema_version"),
+            );
+        } else if self.schema_version.minor > expected.minor {
+            diagnostics.push(
+                Diagnostic::new(
+                    "SC0021",
+                    DiagnosticSeverity::Warning,
+                    "engine-scene",
+                    format!(
+                        "Scene schema version {}.{}.{} is newer than expected \
+                         {}.{}.{}; some features may not be supported",
+                        self.schema_version.major,
+                        self.schema_version.minor,
+                        self.schema_version.patch,
+                        expected.major,
+                        expected.minor,
+                        expected.patch,
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .path("schema_version"),
+            );
+        }
+
+        diagnostics
+    }
+
+    /// Collect all asset dependencies referenced by components in this scene.
+    ///
+    /// Scans every entity's component fields for `Value::Asset` entries and
+    /// returns a deduplicated list of [`AssetId`] values.
+    pub fn collect_asset_dependencies(&self) -> Vec<AssetId> {
+        let mut deps: BTreeSet<AssetId> = BTreeSet::new();
+
+        for entity in &self.entities {
+            for component in entity.components.values() {
+                for value in component.fields.values() {
+                    if let Value::Asset(asset) = value {
+                        deps.insert(asset.clone());
+                    }
+                }
+            }
+        }
+
+        deps.into_iter().collect()
+    }
 }
 
 pub fn sample_scene() -> Scene {

@@ -2,7 +2,7 @@ use engine_renderer::{
     AxisAlignedBox, ClearFlags, LightItem, LightKind, Rect, RenderFrameInput, RenderView,
     RenderableItem, ShadowMode, ViewCompose, IDENTITY_MAT4,
 };
-use engine_serialize::{Diagnostic, DiagnosticSeverity};
+use engine_serialize::{Diagnostic, DiagnosticSeverity, PersistentId};
 
 use crate::scene::{ECS_SCENE_CONTRACT, Scene};
 use crate::validation::{
@@ -10,7 +10,7 @@ use crate::validation::{
     light_kind_field, string_field, validate_scene, vec3_field,
 };
 use crate::World;
-use crate::components::{self, Camera, Light, Renderable, Transform, Bounds};
+use crate::components;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Legacy Scene extraction path
@@ -126,7 +126,8 @@ pub fn extract_renderer_input_from_world(
     type CameraEntry = (i32, Option<PersistentId>, components::Camera, components::Transform, crate::Entity);
     let mut cameras: Vec<CameraEntry> = Vec::new();
 
-    for (entity, camera) in world.query::<components::Camera>() {
+    for (entity, camera_ref) in world.query::<components::Camera>() {
+        let camera = camera_ref.clone();
         let pid = world.persistent_id(entity).map(|s| s.to_string());
         let transform = world
             .get::<components::Transform>(entity)
@@ -334,7 +335,7 @@ pub fn extract_renderer_input_from_world(
             intensity: light.intensity,
             range: light.range,
             position,
-            direction,
+            direction: light.direction,
             spot_angles,
             shadow_mode: map_shadow_mode(light.shadow_mode),
         });
@@ -580,7 +581,7 @@ mod tests {
     fn extract_from_world_with_camera_yields_view() {
         let mut world = World::new();
         let e = world.create_entity();
-        world.add_component(e, Camera::default());
+        world.add_component(e, components::Camera::default());
         world.add_component(e, components::Transform::default());
 
         let result = extract_renderer_input_from_world(&world, 0);
@@ -637,12 +638,12 @@ mod tests {
         let mut world = World::new();
         // Camera looking down -Z.
         let e_cam = world.create_entity();
-        world.add_component(e_cam, Camera::default());
+        world.add_component(e_cam, components::Camera::default());
         world.add_component(e_cam, components::Transform::default());
 
         // Renderable in front of camera (should be visible).
         let e_front = world.create_entity();
-        world.add_component(e_front, Renderable {
+        world.add_component(e_front, components::Renderable {
             mesh_asset: "mesh-visible".into(),
             material_asset: "mat-default".into(),
             visible: true,
@@ -653,14 +654,14 @@ mod tests {
             translation: glam::Vec3::new(0.0, 0.0, -5.0),
             ..Default::default()
         });
-        world.add_component(e_front, Bounds {
+        world.add_component(e_front, components::Bounds {
             center: [0.0, 0.0, -5.0],
             half_extents: [0.5, 0.5, 0.5],
         });
 
         // Renderable behind camera (should be culled).
         let e_back = world.create_entity();
-        world.add_component(e_back, Renderable {
+        world.add_component(e_back, components::Renderable {
             mesh_asset: "mesh-culled".into(),
             material_asset: "mat-default".into(),
             visible: true,
@@ -671,7 +672,7 @@ mod tests {
             translation: glam::Vec3::new(0.0, 0.0, 10.0),
             ..Default::default()
         });
-        world.add_component(e_back, Bounds {
+        world.add_component(e_back, components::Bounds {
             center: [0.0, 0.0, 10.0],
             half_extents: [0.5, 0.5, 0.5],
         });
@@ -689,7 +690,7 @@ mod tests {
     fn world_extraction_with_light_produces_light_item() {
         let mut world = World::new();
         let e_cam = world.create_entity();
-        world.add_component(e_cam, Camera::default());
+        world.add_component(e_cam, components::Camera::default());
         world.add_component(e_cam, components::Transform::default());
 
         let e_light = world.create_entity();
