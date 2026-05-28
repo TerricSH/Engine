@@ -19,6 +19,7 @@ subsystem-scripting-csharp = []
 [dependencies]
 crossbeam-channel.workspace = true
 engine-serialize = { path = "../engine-serialize" }
+platform = { path = "../platform" }
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
