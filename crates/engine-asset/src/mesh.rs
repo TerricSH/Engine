@@ -174,11 +174,11 @@ pub fn create_test_cube() -> MeshData {
         Vec3::NEG_Z, Vec3::NEG_Z, Vec3::NEG_Z, Vec3::NEG_Z,
     ];
     let _indices: Vec<u32> = (0..24u32).collect();
-    // Each face as 2 triangles (6 indices per face)
+    // Each face as 2 triangles (6 indices per face), CCW winding
     let indices = vec![
-        0,1,2, 0,2,3, 4,5,6, 4,6,7,
-        8,9,10, 8,10,11, 12,13,14, 12,14,15,
-        16,17,18, 16,18,19, 20,21,22, 20,22,23,
+        0,1,2, 1,2,3, 4,5,6, 5,6,7,
+        8,9,10, 9,10,11, 12,13,14, 13,14,15,
+        16,17,18, 17,18,19, 20,21,22, 21,22,23,
     ];
     MeshData {
         positions,
