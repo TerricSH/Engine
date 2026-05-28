@@ -110,6 +110,11 @@ impl Diagnostic {
         self.path = Some(path.into());
         self
     }
+
+    pub fn entity(mut self, entity: impl Into<PersistentId>) -> Self {
+        self.entity = Some(entity.into());
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
