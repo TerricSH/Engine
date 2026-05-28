@@ -5,19 +5,46 @@
 //! This crate defines the types and traits for loading, instantiating, and
 //! interacting with scripts (currently targeting .NET via CoreCLR/NativeAOT).
 //!
+//! # Modules
+//!
+//! * [`value`] — [`ScriptValue`] enum for cross-boundary data.
+//! * [`host`] — [`ScriptError`], [`ScriptHandle`], [`ScriptInstance`],
+//!   [`ScriptHost`] trait, plus [`NullScriptHost`] and [`MockHost`].
+//! * [`engine`] — [`ScriptEngine`] coordinator.
+//! * [`lifecycle`] — Standard lifecycle callback name constants.
+//! * [`component`] — [`ScriptComponent`], [`ScriptInstanceState`],
+//!   [`ScriptManager`] for ECS scene integration.
+//! * [`protocol`] — JSON-line wire protocol for process-based hosts.
+//! * [`process_host`] — [`ProcessHost`] stub for CoreCLR child-process
+//!   communication.
+//!
 //! # Safety
 //!
 //! This crate is **excepted** from `forbid(unsafe_code)` because .NET hosting
 //! requires unsafe FFI. Every `unsafe` block **must** carry a `// SAFETY:`
 //! comment explaining why the invariants are upheld.
 
+mod component;
 mod engine;
 mod host;
+mod lifecycle;
+mod process_host;
+mod protocol;
 mod value;
 
+// Re-export lifecycle constants at the crate root for convenience.
+pub use lifecycle::lifecycle::{ON_CREATE, ON_START, ON_UPDATE, ON_DESTROY};
+
+// Core types.
 pub use value::ScriptValue;
-pub use host::{ScriptError, ScriptHandle, ScriptInstance, ScriptHost, NullScriptHost};
+pub use host::{
+    MockHost, MockScriptInstance, NullScriptHost, ScriptError, ScriptHandle, ScriptInstance,
+    ScriptHost,
+};
 pub use engine::ScriptEngine;
+pub use component::{ScriptComponent, ScriptInstanceState, ScriptManager};
+pub use protocol::ScriptMessage;
+pub use process_host::{ProcessHost, ProcessScriptInstance};
 
 #[cfg(test)]
 mod tests {
@@ -82,7 +109,10 @@ mod tests {
 
     #[test]
     fn script_value_float() {
-        assert_eq!(ScriptValue::Float(std::f64::consts::PI), ScriptValue::Float(std::f64::consts::PI));
+        assert_eq!(
+            ScriptValue::Float(std::f64::consts::PI),
+            ScriptValue::Float(std::f64::consts::PI)
+        );
     }
 
     #[test]
@@ -138,6 +168,29 @@ mod tests {
         assert_eq!(format!("{:?}", val), "Map({\"key\": Bool(true)})");
     }
 
+    // ── ScriptValue serialization ────────────────────────────────────────
+
+    #[test]
+    fn script_value_serde_roundtrip() {
+        let cases = vec![
+            ScriptValue::Null,
+            ScriptValue::Bool(true),
+            ScriptValue::Int(42),
+            ScriptValue::Float(3.14),
+            ScriptValue::String("hello".into()),
+            ScriptValue::Vec3([1.0, 2.0, 3.0]),
+            ScriptValue::Vec4([1.0, 2.0, 3.0, 4.0]),
+            ScriptValue::EntityId("ent-001".into()),
+            ScriptValue::AssetIdWrapper("mesh-cube".into()),
+            ScriptValue::Array(vec![ScriptValue::Int(1), ScriptValue::Int(2)]),
+        ];
+        for val in cases {
+            let json = serde_json::to_string(&val).unwrap();
+            let back: ScriptValue = serde_json::from_str(&json).unwrap();
+            assert_eq!(val, back, "round-trip failed for {val:?} -> {json}");
+        }
+    }
+
     // ── ScriptHandle tests ───────────────────────────────────────────────
 
     #[test]
@@ -183,9 +236,19 @@ mod tests {
     }
 
     #[test]
-    fn null_script_host_load_assembly_fails() {
+    fn null_script_host_load_assembly_now_tracks() {
         let mut host = NullScriptHost::new();
         let result = host.load_assembly("test", b"data");
+        assert!(result.is_ok());
+        let handle = result.unwrap();
+        assert_eq!(handle.id(), "test");
+    }
+
+    #[test]
+    fn null_script_host_instantiate_fails() {
+        let mut host = NullScriptHost::new();
+        let handle = ScriptHandle::new("test");
+        let result = host.instantiate(&handle);
         assert!(result.is_err());
         match result {
             Err(ScriptError::UnsupportedFeature(msg)) => {
@@ -196,19 +259,11 @@ mod tests {
     }
 
     #[test]
-    fn null_script_host_instantiate_fails() {
+    fn null_script_host_unload_now_succeeds() {
         let mut host = NullScriptHost::new();
-        let handle = ScriptHandle::new("test");
-        let result = host.instantiate(&handle);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn null_script_host_unload_fails() {
-        let mut host = NullScriptHost::new();
-        let handle = ScriptHandle::new("test");
+        let handle = host.load_assembly("test", b"data").unwrap();
         let result = host.unload(&handle);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -248,8 +303,8 @@ mod tests {
     #[test]
     fn script_engine_update_no_panic() {
         let mut engine = ScriptEngine::new();
-        engine.update(0.016); // Should not panic
-        engine.update(1.0);
+        let _ = engine.update(0.016); // Should not panic
+        let _ = engine.update(1.0);
     }
 
     #[test]
