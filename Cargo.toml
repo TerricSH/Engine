@@ -42,6 +42,7 @@ glow = "0.16"
 gltf = "1.4"
 image = "0.25"
 indexmap = { version = "2.2", features = ["serde"] }
+naga = { version = "0.20", features = ["glsl-in", "spv-out"] }
 notify = "7.0"
 rapier3d = "0.22"
 raw-window-handle = "0.6"
