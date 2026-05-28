@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+pub mod diagnostics;
+pub use diagnostics::*;
+
 use engine_renderer::{FrameStats, Renderer};
 use engine_scene::{extract_renderer_input, Scene};
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
@@ -21,6 +24,7 @@ pub struct EngineRuntime {
     config: EngineConfig,
     renderer: Renderer,
     scene: Option<Scene>,
+    collector: DiagnosticsCollector,
 }
 
 impl EngineRuntime {
@@ -29,15 +33,38 @@ impl EngineRuntime {
             config,
             renderer: Renderer::new(),
             scene: None,
+            collector: DiagnosticsCollector::new(),
         }
     }
+
     pub fn config(&self) -> &EngineConfig {
         &self.config
     }
+
     pub fn load_scene(&mut self, scene: Scene) {
         self.scene = Some(scene);
     }
 
+    /// Access the diagnostics collector (immutable).
+    pub fn diagnostics_collector(&self) -> &DiagnosticsCollector {
+        &self.collector
+    }
+
+    /// Access the diagnostics collector (mutable).
+    pub fn diagnostics_collector_mut(&mut self) -> &mut DiagnosticsCollector {
+        &mut self.collector
+    }
+
+    /// Build an aggregate [`RuntimeDiagnostics`] snapshot for editor/tooling.
+    pub fn runtime_diagnostics(&self) -> RuntimeDiagnostics {
+        RuntimeDiagnostics {
+            collector: self.collector.clone(),
+            reload_queue: None,
+            script_engine_state: String::new(),
+        }
+    }
+
+    /// Render one frame and record GPU statistics into the diagnostics collector.
     pub fn render_frame(&mut self, frame_index: u64) -> Result<FrameStats, Vec<Diagnostic>> {
         let scene = self.scene.as_ref().ok_or_else(|| {
             vec![Diagnostic::new(
@@ -48,7 +75,11 @@ impl EngineRuntime {
             )]
         })?;
         let input = extract_renderer_input(scene, frame_index)?;
-        self.renderer.draw_scene(&input)
+        let result = self.renderer.draw_scene(&input);
+        if let Ok(stats) = &result {
+            self.collector.record_frame(frame_index, stats);
+        }
+        result
     }
 }
 
@@ -112,5 +143,22 @@ mod tests {
         let mut runtime = EngineRuntime::new(config);
         let result = runtime.render_frame(0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn engine_runtime_diagnostics_collector() {
+        let config = EngineConfig::default();
+        let runtime = EngineRuntime::new(config);
+        let collector = runtime.diagnostics_collector();
+        assert!(collector.all().is_empty());
+    }
+
+    #[test]
+    fn engine_runtime_runtime_diagnostics() {
+        let config = EngineConfig::default();
+        let runtime = EngineRuntime::new(config);
+        let rd = runtime.runtime_diagnostics();
+        assert_eq!(rd.script_engine_state, "");
+        assert!(rd.reload_queue.is_none());
     }
 }
