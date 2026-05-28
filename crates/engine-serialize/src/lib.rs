@@ -111,8 +111,10 @@ impl Diagnostic {
         self
     }
 
-    pub fn entity(mut self, entity: impl Into<PersistentId>) -> Self {
-        self.entity = Some(entity.into());
+    /// Attach a related entity persistent ID (accepts both `PersistentId`
+    /// and `Option<PersistentId>`).
+    pub fn entity(mut self, entity: impl Into<Option<PersistentId>>) -> Self {
+        self.entity = entity.into();
         self
     }
 }

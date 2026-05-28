@@ -1,5 +1,9 @@
-use super::{extract_renderer_input, sample_scene, validate_scene, EntityRecord};
+use super::{
+    extract_renderer_input, sample_scene, validate_scene, EntityRecord, Scene, SCENE_SCHEMA_VERSION,
+};
+use engine_serialize::SchemaVersion;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 // ============================================================================
 // Basic validation and extraction
@@ -169,4 +173,132 @@ fn extraction_fails_for_scene_with_missing_camera() {
     scene.scene_settings.active_camera = None;
     let result = extract_renderer_input(&scene, 0);
     assert!(result.is_err(), "extraction should fail with no camera");
+}
+
+// ============================================================================
+// Scene save/load round-trip
+// ============================================================================
+
+#[test]
+fn scene_save_load_roundtrip() {
+    let scene = sample_scene();
+    let dir = std::env::temp_dir().join("engine-scene-tests");
+    let path = dir.join("test_roundtrip.scene.ron");
+
+    // Clean up any previous test file.
+    let _ = std::fs::remove_file(&path);
+
+    // Save
+    scene.save_to_file(&path).expect("save should succeed");
+
+    // Load
+    let loaded = Scene::load_from_file(&path).expect("load should succeed");
+
+    // Verify structural equality
+    assert_eq!(loaded.schema_version, scene.schema_version);
+    assert_eq!(loaded.scene_id, scene.scene_id);
+    assert_eq!(loaded.name, scene.name);
+    assert_eq!(loaded.entities.len(), scene.entities.len());
+    assert_eq!(loaded.dependencies, scene.dependencies);
+
+    // Verify entity data
+    for orig_entity in &scene.entities {
+        let found = loaded
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == orig_entity.persistent_id);
+        assert!(
+            found.is_some(),
+            "missing entity {} after round-trip",
+            orig_entity.persistent_id
+        );
+        if let Some(le) = found {
+            assert_eq!(le.enabled, orig_entity.enabled);
+            assert_eq!(le.components.len(), orig_entity.components.len());
+            // Check first component's fields match
+            for (comp_type, orig_comp) in &orig_entity.components {
+                let loaded_comp = le.components.get(comp_type)
+                    .expect("component type missing after round-trip");
+                assert_eq!(loaded_comp.fields, orig_comp.fields);
+            }
+        }
+    }
+
+    // Clean up
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+// ============================================================================
+// Scene version check
+// ============================================================================
+
+#[test]
+fn scene_version_match_returns_empty_diagnostics() {
+    let scene = sample_scene();
+    let diags = scene.check_version();
+    assert!(
+        diags.is_empty(),
+        "expected empty diagnostics for matching version, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn scene_version_major_mismatch_returns_error() {
+    let mut scene = sample_scene();
+    scene.schema_version = SchemaVersion::new(1, 0, 0);
+    let diags = scene.check_version();
+    assert!(
+        diags.iter().any(|d| d.code == "SC0020"),
+        "expected SC0020 for major version mismatch, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn scene_version_minor_ahead_returns_warning() {
+    let mut scene = sample_scene();
+    scene.schema_version = SchemaVersion::new(0, 2, 0);
+    let diags = scene.check_version();
+    assert!(
+        diags.iter().any(|d| d.code == "SC0021"),
+        "expected SC0021 for newer minor version, got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn scene_version_older_patch_is_compatible() {
+    let mut scene = sample_scene();
+    scene.schema_version = SchemaVersion::new(0, 1, 0); // same as current
+    let diags = scene.check_version();
+    assert!(
+        diags.is_empty(),
+        "expected no errors for older patch version, got: {:?}",
+        diags
+    );
+}
+
+// ============================================================================
+// Scene collect_asset_dependencies
+// ============================================================================
+
+#[test]
+fn scene_collect_asset_dependencies_includes_mesh_and_material() {
+    let scene = sample_scene();
+    let deps = scene.collect_asset_dependencies();
+    // sample_scene has mesh-cube and mat-default
+    assert!(
+        deps.iter().any(|a| a.id == "mesh-cube"),
+        "expected mesh-cube in deps, got: {:?}",
+        deps
+    );
+    assert!(
+        deps.iter().any(|a| a.id == "mat-default"),
+        "expected mat-default in deps, got: {:?}",
+        deps
+    );
+    // Should not have duplicates
+    assert_eq!(deps.len(), 2, "expected exactly 2 unique dependencies");
 }

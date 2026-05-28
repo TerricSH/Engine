@@ -10,7 +10,10 @@ mod world;
 
 pub use scene::*;
 pub use validation::validate_scene;
-pub use extraction::extract_renderer_input;
+pub use extraction::{
+    extract_renderer_input, extract_renderer_input_from_world, extract_frustum_planes,
+    aabb_in_frustum,
+};
 pub use entity::{Entity, EntityManager};
 pub use component::{Component, SparseSet, ComponentStorageDyn};
 pub use world::World;
