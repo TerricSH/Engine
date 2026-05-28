@@ -6,6 +6,7 @@ members = [
     "crates/render-opengl",
     "crates/render-dx12",
     "crates/engine-core",
+    "crates/engine-messaging",
     "crates/engine-serialize",
     "crates/engine-renderer",
     "crates/engine-scene",
