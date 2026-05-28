@@ -171,6 +171,7 @@ fn run_contract_triangle() {
                 }
                 PlatformEvent::CloseRequested => EventFlow::Exit,
                 PlatformEvent::Resumed | PlatformEvent::Suspended => EventFlow::Continue,
+                _ => EventFlow::Continue,
             }
         }
     }
@@ -635,11 +636,13 @@ fn run_static_lit_scene() {
                 }
                 PlatformEvent::CloseRequested => EventFlow::Exit,
                 PlatformEvent::Resumed | PlatformEvent::Suspended => EventFlow::Continue,
+                _ => EventFlow::Continue,
             }
         }
     }
 
     let max_frames = parse_frame_limit();
+
     let app = StaticLitSceneApp {
         renderer: None,
         frames: 0,
@@ -981,6 +984,7 @@ fn run_model_viewer() {
                 }
                 PlatformEvent::CloseRequested => EventFlow::Exit,
                 PlatformEvent::Resumed | PlatformEvent::Suspended => EventFlow::Continue,
+                _ => EventFlow::Continue,
             }
         }
     }
@@ -1135,6 +1139,7 @@ fn run_vulkan_scene(title: &str, scene: render_vulkan::VulkanSceneKind, auto_res
                     EventFlow::Exit
                 }
                 PlatformEvent::Resumed | PlatformEvent::Suspended => EventFlow::Continue,
+                _ => EventFlow::Continue,
             }
         }
     }
