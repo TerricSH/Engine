@@ -842,6 +842,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-messaging"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "engine-serialize",
+ "serde",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "engine-nav"
 version = "0.1.0"
 dependencies = [
