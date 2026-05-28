@@ -235,6 +235,82 @@ impl<M: Message> Default for ChannelBus<M> {
 }
 
 // ---------------------------------------------------------------------------
+// Input event message types (re-exported from platform for convenience)
+// ---------------------------------------------------------------------------
+
+/// Re-export common platform types so downstream code only needs `engine-messaging`.
+pub use platform::{
+    KeyCode, MouseButton, PlatformEvent,
+    Modifiers,
+};
+
+// ── Concrete message wrappers (each maps to one PlatformEvent variant) ──
+
+/// Emitted when a key is pressed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyPressed { pub key: KeyCode, pub modifiers: Modifiers }
+
+/// Emitted when a key is released.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyReleased { pub key: KeyCode, pub modifiers: Modifiers }
+
+/// Emitted when the mouse moves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MouseMoved { pub x: f64, pub y: f64 }
+
+/// Emitted when a mouse button is pressed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MousePressed { pub button: MouseButton, pub x: f64, pub y: f64 }
+
+/// Emitted when a mouse button is released.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MouseReleased { pub button: MouseButton, pub x: f64, pub y: f64 }
+
+/// Emitted when the scroll wheel moves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MouseWheelScrolled { pub delta: (f32, f32) }
+
+/// Emitted when a character is typed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CharacterTyped { pub character: char }
+
+// ---------------------------------------------------------------------------
+// Bridge: PlatformEvent → MessageBus
+// ---------------------------------------------------------------------------
+
+/// Dispatch a [`PlatformEvent`] as typed messages into a [`MessageBus`].
+///
+/// Call this from your `WindowApp::on_event` implementation so that
+/// engine systems can subscribe to specific input events without
+/// depending on `platform` directly.
+pub fn dispatch_input(bus: &mut MessageBus, event: &PlatformEvent) {
+    match event {
+        PlatformEvent::KeyPressed { key, modifiers } => {
+            bus.publish(KeyPressed { key: *key, modifiers: *modifiers });
+        }
+        PlatformEvent::KeyReleased { key, modifiers } => {
+            bus.publish(KeyReleased { key: *key, modifiers: *modifiers });
+        }
+        PlatformEvent::MouseMoved { x, y } => {
+            bus.publish(MouseMoved { x: *x, y: *y });
+        }
+        PlatformEvent::MousePressed { button, x, y } => {
+            bus.publish(MousePressed { button: *button, x: *x, y: *y });
+        }
+        PlatformEvent::MouseReleased { button, x, y } => {
+            bus.publish(MouseReleased { button: *button, x: *x, y: *y });
+        }
+        PlatformEvent::MouseWheelScrolled { delta } => {
+            bus.publish(MouseWheelScrolled { delta: *delta });
+        }
+        PlatformEvent::CharacterTyped { character } => {
+            bus.publish(CharacterTyped { character: *character });
+        }
+        _ => {} // lifecycle events have no message wrapper
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
