@@ -721,6 +721,7 @@ fn run_model_viewer() {
         camera_angle: f32,
         width: f32,
         height: f32,
+        saved_screenshot: bool,
     }
 
     impl BackendRenderer for ModelViewerBackend {
@@ -813,6 +814,18 @@ fn run_model_viewer() {
                     )]);
                 }
             };
+            // Screenshot after first successful render (swapchain exists)
+            if !self.saved_screenshot {
+                self.saved_screenshot = true;
+                use render_core::Device;
+                if let Err(e) = engine_renderer::screenshot::save_framebuffer(
+                    &mut self.device,
+                    std::path::Path::new("screenshot.png"),
+                    0, 0, self.width as u32, self.height as u32,
+                ) {
+                    tracing::warn!("screenshot failed: {e}");
+                }
+            }
             Ok(FrameStats {
                 draw_calls: stats.draw_calls,
                 triangles: stats.triangles,
@@ -941,6 +954,7 @@ fn run_model_viewer() {
                 camera_angle: 0.0,
                 width: size.width.max(1) as f32,
                 height: size.height.max(1) as f32,
+                saved_screenshot: false,
             };
 
             let mut renderer = Renderer::new();
