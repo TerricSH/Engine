@@ -932,6 +932,8 @@ version = "0.1.0"
 dependencies = [
  "engine-renderer",
  "engine-serialize",
+ "glam",
+ "ron",
  "serde",
 ]
 
