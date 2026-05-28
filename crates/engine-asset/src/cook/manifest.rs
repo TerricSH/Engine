@@ -44,6 +44,8 @@ pub enum AssetType {
     Animation,
     Skeleton,
     NavMesh,
+    /// Logic asset (behavior graph / state machine / skill graph / quest dialogue).
+    Logic,
     /// Catch-all for unknown or user-defined asset types.
     Unknown,
 }
@@ -66,6 +68,7 @@ impl AssetType {
             AssetType::Animation => 10,
             AssetType::Skeleton => 11,
             AssetType::NavMesh => 12,
+            AssetType::Logic => 13,
             AssetType::Unknown => 0xFFFF,
         }
     }
@@ -85,6 +88,7 @@ impl AssetType {
             10 => AssetType::Animation,
             11 => AssetType::Skeleton,
             12 => AssetType::NavMesh,
+            13 => AssetType::Logic,
             _ => AssetType::Unknown,
         }
     }
@@ -150,6 +154,7 @@ mod tests {
             AssetType::Animation,
             AssetType::Skeleton,
             AssetType::NavMesh,
+            AssetType::Logic,
             AssetType::Unknown,
         ];
         for ty in cases {

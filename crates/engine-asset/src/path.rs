@@ -45,6 +45,7 @@ pub fn asset_path(id: &AssetId) -> Option<PathBuf> {
             "animation" => "animations",
             "audio" => "audio",
             "font" => "fonts",
+            "logic" => "logic",
             "pipeline" => "pipelines",
             "navmesh" => "navmeshes",
             "script" => "scripts",

@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
+use engine_asset::ReloadCoordinator;
 use engine_core::{EngineConfig, EngineRuntime};
+
+mod diagnostics;
 
 fn main() {
     tracing_subscriber::fmt::init();
@@ -26,11 +29,51 @@ fn main() {
 fn run_gate04_scene() {
     let mut runtime = EngineRuntime::new(EngineConfig::default());
     runtime.load_scene(engine_scene::sample_scene());
+
+    let dir = std::env::temp_dir().join("sandbox_reload");
+    let _ = std::fs::create_dir_all(&dir);
+    let reload_coordinator = ReloadCoordinator::new(&dir, &dir, &dir)
+        .expect("reload coordinator creation should succeed");
+    let mut sandbox_diags = diagnostics::SandboxDiagnostics::new();
+
     match runtime.render_frame(0) {
-        Ok(stats) => tracing::info!(
-            draw_calls = stats.draw_calls,
-            "gate04 scene rendered through contract path"
-        ),
+        Ok(stats) => {
+            tracing::info!(
+                draw_calls = stats.draw_calls,
+                "gate04 scene rendered through contract path"
+            );
+
+            // The runtime's DiagnosticsCollector already recorded frame stats
+            // inside render_frame().  Build a RuntimeDiagnostics snapshot and
+            // feed it to the sandbox aggregator along with reload coordinator state.
+            let runtime_diags = runtime.runtime_diagnostics();
+            sandbox_diags.update(&runtime_diags, &reload_coordinator);
+
+            // Log aggregated diagnostics
+            let all = sandbox_diags.all_diagnostics();
+            tracing::info!(
+                count = all.len(),
+                "sandbox diagnostics collected"
+            );
+            for diagnostic in &all {
+                tracing::debug!(
+                    code = diagnostic.code,
+                    severity = ?diagnostic.severity,
+                    message = diagnostic.message,
+                    "aggregated diagnostic"
+                );
+            }
+
+            // Also log the raw render stats for immediate feedback.
+            tracing::info!(
+                draw_calls = stats.draw_calls,
+                triangles = stats.triangles,
+                gpu_ms = stats.gpu_frame_ms,
+                visible = stats.visible_drawables,
+                culled = stats.culled_drawables,
+                "gate04 frame stats"
+            );
+        }
         Err(diagnostics) => {
             for diagnostic in diagnostics {
                 tracing::error!(code = diagnostic.code, message = diagnostic.message);

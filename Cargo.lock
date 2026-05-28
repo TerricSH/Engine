@@ -859,6 +859,7 @@ dependencies = [
  "engine-asset",
  "engine-renderer",
  "engine-scene",
+ "engine-script",
  "engine-serialize",
  "engine-ui",
  "glam",
@@ -950,8 +951,10 @@ dependencies = [
 name = "engine-serialize"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2316,6 +2319,8 @@ name = "platform"
 version = "0.1.0"
 dependencies = [
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
  "winit",
@@ -2796,6 +2801,7 @@ dependencies = [
  "engine-core",
  "engine-renderer",
  "engine-scene",
+ "engine-serialize",
  "glam",
  "platform",
  "raw-window-handle",

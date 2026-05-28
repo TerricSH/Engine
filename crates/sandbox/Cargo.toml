@@ -21,6 +21,7 @@ engine-asset = { path = "../engine-asset" }
 engine-core = { path = "../engine-core" }
 engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
+engine-serialize = { path = "../engine-serialize" }
 glam.workspace = true
 render-core = { path = "../render-core" }
 platform = { path = "../platform" }
