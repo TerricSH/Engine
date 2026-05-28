@@ -193,7 +193,7 @@ impl VulkanRenderer {
                 let textured_quad = self
                     .textured_quad
                     .as_ref()
-                    .expect("textured resources exist for textured scene");
+                    .ok_or(VulkanError::Loader("textured resources not initialized".into()))?;
                 (
                     PipelineKind::TexturedQuad {
                         descriptor_set_layout: textured_quad.descriptor_set_layout,
@@ -226,9 +226,9 @@ impl VulkanRenderer {
     }
 
     unsafe fn record_and_submit(&mut self) -> VkResult<()> {
-        let swapchain = self.swapchain.as_ref().expect("swapchain present");
-        let pipeline = self.pipeline.as_ref().expect("pipeline present");
-        let frames = self.frames.as_mut().expect("frames present");
+        let swapchain = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let pipeline = self.pipeline.as_ref().ok_or(VulkanError::Loader("pipeline not initialized".into()))?;
+        let frames = self.frames.as_mut().ok_or(VulkanError::Loader("frames not initialized".into()))?;
         let device = &self.device.device;
 
         let frame = &frames.frames[frames.current];
@@ -333,7 +333,7 @@ impl VulkanRenderer {
                     let textured_quad = self
                         .textured_quad
                         .as_ref()
-                        .expect("textured resources exist for textured scene");
+                        .ok_or(VulkanError::Loader("textured resources not initialized".into()))?;
                     let vertex_buffers = [textured_quad.vertex_buffer.buffer];
                     let offsets = [0_u64];
                     let descriptor_sets = [textured_quad.descriptor_set];

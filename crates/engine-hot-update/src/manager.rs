@@ -95,7 +95,9 @@ impl PackageManager {
 
         // Verify content hash (immutable borrow first).
         let (files, manifest_version) = {
-            let entry = self.packages.get(package_id).unwrap();
+            let entry = self.packages.get(package_id).ok_or_else(|| {
+                HotUpdateError::PackageNotFound(package_id.to_string())
+            })?;
             let actual_hash = compute_hash(&entry.package_data);
             if actual_hash != entry.manifest.content_hash {
                 return Err(HotUpdateError::VerificationFailed {
@@ -106,7 +108,9 @@ impl PackageManager {
             (entry.files.clone(), entry.manifest.version.clone())
         };
 
-        let entry = self.packages.get_mut(package_id).unwrap();
+        let entry = self.packages.get_mut(package_id).ok_or_else(|| {
+            HotUpdateError::PackageNotFound(package_id.to_string())
+        })?;
 
         let install_dir = self.base_path.join("installed").join(package_id);
         let timestamp = current_timestamp();
@@ -281,7 +285,11 @@ fn parse_package_blob(data: &[u8]) -> Result<Vec<ParsedFile>, HotUpdateError> {
     }
 
     let (count_bytes, mut remaining) = data.split_at(8);
-    let file_count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+    let file_count = u64::from_le_bytes(
+        count_bytes
+            .try_into()
+            .map_err(|_| HotUpdateError::InvalidPackage("header: failed to parse file count".to_string()))?,
+    ) as usize;
 
     let mut files = Vec::with_capacity(file_count);
 
@@ -294,7 +302,14 @@ fn parse_package_blob(data: &[u8]) -> Result<Vec<ParsedFile>, HotUpdateError> {
             )));
         }
         let (path_len_bytes, after_path_len) = remaining.split_at(8);
-        let path_len = u64::from_le_bytes(path_len_bytes.try_into().unwrap()) as usize;
+        let path_len = u64::from_le_bytes(
+            path_len_bytes.try_into().map_err(|_| {
+                HotUpdateError::InvalidPackage(format!(
+                    "file {}: failed to parse path length",
+                    i
+                ))
+            })?,
+        ) as usize;
 
         // path
         if after_path_len.len() < path_len {
@@ -321,7 +336,14 @@ fn parse_package_blob(data: &[u8]) -> Result<Vec<ParsedFile>, HotUpdateError> {
             )));
         }
         let (content_len_bytes, after_content_len) = after_path.split_at(8);
-        let content_len = u64::from_le_bytes(content_len_bytes.try_into().unwrap()) as usize;
+        let content_len = u64::from_le_bytes(
+            content_len_bytes.try_into().map_err(|_| {
+                HotUpdateError::InvalidPackage(format!(
+                    "file {}: failed to parse content length",
+                    i
+                ))
+            })?,
+        ) as usize;
 
         // content
         if after_content_len.len() < content_len {

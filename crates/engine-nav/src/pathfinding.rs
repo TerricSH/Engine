@@ -81,13 +81,14 @@ impl PartialEq for AStarNode {
 impl PartialOrd for AStarNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         // BinaryHeap is a max-heap; reverse so smallest f_score is on top.
-        other.f_score.partial_cmp(&self.f_score)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for AStarNode {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // BinaryHeap is a max-heap; reverse so smallest f_score is on top.
+        other.f_score.partial_cmp(&self.f_score).unwrap_or(Ordering::Equal)
     }
 }
 

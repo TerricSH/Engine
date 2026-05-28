@@ -46,7 +46,15 @@ impl Renderer {
             backend: Some(backend),
         }
     }
+}
 
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Renderer {
     pub fn set_backend(&mut self, backend: Box<dyn BackendRenderer>) {
         self.backend = Some(backend);
     }

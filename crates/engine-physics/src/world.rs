@@ -198,7 +198,7 @@ impl PhysicsWorld {
     /// Returns `None` if the handle is invalid or the body has been removed.
     pub fn body_position(&self, body: RigidBodyHandle) -> Option<(glam::Vec3, glam::Quat)> {
         let body_ref = self.bodies.get(body.0)?;
-        Some(from_rapier_isometry(&body_ref.position()))
+        Some(from_rapier_isometry(body_ref.position()))
     }
 
     // ── Collider management ─────────────────────────────────────────────────

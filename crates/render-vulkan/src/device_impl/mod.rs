@@ -29,7 +29,11 @@ use crate::surface::Surface;
 use self::encoder::VkCmdEncoder;
 use self::slab::{BufEntry, FrameSync, PipeEntry, PlEntry, Slab};
 
+// SAFETY: all fields are Send-safe: Vulkan handles are integers or wrapped in
+// ManuallyDrop which is Send; Instance/Surface are Send; allocator Mutex is Send.
 unsafe impl Send for VulkanDevice {}
+// SAFETY: all fields are Sync-safe: mutable access requires &mut self; Vulkan
+// handles are integers; allocator Mutex provides interior mutability safely.
 unsafe impl Sync for VulkanDevice {}
 
 // ============================================================================
@@ -121,7 +125,11 @@ impl VulkanDevice {
         height: u32,
         enable_validation: bool,
     ) -> Result<Self, VulkanError> {
+        // SAFETY: `Instance::new` wraps the Vulkan C entry-point creation; the
+        // returned value owns the instance handle.
         let instance = unsafe { Instance::new(display_handle, enable_validation) }?;
+        // SAFETY: `Surface::new` calls Vulkan FFI to create a surface; handles
+        // are valid and owned by the newly-created Surface value.
         let surface = unsafe {
             Surface::new(
                 &instance.entry,
@@ -130,10 +138,17 @@ impl VulkanDevice {
                 window_handle,
             )
         }?;
+        // SAFETY: `select` iterates physical devices and picks one; the
+        // instance/physical-device handles are valid.
         let adapter = unsafe {
             crate::adapter::select(&instance.instance, &surface.loader, surface.surface)
         }?;
+        // SAFETY: `VkLogicalDevice::new` creates a Vulkan logical device; all
+        // inputs (instance, physical device) are valid.
         let ld = unsafe { VkLogicalDevice::new(&instance.instance, &adapter) }?;
+        // SAFETY: `device_name` is a null-terminated `VkPhysicalDeviceProperties`
+        // field guaranteed by the Vulkan spec to be a valid NUL-terminated char
+        // array.
         let name = unsafe { CStr::from_ptr(adapter.properties.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -247,10 +262,14 @@ impl VulkanDevice {
         self.window_width = w.max(1);
         self.window_height = h.max(1);
         self.minimized = w == 0 || h == 0;
+        // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
+        // ensures VkLogicalDevice is not dropped before VulkanDevice).
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
         self.destroy_mvp();
     }
     pub fn wait_idle(&self) {
+        // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
+        // ensures VkLogicalDevice is not dropped before VulkanDevice).
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
     }
 
@@ -327,6 +346,9 @@ impl VulkanDevice {
         // ── Shadow mapping ──────────────────────────────────────────────
         self.ensure_shadow()?;
         let light_mvp = self.compute_light_mvp();
+        // SAFETY: `light_mvp` is a stack-local array whose address is valid for
+        // the full size of `[[f32; 4]; 4]`; the resulting byte slice has the same
+        // lifetime as the borrow of `self`.
         let mvp_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 &light_mvp as *const _ as *const u8,
@@ -358,10 +380,13 @@ impl VulkanDevice {
         let frag = self
             .mvp_frag_spv
             .ok_or(VulkanError::MissingShader("model.frag"))?;
-        let fmt = self.swapchain.as_ref().unwrap().format;
+        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let fmt = sc.format;
         let ext = self.swapchain_extent;
         let d = &self.logical_device.device;
+        // SAFETY: `d` is a valid AshDevice; `vert` contains valid SPIR-V code.
         let vm = unsafe { mk_sm(d, vert)? };
+        // SAFETY: `d` is a valid AshDevice; `frag` contains valid SPIR-V code.
         let fm = unsafe { mk_sm(d, frag)? };
 
         // --- Pipeline layout: set=0 (UBO) + set=1 (shadow map) + no push constants ---
@@ -373,6 +398,8 @@ impl VulkanDevice {
             set_layouts.push(sdl);
         }
         let pli = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        // SAFETY: `d` is a valid AshDevice; `pli` describes a valid pipeline
+        // layout; `None` means no custom allocator.
         let pl = unsafe { d.create_pipeline_layout(&pli, None) }
             .map_err(|r| VulkanError::vk("cpl_model", r))?;
 
@@ -427,17 +454,23 @@ impl VulkanDevice {
             .attachments(&atts)
             .subpasses(&subpasses)
             .dependencies(&deps);
+        // SAFETY: `d` is a valid AshDevice; `rp_info` describes a valid render
+        // pass; `None` means no custom allocator.
         let rp = unsafe { d.create_render_pass(&rp_info, None) }
             .map_err(|r| VulkanError::vk("crp_model", r))?;
 
         // --- Framebuffers (one per swapchain image, color + depth) ---
+        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
         let depth_view = self
             .depth_image_view
             .unwrap_or(vk::ImageView::null());
         let mut fbs = Vec::new();
-        for iv in &self.swapchain.as_ref().unwrap().image_views {
+        for iv in &sc.image_views {
             let att_views = [*iv, depth_view];
             fbs.push(
+                // SAFETY: `d` is a valid AshDevice; framebuffer creation info
+                // references a valid render pass and image views; `None` means
+                // no custom allocator.
                 unsafe {
                     d.create_framebuffer(
                         &vk::FramebufferCreateInfo::default()
@@ -530,8 +563,13 @@ impl VulkanDevice {
             .layout(pl)
             .render_pass(rp)
             .subpass(0);
+        // SAFETY: `d` is a valid AshDevice; `pinfo` describes a valid graphics
+        // pipeline; `vk::PipelineCache::null()` is allowed; `None` means no
+        // custom allocator.
         let p = unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[pinfo], None) }
             .map_err(|(_, r)| VulkanError::vk("cgp_model", r))?[0];
+        // SAFETY: `vm` and `fm` were created by this device and are no longer
+        // needed after pipeline creation; `None` means no custom allocator.
         unsafe {
             d.destroy_shader_module(vm, None);
             d.destroy_shader_module(fm, None);
@@ -554,10 +592,10 @@ impl VulkanDevice {
         // NOTE: command buffer is already started by render_model_frame
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
-        let sc = self.swapchain.as_ref().unwrap();
-        let rp = self.model_rp.unwrap();
-        let pl = self.model_pipeline.unwrap();
-        let pll = self.model_pipeline_layout.unwrap();
+        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let rp = self.model_rp.ok_or(VulkanError::Loader("model render pass not initialized".into()))?;
+        let pl = self.model_pipeline.ok_or(VulkanError::Loader("model pipeline not initialized".into()))?;
+        let pll = self.model_pipeline_layout.ok_or(VulkanError::Loader("model pipeline layout not initialized".into()))?;
 
         // Look up Vulkan buffer handles from the slab
         let vk_vb = self
@@ -599,6 +637,8 @@ impl VulkanDevice {
                 extent: sc.extent,
             })
             .clear_values(&cc_both);
+        // SAFETY: `f.command_buffer` is a valid command buffer in the recording
+        // state; `rpbi` references a valid render pass and framebuffer.
         unsafe {
             d.cmd_begin_render_pass(f.command_buffer, &rpbi, vk::SubpassContents::INLINE);
         }
@@ -610,6 +650,9 @@ impl VulkanDevice {
             min_depth: 0.0,
             max_depth: 1.0,
         };
+        // SAFETY: command buffer is in the recording state; all handles
+        // (pipeline, descriptor sets, buffers) are valid Vulkan objects created
+        // by the same device; the render pass is active.
         unsafe {
             d.cmd_set_viewport(f.command_buffer, 0, &[vp]);
             d.cmd_set_scissor(
@@ -654,14 +697,18 @@ impl VulkanDevice {
 
     fn ensure_sc(&mut self) -> VkResult<()> {
         if self.swapchain.is_none() {
+            let instance = self.instance.as_ref().ok_or(VulkanError::Loader("instance not initialized".into()))?;
+            let surface = self.surface.as_ref().ok_or(VulkanError::Loader("surface not initialized".into()))?;
+            // SAFETY: all handles (instance, device, physical device, surface)
+            // are valid; `Swapchain::new` takes ownership of the cloned device.
             match unsafe {
                 crate::swapchain::Swapchain::new(
-                    &self.instance.as_ref().unwrap().instance,
+                    &instance.instance,
                     self.logical_device.device.clone(),
                     self.adapter.physical_device,
                     self.logical_device.queue_family_index,
-                    &self.surface.as_ref().unwrap().loader,
-                    self.surface.as_ref().unwrap().surface,
+                    &surface.loader,
+                    surface.surface,
                     self.window_width,
                     self.window_height,
                 )
@@ -687,14 +734,19 @@ impl VulkanDevice {
     }
 
     fn acquire(&self, fi: usize) -> VkResult<(u32, bool)> {
-        let sc = self.swapchain.as_ref().unwrap();
+        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
         let f = &self.frame_sync[fi];
+        // SAFETY: `f.in_flight_fence` is a valid fence created by this device;
+        // waiting with `u64::MAX` timeout is safe.
         unsafe {
             self.logical_device
                 .device
                 .wait_for_fences(&[f.in_flight_fence], true, u64::MAX)
                 .map_err(|r| VulkanError::vk("wf", r))?;
         }
+        // SAFETY: `sc.loader` is a valid swapchain loader; `sc.swapchain` is a
+        // valid VkSwapchainKHR; `f.image_available` is a valid semaphore;
+        // timeout parameters are standard Vulkan.
         let (ii, sub) = unsafe {
             sc.loader.acquire_next_image(
                 sc.swapchain,
@@ -710,6 +762,8 @@ impl VulkanDevice {
                 VulkanError::vk("aq", r)
             }
         })?;
+        // SAFETY: `f.in_flight_fence` has been signaled (wait completed above);
+        // resetting a signaled fence is valid.
         unsafe {
             self.logical_device
                 .device
@@ -721,11 +775,15 @@ impl VulkanDevice {
 
     fn begin_cb(&self, fi: usize) -> VkResult<()> {
         let f = &self.frame_sync[fi];
+        // SAFETY: `f.command_buffer` is a valid command buffer allocated from a
+        // pool with `RESET_COMMAND_BUFFER` flag; `f.command_pool` owns it.
         unsafe {
             self.logical_device
                 .device
                 .reset_command_buffer(f.command_buffer, vk::CommandBufferResetFlags::empty())
                 .map_err(|r| VulkanError::vk("rcb", r))?;
+            // SAFETY: after reset the command buffer is in the initial state;
+            // `begin_command_buffer` transitions it to recording state.
             self.logical_device
                 .device
                 .begin_command_buffer(
@@ -742,9 +800,9 @@ impl VulkanDevice {
         self.begin_cb(fi)?;
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
-        let sc = self.swapchain.as_ref().unwrap();
-        let rp = self.mvp_rp.unwrap();
-        let pl = self.mvp_pipeline.unwrap();
+        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let rp = self.mvp_rp.ok_or(VulkanError::Loader("MVP render pass not initialized".into()))?;
+        let pl = self.mvp_pipeline.ok_or(VulkanError::Loader("MVP pipeline not initialized".into()))?;
         let cc = [vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.02, 0.02, 0.06, 1.0],
@@ -758,6 +816,8 @@ impl VulkanDevice {
                 extent: sc.extent,
             })
             .clear_values(&cc);
+        // SAFETY: command buffer is in recording state; render pass and
+        // framebuffer are valid; `SubpassContents::INLINE` is correct.
         unsafe {
             d.cmd_begin_render_pass(f.command_buffer, &rpbi, vk::SubpassContents::INLINE);
         }
@@ -769,6 +829,8 @@ impl VulkanDevice {
             min_depth: 0.0,
             max_depth: 1.0,
         };
+        // SAFETY: command buffer is inside a render pass instance; handles are
+        // valid Vulkan objects created by the same device.
         unsafe {
             d.cmd_set_viewport(f.command_buffer, 0, &[vp]);
             d.cmd_set_scissor(
@@ -789,7 +851,9 @@ impl VulkanDevice {
     fn submit_and_present(&self, fi: usize, ii: u32) -> VkResult<bool> {
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
-        let sc = self.swapchain.as_ref().unwrap();
+        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        // SAFETY: command buffer is in recording state; `end_command_buffer`
+        // transitions it to completed state for submission.
         unsafe {
             d.end_command_buffer(f.command_buffer)
                 .map_err(|r| VulkanError::vk("ecb", r))?;
@@ -803,12 +867,17 @@ impl VulkanDevice {
             .wait_dst_stage_mask(&wst)
             .command_buffers(&cbs)
             .signal_semaphores(&ss);
+        // SAFETY: `queue` is a valid VkQueue; command buffer is in completed
+        // state; semaphores and fence are valid; submit info is correctly
+        // structured.
         unsafe {
             d.queue_submit(self.logical_device.queue, &[si], f.in_flight_fence)
                 .map_err(|r| VulkanError::vk("qs", r))?;
         }
         let sca = [sc.swapchain];
         let ia = [ii];
+        // SAFETY: `queue` is valid; swapchain, semaphores, and image indices
+        // are valid; `PresentInfoKHR` is correctly structured.
         match unsafe {
             sc.loader.queue_present(
                 self.logical_device.queue,
@@ -832,41 +901,50 @@ impl VulkanDevice {
         self.destroy_depth_texture();
         let d = &self.logical_device.device;
         for fb in self.mvp_framebuffers.drain(..) {
+            // SAFETY: `fb` was created by this device and is still alive; not
+            // already destroyed; `None` means no custom allocator.
             unsafe {
                 d.destroy_framebuffer(fb, None);
             }
         }
         for fb in self.model_framebuffers.drain(..) {
+            // SAFETY: `fb` was created by this device and is still alive.
             unsafe {
                 d.destroy_framebuffer(fb, None);
             }
         }
         if let Some(p) = self.mvp_pipeline.take() {
+            // SAFETY: `p` was created by this device and is still alive.
             unsafe {
                 d.destroy_pipeline(p, None);
             }
         }
         if let Some(l) = self.mvp_pipeline_layout.take() {
+            // SAFETY: `l` was created by this device and is still alive.
             unsafe {
                 d.destroy_pipeline_layout(l, None);
             }
         }
         if let Some(p) = self.model_pipeline.take() {
+            // SAFETY: `p` was created by this device and is still alive.
             unsafe {
                 d.destroy_pipeline(p, None);
             }
         }
         if let Some(l) = self.model_pipeline_layout.take() {
+            // SAFETY: `l` was created by this device and is still alive.
             unsafe {
                 d.destroy_pipeline_layout(l, None);
             }
         }
         if let Some(rp) = self.mvp_rp.take() {
+            // SAFETY: `rp` was created by this device and is still alive.
             unsafe {
                 d.destroy_render_pass(rp, None);
             }
         }
         if let Some(rp) = self.model_rp.take() {
+            // SAFETY: `rp` was created by this device and is still alive.
             unsafe {
                 d.destroy_render_pass(rp, None);
             }
@@ -881,10 +959,13 @@ impl VulkanDevice {
         let frag = self
             .mvp_frag_spv
             .ok_or(VulkanError::MissingShader("mvp.frag"))?;
-        let fmt = self.swapchain.as_ref().unwrap().format;
+        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let fmt = sc.format;
         let ext = self.swapchain_extent;
         let d = &self.logical_device.device;
+        // SAFETY: `d` is a valid AshDevice; `vert` contains valid SPIR-V code.
         let vm = unsafe { mk_sm(d, vert)? };
+        // SAFETY: `d` is a valid AshDevice; `frag` contains valid SPIR-V code.
         let fm = unsafe { mk_sm(d, frag)? };
         let at = vk::AttachmentDescription::default()
             .format(fmt)
@@ -910,9 +991,13 @@ impl VulkanDevice {
             .attachments(&atts)
             .subpasses(&sps)
             .dependencies(&deps);
+        // SAFETY: `d` is a valid AshDevice; `rpi` describes a valid render
+        // pass; `None` means no custom allocator.
         let rp =
             unsafe { d.create_render_pass(&rpi, None) }.map_err(|r| VulkanError::vk("crp", r))?;
         let pli = vk::PipelineLayoutCreateInfo::default();
+        // SAFETY: `d` is a valid AshDevice; `pli` describes a valid pipeline
+        // layout; `None` means no custom allocator.
         let pl = unsafe { d.create_pipeline_layout(&pli, None) }
             .map_err(|r| VulkanError::vk("cpl", r))?;
         let main = c"main";
@@ -959,16 +1044,24 @@ impl VulkanDevice {
             .layout(pl)
             .render_pass(rp)
             .subpass(0);
+        // SAFETY: `d` is a valid AshDevice; `pinfo` describes a valid graphics
+        // pipeline; `vk::PipelineCache::null()` is allowed; `None` means no
+        // custom allocator.
         let p = unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[pinfo], None) }
             .map_err(|(_, r)| VulkanError::vk("cgp", r))?[0];
+        // SAFETY: `vm` and `fm` were created by this device and are no longer
+        // needed after pipeline creation; `None` means no custom allocator.
         unsafe {
             d.destroy_shader_module(vm, None);
             d.destroy_shader_module(fm, None);
         }
         let mut fbs = Vec::new();
-        for iv in &self.swapchain.as_ref().unwrap().image_views {
+        for iv in &sc.image_views {
             let iva = [*iv];
             fbs.push(
+                // SAFETY: `d` is a valid AshDevice; framebuffer creation info
+                // references a valid render pass and image views; `None` means
+                // no custom allocator.
                 unsafe {
                     d.create_framebuffer(
                         &vk::FramebufferCreateInfo::default()
@@ -993,6 +1086,8 @@ impl VulkanDevice {
     fn build_frames(&mut self) -> VkResult<()> {
         let d = &self.logical_device.device;
         for _ in 0..2 {
+            // SAFETY: `d` is a valid AshDevice; the queue family index is valid
+            // for this device; `None` means no custom allocator.
             let cp = unsafe {
                 d.create_command_pool(
                     &vk::CommandPoolCreateInfo::default()
@@ -1002,6 +1097,8 @@ impl VulkanDevice {
                 )
             }
             .map_err(|r| VulkanError::vk("ccp", r))?;
+            // SAFETY: `cp` was just created and is valid; allocation info
+            // correctly references the pool with PRIMARY level.
             let cbs = unsafe {
                 d.allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
@@ -1012,10 +1109,15 @@ impl VulkanDevice {
             }
             .map_err(|r| VulkanError::vk("acb", r))?;
             let si = vk::SemaphoreCreateInfo::default();
+            // SAFETY: `d` is a valid AshDevice; `si` describes a valid
+            // semaphore; `None` means no custom allocator.
             let ia =
                 unsafe { d.create_semaphore(&si, None) }.map_err(|r| VulkanError::vk("cs", r))?;
+            // SAFETY: same as above for the render-finished semaphore.
             let rf =
                 unsafe { d.create_semaphore(&si, None) }.map_err(|r| VulkanError::vk("cs", r))?;
+            // SAFETY: `d` is a valid AshDevice; fence is created in SIGNALED
+            // state; `None` means no custom allocator.
             let fl = unsafe {
                 d.create_fence(
                     &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -1069,11 +1171,15 @@ impl VulkanDevice {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `d` is a valid AshDevice; `image_info` describes a valid
+        // 2D depth image; `None` means no custom allocator.
         let image = unsafe { d.create_image(&image_info, None) }
             .map_err(|r| VulkanError::vk("create_shadow_image", r))?;
+        // SAFETY: `image` was just created by this device; querying memory
+        // requirements for a valid image is safe.
         let req = unsafe { d.get_image_memory_requirements(image) };
         let allocation = allocator
-            .borrow_mut()
+            .lock().map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
             .allocate(&crate::allocator::AllocationCreateDesc {
                 name: "shadow-map",
                 requirements: req,
@@ -1082,6 +1188,8 @@ impl VulkanDevice {
                 allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
+        // SAFETY: `image` was created by this device; `allocation` was created
+        // for this image's memory requirements; the memory and offset are valid.
         unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
             .map_err(|r| VulkanError::vk("bind_shadow_image", r))?;
 
@@ -1097,6 +1205,8 @@ impl VulkanDevice {
                 base_array_layer: 0,
                 layer_count: 1,
             });
+        // SAFETY: `d` is a valid AshDevice; `view_info` references a valid
+        // image and subresource range; `None` means no custom allocator.
         let image_view = unsafe { d.create_image_view(&view_info, None) }
             .map_err(|r| VulkanError::vk("create_shadow_image_view", r))?;
 
@@ -1114,6 +1224,8 @@ impl VulkanDevice {
             .max_lod(1.0)
             .mip_lod_bias(0.0)
             .anisotropy_enable(false);
+        // SAFETY: `d` is a valid AshDevice; `sampler_info` describes a valid
+        // sampler; `None` means no custom allocator.
         let sampler = unsafe { d.create_sampler(&sampler_info, None) }
             .map_err(|r| VulkanError::vk("create_shadow_sampler", r))?;
 
@@ -1155,6 +1267,8 @@ impl VulkanDevice {
             .attachments(&atts)
             .subpasses(&subpasses)
             .dependencies(&deps);
+        // SAFETY: `d` is a valid AshDevice; `rp_info` describes a valid
+        // depth-only render pass; `None` means no custom allocator.
         let rp = unsafe { d.create_render_pass(&rp_info, None) }
             .map_err(|r| VulkanError::vk("crp_shadow", r))?;
 
@@ -1166,13 +1280,17 @@ impl VulkanDevice {
         }];
         let pli = vk::PipelineLayoutCreateInfo::default()
             .push_constant_ranges(&pc_range);
+        // SAFETY: `d` is a valid AshDevice; `pli` describes a valid pipeline
+        // layout with push constant ranges; `None` means no custom allocator.
         let pll = unsafe { d.create_pipeline_layout(&pli, None) }
             .map_err(|r| VulkanError::vk("cpl_shadow", r))?;
 
         // ---- 6. Shadow pipeline (depth-only, no color writes) ----
         let vert_spv = crate::shaders_embedded::SHADOW_VERT_SPV;
         let frag_spv = crate::shaders_embedded::SHADOW_FRAG_SPV;
+        // SAFETY: `d` is a valid AshDevice; `vert_spv` contains valid SPIR-V.
         let vm = unsafe { mk_sm(d, vert_spv) }?;
+        // SAFETY: `d` is a valid AshDevice; `frag_spv` contains valid SPIR-V.
         let fm = unsafe { mk_sm(d, frag_spv) }?;
 
         let main = c"main";
@@ -1242,16 +1360,23 @@ impl VulkanDevice {
             .layout(pll)
             .render_pass(rp)
             .subpass(0);
+        // SAFETY: `d` is a valid AshDevice; `pinfo` describes a valid graphics
+        // pipeline (depth-only, no color attachments); `vk::PipelineCache::null()`
+        // is allowed; `None` means no custom allocator.
         let pipeline =
             unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[pinfo], None) }
                 .map_err(|(_, r)| VulkanError::vk("cgp_shadow", r))?[0];
 
+        // SAFETY: `vm` and `fm` were created by this device and are no longer
+        // needed after pipeline creation; `None` means no custom allocator.
         unsafe {
             d.destroy_shader_module(vm, None);
             d.destroy_shader_module(fm, None);
         }
 
         // ---- 7. Framebuffer ----
+        // SAFETY: `d` is a valid AshDevice; framebuffer info references a valid
+        // render pass and image view; `None` means no custom allocator.
         let fb = unsafe {
             d.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
@@ -1272,6 +1397,9 @@ impl VulkanDevice {
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
         let ds_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&ds_bindings);
+        // SAFETY: `d` is a valid AshDevice; `ds_layout_info` describes a valid
+        // layout with one combined image sampler binding; `None` means no custom
+        // allocator.
         let ds_layout = unsafe { d.create_descriptor_set_layout(&ds_layout_info, None) }
             .map_err(|r| VulkanError::vk("create_shadow_ds_layout", r))?;
 
@@ -1283,6 +1411,8 @@ impl VulkanDevice {
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
             .pool_sizes(&pool_sizes);
+        // SAFETY: `d` is a valid AshDevice; `pool_info` describes a valid pool;
+        // `None` means no custom allocator.
         let pool = unsafe { d.create_descriptor_pool(&pool_info, None) }
             .map_err(|r| VulkanError::vk("create_shadow_ds_pool", r))?;
 
@@ -1290,6 +1420,8 @@ impl VulkanDevice {
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&ds_layouts);
+        // SAFETY: `d` is a valid AshDevice; `alloc_info` references a valid
+        // pool and layout; the pool has enough capacity.
         let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
             .map_err(|r| VulkanError::vk("alloc_shadow_ds", r))?;
         let desc_set = desc_sets[0];
@@ -1304,6 +1436,8 @@ impl VulkanDevice {
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_info)];
+        // SAFETY: `d` is a valid AshDevice; write descriptor references valid
+        // descriptor set, sampler, and image view; no zero handles.
         unsafe {
             d.update_descriptor_sets(&writes, &[]);
         }
@@ -1325,6 +1459,8 @@ impl VulkanDevice {
         let bind_set_layouts = [ds_layout];
         let bind_pli = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&bind_set_layouts);
+        // SAFETY: `d` is a valid AshDevice; `bind_pli` describes a valid layout;
+        // `None` means no custom allocator.
         let bind_pll = unsafe { d.create_pipeline_layout(&bind_pli, None) }
             .map_err(|r| VulkanError::vk("cpl_shadow_bind", r))?;
         self.shadow_bind_layout = Some(bind_pll);
@@ -1338,37 +1474,49 @@ impl VulkanDevice {
 
         // Descriptor pool automatically frees its descriptor sets
         if let Some(pool) = self.shadow_desc_pool.take() {
+            // SAFETY: `pool` was created by this device and is still alive.
             unsafe { d.destroy_descriptor_pool(pool, None); }
         }
         if let Some(layout) = self.shadow_desc_layout.take() {
+            // SAFETY: `layout` was created by this device and is still alive.
             unsafe { d.destroy_descriptor_set_layout(layout, None); }
         }
         if let Some(layout) = self.shadow_bind_layout.take() {
+            // SAFETY: `layout` was created by this device and is still alive.
             unsafe { d.destroy_pipeline_layout(layout, None); }
         }
         if let Some(fb) = self.shadow_fb.take() {
+            // SAFETY: `fb` was created by this device and is still alive.
             unsafe { d.destroy_framebuffer(fb, None); }
         }
         if let Some(p) = self.shadow_pipeline.take() {
+            // SAFETY: `p` was created by this device and is still alive.
             unsafe { d.destroy_pipeline(p, None); }
         }
         if let Some(l) = self.shadow_pipeline_layout.take() {
+            // SAFETY: `l` was created by this device and is still alive.
             unsafe { d.destroy_pipeline_layout(l, None); }
         }
         if let Some(rp) = self.shadow_rp.take() {
+            // SAFETY: `rp` was created by this device and is still alive.
             unsafe { d.destroy_render_pass(rp, None); }
         }
         if let Some(s) = self.shadow_sampler.take() {
+            // SAFETY: `s` was created by this device and is still alive.
             unsafe { d.destroy_sampler(s, None); }
         }
         if let Some(iv) = self.shadow_map_view.take() {
+            // SAFETY: `iv` was created by this device and is still alive.
             unsafe { d.destroy_image_view(iv, None); }
         }
         if let Some(img) = self.shadow_map.take() {
+            // SAFETY: `img` was created by this device and is still alive.
             unsafe { d.destroy_image(img, None); }
         }
         if let Some(mut a) = self.shadow_allocation.take() {
-            let _ = self.logical_device.allocator().borrow_mut().free(&mut a);
+            if let Ok(mut guard) = self.logical_device.allocator().lock() {
+                let _ = guard.free(&mut a);
+            }
         }
     }
 
@@ -1400,9 +1548,9 @@ impl VulkanDevice {
     ) -> VkResult<()> {
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
-        let rp = self.shadow_rp.unwrap();
-        let pl = self.shadow_pipeline.unwrap();
-        let pll = self.shadow_pipeline_layout.unwrap();
+        let rp = self.shadow_rp.ok_or(VulkanError::Loader("shadow render pass not initialized".into()))?;
+        let pl = self.shadow_pipeline.ok_or(VulkanError::Loader("shadow pipeline not initialized".into()))?;
+        let pll = self.shadow_pipeline_layout.ok_or(VulkanError::Loader("shadow pipeline layout not initialized".into()))?;
         const SHADOW_SIZE: u32 = 2048;
 
         // Look up Vulkan buffer handles
@@ -1427,7 +1575,7 @@ impl VulkanDevice {
         let clear_values = [clear_depth];
         let rpbi = vk::RenderPassBeginInfo::default()
             .render_pass(rp)
-            .framebuffer(self.shadow_fb.unwrap())
+            .framebuffer(self.shadow_fb.ok_or(VulkanError::Loader("shadow framebuffer not initialized".into()))?)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
@@ -1437,6 +1585,8 @@ impl VulkanDevice {
             })
             .clear_values(&clear_values);
 
+        // SAFETY: command buffer is in recording state; render pass and
+        // framebuffer are valid; `SubpassContents::INLINE` is correct.
         unsafe {
             d.cmd_begin_render_pass(f.command_buffer, &rpbi, vk::SubpassContents::INLINE);
         }
@@ -1450,6 +1600,9 @@ impl VulkanDevice {
             min_depth: 0.0,
             max_depth: 1.0,
         };
+        // SAFETY: command buffer is inside a render pass instance; all handles
+        // (pipeline, push constants, buffers) are valid; `light_mvp` is a
+        // stack-local array valid for the duration of the unsafe block.
         unsafe {
             d.cmd_set_viewport(f.command_buffer, 0, &[vp]);
             d.cmd_set_scissor(
@@ -1466,6 +1619,9 @@ impl VulkanDevice {
             d.cmd_bind_pipeline(f.command_buffer, vk::PipelineBindPoint::GRAPHICS, pl);
 
             // Push constant: mat4 light MVP (64 bytes)
+            // SAFETY: `light_mvp` pointer is valid for the size of the matrix;
+            // push constant range (64 bytes at offset 0) matches the pipeline
+            // layout declaration.
             let mvp_bytes: &[u8] = std::slice::from_raw_parts(
                 light_mvp.as_ptr() as *const u8,
                 std::mem::size_of::<[[f32; 4]; 4]>(),
@@ -1490,7 +1646,7 @@ impl VulkanDevice {
         // Pipeline barrier: make shadow depth writes visible to fragment shader reads
         // in the subsequent forward render pass.
         let barrier = vk::ImageMemoryBarrier::default()
-            .image(self.shadow_map.unwrap())
+            .image(self.shadow_map.ok_or(VulkanError::Loader("shadow map image not initialized".into()))?)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::DEPTH,
                 base_mip_level: 0,
@@ -1502,6 +1658,9 @@ impl VulkanDevice {
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
             .old_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
             .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+        // SAFETY: command buffer is still in recording state (not yet ended);
+        // the barrier references a valid image; stage masks are correct for
+        // depth write → shader read transition.
         unsafe {
             d.cmd_pipeline_barrier(
                 f.command_buffer,
@@ -1552,16 +1711,22 @@ impl render_core::Device for VulkanDevice {
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `d.device` is a valid AshDevice; `bi` describes a valid
+        // buffer; `None` means no custom allocator.
         let buffer = unsafe { d.device.create_buffer(&bi, None) }.map_err(|r| {
             render_core::RhiError::Backend {
                 detail: format!("{r:?}"),
             }
         })?;
+        // SAFETY: `buffer` was just created by this device; querying memory
+        // requirements for a valid buffer is safe.
         let req = unsafe { d.device.get_buffer_memory_requirements(buffer) };
         let alloc_handle = d.allocator();
         let location = crate::allocator::MemoryLocation::CpuToGpu;
         let mut allocation = alloc_handle
-            .borrow_mut()
+            .lock().map_err(|e| render_core::RhiError::Backend {
+                detail: format!("allocator lock: {e}"),
+            })?
             .allocate(&crate::allocator::AllocationCreateDesc {
                 name: "device-buffer",
                 requirements: req,
@@ -1572,11 +1737,17 @@ impl render_core::Device for VulkanDevice {
             .map_err(|e| render_core::RhiError::Backend {
                 detail: format!("{e}"),
             })?;
+        // SAFETY: `buffer` was created by this device; `allocation` was created
+        // for this buffer's memory requirements; the memory and offset are valid.
         if let Err(r) = unsafe {
             d.device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
         } {
-            let _ = alloc_handle.borrow_mut().free(&mut allocation);
+            if let Ok(mut alloc_guard) = alloc_handle.lock() {
+                let _ = alloc_guard.free(&mut allocation);
+            }
+            // SAFETY: `buffer` was just created; not bound to memory; destroying
+            // a freshly-created buffer is safe even on failed bind.
             unsafe {
                 d.device.destroy_buffer(buffer, None);
             }
@@ -1702,6 +1873,9 @@ impl render_core::Device for VulkanDevice {
                 .attachments(&atts)
                 .subpasses(&subpasses)
                 .dependencies(&deps);
+            // SAFETY: `d` is a valid AshDevice; `rp_info` describes a valid
+            // render pass with color + depth attachments; `None` means no
+            // custom allocator.
             (
                 unsafe { d.create_render_pass(&rp_info, None) }.map_err(|r| {
                     render_core::RhiError::Backend {
@@ -1733,6 +1907,9 @@ impl render_core::Device for VulkanDevice {
                 .attachments(&atts)
                 .subpasses(&subpasses)
                 .dependencies(&deps);
+            // SAFETY: `d` is a valid AshDevice; `rp_info` describes a valid
+            // render pass with color attachment only; `None` means no custom
+            // allocator.
             (
                 unsafe { d.create_render_pass(&rp_info, None) }.map_err(|r| {
                     render_core::RhiError::Backend {
@@ -1771,6 +1948,9 @@ impl render_core::Device for VulkanDevice {
                 .width(desc.width)
                 .height(desc.height)
                 .layers(1);
+            // SAFETY: `d` is a valid AshDevice; `fi` references a valid render
+            // pass and image views (null image views are allowed for placeholders);
+            // `None` means no custom allocator.
             unsafe { d.create_framebuffer(&fi, None) }
         } else {
             let fi = vk::FramebufferCreateInfo::default()
@@ -1778,6 +1958,8 @@ impl render_core::Device for VulkanDevice {
                 .width(desc.width)
                 .height(desc.height)
                 .layers(1);
+            // SAFETY: `d` is a valid AshDevice; `fi` references a valid render
+            // pass; `None` means no custom allocator.
             unsafe { d.create_framebuffer(&fi, None) }
         }
         .map_err(|r| render_core::RhiError::Backend {
@@ -1811,13 +1993,16 @@ impl render_core::Device for VulkanDevice {
             set_layouts.push(sdl);
         }
         // Also add any from the descriptor
-        for bg in &desc.bind_group_layouts {
+        for _bg in &desc.bind_group_layouts {
             // For now, bind_group_layouts from descriptor are ignored
             // since set=0 is always the per-frame layout
         }
         let info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&pc_ranges);
+        // SAFETY: `d` is a valid AshDevice; `info` describes a valid pipeline
+        // layout with descriptor set layouts and push constant ranges; `None`
+        // means no custom allocator.
         let layout = unsafe { d.create_pipeline_layout(&info, None) }.map_err(|r| {
             render_core::RhiError::Backend {
                 detail: format!("{r:?}"),
@@ -1825,7 +2010,7 @@ impl render_core::Device for VulkanDevice {
         })?;
         let (idx, gen) = self.pipeline_layouts.insert(PlEntry {
             layout,
-            device: d.clone(),
+            _device: d.clone(),
         });
         Ok(PipelineLayoutHandle::new(idx, gen))
     }
@@ -1844,9 +2029,11 @@ impl render_core::Device for VulkanDevice {
                 detail: "no frag spv".into(),
             })?,
         );
+        // SAFETY: `d` is a valid AshDevice; `vs` contains valid SPIR-V code.
         let vm = (unsafe { mk_sm(d, vs) }).map_err(|e| render_core::RhiError::Backend {
             detail: format!("{e}"),
         })?;
+        // SAFETY: `d` is a valid AshDevice; `fs` contains valid SPIR-V code.
         let fm = (unsafe { mk_sm(d, fs) }).map_err(|e| render_core::RhiError::Backend {
             detail: format!("{e}"),
         })?;
@@ -1934,6 +2121,8 @@ impl render_core::Device for VulkanDevice {
                 .attachments(&atts)
                 .subpasses(&sps)
                 .dependencies(&deps);
+            // SAFETY: `d` is a valid AshDevice; `rpi` describes a valid render
+            // pass; `None` means no custom allocator.
             unsafe { d.create_render_pass(&rpi, None) }.map_err(|r| {
                 render_core::RhiError::Backend {
                     detail: format!("{r:?}"),
@@ -1967,11 +2156,16 @@ impl render_core::Device for VulkanDevice {
             .layout(pll)
             .render_pass(rp)
             .subpass(0);
+        // SAFETY: `d` is a valid AshDevice; `pinfo` describes a valid graphics
+        // pipeline; `vk::PipelineCache::null()` is allowed; `None` means no
+        // custom allocator.
         let pipeline =
             unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[pinfo], None) }
                 .map_err(|(_, r)| render_core::RhiError::Backend {
                     detail: format!("{r:?}"),
                 })?[0];
+        // SAFETY: `vm` and `fm` were created by this device and are no longer
+        // needed after pipeline creation; `None` means no custom allocator.
         unsafe {
             d.destroy_shader_module(vm, None);
             d.destroy_shader_module(fm, None);
@@ -2000,6 +2194,7 @@ impl render_core::Device for VulkanDevice {
             .map_err(|e| render_core::RhiError::Backend {
                 detail: format!("{e}"),
             })?;
+        self.last_image_index = ii;
         self.begin_cb(fi)
             .map_err(|e| render_core::RhiError::Backend {
                 detail: format!("{e}"),
@@ -2013,11 +2208,27 @@ impl render_core::Device for VulkanDevice {
         let encoder = Box::new(VkCmdEncoder {
             device: self.logical_device.device.clone(),
             cmd: f.command_buffer,
-            pipelines: &self.pipelines as *const Slab<PipeEntry>,
-            buffers: &self.buffers as *const Slab<BufEntry>,
-            render_passes: &self.render_passes as *const Slab<vk::RenderPass>,
-            framebuffers: &self.framebuffers as *const Slab<vk::Framebuffer>,
-            pipeline_layouts: &self.pipeline_layouts as *const Slab<PlEntry>,
+            // Snapshot slab entries into owned Vec caches — no raw pointers.
+            pipeline_cache: self
+                .pipelines
+                .slots
+                .iter()
+                .map(|s| s.as_ref().map(|(g, e)| (*g, e.pipeline)))
+                .collect(),
+            buffer_cache: self
+                .buffers
+                .slots
+                .iter()
+                .map(|s| s.as_ref().map(|(g, e)| (*g, e.buffer)))
+                .collect(),
+            render_pass_cache: self.render_passes.slots.clone(),
+            framebuffer_cache: self.framebuffers.slots.clone(),
+            pipeline_layout_cache: self
+                .pipeline_layouts
+                .slots
+                .iter()
+                .map(|s| s.as_ref().map(|(g, e)| (*g, e.layout)))
+                .collect(),
             current_desc_set: desc_set,
         });
 
@@ -2027,6 +2238,9 @@ impl render_core::Device for VulkanDevice {
         if let Some(sds) = self.shadow_desc_set {
             if let Some(bind_pll) = self.shadow_bind_layout {
                 let shadow_sets = [sds];
+                // SAFETY: command buffer is in recording state; descriptor set,
+                // pipeline layout, and command buffer are valid Vulkan objects
+                // created by the same device.
                 unsafe {
                     self.logical_device.device.cmd_bind_descriptor_sets(
                         f.command_buffer,
@@ -2056,6 +2270,8 @@ impl render_core::Device for VulkanDevice {
                     detail: format!("{e}"),
                 })?;
         if subopt {
+            // SAFETY: `self.logical_device` is alive by type invariant
+            // (ManuallyDrop ensures destruction order).
             let _ = unsafe { self.logical_device.device.device_wait_idle() };
             self.swapchain = None;
         }
@@ -2073,6 +2289,8 @@ impl render_core::Device for VulkanDevice {
         w: u32,
         h: u32,
     ) -> Result<(), render_core::RhiError> {
+        // SAFETY: `self.logical_device` is alive by type invariant
+        // (ManuallyDrop ensures destruction order).
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
         self.window_width = w.max(1);
         self.window_height = h.max(1);
@@ -2081,6 +2299,8 @@ impl render_core::Device for VulkanDevice {
     }
 
     fn wait_idle(&self) {
+        // SAFETY: `self.logical_device` is alive by type invariant
+        // (ManuallyDrop ensures destruction order).
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
     }
 
@@ -2093,6 +2313,8 @@ impl render_core::Device for VulkanDevice {
     ) -> Result<Vec<u8>, render_core::RhiError> {
         // Flush all pending GPU work so the swapchain images are in a
         // deterministic layout (PRESENT_SRC_KHR after the last render pass).
+        // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
+        // ensures destruction order).
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
 
         let sc = self
@@ -2126,6 +2348,8 @@ impl render_core::Device for VulkanDevice {
         //    VK_IMAGE_USAGE_TRANSFER_SRC_BIT for vkCmdCopyImageToBuffer to
         //    work.  Add this to the usage flags in swapchain::new().
         // -----------------------------------------------------------------
+        // SAFETY: `device` is a valid AshDevice; buffer creation describes a
+        // valid TRANSFER_DST buffer; `None` means no custom allocator.
         let staging_buffer = unsafe {
             device.create_buffer(
                 &vk::BufferCreateInfo::default()
@@ -2139,29 +2363,33 @@ impl render_core::Device for VulkanDevice {
             detail: format!("create staging buffer: {r:?}"),
         })?;
 
+        // SAFETY: `staging_buffer` was just created by this device; querying
+        // memory requirements for a valid buffer is safe.
         let req = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
         let alloc_handle = d.allocator();
-        let mut staging_alloc =
-            match alloc_handle
-                .borrow_mut()
-                .allocate(&crate::allocator::AllocationCreateDesc {
-                    name: "read_pixels staging",
-                    requirements: req,
-                    location: crate::allocator::MemoryLocation::GpuToCpu,
-                    linear: true,
-                    allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
-                }) {
-                Ok(a) => a,
-                Err(e) => {
-                    // SAFETY: buffer was just created and is not in use.
-                    unsafe { device.destroy_buffer(staging_buffer, None) };
-                    return Err(render_core::RhiError::Backend {
-                        detail: format!("alloc staging: {e}"),
-                    });
+        let mut staging_alloc = alloc_handle
+            .lock().map_err(|e| render_core::RhiError::Backend {
+                detail: format!("allocator lock: {e}"),
+            })?
+            .allocate(&crate::allocator::AllocationCreateDesc {
+                name: "read_pixels staging",
+                requirements: req,
+                location: crate::allocator::MemoryLocation::GpuToCpu,
+                linear: true,
+                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
+            })
+            .map_err(|e| {
+                // SAFETY: buffer was just created by this device and is not
+                // in use; destroying it on allocation failure is correct.
+                unsafe { device.destroy_buffer(staging_buffer, None) };
+                render_core::RhiError::Backend {
+                    detail: format!("alloc staging: {e}"),
                 }
-            };
+            })?;
 
-        // SAFETY: allocation was created for this buffer's requirements.
+        // SAFETY: `staging_buffer` was created by this device; `staging_alloc`
+        // was created for this buffer's memory requirements; memory and offset
+        // are valid.
         if let Err(r) = unsafe {
             device.bind_buffer_memory(
                 staging_buffer,
@@ -2169,8 +2397,9 @@ impl render_core::Device for VulkanDevice {
                 staging_alloc.offset(),
             )
         } {
-            // SAFETY: buffer/allocation were just created and are not in use.
-            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            // SAFETY: buffer/allocation were just created and are not in use
+            // after the failed bind; cleanup is safe.
+            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             return Err(render_core::RhiError::Backend {
                 detail: format!("bind staging: {r:?}"),
@@ -2180,6 +2409,8 @@ impl render_core::Device for VulkanDevice {
         // -----------------------------------------------------------------
         // 2. One-shot command pool + command buffer.
         // -----------------------------------------------------------------
+        // SAFETY: `device` is a valid AshDevice; the queue family index is
+        // valid for this device; `None` means no custom allocator.
         let cmd_pool = unsafe {
             device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -2189,13 +2420,16 @@ impl render_core::Device for VulkanDevice {
             )
         }
         .map_err(|r| {
-            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+            // SAFETY: cleanup only happen on error; all handles are valid.
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("create pool: {r:?}"),
             }
         })?;
 
+        // SAFETY: `cmd_pool` was just created and is valid; allocation info
+        // correctly references the pool with PRIMARY level and 1 buffer.
         let cmd_buffer = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -2205,8 +2439,9 @@ impl render_core::Device for VulkanDevice {
             )
         }
         .map_err(|r| {
+            // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("alloc cb: {r:?}"),
@@ -2217,7 +2452,7 @@ impl render_core::Device for VulkanDevice {
         // 3. Record the copy command buffer.
         // -----------------------------------------------------------------
         // SAFETY: command buffer is in the initial state (just allocated from
-        // a transient pool).
+        // a transient pool); begin transitions it to recording state.
         unsafe {
             device.begin_command_buffer(
                 cmd_buffer,
@@ -2226,8 +2461,9 @@ impl render_core::Device for VulkanDevice {
             )
         }
         .map_err(|r| {
+            // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("begin cb: {r:?}"),
@@ -2254,8 +2490,9 @@ impl render_core::Device for VulkanDevice {
             })
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        // SAFETY: command buffer is recording; barrier references a live
-        // swapchain image.
+        // SAFETY: command buffer is in recording state; barrier references a
+        // live swapchain image; stage and access masks match the layout
+        // transition semantics.
         unsafe {
             device.cmd_pipeline_barrier(
                 cmd_buffer,
@@ -2289,8 +2526,8 @@ impl render_core::Device for VulkanDevice {
                 height,
                 depth: 1,
             });
-        // SAFETY: both image and buffer are valid, image is in the
-        // TRANSFER_SRC_OPTIMAL layout.
+        // SAFETY: both image and buffer are valid Vulkan objects; image is in
+        // TRANSFER_SRC_OPTIMAL layout; copy region is within bounds.
         unsafe {
             device.cmd_copy_image_to_buffer(
                 cmd_buffer,
@@ -2317,7 +2554,8 @@ impl render_core::Device for VulkanDevice {
             })
             .src_access_mask(vk::AccessFlags::TRANSFER_READ)
             .dst_access_mask(vk::AccessFlags::empty());
-        // SAFETY: command buffer is still recording; image is live.
+        // SAFETY: command buffer is still recording; image is live; restoring
+        // the original layout matches the swapchain contract.
         unsafe {
             device.cmd_pipeline_barrier(
                 cmd_buffer,
@@ -2330,10 +2568,12 @@ impl render_core::Device for VulkanDevice {
             );
         }
 
-        // SAFETY: recording is complete.
+        // SAFETY: command buffer is in recording state; after this call it
+        // transitions to completed state, ready for submission.
         unsafe { device.end_command_buffer(cmd_buffer) }.map_err(|r| {
+            // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("end cb: {r:?}"),
@@ -2343,11 +2583,13 @@ impl render_core::Device for VulkanDevice {
         // -----------------------------------------------------------------
         // 4. Submit and wait for completion.
         // -----------------------------------------------------------------
-        // SAFETY: fence is created fresh for this one-shot submit.
+        // SAFETY: `device` is a valid AshDevice; fence is created with default
+        // (unsignaled) state; `None` means no custom allocator.
         let fence =
             unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|r| {
+                // SAFETY: cleanup only on error; all handles are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
-                let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+                if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
                 unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
                     detail: format!("create fence: {r:?}"),
@@ -2356,29 +2598,35 @@ impl render_core::Device for VulkanDevice {
 
         let cmd_buffers = [cmd_buffer];
         let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
-        // SAFETY: queue, command buffer, and fence are all valid.
+        // SAFETY: `d.queue` is a valid VkQueue; command buffer is in completed
+        // state; fence is valid and unsignaled; submit info is correctly
+        // structured.
         unsafe { device.queue_submit(d.queue, &[submit_info], fence) }.map_err(|r| {
+            // SAFETY: cleanup only on error; all handles are valid.
             unsafe { device.destroy_fence(fence, None) };
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("queue submit: {r:?}"),
             }
         })?;
 
-        // SAFETY: fence is valid and associated with the submitted work.
+        // SAFETY: fence is valid and associated with the submitted work;
+        // waiting with `u64::MAX` timeout and `true` (waitAll) is standard.
         unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|r| {
+            // SAFETY: cleanup only on error; all handles are valid.
             unsafe { device.destroy_fence(fence, None) };
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("wait fence: {r:?}"),
             }
         })?;
 
-        // SAFETY: fence has been waited on and is no longer needed.
+        // SAFETY: fence has been waited on and is no longer needed; destroying
+        // a signaled fence is safe.
         unsafe { device.destroy_fence(fence, None) };
 
         // -----------------------------------------------------------------
@@ -2387,8 +2635,9 @@ impl render_core::Device for VulkanDevice {
         let raw_pixels = match staging_alloc.mapped_slice_mut() {
             Some(slice) => slice[..buffer_size as usize].to_vec(),
             None => {
+                // SAFETY: cleanup only on error; all handles are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
-                let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+                if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
                 unsafe { device.destroy_buffer(staging_buffer, None) };
                 return Err(render_core::RhiError::Backend {
                     detail: "staging buffer is not CPU mapped".into(),
@@ -2414,10 +2663,10 @@ impl render_core::Device for VulkanDevice {
         // -----------------------------------------------------------------
         // 7. Clean up temporary resources.
         // -----------------------------------------------------------------
-        // SAFETY: objects were created from this device and are no longer in
-        // use after fence wait.
+        // SAFETY: all objects were created from this device and are no longer
+        // in use after fence wait; reverse order of creation is respected.
         unsafe { device.destroy_command_pool(cmd_pool, None) };
-        let _ = alloc_handle.borrow_mut().free(&mut staging_alloc);
+        if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
         unsafe { device.destroy_buffer(staging_buffer, None) };
 
         Ok(result)
@@ -2430,49 +2679,62 @@ impl render_core::Device for VulkanDevice {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
+        // ensures it is not dropped before this destructor runs).
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
         let d = &self.logical_device.device;
         for fb in self.mvp_framebuffers.drain(..) {
+            // SAFETY: `fb` was created by this device and is not yet destroyed.
             unsafe {
                 d.destroy_framebuffer(fb, None);
             }
         }
         for fb in self.model_framebuffers.drain(..) {
+            // SAFETY: `fb` was created by this device and is not yet destroyed.
             unsafe {
                 d.destroy_framebuffer(fb, None);
             }
         }
         if let Some(p) = self.mvp_pipeline.take() {
+            // SAFETY: `p` was created by this device and is not yet destroyed.
             unsafe {
                 d.destroy_pipeline(p, None);
             }
         }
         if let Some(l) = self.mvp_pipeline_layout.take() {
+            // SAFETY: `l` was created by this device and is not yet destroyed.
             unsafe {
                 d.destroy_pipeline_layout(l, None);
             }
         }
         if let Some(p) = self.model_pipeline.take() {
+            // SAFETY: `p` was created by this device and is not yet destroyed.
             unsafe {
                 d.destroy_pipeline(p, None);
             }
         }
         if let Some(l) = self.model_pipeline_layout.take() {
+            // SAFETY: `l` was created by this device and is not yet destroyed.
             unsafe {
                 d.destroy_pipeline_layout(l, None);
             }
         }
         if let Some(rp) = self.mvp_rp.take() {
+            // SAFETY: `rp` was created by this device and is not yet destroyed.
             unsafe {
                 d.destroy_render_pass(rp, None);
             }
         }
         if let Some(rp) = self.model_rp.take() {
+            // SAFETY: `rp` was created by this device and is not yet destroyed.
             unsafe {
                 d.destroy_render_pass(rp, None);
             }
         }
         for fs in self.frame_sync.drain(..) {
+            // SAFETY: all handles in `fs` were created by this device and are
+            // not yet destroyed; destruction order does not matter among
+            // fences, semaphores, and pools.
             unsafe {
                 d.destroy_fence(fs.in_flight_fence, None);
                 d.destroy_semaphore(fs.image_available, None);
@@ -2482,6 +2744,7 @@ impl Drop for VulkanDevice {
         }
         for s in self.pipelines.slots.drain(..) {
             if let Some((_, e)) = s {
+                // SAFETY: `e.pipeline` was created by this device.
                 unsafe {
                     d.destroy_pipeline(e.pipeline, None);
                 }
@@ -2489,16 +2752,20 @@ impl Drop for VulkanDevice {
         }
         for s in self.buffers.slots.drain(..) {
             if let Some((_, mut e)) = s {
+                // SAFETY: `e.buffer` was created by this device.
                 unsafe {
                     d.destroy_buffer(e.buffer, None);
                 }
                 if let Some(mut a) = e.allocation.take() {
-                    let _ = e.allocator.borrow_mut().free(&mut a);
+                    if let Ok(mut guard) = e.allocator.lock() {
+                        let _ = guard.free(&mut a);
+                    }
                 }
             }
         }
         for s in self.render_passes.slots.drain(..) {
             if let Some((_, rp)) = s {
+                // SAFETY: `rp` was created by this device.
                 unsafe {
                     d.destroy_render_pass(rp, None);
                 }
@@ -2506,6 +2773,7 @@ impl Drop for VulkanDevice {
         }
         for s in self.framebuffers.slots.drain(..) {
             if let Some((_, fb)) = s {
+                // SAFETY: `fb` was created by this device.
                 unsafe {
                     d.destroy_framebuffer(fb, None);
                 }
@@ -2513,6 +2781,7 @@ impl Drop for VulkanDevice {
         }
         for s in self.pipeline_layouts.slots.drain(..) {
             if let Some((_, e)) = s {
+                // SAFETY: `e.layout` was created by this device.
                 unsafe {
                     d.destroy_pipeline_layout(e.layout, None);
                 }
@@ -2591,6 +2860,13 @@ fn compare_op(s: &Option<String>) -> vk::CompareOp {
     }
 }
 
+/// Create a Vulkan shader module from SPIR-V bytecode.
+///
+/// # Safety
+///
+/// - `d` must be a valid [`AshDevice`] that has not been destroyed.
+/// - `spv` must contain valid SPIR-V binary data (word-aligned, correctly
+///   sized for the targeted shader stage).
 unsafe fn mk_sm(d: &AshDevice, spv: &[u8]) -> VkResult<vk::ShaderModule> {
     if spv.is_empty() {
         return Err(VulkanError::MissingShader(""));

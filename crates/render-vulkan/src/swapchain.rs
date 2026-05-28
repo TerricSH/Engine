@@ -10,10 +10,8 @@ pub struct Swapchain {
     pub loader: swapchain::Device,
     pub swapchain: vk::SwapchainKHR,
     pub format: vk::Format,
-    #[allow(dead_code)]
-    pub color_space: vk::ColorSpaceKHR,
+    pub _color_space: vk::ColorSpaceKHR,
     pub extent: vk::Extent2D,
-    #[allow(dead_code)]
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
     device: AshDevice,
@@ -138,7 +136,7 @@ impl Swapchain {
             loader,
             swapchain,
             format: surface_format.format,
-            color_space: surface_format.color_space,
+            _color_space: surface_format.color_space,
             extent,
             images,
             image_views,

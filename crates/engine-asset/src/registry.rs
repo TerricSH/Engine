@@ -42,9 +42,8 @@ pub struct AssetInfo {
 // Cache internals
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub struct CachedEntry {
-    pub(crate) info: AssetInfo,
+    pub(crate) _info: AssetInfo,
     pub(crate) raw_bytes: Arc<Vec<u8>>,
     pub(crate) typed: Option<Arc<dyn Any + Send + Sync + 'static>>,
 }
@@ -136,7 +135,7 @@ impl AssetRegistry {
         self.cache.insert(
             id.clone(),
             CachedEntry {
-                info: AssetInfo {
+                _info: AssetInfo {
                     id: id.clone(),
                     path: Some(path.display().to_string()),
                     state: AssetState::Ready,
@@ -206,7 +205,7 @@ impl AssetRegistry {
         self.cache.insert(
             id.clone(),
             CachedEntry {
-                info: AssetInfo {
+                _info: AssetInfo {
                     id: id.clone(),
                     path: Some(path.display().to_string()),
                     state: AssetState::Ready,

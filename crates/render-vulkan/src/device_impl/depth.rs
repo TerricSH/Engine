@@ -37,7 +37,8 @@ impl VulkanDevice {
         let req = unsafe { d.get_image_memory_requirements(image) };
         let allocator = self.logical_device.allocator();
         let allocation = allocator
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .allocate(&crate::allocator::AllocationCreateDesc {
                 name: "depth-buffer",
                 requirements: req,
@@ -82,11 +83,11 @@ impl VulkanDevice {
             }
         }
         if let Some(mut a) = self.depth_allocation.take() {
-            let _ = self.logical_device.allocator().borrow_mut().free(&mut a);
+            let _ = self.logical_device.allocator().lock().unwrap().free(&mut a);
         }
     }
 
-    pub(crate) fn depth_view(&self) -> Option<vk::ImageView> {
+    pub(crate) fn _depth_view(&self) -> Option<vk::ImageView> {
         self.depth_image_view
     }
 }

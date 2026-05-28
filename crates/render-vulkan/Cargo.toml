@@ -20,6 +20,7 @@ subsystem-scripting-csharp = []
 [dependencies]
 ash.workspace = true
 ash-window.workspace = true
+glam.workspace = true
 engine-renderer = { path = "../engine-renderer" }
 raw-window-handle.workspace = true
 render-core = { path = "../render-core" }

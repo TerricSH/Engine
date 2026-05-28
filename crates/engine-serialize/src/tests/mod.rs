@@ -142,9 +142,9 @@ fn value_uint_variant() {
 
 #[test]
 fn value_float_variants() {
-    let f32_val = Value::Float32(3.14);
+    let f32_val = Value::Float32(std::f32::consts::PI);
     let f64_val = Value::Float64(2.71);
-    assert_eq!(format!("{:?}", f32_val), "Float32(3.14)");
+    assert_eq!(format!("{:?}", f32_val), format!("Float32({:?})", std::f32::consts::PI));
     assert_eq!(format!("{:?}", f64_val), "Float64(2.71)");
 }
 

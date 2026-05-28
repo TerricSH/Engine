@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn script_value_float() {
-        assert_eq!(ScriptValue::Float(3.14), ScriptValue::Float(3.14));
+        assert_eq!(ScriptValue::Float(std::f64::consts::PI), ScriptValue::Float(std::f64::consts::PI));
     }
 
     #[test]

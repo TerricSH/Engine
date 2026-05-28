@@ -8,8 +8,6 @@ use render_core::{
     PipelineHandle, PipelineLayoutHandle, RenderPassHandle,
 };
 
-use super::slab::{BufEntry, PipeEntry, PlEntry, Slab};
-
 // ============================================================================
 // VkCmdEncoder
 // ============================================================================
@@ -17,15 +15,26 @@ use super::slab::{BufEntry, PipeEntry, PlEntry, Slab};
 pub(crate) struct VkCmdEncoder {
     pub(crate) device: AshDevice,
     pub(crate) cmd: vk::CommandBuffer,
-    pub(crate) pipelines: *const Slab<PipeEntry>,
-    pub(crate) buffers: *const Slab<BufEntry>,
-    pub(crate) render_passes: *const Slab<vk::RenderPass>,
-    pub(crate) framebuffers: *const Slab<vk::Framebuffer>,
-    pub(crate) pipeline_layouts: *const Slab<PlEntry>,
+    /// Snapshot of slab entries taken at encoder creation.
+    /// Each slot: `Some((generation, pipeline))` if occupied.
+    pub(crate) pipeline_cache: Vec<Option<(u32, vk::Pipeline)>>,
+    /// Snapshot of slab entries taken at encoder creation.
+    /// Each slot: `Some((generation, buffer))` if occupied.
+    pub(crate) buffer_cache: Vec<Option<(u32, vk::Buffer)>>,
+    /// Snapshot of slab entries taken at encoder creation.
+    /// Each slot: `Some((generation, render_pass))` if occupied.
+    pub(crate) render_pass_cache: Vec<Option<(u32, vk::RenderPass)>>,
+    /// Snapshot of slab entries taken at encoder creation.
+    /// Each slot: `Some((generation, framebuffer))` if occupied.
+    pub(crate) framebuffer_cache: Vec<Option<(u32, vk::Framebuffer)>>,
+    /// Snapshot of slab entries taken at encoder creation.
+    /// Each slot: `Some((generation, layout))` if occupied.
+    pub(crate) pipeline_layout_cache: Vec<Option<(u32, vk::PipelineLayout)>>,
     // Per-frame descriptor set (set=0 per FD-041), set by begin_frame
     pub(crate) current_desc_set: vk::DescriptorSet,
 }
-unsafe impl Send for VkCmdEncoder {}
+// VkCmdEncoder: all fields are Send (AshDevice and Vulkan handles), no raw pointers.
+// The unsafe impl Send is removed — Send is derived automatically.
 
 impl CmdEncoderTrait for VkCmdEncoder {
     fn begin_render_pass(
@@ -36,9 +45,15 @@ impl CmdEncoderTrait for VkCmdEncoder {
         clear: [f32; 4],
         _depth: Option<f32>,
     ) {
-        let rp_entry = unsafe { &*self.render_passes }.get(rp.index, rp.generation);
-        let fb_entry = unsafe { &*self.framebuffers }.get(fb.index, fb.generation);
-        if let (Some(&rp_), Some(&fb_)) = (rp_entry, fb_entry) {
+        let rp_ = self
+            .render_pass_cache
+            .get(rp.index as usize)
+            .and_then(|s| s.as_ref().filter(|(g, _)| *g == rp.generation).map(|(_, v)| *v));
+        let fb_ = self
+            .framebuffer_cache
+            .get(fb.index as usize)
+            .and_then(|s| s.as_ref().filter(|(g, _)| *g == fb.generation).map(|(_, v)| *v));
+        if let (Some(rp_), Some(fb_)) = (rp_, fb_) {
             let cc = vk::ClearValue {
                 color: vk::ClearColorValue { float32: clear },
             };
@@ -64,13 +79,16 @@ impl CmdEncoderTrait for VkCmdEncoder {
         }
     }
     fn bind_pipeline(&mut self, p: PipelineHandle) {
-        let entry = unsafe { &*self.pipelines }.get(p.index, p.generation);
-        if let Some(e) = entry {
+        if let Some(&pipeline) = self
+            .pipeline_cache
+            .get(p.index as usize)
+            .and_then(|s| s.as_ref().filter(|(g, _)| *g == p.generation).map(|(_, v)| v))
+        {
             unsafe {
                 self.device.cmd_bind_pipeline(
                     self.cmd,
                     vk::PipelineBindPoint::GRAPHICS,
-                    e.pipeline,
+                    pipeline,
                 );
             }
         }
@@ -79,9 +97,9 @@ impl CmdEncoderTrait for VkCmdEncoder {
         let v: Vec<vk::Buffer> = bufs
             .iter()
             .filter_map(|h| {
-                unsafe { &*self.buffers }
-                    .get(h.index, h.generation)
-                    .map(|e| e.buffer)
+                self.buffer_cache
+                    .get(h.index as usize)
+                    .and_then(|s| s.as_ref().filter(|(g, _)| *g == h.generation).map(|(_, b)| *b))
             })
             .collect();
         if !v.is_empty() {
@@ -91,11 +109,15 @@ impl CmdEncoderTrait for VkCmdEncoder {
         }
     }
     fn bind_index_buffer(&mut self, buf: BufferHandle, o: u64, f: IndexFormat) {
-        if let Some(e) = unsafe { &*self.buffers }.get(buf.index, buf.generation) {
+        if let Some(&buffer) = self
+            .buffer_cache
+            .get(buf.index as usize)
+            .and_then(|s| s.as_ref().filter(|(g, _)| *g == buf.generation).map(|(_, b)| b))
+        {
             unsafe {
                 self.device.cmd_bind_index_buffer(
                     self.cmd,
-                    e.buffer,
+                    buffer,
                     o,
                     match f {
                         IndexFormat::U16 => vk::IndexType::UINT16,
@@ -112,7 +134,11 @@ impl CmdEncoderTrait for VkCmdEncoder {
         _: &[render_core::DescriptorSetHandle],
         do_: &[u32],
     ) {
-        if let Some(entry) = unsafe { &*self.pipeline_layouts }.get(pl.index, pl.generation) {
+        if let Some(&layout) = self
+            .pipeline_layout_cache
+            .get(pl.index as usize)
+            .and_then(|s| s.as_ref().filter(|(g, _)| *g == pl.generation).map(|(_, l)| l))
+        {
             let set = self.current_desc_set;
             if set != vk::DescriptorSet::null() {
                 let sets = [set];
@@ -120,7 +146,7 @@ impl CmdEncoderTrait for VkCmdEncoder {
                     self.device.cmd_bind_descriptor_sets(
                         self.cmd,
                         vk::PipelineBindPoint::GRAPHICS,
-                        entry.layout,
+                        layout,
                         fs,
                         &sets,
                         do_,
@@ -171,11 +197,15 @@ impl CmdEncoderTrait for VkCmdEncoder {
         }
     }
     fn push_constants(&mut self, pl: PipelineLayoutHandle, sf: u32, off: u32, data: &[u8]) {
-        if let Some(e) = unsafe { &*self.pipeline_layouts }.get(pl.index, pl.generation) {
+        if let Some(&layout) = self
+            .pipeline_layout_cache
+            .get(pl.index as usize)
+            .and_then(|s| s.as_ref().filter(|(g, _)| *g == pl.generation).map(|(_, l)| l))
+        {
             unsafe {
                 self.device.cmd_push_constants(
                     self.cmd,
-                    e.layout,
+                    layout,
                     vk::ShaderStageFlags::from_raw(sf),
                     off,
                     data,

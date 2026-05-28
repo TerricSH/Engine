@@ -9,7 +9,7 @@ use crate::encoder::{DeviceRef, OpenGlCommandEncoder};
 // Format conversion helpers
 // ============================================================================
 
-/// Returns (internal_format, format, pixel_type) for 	ex_image_2d.
+/// Returns (internal_format, format, pixel_type) for tex_image_2d.
 fn convert_texture_format(format: TextureFormat) -> (i32, u32, u32) {
     match format {
         TextureFormat::Rgba8Unorm => (glow::RGBA8 as i32, glow::RGBA, glow::UNSIGNED_BYTE),
@@ -22,7 +22,7 @@ fn convert_texture_format(format: TextureFormat) -> (i32, u32, u32) {
     }
 }
 
-fn convert_index_format(format: IndexFormat) -> u32 {
+fn _convert_index_format(format: IndexFormat) -> u32 {
     match format {
         IndexFormat::U16 => glow::UNSIGNED_SHORT,
         IndexFormat::U32 => glow::UNSIGNED_INT,
@@ -86,34 +86,34 @@ impl<T> ResourceSlab<T> {
 
 pub(crate) struct BufferSlot {
     pub(crate) gl_buffer: glow::Buffer,
-    pub(crate) size_bytes: u64,
+    pub(crate) _size_bytes: u64,
     pub(crate) usage: BufferUsage,
 }
 
 pub(crate) struct TextureSlot {
     pub(crate) gl_texture: glow::Texture,
-    pub(crate) format: TextureFormat,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    pub(crate) _format: TextureFormat,
+    pub(crate) _width: u32,
+    pub(crate) _height: u32,
 }
 
 pub(crate) struct ShaderModuleSlot {
-    pub(crate) format: ShaderFormat,
-    pub(crate) source_hash: [u8; 32],
+    pub(crate) _format: ShaderFormat,
+    pub(crate) _source_hash: [u8; 32],
 }
 
 pub(crate) struct RenderPassSlot {
-    pub(crate) descriptor: RenderPassDescriptor,
+    pub(crate) _descriptor: RenderPassDescriptor,
 }
 
 pub(crate) struct FramebufferSlot {
     pub(crate) gl_framebuffer: glow::Framebuffer,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    pub(crate) _width: u32,
+    pub(crate) _height: u32,
 }
 
 pub(crate) struct PipelineLayoutSlot {
-    pub(crate) descriptor: PipelineLayoutDescriptor,
+    pub(crate) _descriptor: PipelineLayoutDescriptor,
 }
 
 pub(crate) struct PipelineSlot {
@@ -123,8 +123,8 @@ pub(crate) struct PipelineSlot {
 pub(crate) struct SurfaceSlot {}
 
 pub(crate) struct SwapchainSlot {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    pub(crate) _width: u32,
+    pub(crate) _height: u32,
 }
 
 // ============================================================================
@@ -240,8 +240,8 @@ impl Device for OpenGlDevice {
         descriptor: &SwapchainDescriptor,
     ) -> Result<SwapchainHandle, RhiError> {
         let (idx, gen) = self.swapchains.alloc(SwapchainSlot {
-            width: descriptor.width,
-            height: descriptor.height,
+            _width: descriptor.width,
+            _height: descriptor.height,
         });
         Ok(ResourceHandle::new(idx, gen))
     }
@@ -272,7 +272,7 @@ impl Device for OpenGlDevice {
 
         let (idx, gen) = self.buffers.alloc(BufferSlot {
             gl_buffer,
-            size_bytes: descriptor.size_bytes,
+            _size_bytes: descriptor.size_bytes,
             usage: descriptor.usage_flags,
         });
         Ok(ResourceHandle::new(idx, gen))
@@ -359,9 +359,9 @@ impl Device for OpenGlDevice {
 
         let (idx, gen) = self.textures.alloc(TextureSlot {
             gl_texture,
-            format: descriptor.format,
-            width: descriptor.width,
-            height: descriptor.height,
+            _format: descriptor.format,
+            _width: descriptor.width,
+            _height: descriptor.height,
         });
         Ok(ResourceHandle::new(idx, gen))
     }
@@ -383,8 +383,8 @@ impl Device for OpenGlDevice {
         descriptor: &ShaderModuleDescriptor,
     ) -> Result<ShaderModuleHandle, RhiError> {
         let (idx, gen) = self.shader_modules.alloc(ShaderModuleSlot {
-            format: descriptor.format,
-            source_hash: descriptor.source_hash,
+            _format: descriptor.format,
+            _source_hash: descriptor.source_hash,
         });
         Ok(ResourceHandle::new(idx, gen))
     }
@@ -401,7 +401,7 @@ impl Device for OpenGlDevice {
     ) -> Result<RenderPassHandle, RhiError> {
         let (idx, gen) = self
             .render_passes
-            .alloc(RenderPassSlot { descriptor: descriptor.clone() });
+            .alloc(RenderPassSlot { _descriptor: descriptor.clone() });
         Ok(ResourceHandle::new(idx, gen))
     }
 
@@ -466,8 +466,8 @@ impl Device for OpenGlDevice {
 
         let (idx, gen) = self.framebuffers.alloc(FramebufferSlot {
             gl_framebuffer,
-            width: descriptor.width,
-            height: descriptor.height,
+            _width: descriptor.width,
+            _height: descriptor.height,
         });
         Ok(ResourceHandle::new(idx, gen))
     }
@@ -490,7 +490,7 @@ impl Device for OpenGlDevice {
     ) -> Result<PipelineLayoutHandle, RhiError> {
         let (idx, gen) = self
             .pipeline_layouts
-            .alloc(PipelineLayoutSlot { descriptor: descriptor.clone() });
+            .alloc(PipelineLayoutSlot { _descriptor: descriptor.clone() });
         Ok(ResourceHandle::new(idx, gen))
     }
 

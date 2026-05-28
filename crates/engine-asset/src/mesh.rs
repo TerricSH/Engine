@@ -40,7 +40,7 @@ pub fn load_mesh_from_gltf(path: &std::path::Path) -> Result<MeshData, MeshError
 
     // Pick the first mesh's first primitive.
     for mesh in doc.meshes() {
-        for prim in mesh.primitives() {
+        if let Some(prim) = mesh.primitives().next() {
             let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
 
             let positions: Vec<[f32; 3]> = reader
@@ -173,7 +173,7 @@ pub fn create_test_cube() -> MeshData {
         Vec3::Z, Vec3::Z, Vec3::Z, Vec3::Z,
         Vec3::NEG_Z, Vec3::NEG_Z, Vec3::NEG_Z, Vec3::NEG_Z,
     ];
-    let indices: Vec<u32> = (0..24u32).collect();
+    let _indices: Vec<u32> = (0..24u32).collect();
     // Each face as 2 triangles (6 indices per face)
     let indices = vec![
         0,1,2, 0,2,3, 4,5,6, 4,6,7,
