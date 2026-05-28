@@ -59,6 +59,26 @@ pub trait CommandEncoder: Send {
         data: &[u8],
     );
     fn end_render_pass(&mut self);
+
+    // ── Secondary command buffer support ──
+
+    /// Execute a chain of pre-recorded secondary command buffers.
+    ///
+    /// Secondary command buffers are recorded offline (potentially from
+    /// worker threads) and executed inside a render pass.  The default
+    /// implementation is a no-op; backends that support secondary buffers
+    /// override this method.
+    fn execute_commands(&mut self, _secondaries: &[SecondaryCmdBuffer]) {}
+}
+
+/// Handle to a pre-recorded secondary command buffer.
+///
+/// Created by [`CommandPool::record_secondary`](crate::handles::CommandPool::record_secondary)
+/// and consumed by [`CommandEncoder::execute_commands`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecondaryCmdBuffer {
+    pub(crate) index: u32,
+    pub(crate) generation: u32,
 }
 
 // ============================================================================
