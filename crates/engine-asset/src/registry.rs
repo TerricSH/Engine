@@ -263,6 +263,11 @@ impl AssetRegistry {
         Ok(())
     }
 
+    /// Return all cached asset IDs (for editor browsing).
+    pub fn cached_ids(&self) -> Vec<AssetId> {
+        self.cache.keys().cloned().collect()
+    }
+
     /// Return the number of assets currently being loaded asynchronously.
     ///
     /// All loads in this implementation are synchronous, so this always
