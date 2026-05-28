@@ -1,12 +1,18 @@
 #![forbid(unsafe_code)]
 
-//! Platform layer for Gate 2.
+//! Platform layer.
 //!
 //! This crate owns the winit-based desktop window and event loop and
 //! exposes a minimal [`WindowApp`] callback surface so renderer crates do
-//! not need to depend on winit directly. Per `FD-013` the public boundary
-//! is winit-only at this gate; the `PlatformAdapter` trait planned for
-//! mobile/console comes in Gate 7.
+//! not need to depend on winit directly.
+//!
+//! # Profiles & Adapter (Gate 7)
+//!
+//! * [`profile`] — [`PlatformProfile`] constants describing desktop,
+//!   Android, and iOS runtime capabilities (JIT/AOT, texture limits, …).
+//! * [`adapter`] — [`PlatformAdapter`] trait for lifecycle, IME,
+//!   safe-area, low-memory, and touch events, plus [`TouchEvent`] /
+//!   [`TouchPhase`].
 
 use std::sync::Arc;
 
@@ -17,6 +23,13 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 pub use winit;
+
+// ── Gate 7: Platform profiles & adapter ──────────────────────────────────
+pub mod profile;
+pub mod adapter;
+
+pub use adapter::{PlatformAdapter, TouchEvent, TouchPhase};
+pub use profile::{PlatformFamily, PlatformProfile, ANDROID_PROFILE, DESKTOP_PROFILE, IOS_PROFILE};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowDescriptor {
