@@ -841,6 +841,7 @@ fn run_model_viewer() {
         frames: u64,
         max_frames: Option<u64>,
         mesh: Option<engine_asset::mesh::MeshData>,
+        last_frame_time: std::time::Instant,
     }
 
     impl WindowApp for ModelViewerApp {
@@ -882,13 +883,28 @@ fn run_model_viewer() {
                 render_vulkan::shaders_embedded::FORWARD_FRAG_SPV,
             );
 
-            // ── Build interleaved vertex buffer ───────────────────────
+            // ── Build interleaved vertex buffer (cube + ground plane) ─
             let mesh = self.mesh.take().expect("mesh loaded earlier");
             let stride = 32u64; // position(12) + normal(12) + uv(8)
 
-            let mut vert_bytes: Vec<u8> =
-                Vec::with_capacity(mesh.positions.len() * stride as usize);
-            for i in 0..mesh.positions.len() {
+            // Ground plane: a 6×6 quad at y=−1.0, normal +Y
+            let plane_verts: [(f32, f32, f32); 4] = [
+                (-3.0, -1.0, -3.0), (3.0, -1.0, -3.0),
+                (3.0, -1.0,  3.0), (-3.0, -1.0,  3.0),
+            ];
+            let plane_uvs: [(f32, f32); 4] = [
+                (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0),
+            ];
+            let plane_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+
+            let cube_vert_count = mesh.positions.len();
+            let plane_vert_offset = cube_vert_count as u32;
+            let total_verts = cube_vert_count + plane_verts.len();
+            let total_indices = mesh.indices.len() + plane_indices.len();
+
+            let mut vert_bytes: Vec<u8> = Vec::with_capacity(total_verts * stride as usize);
+            // Cube vertices
+            for i in 0..cube_vert_count {
                 let p = mesh.positions[i];
                 let n = mesh.normals[i];
                 let uv = mesh.uvs.get(i).copied().unwrap_or(Vec2::ZERO);
@@ -900,6 +916,19 @@ fn run_model_viewer() {
                 vert_bytes.extend_from_slice(&n.z.to_ne_bytes());
                 vert_bytes.extend_from_slice(&uv.x.to_ne_bytes());
                 vert_bytes.extend_from_slice(&uv.y.to_ne_bytes());
+            }
+            // Plane vertices (normal = 0, 1, 0)
+            for (i, &(px, py, pz)) in plane_verts.iter().enumerate() {
+                let uv = plane_uvs[i];
+                vert_bytes.extend_from_slice(&px.to_ne_bytes());
+                vert_bytes.extend_from_slice(&py.to_ne_bytes());
+                vert_bytes.extend_from_slice(&pz.to_ne_bytes());
+                let one: f32 = 1.0; let zero: f32 = 0.0;
+                vert_bytes.extend_from_slice(&zero.to_ne_bytes());
+                vert_bytes.extend_from_slice(&one.to_ne_bytes());
+                vert_bytes.extend_from_slice(&zero.to_ne_bytes());
+                vert_bytes.extend_from_slice(&uv.0.to_ne_bytes());
+                vert_bytes.extend_from_slice(&uv.1.to_ne_bytes());
             }
 
             let vb_desc = BufferDescriptor {
@@ -920,11 +949,13 @@ fn run_model_viewer() {
                 std::process::exit(1);
             }
 
-            // ── Build index buffer ────────────────────────────────────
-            let mut idx_bytes: Vec<u8> =
-                Vec::with_capacity(mesh.indices.len() * 4);
+            // ── Build index buffer (cube + plane, plane indices offset) ─
+            let mut idx_bytes: Vec<u8> = Vec::with_capacity(total_indices * 4);
             for i in &mesh.indices {
                 idx_bytes.extend_from_slice(&i.to_ne_bytes());
+            }
+            for i in plane_indices {
+                idx_bytes.extend_from_slice(&(i + plane_vert_offset).to_ne_bytes());
             }
             let ib_desc = BufferDescriptor {
                 size_bytes: idx_bytes.len() as u64,
@@ -944,7 +975,7 @@ fn run_model_viewer() {
                 std::process::exit(1);
             }
 
-            let index_count = mesh.indices.len() as u32;
+            let index_count = total_indices as u32;
 
             let backend = ModelViewerBackend {
                 device,
@@ -967,6 +998,14 @@ fn run_model_viewer() {
             match event {
                 PlatformEvent::Resized { .. } => EventFlow::Continue,
                 PlatformEvent::Redraw => {
+                    // FPS limiter: target ~60 FPS
+                    let elapsed = self.last_frame_time.elapsed();
+                    let target_frame_time = std::time::Duration::from_secs_f64(1.0 / 60.0);
+                    if elapsed < target_frame_time {
+                        std::thread::sleep(target_frame_time - elapsed);
+                    }
+                    self.last_frame_time = std::time::Instant::now();
+
                     if let Some(ref mut renderer) = self.renderer {
                         let mut input = RenderFrameInput::empty(self.frames);
                         input.views.push(engine_renderer::RenderView {
@@ -1026,6 +1065,7 @@ fn run_model_viewer() {
         frames: 0,
         max_frames,
         mesh: Some(mesh),
+        last_frame_time: std::time::Instant::now(),
     };
     if let Err(err) = platform::run(
         WindowDescriptor {
