@@ -24,6 +24,7 @@ engine-scene = { path = "../engine-scene" }
 engine-serialize = { path = "../engine-serialize" }
 engine-ui = { path = "../engine-ui" }
 glam.workspace = true
+ron.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
