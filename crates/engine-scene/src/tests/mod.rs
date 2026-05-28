@@ -1,9 +1,8 @@
 use super::{
-    extract_renderer_input, sample_scene, validate_scene, EntityRecord, Scene, SCENE_SCHEMA_VERSION,
+    extract_renderer_input, sample_scene, validate_scene, EntityRecord, Scene,
 };
 use engine_serialize::SchemaVersion;
 use std::collections::BTreeMap;
-use std::path::Path;
 
 // ============================================================================
 // Basic validation and extraction

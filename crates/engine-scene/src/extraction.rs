@@ -178,7 +178,7 @@ pub fn extract_renderer_input_from_world(
         extract_frustum_planes(&view_proj)
     });
 
-    for (view_idx, (priority, pid, camera, transform, entity)) in cameras.iter().enumerate() {
+    for (view_idx, (priority, pid, camera, transform, _entity)) in cameras.iter().enumerate() {
         let view = compute_view_matrix(transform);
         let proj = compute_projection_matrix(camera);
 
@@ -532,7 +532,7 @@ mod tests {
         let proj = glam::Mat4::perspective_rh_gl(
             std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0,
         );
-        let view = glam::Mat4::identity();
+        let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
         // Box at origin (in front of camera).
@@ -544,7 +544,7 @@ mod tests {
         let proj = glam::Mat4::perspective_rh_gl(
             std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0,
         );
-        let view = glam::Mat4::identity();
+        let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
         // Box far behind the camera.
@@ -556,7 +556,7 @@ mod tests {
         let proj = glam::Mat4::perspective_rh_gl(
             std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0,
         );
-        let view = glam::Mat4::identity();
+        let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
         // Box far beyond the far plane.
@@ -568,7 +568,7 @@ mod tests {
         let proj = glam::Mat4::perspective_rh_gl(
             std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0,
         );
-        let view = glam::Mat4::identity();
+        let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
         // Large box straddling the camera should be visible.
@@ -604,7 +604,7 @@ mod tests {
         let scene_input = extract_renderer_input(&scene, 7).expect("scene extraction OK");
 
         // Convert scene to world and extract via the new path.
-        let world = World::from(&scene);
+        let world = World::from_scene(&scene);
         let world_input = extract_renderer_input_from_world(&world, 7).expect("world extraction OK");
 
         // Compare counts (the structural output should match).
