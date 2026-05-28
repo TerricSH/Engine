@@ -92,6 +92,22 @@ pub struct VulkanDevice {
     pub(crate) depth_image: Option<vk::Image>,
     pub(crate) depth_image_view: Option<vk::ImageView>,
     pub(crate) depth_allocation: Option<crate::allocator::Allocation>,
+
+    // Shadow mapping (directional light, 2048×2048)
+    pub(crate) shadow_map: Option<vk::Image>,
+    pub(crate) shadow_map_view: Option<vk::ImageView>,
+    pub(crate) shadow_allocation: Option<crate::allocator::Allocation>,
+    pub(crate) shadow_sampler: Option<vk::Sampler>,
+    pub(crate) shadow_rp: Option<vk::RenderPass>,
+    pub(crate) shadow_pipeline_layout: Option<vk::PipelineLayout>,
+    pub(crate) shadow_pipeline: Option<vk::Pipeline>,
+    pub(crate) shadow_fb: Option<vk::Framebuffer>,
+    pub(crate) shadow_desc_set: Option<vk::DescriptorSet>,
+    pub(crate) shadow_desc_layout: Option<vk::DescriptorSetLayout>,
+    pub(crate) shadow_desc_pool: Option<vk::DescriptorPool>,
+    /// Pipeline layout containing only set=1 (shadow map), used to bind the
+    /// shadow descriptor set in `begin_frame` before the encoder takes over.
+    pub(crate) shadow_bind_layout: Option<vk::PipelineLayout>,
 }
 
 impl VulkanDevice {
@@ -184,6 +200,20 @@ impl VulkanDevice {
             depth_image: None,
             depth_image_view: None,
             depth_allocation: None,
+
+            // Shadow mapping
+            shadow_map: None,
+            shadow_map_view: None,
+            shadow_allocation: None,
+            shadow_sampler: None,
+            shadow_rp: None,
+            shadow_pipeline_layout: None,
+            shadow_pipeline: None,
+            shadow_fb: None,
+            shadow_desc_set: None,
+            shadow_desc_layout: None,
+            shadow_desc_pool: None,
+            shadow_bind_layout: None,
         })
     }
 
@@ -287,6 +317,22 @@ impl VulkanDevice {
         }
         let fi = self.current_frame;
         let (ii, subopt) = self.acquire(fi)?;
+
+        // ── Shadow mapping ──────────────────────────────────────────────
+        self.ensure_shadow()?;
+        let light_mvp = self.compute_light_mvp();
+        // Write light_view_proj to UBO at offset 176 (after camera_pos)
+        let mvp_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                &light_mvp as *const _ as *const u8,
+                std::mem::size_of::<[[f32; 4]; 4]>(),
+            )
+        };
+        self.write_ubo(fi, mvp_bytes, 176);
+
+        // ── Record commands ────────────────────────────────────────────
+        self.begin_cb(fi)?;
+        self.record_shadow_pass(fi, &light_mvp, vertex_buf, index_buf, index_count)?;
         self.record_model(fi, ii, vertex_buf, index_buf, index_count)?;
         self.submit_and_present(fi, ii)?;
         if subopt {
@@ -313,12 +359,14 @@ impl VulkanDevice {
         let vm = unsafe { mk_sm(d, vert)? };
         let fm = unsafe { mk_sm(d, frag)? };
 
-        // --- Pipeline layout: set=0 (UBO) + no push constants ---
-        let set_layouts = if let Some(dsl) = self.desc_set_layout_0 {
-            vec![dsl]
-        } else {
-            Vec::new()
-        };
+        // --- Pipeline layout: set=0 (UBO) + set=1 (shadow map) + no push constants ---
+        let mut set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+        if let Some(dsl) = self.desc_set_layout_0 {
+            set_layouts.push(dsl);
+        }
+        if let Some(sdl) = self.shadow_desc_layout {
+            set_layouts.push(sdl);
+        }
         let pli = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
         let pl = unsafe { d.create_pipeline_layout(&pli, None) }
             .map_err(|r| VulkanError::vk("cpl_model", r))?;
@@ -498,7 +546,7 @@ impl VulkanDevice {
         index_buf: render_core::BufferHandle,
         index_count: u32,
     ) -> VkResult<()> {
-        self.begin_cb(fi)?;
+        // NOTE: command buffer is already started by render_model_frame
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
         let sc = self.swapchain.as_ref().unwrap();
@@ -518,7 +566,7 @@ impl VulkanDevice {
             .map(|e| e.buffer)
             .ok_or(VulkanError::Loader("index buffer not found".into()))?;
 
-        // Descriptor set for the current frame
+        // Descriptor set for the current frame (set=0)
         let desc_set = self
             .frame_desc_sets
             .get(fi)
@@ -568,15 +616,21 @@ impl VulkanDevice {
                 }],
             );
             d.cmd_bind_pipeline(f.command_buffer, vk::PipelineBindPoint::GRAPHICS, pl);
-            // Bind descriptor set (set=0, UBO)
+            // Bind descriptor sets (set=0 = UBO, set=1 = shadow map)
+            let mut desc_sets: Vec<vk::DescriptorSet> = Vec::new();
             if desc_set != vk::DescriptorSet::null() {
-                let sets = [desc_set];
+                desc_sets.push(desc_set);
+            }
+            if let Some(sds) = self.shadow_desc_set {
+                desc_sets.push(sds);
+            }
+            if !desc_sets.is_empty() {
                 d.cmd_bind_descriptor_sets(
                     f.command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
                     pll,
                     0,
-                    &sets,
+                    &desc_sets,
                     &[],
                 );
             }
@@ -614,6 +668,8 @@ impl VulkanDevice {
                     self.create_depth_texture()?;
                     // Create descriptor set infrastructure
                     self.create_descriptor_infra()?;
+                    // Create shadow mapping resources
+                    self.ensure_shadow()?;
                 }
                 Err(VulkanError::SurfaceMinimized) => {
                     self.minimized = true;
@@ -975,6 +1031,489 @@ impl VulkanDevice {
 }
 
 // ============================================================================
+// Shadow mapping
+// ============================================================================
+
+impl VulkanDevice {
+    /// Ensure shadow mapping resources exist (idempotent).
+    pub(crate) fn ensure_shadow(&mut self) -> VkResult<()> {
+        if self.shadow_map.is_some() {
+            return Ok(());
+        }
+        self.create_shadow_resources()
+    }
+
+    /// Create 2048×2048 directional-light shadow mapping resources.
+    fn create_shadow_resources(&mut self) -> VkResult<()> {
+        let d = &self.logical_device.device;
+        let allocator = self.logical_device.allocator();
+        const SHADOW_SIZE: u32 = 2048;
+
+        // ---- 1. Shadow map image (D32_SFLOAT, GPU-only) ----
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::D32_SFLOAT)
+            .extent(vk::Extent3D {
+                width: SHADOW_SIZE,
+                height: SHADOW_SIZE,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let image = unsafe { d.create_image(&image_info, None) }
+            .map_err(|r| VulkanError::vk("create_shadow_image", r))?;
+        let req = unsafe { d.get_image_memory_requirements(image) };
+        let allocation = allocator
+            .borrow_mut()
+            .allocate(&crate::allocator::AllocationCreateDesc {
+                name: "shadow-map",
+                requirements: req,
+                location: crate::allocator::MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
+            })
+            .map_err(|e| VulkanError::Allocation(e.to_string()))?;
+        unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
+            .map_err(|r| VulkanError::vk("bind_shadow_image", r))?;
+
+        // ---- 2. Image view ----
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::D32_SFLOAT)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let image_view = unsafe { d.create_image_view(&view_info, None) }
+            .map_err(|r| VulkanError::vk("create_shadow_image_view", r))?;
+
+        // ---- 3. Sampler (PCF: COMPARE_MODE + LINEAR + CLAMP_TO_EDGE) ----
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .compare_enable(true)
+            .compare_op(vk::CompareOp::LESS)
+            .min_lod(0.0)
+            .max_lod(1.0)
+            .mip_lod_bias(0.0)
+            .anisotropy_enable(false);
+        let sampler = unsafe { d.create_sampler(&sampler_info, None) }
+            .map_err(|r| VulkanError::vk("create_shadow_sampler", r))?;
+
+        // ---- 4. Render pass (depth-only, CLEAR load op) ----
+        let depth_at = vk::AttachmentDescription::default()
+            .format(vk::Format::D32_SFLOAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+        let depth_ref = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .depth_stencil_attachment(&depth_ref);
+        // Subpass dependencies: external → shadow (write), shadow → external (read)
+        let deps = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(vk::PipelineStageFlags::TOP_OF_PIPE)
+                .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE),
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ),
+        ];
+        let atts = [depth_at];
+        let subpasses = [subpass];
+        let rp_info = vk::RenderPassCreateInfo::default()
+            .attachments(&atts)
+            .subpasses(&subpasses)
+            .dependencies(&deps);
+        let rp = unsafe { d.create_render_pass(&rp_info, None) }
+            .map_err(|r| VulkanError::vk("crp_shadow", r))?;
+
+        // ---- 5. Pipeline layout (push constant: mat4 light MVP at vertex stage) ----
+        let pc_range = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::VERTEX,
+            offset: 0,
+            size: 64,
+        }];
+        let pli = vk::PipelineLayoutCreateInfo::default()
+            .push_constant_ranges(&pc_range);
+        let pll = unsafe { d.create_pipeline_layout(&pli, None) }
+            .map_err(|r| VulkanError::vk("cpl_shadow", r))?;
+
+        // ---- 6. Shadow pipeline (depth-only, no color writes) ----
+        let vert_spv = crate::shaders_embedded::SHADOW_VERT_SPV;
+        let frag_spv = crate::shaders_embedded::SHADOW_FRAG_SPV;
+        let vm = unsafe { mk_sm(d, vert_spv) }?;
+        let fm = unsafe { mk_sm(d, frag_spv) }?;
+
+        let main = c"main";
+        let sr = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vm)
+                .name(main),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fm)
+                .name(main),
+        ];
+
+        // Vertex input (position at loc=0, stride 32)
+        let vb = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let va = [vk::VertexInputAttributeDescription {
+            location: 0,
+            binding: 0,
+            format: vk::Format::R32G32B32_SFLOAT,
+            offset: 0,
+        }];
+        let vi = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vb)
+            .vertex_attribute_descriptions(&va);
+
+        let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let vs = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rs = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0)
+            .depth_bias_enable(true)
+            .depth_bias_constant_factor(1.5)
+            .depth_bias_slope_factor(1.5);
+        let ms = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // No color attachments – empty blend state
+        let cba: [vk::PipelineColorBlendAttachmentState; 0] = [];
+        let cb = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&cba);
+        let ds_state = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        let dyns = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let ds = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyns);
+
+        let pinfo = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&sr)
+            .vertex_input_state(&vi)
+            .input_assembly_state(&ia)
+            .viewport_state(&vs)
+            .rasterization_state(&rs)
+            .multisample_state(&ms)
+            .depth_stencil_state(&ds_state)
+            .color_blend_state(&cb)
+            .dynamic_state(&ds)
+            .layout(pll)
+            .render_pass(rp)
+            .subpass(0);
+        let pipeline =
+            unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[pinfo], None) }
+                .map_err(|(_, r)| VulkanError::vk("cgp_shadow", r))?[0];
+
+        unsafe {
+            d.destroy_shader_module(vm, None);
+            d.destroy_shader_module(fm, None);
+        }
+
+        // ---- 7. Framebuffer ----
+        let fb = unsafe {
+            d.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(rp)
+                    .attachments(&[image_view])
+                    .width(SHADOW_SIZE)
+                    .height(SHADOW_SIZE)
+                    .layers(1),
+                None,
+            )
+        }
+        .map_err(|r| VulkanError::vk("cfb_shadow", r))?;
+
+        // ---- 8. Descriptor set layout (set=1, binding 0 = combined image sampler) ----
+        let ds_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let ds_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&ds_bindings);
+        let ds_layout = unsafe { d.create_descriptor_set_layout(&ds_layout_info, None) }
+            .map_err(|r| VulkanError::vk("create_shadow_ds_layout", r))?;
+
+        // ---- 9. Descriptor pool + set ----
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+        }];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&pool_sizes);
+        let pool = unsafe { d.create_descriptor_pool(&pool_info, None) }
+            .map_err(|r| VulkanError::vk("create_shadow_ds_pool", r))?;
+
+        let ds_layouts = [ds_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&ds_layouts);
+        let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
+            .map_err(|r| VulkanError::vk("alloc_shadow_ds", r))?;
+        let desc_set = desc_sets[0];
+
+        // Write descriptor: combine shadow map view + sampler
+        let image_info = [vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(image_view)
+            .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info)];
+        unsafe {
+            d.update_descriptor_sets(&writes, &[]);
+        }
+
+        // ---- Store ----
+        self.shadow_map = Some(image);
+        self.shadow_map_view = Some(image_view);
+        self.shadow_allocation = Some(allocation);
+        self.shadow_sampler = Some(sampler);
+        self.shadow_rp = Some(rp);
+        self.shadow_pipeline_layout = Some(pll);
+        self.shadow_pipeline = Some(pipeline);
+        self.shadow_fb = Some(fb);
+        self.shadow_desc_layout = Some(ds_layout);
+        self.shadow_desc_pool = Some(pool);
+        self.shadow_desc_set = Some(desc_set);
+
+        // ---- 10. Bind-only pipeline layout (set=1 only, for early binding in begin_frame) ----
+        let bind_set_layouts = [ds_layout];
+        let bind_pli = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&bind_set_layouts);
+        let bind_pll = unsafe { d.create_pipeline_layout(&bind_pli, None) }
+            .map_err(|r| VulkanError::vk("cpl_shadow_bind", r))?;
+        self.shadow_bind_layout = Some(bind_pll);
+
+        Ok(())
+    }
+
+    /// Destroy all shadow mapping resources (reverse order of creation).
+    pub(crate) fn destroy_shadow_resources(&mut self) {
+        let d = &self.logical_device.device;
+
+        // Descriptor pool automatically frees its descriptor sets
+        if let Some(pool) = self.shadow_desc_pool.take() {
+            unsafe { d.destroy_descriptor_pool(pool, None); }
+        }
+        if let Some(layout) = self.shadow_desc_layout.take() {
+            unsafe { d.destroy_descriptor_set_layout(layout, None); }
+        }
+        if let Some(layout) = self.shadow_bind_layout.take() {
+            unsafe { d.destroy_pipeline_layout(layout, None); }
+        }
+        if let Some(fb) = self.shadow_fb.take() {
+            unsafe { d.destroy_framebuffer(fb, None); }
+        }
+        if let Some(p) = self.shadow_pipeline.take() {
+            unsafe { d.destroy_pipeline(p, None); }
+        }
+        if let Some(l) = self.shadow_pipeline_layout.take() {
+            unsafe { d.destroy_pipeline_layout(l, None); }
+        }
+        if let Some(rp) = self.shadow_rp.take() {
+            unsafe { d.destroy_render_pass(rp, None); }
+        }
+        if let Some(s) = self.shadow_sampler.take() {
+            unsafe { d.destroy_sampler(s, None); }
+        }
+        if let Some(iv) = self.shadow_map_view.take() {
+            unsafe { d.destroy_image_view(iv, None); }
+        }
+        if let Some(img) = self.shadow_map.take() {
+            unsafe { d.destroy_image(img, None); }
+        }
+        if let Some(mut a) = self.shadow_allocation.take() {
+            let _ = self.logical_device.allocator().borrow_mut().free(&mut a);
+        }
+    }
+
+    /// Compute a light view-projection matrix for directional shadow mapping.
+    fn compute_light_mvp(&self) -> [[f32; 4]; 4] {
+        let light_dir = glam::Vec3::new(0.5, -0.707, 0.5).normalize();
+        // Position the light far away, looking at the origin
+        let light_pos = -light_dir * 10.0;
+        let view =
+            glam::Mat4::look_at_rh(light_pos, glam::Vec3::ZERO, glam::Vec3::Y);
+        let ortho = glam::Mat4::orthographic_rh(-5.0, 5.0, -5.0, 5.0, 0.1, 20.0);
+        let light_mvp = ortho * view;
+        light_mvp.to_cols_array_2d()
+    }
+
+    /// Record a shadow-mapping render pass into the already-begun command buffer.
+    ///
+    /// The command buffer MUST have been started via [`begin_cb`] before calling
+    /// this method. The shadow map is bound as a depth attachment and the scene
+    /// is rendered from the light's point of view using the given `light_mvp`
+    /// push constant.
+    fn record_shadow_pass(
+        &self,
+        fi: usize,
+        light_mvp: &[[f32; 4]; 4],
+        vertex_buf: render_core::BufferHandle,
+        index_buf: render_core::BufferHandle,
+        index_count: u32,
+    ) -> VkResult<()> {
+        let d = &self.logical_device.device;
+        let f = &self.frame_sync[fi];
+        let rp = self.shadow_rp.unwrap();
+        let pl = self.shadow_pipeline.unwrap();
+        let pll = self.shadow_pipeline_layout.unwrap();
+        const SHADOW_SIZE: u32 = 2048;
+
+        // Look up Vulkan buffer handles
+        let vk_vb = self
+            .buffers
+            .get(vertex_buf.index, vertex_buf.generation)
+            .map(|e| e.buffer)
+            .ok_or(VulkanError::Loader("vertex buffer not found".into()))?;
+        let vk_ib = self
+            .buffers
+            .get(index_buf.index, index_buf.generation)
+            .map(|e| e.buffer)
+            .ok_or(VulkanError::Loader("index buffer not found".into()))?;
+
+        // Begin shadow render pass
+        let clear_depth = vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
+        };
+        let clear_values = [clear_depth];
+        let rpbi = vk::RenderPassBeginInfo::default()
+            .render_pass(rp)
+            .framebuffer(self.shadow_fb.unwrap())
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: SHADOW_SIZE,
+                    height: SHADOW_SIZE,
+                },
+            })
+            .clear_values(&clear_values);
+
+        unsafe {
+            d.cmd_begin_render_pass(f.command_buffer, &rpbi, vk::SubpassContents::INLINE);
+        }
+
+        // Viewport + scissor
+        let vp = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: SHADOW_SIZE as f32,
+            height: SHADOW_SIZE as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        unsafe {
+            d.cmd_set_viewport(f.command_buffer, 0, &[vp]);
+            d.cmd_set_scissor(
+                f.command_buffer,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: SHADOW_SIZE,
+                        height: SHADOW_SIZE,
+                    },
+                }],
+            );
+            d.cmd_bind_pipeline(f.command_buffer, vk::PipelineBindPoint::GRAPHICS, pl);
+
+            // Push constant: mat4 light MVP (64 bytes)
+            let mvp_bytes: &[u8] = std::slice::from_raw_parts(
+                light_mvp.as_ptr() as *const u8,
+                std::mem::size_of::<[[f32; 4]; 4]>(),
+            );
+            d.cmd_push_constants(
+                f.command_buffer,
+                pll,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                mvp_bytes,
+            );
+
+            // Vertex + index buffers
+            let vbs = [vk_vb];
+            let offsets = [0u64];
+            d.cmd_bind_vertex_buffers(f.command_buffer, 0, &vbs, &offsets);
+            d.cmd_bind_index_buffer(f.command_buffer, vk_ib, 0, vk::IndexType::UINT32);
+            d.cmd_draw_indexed(f.command_buffer, index_count, 1, 0, 0, 0);
+            d.cmd_end_render_pass(f.command_buffer);
+        }
+
+        // Pipeline barrier: make shadow depth writes visible to fragment shader reads
+        // in the subsequent forward render pass.
+        let barrier = vk::ImageMemoryBarrier::default()
+            .image(self.shadow_map.unwrap())
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+        unsafe {
+            d.cmd_pipeline_barrier(
+                f.command_buffer,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Device trait impl
 // ============================================================================
 
@@ -1258,9 +1797,13 @@ impl render_core::Device for VulkanDevice {
             })
             .collect();
         // Include the per-frame descriptor set layout (set=0 UBO per FD-041)
+        // and the shadow map descriptor set layout (set=1) when available.
         let mut set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
         if let Some(dsl) = self.desc_set_layout_0 {
             set_layouts.push(dsl);
+        }
+        if let Some(sdl) = self.shadow_desc_layout {
+            set_layouts.push(sdl);
         }
         // Also add any from the descriptor
         for bg in &desc.bind_group_layouts {
@@ -1472,6 +2015,26 @@ impl render_core::Device for VulkanDevice {
             pipeline_layouts: &self.pipeline_layouts as *const Slab<PlEntry>,
             current_desc_set: desc_set,
         });
+
+        // Pre-bind the shadow descriptor set at set=1 (if available) so that
+        // subsequent encoder operations do not leave it unbound.  The encoder
+        // later binds the UBO at set=0 via `bind_descriptor_sets`.
+        if let Some(sds) = self.shadow_desc_set {
+            if let Some(bind_pll) = self.shadow_bind_layout {
+                let shadow_sets = [sds];
+                unsafe {
+                    self.logical_device.device.cmd_bind_descriptor_sets(
+                        f.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        bind_pll,
+                        1,
+                        &shadow_sets,
+                        &[],
+                    );
+                }
+            }
+        }
+
         Ok((ii, encoder))
     }
 
@@ -1950,6 +2513,7 @@ impl Drop for VulkanDevice {
                 }
             }
         }
+        self.destroy_shadow_resources();
         self.destroy_descriptor_infra();
         self.destroy_depth_texture();
         drop(self.swapchain.take());
