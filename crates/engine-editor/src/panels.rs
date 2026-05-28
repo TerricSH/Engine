@@ -1,7 +1,9 @@
+use engine_scene::Scene;
 use engine_serialize::PersistentId;
 use tracing;
 
 use crate::editor_ui::EditorUi;
+use crate::scene_view;
 use crate::EditorError;
 
 // -------------------------------------------------------------------
@@ -106,6 +108,45 @@ impl SceneViewPanel {
     /// The currently assigned render-target label.
     pub fn render_target(&self) -> Option<&str> {
         self.render_target_label.as_deref()
+    }
+
+    /// Render the scene view with real scene data and compute camera matrices.
+    ///
+    /// Displays the orbit camera controls and the computed view/projection
+    /// matrices.  Returns the view and projection matrices as a tuple.
+    pub fn ui_with_scene(&mut self, ui: &mut EditorUi, _scene: &Scene) -> (glam::Mat4, glam::Mat4) {
+        let _ = ui.collapsing_header("Transform", true);
+        ui.text_field("Name", &self.name);
+
+        let _ = ui.separator();
+        let _ = ui.collapsing_header("Camera", true);
+
+        if let Some(v) = ui.slider_f32("Pitch", self.pitch, -89.0, 89.0) {
+            self.pitch = v;
+        }
+        if let Some(v) = ui.slider_f32("Yaw", self.yaw, -180.0, 180.0) {
+            self.yaw = v;
+        }
+        if let Some(v) = ui.slider_f32("Distance", self.distance, 0.1, 100.0) {
+            self.distance = v;
+        }
+
+        let _ = ui.separator();
+        self.show_grid = ui.checkbox("Show Grid", self.show_grid);
+
+        // ── Compute camera matrices ──────────────────────────────
+        let view = scene_view::orbit_view_matrix(self.pitch, self.yaw, self.distance, self.target);
+        let proj = scene_view::orbit_projection_matrix(60.0, 16.0 / 9.0, 0.1, 100.0);
+
+        let _ = ui.separator();
+        let cam_open = ui.collapsing_header("Camera Matrices", false);
+        if cam_open {
+            ui.text_field("View", &format!("{:?}", view.to_cols_array_2d()));
+            ui.text_field("Proj", &format!("{:?}", proj.to_cols_array_2d()));
+        }
+
+        tracing::debug!(panel = %self.name, "SceneViewPanel.ui_with_scene");
+        (view, proj)
     }
 }
 
