@@ -77,7 +77,7 @@ fn resource_handle_equality() {
 fn resource_handle_copy_clone() {
     let a = BufferHandle::new(7, 1);
     let b = a;
-    let c = a.clone();
+    let c = a;
     assert_eq!(a, b);
     assert_eq!(a, c);
 }

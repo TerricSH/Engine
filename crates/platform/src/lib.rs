@@ -109,6 +109,7 @@ pub use self::input_types::*;
 mod input_types {
     /// Key codes (subset of winit's VirtualKeyCode for engine use).
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[allow(dead_code)]
     pub enum KeyCode {
         Escape, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
         Key0, Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9,
@@ -201,6 +202,7 @@ mod input_types {
 
     /// Mouse button identifiers.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[allow(dead_code)]
     pub enum MouseButton {
         Left, Right, Middle, Other(u16),
     }
@@ -461,7 +463,7 @@ mod tests {
     fn event_flow_copy_clone() {
         let a = EventFlow::Continue;
         let b = a;
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, b);
         assert_eq!(a, c);
     }

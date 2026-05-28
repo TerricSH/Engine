@@ -10,8 +10,12 @@ use crate::device::{BufferSlot, OpenGlDevice};
 /// mutable GL accessor).
 pub(crate) struct DeviceRef(pub(crate) *const OpenGlDevice);
 
-unsafe impl Send for DeviceRef {}
-unsafe impl Sync for DeviceRef {}
+// SAFETY: The encoder is created per-frame in begin_frame() and consumed in
+// end_frame(), before the owning OpenGlDevice is dropped. The raw pointer in
+// device_ptr points to the OpenGlDevice that outlives this encoder. Encoder
+// methods only read from the device (handle resolution), never mutate it,
+// so no data races are possible within the single-frame scope.
+unsafe impl Send for OpenGlCommandEncoder {}
 
 pub struct OpenGlCommandEncoder {
     pub(crate) gl: Arc<glow::Context>,
@@ -20,11 +24,12 @@ pub struct OpenGlCommandEncoder {
     pub(crate) current_framebuffer: Option<glow::Framebuffer>,
 }
 
-unsafe impl Send for OpenGlCommandEncoder {}
-
 impl OpenGlCommandEncoder {
     /// Resolve a buffer handle.
     fn buffer_slot(&self, handle: BufferHandle) -> Option<&BufferSlot> {
+        // SAFETY: device_ptr points to the OpenGlDevice that outlives this
+        // encoder — the encoder is created and used within a single frame
+        // and dropped before the device.
         let device = unsafe { &*self.device_ptr.0 };
         device
             .buffers
@@ -35,6 +40,8 @@ impl OpenGlCommandEncoder {
 
     /// Resolve a pipeline handle to its GL program.
     fn resolve_pipeline(&self, handle: PipelineHandle) -> Option<glow::Program> {
+        // SAFETY: Same as buffer_slot — device_ptr is valid for the encoder's
+        // lifetime (single-frame scope, dropped before the device).
         let device = unsafe { &*self.device_ptr.0 };
         device
             .pipelines
@@ -45,6 +52,8 @@ impl OpenGlCommandEncoder {
 
     /// Resolve a framebuffer handle to its GL framebuffer.
     fn resolve_framebuffer(&self, handle: FramebufferHandle) -> Option<glow::Framebuffer> {
+        // SAFETY: Same as buffer_slot — device_ptr is valid for the encoder's
+        // lifetime (single-frame scope, dropped before the device).
         let device = unsafe { &*self.device_ptr.0 };
         device
             .framebuffers

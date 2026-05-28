@@ -38,7 +38,7 @@ pub struct AudioSource {
 
 impl AudioSource {
     /// Create a new `AudioSource` bound to the given engine.
-    pub(crate) fn new(
+    pub(crate) fn _new(
         clip: Arc<AudioClip>,
         cmd_tx: crossbeam_channel::Sender<AudioCommand>,
         id: u64,

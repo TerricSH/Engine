@@ -1,5 +1,6 @@
 //! Per-frame command pools, command buffers, semaphores, fences, and
 //! secondary command buffer support for multi-threaded recording.
+#![allow(dead_code)]
 
 use std::sync::Mutex;
 
@@ -123,8 +124,7 @@ impl FrameContext {
         Ok(Self { frames, current: 0, device, secondary_pool: Mutex::new(secondary_pool) })
     }
 
-    #[allow(dead_code)]
-    pub fn current_frame(&self) -> &Frame {
+    pub fn _current_frame(&self) -> &Frame {
         &self.frames[self.current]
     }
 

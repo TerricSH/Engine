@@ -49,14 +49,13 @@ pub use engine::AudioEngine;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of simultaneous voices (pre-allocated pool, never exceeded).
-const MAX_VOICES: usize = 32;
+const _MAX_VOICES: usize = 32;
 
 /// Volume ramp duration in seconds (linear, avoids clicks on parameter changes).
-const VOLUME_RAMP_SECS: f32 = 0.005;
+const _VOLUME_RAMP_SECS: f32 = 0.005;
 
 /// Number of output channels (always stereo).
-#[allow(dead_code)]
-const OUTPUT_CHANNELS: u16 = 2;
+const _OUTPUT_CHANNELS: u16 = 2;
 
 // ---------------------------------------------------------------------------
 // AudioError
@@ -98,6 +97,7 @@ pub enum AudioError {
 // ---------------------------------------------------------------------------
 
 /// Commands sent from the main thread to the audio callback thread.
+#[allow(dead_code)]
 pub(crate) enum AudioCommand {
     Play {
         id: u64,
@@ -228,7 +228,7 @@ impl AudioListener {
 /// Constant-power stereo pan from emitter position relative to listener.
 ///
 /// Returns `(left_gain, right_gain)` where both sum in power to 1.0 at centre.
-pub(crate) fn compute_stereo_pan(
+pub(crate) fn _compute_stereo_pan(
     emitter: Vec3,
     listener_pos: Vec3,
     listener_forward: Vec3,
@@ -255,7 +255,7 @@ pub(crate) fn compute_stereo_pan(
 }
 
 /// Inverse-distance attenuation with rolloff factor.
-pub(crate) fn distance_attenuation(distance: f32, max_distance: f32, rolloff: f32) -> f32 {
+pub(crate) fn _distance_attenuation(distance: f32, max_distance: f32, rolloff: f32) -> f32 {
     if distance <= 0.0 {
         return 1.0;
     }

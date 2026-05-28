@@ -5,14 +5,13 @@
 //! This is a simple direct allocator — every allocation gets its own
 //! `VkDeviceMemory` block.  No sub-allocation, no pooling.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Public aliases & re-exports
 // ---------------------------------------------------------------------------
 
-pub type SharedAllocator = Rc<RefCell<VulkanAllocator>>;
+pub type SharedAllocator = Arc<Mutex<VulkanAllocator>>;
 pub use self::inner::{Allocation, AllocationCreateDesc, AllocationScheme, MemoryLocation, VulkanAllocator};
 
 // ---------------------------------------------------------------------------
@@ -29,6 +28,7 @@ mod inner {
         GpuOnly,
         CpuToGpu,
         GpuToCpu,
+        #[allow(dead_code)]
         CpuOnly,
     }
 
@@ -37,7 +37,9 @@ mod inner {
         pub name: &'static str,
         pub requirements: vk::MemoryRequirements,
         pub location: MemoryLocation,
+        #[allow(dead_code)]
         pub linear: bool,
+        #[allow(dead_code)]
         pub allocation_scheme: AllocationScheme,
     }
 
@@ -52,11 +54,10 @@ mod inner {
         size: vk::DeviceSize,
         offset: vk::DeviceSize,
         mapped_ptr: Option<*mut u8>,
-        #[allow(dead_code)]
-        name: &'static str,
+        _name: &'static str,
     }
 
-    unsafe impl Send for Allocation {}
+
 
     impl Allocation {
         pub fn memory(&self) -> vk::DeviceMemory {
@@ -119,7 +120,7 @@ mod inner {
                 }
             };
 
-            Ok(Allocation { memory, size, offset: 0, mapped_ptr, name: desc.name })
+            Ok(Allocation { memory, size, offset: 0, mapped_ptr, _name: desc.name })
         }
 
         /// Free memory.

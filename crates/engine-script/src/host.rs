@@ -163,6 +163,12 @@ impl NullScriptHost {
     }
 }
 
+impl Default for NullScriptHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScriptHost for NullScriptHost {
     fn name(&self) -> &str {
         "null"

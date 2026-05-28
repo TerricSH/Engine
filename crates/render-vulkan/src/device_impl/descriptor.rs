@@ -56,7 +56,8 @@ impl VulkanDevice {
             let req = unsafe { d.get_buffer_memory_requirements(buf) };
             self.ubo_alignment = req.alignment as u64;
             let allocation = allocator
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .allocate(&crate::allocator::AllocationCreateDesc {
                     name: ["frame-ubo-0", "frame-ubo-1"][i],
                     requirements: req,
@@ -157,7 +158,7 @@ impl VulkanDevice {
     pub(crate) fn destroy_descriptor_infra(&mut self) {
         let d = &self.logical_device.device;
         for mut a in self.ubo_allocations.drain(..) {
-            let _ = self.logical_device.allocator().borrow_mut().free(&mut a);
+            let _ = self.logical_device.allocator().lock().unwrap().free(&mut a);
         }
         for buf in self.frame_ubos.drain(..) {
             unsafe {

@@ -2606,6 +2606,7 @@ dependencies = [
  "ash",
  "ash-window",
  "engine-renderer",
+ "glam",
  "raw-window-handle",
  "render-core",
  "thiserror 1.0.69",

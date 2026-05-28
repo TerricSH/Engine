@@ -18,7 +18,7 @@ pub(crate) struct BufEntry {
 impl Drop for BufEntry {
     fn drop(&mut self) {
         if let Some(mut a) = self.allocation.take() {
-            let _ = self.allocator.borrow_mut().free(&mut a);
+            let _ = self.allocator.lock().unwrap().free(&mut a);
         }
     }
 }
@@ -63,7 +63,7 @@ pub(crate) struct PipeEntry {
 
 pub(crate) struct PlEntry {
     pub(crate) layout: vk::PipelineLayout,
-    pub(crate) device: AshDevice,
+    pub(crate) _device: AshDevice,
 }
 
 // ============================================================================

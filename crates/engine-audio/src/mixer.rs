@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -5,8 +7,8 @@ use glam::Vec3;
 
 use crate::clip::AudioClip;
 use crate::{
-    compute_stereo_pan, distance_attenuation, AudioCommand, AudioListener, MAX_VOICES,
-    VOLUME_RAMP_SECS,
+    _compute_stereo_pan, _distance_attenuation, AudioCommand, AudioListener, _MAX_VOICES,
+    _VOLUME_RAMP_SECS,
 };
 
 // ---------------------------------------------------------------------------
@@ -62,8 +64,8 @@ pub(crate) struct MixerState {
 impl MixerState {
     pub(crate) fn new(sample_rate: u32) -> Self {
         // Pre-allocate the voice pool.
-        let mut voices = Vec::with_capacity(MAX_VOICES);
-        for _ in 0..MAX_VOICES {
+        let mut voices = Vec::with_capacity(_MAX_VOICES);
+        for _ in 0.._MAX_VOICES {
             voices.push(MixerVoice::new());
         }
 
@@ -97,9 +99,9 @@ impl MixerState {
                         slot.current_volume = 0.0;
                         slot.voice_volume = volume;
                         slot.volume_ramp_delta =
-                            volume / (sr as f32 * VOLUME_RAMP_SECS).max(1.0);
+                            volume / (sr as f32 * _VOLUME_RAMP_SECS).max(1.0);
                         slot.ramp_samples_remaining =
-                            (sr as f32 * VOLUME_RAMP_SECS) as u32;
+                            (sr as f32 * _VOLUME_RAMP_SECS) as u32;
                         slot.loop_enabled = loop_enabled;
                         slot.paused = false;
                         slot.finished = finished;
@@ -222,14 +224,14 @@ impl MixerState {
 
                 // Spatial audio panning.
                 if v.spatial {
-                    let (pan_l, pan_r) = compute_stereo_pan(
+                    let (pan_l, pan_r) = _compute_stereo_pan(
                         v.emitter_position,
                         self.listener.position,
                         self.listener.forward,
                         self.listener.up,
                     );
                     let dist = v.emitter_position.distance(self.listener.position);
-                    let atten = distance_attenuation(dist, v.emitter_max_distance, v.emitter_rolloff);
+                    let atten = _distance_attenuation(dist, v.emitter_max_distance, v.emitter_rolloff);
                     left_sum += left * pan_l * atten;
                     right_sum += right * pan_r * atten;
                 } else {
@@ -297,7 +299,7 @@ impl MixerVoice {
         let clamped = volume.clamp(0.0, 1.0);
         self.target_volume = clamped;
         self.voice_volume = clamped;
-        let ramp_frames = (sample_rate as f32 * VOLUME_RAMP_SECS) as u32;
+        let ramp_frames = (sample_rate as f32 * _VOLUME_RAMP_SECS) as u32;
         if ramp_frames > 0 {
             self.volume_ramp_delta =
                 (clamped - self.current_volume) / ramp_frames as f32;

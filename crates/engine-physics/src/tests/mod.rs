@@ -24,7 +24,7 @@ fn rigid_body_handle_debug() {
 fn rigid_body_handle_clone_copy() {
     let a = make_rigid_body_handle(1);
     let b = a;
-    let c = a.clone();
+    let c = a;
     assert_eq!(a, b);
     assert_eq!(a, c);
 }
@@ -128,7 +128,7 @@ fn from_rapier_vec_converts_nalgebra_to_glam() {
 
 #[test]
 fn vec_conversion_roundtrip() {
-    let original = glam::Vec3::new(-1.5, 2.7, 3.14);
+    let original = glam::Vec3::new(-1.5, 2.7, std::f32::consts::PI);
     let rapier_v = to_rapier_vec(original);
     let back = from_rapier_vec(rapier_v);
     assert!((original - back).length() < 1e-6);

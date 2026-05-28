@@ -136,7 +136,7 @@ impl MessageBus {
 
     /// Remove a previously registered handler.
     pub fn unsubscribe(&mut self, handler_id: HandlerId) -> Result<(), MessageError> {
-        for (_, entries) in &mut self.handlers {
+        for entries in self.handlers.values_mut() {
             if let Some(pos) = entries.iter().position(|e| e.id == handler_id) {
                 entries.swap_remove(pos);
                 return Ok(());
@@ -324,50 +324,55 @@ mod tests {
     #[test]
     fn subscribe_and_publish() {
         let mut bus = MessageBus::new();
-        let received = std::cell::Cell::new(0);
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let r = std::sync::Arc::clone(&received);
         let _h = bus.subscribe::<TestMsg>(move |msg| {
-            received.set(msg.value);
+            r.store(msg.value, std::sync::atomic::Ordering::SeqCst);
         });
         bus.publish(TestMsg { value: 42 });
-        assert_eq!(received.get(), 42);
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 42);
     }
 
     #[test]
     fn unsubscribe() {
         let mut bus = MessageBus::new();
-        let count = std::cell::Cell::new(0);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let c = std::sync::Arc::clone(&count);
         let h = bus.subscribe::<TestMsg>(move |_| {
-            count.set(count.get() + 1);
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
         bus.publish(TestMsg { value: 1 });
-        assert_eq!(count.get(), 1);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
         bus.unsubscribe(h).unwrap();
         bus.publish(TestMsg { value: 2 });
-        assert_eq!(count.get(), 1, "should not receive after unsubscribe");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "should not receive after unsubscribe");
     }
 
     #[test]
     fn different_types_dont_interfere() {
         let mut bus = MessageBus::new();
-        let test_vals = std::cell::Cell::new(0);
-        let other_vals = std::cell::Cell::new(String::new());
+        let test_vals = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let other_vals = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
-        let _h1 = bus.subscribe::<TestMsg>(|msg| { test_vals.set(msg.value); });
-        let _h2 = bus.subscribe::<OtherMsg>(|msg| { other_vals.set(msg.label.clone()); });
+        let tv = std::sync::Arc::clone(&test_vals);
+        let _h1 = bus.subscribe::<TestMsg>(move |msg| { tv.store(msg.value, std::sync::atomic::Ordering::SeqCst); });
+        let ov = std::sync::Arc::clone(&other_vals);
+        let _h2 = bus.subscribe::<OtherMsg>(move |msg| { *ov.lock().unwrap() = msg.label.clone(); });
 
         bus.publish(OtherMsg { label: "hello".into() });
-        assert_eq!(test_vals.get(), 0);
-        assert_eq!(other_vals.into_inner(), "hello");
+        assert_eq!(test_vals.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(*other_vals.lock().unwrap(), "hello");
     }
 
     #[test]
     fn clear_handlers() {
         let mut bus = MessageBus::new();
-        let count = std::cell::Cell::new(0);
-        let _h = bus.subscribe::<TestMsg>(|_| { count.set(count.get() + 1); });
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let c = std::sync::Arc::clone(&count);
+        let _h = bus.subscribe::<TestMsg>(move |_| { c.fetch_add(1, std::sync::atomic::Ordering::SeqCst); });
         bus.clear_handlers::<TestMsg>();
         bus.publish(TestMsg { value: 0 });
-        assert_eq!(count.get(), 0);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

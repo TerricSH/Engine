@@ -1,7 +1,6 @@
 //! Logical device + single graphics/present queue.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use ash::khr::swapchain;
 use ash::vk;
@@ -54,7 +53,7 @@ impl Device {
             device,
             queue,
             queue_family_index: adapter.queue_family_index,
-            allocator: Some(Rc::new(RefCell::new(allocator))),
+            allocator: Some(Arc::new(Mutex::new(allocator))),
         })
     }
 

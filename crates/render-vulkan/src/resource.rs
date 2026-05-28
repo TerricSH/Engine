@@ -47,8 +47,7 @@ pub struct TexturedQuadResources {
     pub vertex_buffer: BufferResource,
     pub index_buffer: BufferResource,
     pub index_count: u32,
-    #[allow(dead_code)]
-    pub texture: TextureResource,
+    pub _texture: TextureResource,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub descriptor_set: vk::DescriptorSet,
     descriptor_pool: vk::DescriptorPool,
@@ -95,7 +94,7 @@ impl TexturedQuadResources {
             vertex_buffer,
             index_buffer,
             index_count: TEXTURED_INDICES.len() as u32,
-            texture,
+            _texture: texture,
             descriptor_set_layout,
             descriptor_set,
             descriptor_pool,
@@ -142,7 +141,7 @@ impl BufferResource {
         let requirements = unsafe { device.device.get_buffer_memory_requirements(buffer) };
         let allocator = device.allocator();
         let mut allocation = allocator
-            .borrow_mut()
+            .lock().map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
             .allocate(&AllocationCreateDesc {
                 name,
                 requirements,
@@ -158,7 +157,9 @@ impl BufferResource {
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
         };
         if let Err(result) = bind_result {
-            let _ = allocator.borrow_mut().free(&mut allocation);
+            if let Ok(mut guard) = allocator.lock() {
+                let _ = guard.free(&mut allocation);
+            }
             // SAFETY: buffer was created above and is not bound to live resources.
             unsafe { device.device.destroy_buffer(buffer, None) };
             return Err(VulkanError::vk("bind_buffer_memory", result));
@@ -196,7 +197,7 @@ impl BufferResource {
         let allocation = self
             .allocation
             .as_mut()
-            .expect("buffer allocation exists until drop");
+            .ok_or(VulkanError::Loader("buffer allocation not initialized".into()))?;
         let Some(slice) = allocation.mapped_slice_mut() else {
             return Err(VulkanError::MemoryNotMapped(name));
         };
@@ -210,7 +211,9 @@ impl Drop for BufferResource {
         // SAFETY: VulkanRenderer waits for the device to be idle before dropping resources.
         unsafe { self.device.destroy_buffer(self.buffer, None) };
         if let Some(mut allocation) = self.allocation.take() {
-            let _ = self.allocator.borrow_mut().free(&mut allocation);
+            if let Ok(mut guard) = self.allocator.lock() {
+                let _ = guard.free(&mut allocation);
+            }
         }
     }
 }
@@ -258,7 +261,7 @@ impl TextureResource {
         let requirements = unsafe { device.device.get_image_memory_requirements(image) };
         let allocator = device.allocator();
         let allocation = allocator
-            .borrow_mut()
+            .lock().map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
             .allocate(&AllocationCreateDesc {
                 name: "gate2 textured quad image",
                 requirements,
@@ -320,7 +323,9 @@ impl Drop for TextureResource {
             self.device.destroy_image(self.image, None);
         }
         if let Some(mut allocation) = self.allocation.take() {
-            let _ = self.allocator.borrow_mut().free(&mut allocation);
+            if let Ok(mut guard) = self.allocator.lock() {
+                let _ = guard.free(&mut allocation);
+            }
         }
     }
 }
