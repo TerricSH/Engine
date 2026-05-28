@@ -453,9 +453,8 @@ impl VulkanDevice {
             .line_width(1.0);
         let ms = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let cba = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)];
+        let blend_attachment = blend_attachment_from_mode("Alpha");
+        let cba = [blend_attachment];
         let cb = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(&cba);
@@ -1968,6 +1967,31 @@ impl Drop for VulkanDevice {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Build a [`PipelineColorBlendAttachmentState`] from a mode string.
+///
+/// Supported modes: `"Alpha"`, `"Additive"`, `"Multiply"`, or `None` / `"Opaque"`.
+fn blend_attachment_from_mode(mode: &str) -> vk::PipelineColorBlendAttachmentState {
+    let (enable, src_color, dst_color, src_alpha, dst_alpha) = match mode {
+        "Alpha" => (true, vk::BlendFactor::SRC_ALPHA, vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+                    vk::BlendFactor::ONE, vk::BlendFactor::ONE_MINUS_SRC_ALPHA),
+        "Additive" => (true, vk::BlendFactor::SRC_ALPHA, vk::BlendFactor::ONE,
+                       vk::BlendFactor::ONE, vk::BlendFactor::ONE),
+        "Multiply" => (true, vk::BlendFactor::ZERO, vk::BlendFactor::SRC_COLOR,
+                       vk::BlendFactor::ZERO, vk::BlendFactor::SRC_ALPHA),
+        _ => (false, vk::BlendFactor::ONE, vk::BlendFactor::ZERO,
+              vk::BlendFactor::ONE, vk::BlendFactor::ZERO),
+    };
+    vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(enable)
+        .src_color_blend_factor(src_color)
+        .dst_color_blend_factor(dst_color)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(src_alpha)
+        .dst_alpha_blend_factor(dst_alpha)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+}
 
 fn default_dep() -> vk::SubpassDependency {
     vk::SubpassDependency::default()
