@@ -20,5 +20,6 @@ subsystem-scripting-csharp = []
 crossbeam-channel.workspace = true
 engine-serialize = { path = "../engine-serialize" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

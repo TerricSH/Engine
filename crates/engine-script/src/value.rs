@@ -2,11 +2,13 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Values that can be passed between the engine and a script host.
 ///
 /// These cover the common primitives and engine-specific types (vectors,
 /// entity references, asset handles) that need to cross the script boundary.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ScriptValue {
     /// No value / null.
     Null,
