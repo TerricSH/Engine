@@ -22,6 +22,7 @@
 pub mod cooked_shader;
 pub mod dependency;
 pub mod error;
+pub mod logic_asset;
 pub mod manifest;
 pub mod mesh;
 pub mod scene;
@@ -42,6 +43,7 @@ pub use cooked_shader::{
 };
 pub use dependency::{CookState, DependencyGraph, DependencyNode};
 pub use error::CookError;
+pub use logic_asset::{cook_logic_asset, LogicAsset};
 pub use manifest::{AssetType, CookRules, SourceAssetEntry, SourceManifest};
 pub use mesh::cook_mesh;
 pub use scene::cook_scene;
@@ -325,6 +327,17 @@ pub fn cook_orchestrate(
                     Err(e) => {
                         graph.mark_failed(&asset_entry.id, e.to_string());
                         tracing::error!("scene cook failed: {:?}: {e}", asset_entry.id.id);
+                        continue;
+                    }
+                },
+                AssetType::Logic => match logic_asset::cook_logic_asset(&source_path, &output_path) {
+                    Ok(r) => {
+                        graph.mark_cooked(&asset_entry.id, compute_file_hash(&source_path));
+                        r
+                    }
+                    Err(e) => {
+                        graph.mark_failed(&asset_entry.id, e.to_string());
+                        tracing::error!("logic asset cook failed: {:?}: {e}", asset_entry.id.id);
                         continue;
                     }
                 },
