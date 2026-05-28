@@ -17,6 +17,10 @@
 //! * [`protocol`] — JSON-line wire protocol for process-based hosts.
 //! * [`process_host`] — [`ProcessHost`] stub for CoreCLR child-process
 //!   communication.
+//! * [`profile`] — [`PlatformProfile`] enum, [`PlatformConstraints`], and
+//!   [`is_feature_available`] for mobile / AOT compatibility checks.
+//! * [`api_compat`] — [`ApiCompatRange`] and ScriptAPI feature subset constants
+//!   ([`MOBILE_SAFE_FEATURES`], [`DESKTOP_ONLY_FEATURES`]).
 //!
 //! # Safety
 //!
@@ -24,11 +28,14 @@
 //! requires unsafe FFI. Every `unsafe` block **must** carry a `// SAFETY:`
 //! comment explaining why the invariants are upheld.
 
+mod api_compat;
 mod component;
 mod engine;
 mod host;
 mod lifecycle;
+pub mod mobile_subset;
 mod process_host;
+mod profile;
 mod protocol;
 mod value;
 
@@ -45,6 +52,13 @@ pub use engine::ScriptEngine;
 pub use component::{ScriptComponent, ScriptInstanceState, ScriptManager};
 pub use protocol::ScriptMessage;
 pub use process_host::{ProcessHost, ProcessScriptInstance};
+
+// Mobile-safe API subset (data-only, no scripting backend dependency).
+pub use mobile_subset::{mobile_subset_v0, ScriptApiSubset, UnsupportedPattern};
+
+// Platform profile and API compatibility.
+pub use api_compat::{ApiCompatRange, MOBILE_SAFE_FEATURES, DESKTOP_ONLY_FEATURES};
+pub use profile::{is_feature_available, PlatformConstraints, PlatformProfile};
 
 #[cfg(test)]
 mod tests {
