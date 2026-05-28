@@ -21,6 +21,7 @@ crossbeam-channel.workspace = true
 engine-asset = { path = "../engine-asset" }
 engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
+engine-script = { path = "../engine-script" }
 engine-serialize = { path = "../engine-serialize" }
 engine-ui = { path = "../engine-ui" }
 glam.workspace = true
