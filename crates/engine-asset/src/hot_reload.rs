@@ -169,7 +169,7 @@ impl<'a> HotReload<'a> {
 ///
 /// Assets with a `logical_path` (i.e. a non-standard path layout) cannot
 /// be mapped back and return [`None`].
-fn path_to_asset_id(path: &Path) -> Option<AssetId> {
+pub(crate) fn path_to_asset_id(path: &Path) -> Option<AssetId> {
     let path_str = path.to_string_lossy();
     // Normalise to forward slashes so the same logic works on Windows.
     let normalized = path_str.replace('\\', "/");

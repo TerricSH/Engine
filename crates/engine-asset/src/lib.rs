@@ -16,6 +16,7 @@
 
 pub mod cook;
 pub mod mesh;
+pub mod reload;
 mod registry;
 mod loader;
 mod watcher;
@@ -27,6 +28,7 @@ pub use loader::{AssetLoader, AssetHandle, BincodeLoader, RawLoader, AssetError,
 pub use watcher::FileWatcher;
 pub use path::asset_path;
 pub use hot_reload::HotReload;
+pub use reload::ReloadCoordinator;
 
 #[cfg(test)]
 mod tests {
