@@ -724,6 +724,22 @@ fn run_model_viewer() {
     }
 
     impl BackendRenderer for ModelViewerBackend {
+        fn execute_pass(
+            &mut self,
+            input: &RenderFrameInput,
+            pass: &engine_renderer::render_graph::PassNode,
+            stats: &mut FrameStats,
+        ) -> Result<(), Vec<Diagnostic>> {
+            if pass.kind != engine_renderer::render_graph::PassKind::OpaquePbrForward {
+                return Ok(()); // only render on the forward pass
+            }
+            let frame_stats = self.render_frame(input)?;
+            stats.draw_calls += frame_stats.draw_calls;
+            stats.triangles += frame_stats.triangles;
+            stats.visible_drawables += frame_stats.visible_drawables;
+            Ok(())
+        }
+
         fn render_frame(
             &mut self,
             _input: &RenderFrameInput,
