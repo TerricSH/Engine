@@ -27,7 +27,7 @@ pub type ComponentTypeId = String;
 pub type PropertyPath = String;
 pub type HashDigest = [u8; 32];
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AssetId {
     pub id: String,
     pub logical_path: Option<String>,
@@ -129,6 +129,23 @@ pub enum Value {
     List(Vec<Value>),
     Map(BTreeMap<String, Value>),
 }
+
+pub mod logic;
+pub use logic::*;
+
+pub mod hot_update;
+
+// Re-export key hot_update types.
+pub use hot_update::{
+    AssemblyPayload,
+    CompatibilityResult,
+    HotUpdateManifest,
+    ManifestSignature,
+    PayloadHash,
+    PlatformKind,
+    PlatformPayload,
+    RollbackMetadata,
+};
 
 #[cfg(test)]
 mod tests;
