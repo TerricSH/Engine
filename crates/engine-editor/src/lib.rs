@@ -36,6 +36,14 @@ pub enum EditorError {
     /// An I/O operation (read, write, create directory, …) failed.
     #[error("I/O error: {0}")]
     IoFailed(String),
+
+    /// The `dotnet` CLI was not found on `PATH`.
+    #[error("dotnet CLI not found on PATH")]
+    BuildDotnetNotFound,
+
+    /// A C# project build failed with a message.
+    #[error("build failed: {0}")]
+    BuildFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +79,14 @@ pub mod inspector;
 pub mod io;
 #[cfg(feature = "tooling-editor")]
 pub mod scene_view;
+#[cfg(feature = "tooling-editor")]
+pub mod script_build;
+#[cfg(feature = "tooling-editor")]
+pub mod diagnostics;
+#[cfg(feature = "tooling-editor")]
+mod script_inspector;
+#[cfg(feature = "tooling-editor")]
+pub mod build;
 
 #[cfg(feature = "tooling-editor")]
 pub use panels::{EditorPanel, SceneViewPanel, InspectorPanel as LegacyInspectorPanel, AssetBrowserPanel};
@@ -88,6 +104,17 @@ pub use inspector::InspectorPanel;
 pub use io::{save_scene, load_scene, default_scene_path};
 #[cfg(feature = "tooling-editor")]
 pub use scene_view::{orbit_view_matrix, orbit_projection_matrix};
+#[cfg(feature = "tooling-editor")]
+pub use script_inspector::ScriptInspector;
+#[cfg(feature = "tooling-editor")]
+pub use script_build::{ScriptBuildManager, BuildResult};
+#[cfg(feature = "tooling-editor")]
+pub use diagnostics::{DiagnosticsPanel, DiagnosticEntry};
+#[cfg(feature = "tooling-editor")]
+pub use build::{build_csharp_project, BuildError};
+// Note: `build::BuildResult` is intentionally not re-exported here because
+// `script_build::BuildResult` already provides a similar type.  Use
+// `engine_editor::build::BuildResult` to access the build module's version.
 
 // ---------------------------------------------------------------------------
 // EditorScene – scene + undo/redo + selection
@@ -107,6 +134,8 @@ pub struct EditorScene {
     pub history: CommandHistory,
     /// Currently selected entity ID.
     pub selected_entity: Option<PersistentId>,
+    /// Diagnostics panel for displaying scene/asset/script errors.
+    pub diagnostics: DiagnosticsPanel,
 }
 
 #[cfg(feature = "tooling-editor")]
@@ -117,7 +146,13 @@ impl EditorScene {
             scene,
             history: CommandHistory::new(),
             selected_entity: None,
+            diagnostics: DiagnosticsPanel::new("Diagnostics"),
         }
+    }
+
+    /// Mutable access to the diagnostics panel.
+    pub fn diagnostics_mut(&mut self) -> &mut DiagnosticsPanel {
+        &mut self.diagnostics
     }
 
     /// Execute a command on the scene and push it onto the undo stack.

@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
+
+use engine_asset::AssetRegistry;
 use engine_scene::Scene;
-use engine_serialize::PersistentId;
+use engine_serialize::{AssetId, PersistentId, Value};
 use tracing;
 
+use crate::commands::{Command, SetComponentField};
 use crate::editor_ui::EditorUi;
 use crate::scene_view;
 use crate::EditorError;
@@ -269,7 +273,8 @@ impl EditorPanel for InspectorPanel {
 /// Editor panel that browses, previews, and imports assets.
 ///
 /// Maintains a virtual file-tree view, a preview area for a selected
-/// asset, and buttons for import/refresh operations.
+/// asset, and buttons for import/refresh operations.  Also supports
+/// asset assignment via an optional callback.
 pub struct AssetBrowserPanel {
     visible: bool,
     name: String,
@@ -278,6 +283,10 @@ pub struct AssetBrowserPanel {
     entries: Vec<String>,
     /// Name of the asset currently being previewed, if any.
     preview_asset: Option<String>,
+    /// Callback invoked when an asset is selected for assignment.
+    on_assign: Option<Box<dyn FnMut(AssetId) + Send>>,
+    /// Categorized asset IDs extracted from the asset registry.
+    asset_ids: BTreeMap<String, Vec<AssetId>>,
 }
 
 impl AssetBrowserPanel {
@@ -289,6 +298,8 @@ impl AssetBrowserPanel {
             current_path: "/".to_string(),
             entries: Vec::new(),
             preview_asset: None,
+            on_assign: None,
+            asset_ids: BTreeMap::new(),
         }
     }
 
@@ -334,6 +345,123 @@ impl AssetBrowserPanel {
         tracing::info!(panel = %self.name, source = %source_path,
                        "AssetBrowserPanel import");
         Ok(())
+    }
+
+    // ── Asset assignment support ─────────────────────────────────────
+
+    /// Set the callback for when an asset is selected for assignment.
+    ///
+    /// The callback receives the chosen [`AssetId`] once the user confirms
+    /// a pick action.
+    pub fn set_on_assign(&mut self, callback: Option<Box<dyn FnMut(AssetId) + Send>>) {
+        self.on_assign = callback;
+    }
+
+    /// Render a picker UI that lets the user select an asset.
+    ///
+    /// When `filter` is set, only assets of the given type are shown.
+    /// Returns the chosen [`AssetId`] when the user confirms a selection.
+    ///
+    /// This method draws the entry list and triggers the `on_assign`
+    /// callback if one was registered.
+    pub fn pick_asset(
+        &mut self,
+        ui: &mut EditorUi,
+        _filter: Option<engine_asset::cook::AssetType>,
+    ) -> Option<AssetId> {
+        // Draw a header for the picker mode
+        ui.collapsing_header("Pick Asset", true);
+
+        for entry in &self.entries {
+            if ui.button(entry) {
+                // User clicked an entry — treat it as selected
+                let asset_id = AssetId::with_path(
+                    entry.clone(),
+                    format!("{}/{}", self.current_path.trim_end_matches('/'), entry),
+                );
+                // Invoke callback if set
+                if let Some(ref mut cb) = self.on_assign {
+                    cb(asset_id.clone());
+                }
+                return Some(asset_id);
+            }
+        }
+
+        ui.separator();
+        if ui.button("Cancel") {
+            // User cancelled — no asset selected
+        }
+
+        None
+    }
+
+    /// Populate the asset list from an [`AssetRegistry`].
+    ///
+    /// Extracts all cached asset IDs and groups them by category (the
+    /// prefix before the first hyphen in the asset ID).
+    pub fn set_registry(&mut self, registry: &AssetRegistry) {
+        self.asset_ids.clear();
+        for id in registry.cached_ids() {
+            let category = id.id.split('-').next().unwrap_or("other").to_string();
+            self.asset_ids.entry(category).or_default().push(id);
+        }
+    }
+
+    /// Render the asset browser using live [`AssetRegistry`] data.
+    ///
+    /// Shows collapsible category sections with each asset's ID and an
+    /// "Assign to selected" button.  Returns [`SetComponentField`] commands
+    /// prefilled with the selected [`AssetId`] value.
+    pub fn ui_with_registry(
+        &mut self,
+        ui: &mut EditorUi,
+        registry: &AssetRegistry,
+    ) -> Vec<Box<dyn Command>> {
+        let mut commands: Vec<Box<dyn Command>> = Vec::new();
+
+        let _ = ui.collapsing_header("Asset Browser", true);
+
+        if self.asset_ids.is_empty() {
+            ui.text_field("Status", "No assets cached. Call set_registry() first.");
+            return commands;
+        }
+
+        // Collect and sort category names (cloned to avoid borrow issues)
+        let mut categories: Vec<String> = self.asset_ids.keys().cloned().collect();
+        categories.sort();
+
+        for category in &categories {
+            let header_label = format!("{category}/");
+            let open = ui.collapsing_header(&header_label, false);
+            if !open {
+                continue;
+            }
+
+            if let Some(ids) = self.asset_ids.get(category) {
+                for asset_id in ids {
+                    let loaded = registry.contains(asset_id);
+                    let label = if loaded {
+                        format!("{} ✓", asset_id.id)
+                    } else {
+                        asset_id.id.clone()
+                    };
+                    ui.text_field("Asset", &label);
+
+                    if loaded && ui.button("Assign to selected") {
+                        commands.push(Box::new(SetComponentField::new(
+                            "__selected__".to_string(),
+                            "__asset_assign__".to_string(),
+                            asset_id.id.clone(),
+                            Value::Asset(asset_id.clone()),
+                        )));
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(panel = %self.name, categories = %categories.len(),
+                        "AssetBrowserPanel.ui_with_registry");
+        commands
     }
 }
 
