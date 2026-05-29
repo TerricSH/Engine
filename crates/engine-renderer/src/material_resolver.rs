@@ -120,7 +120,7 @@ mod tests {
     fn descriptor_has_debug_label() {
         let resolver = MaterialResolver::new(16);
         let material = dummy_material();
-        let variant = PipelineVariantKey::NONE;
+        let variant = PipelineVariantKey::new();
 
         let (_key, desc) = resolver.resolve(&material, variant);
 
