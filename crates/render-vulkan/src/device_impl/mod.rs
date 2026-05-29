@@ -84,6 +84,12 @@ pub struct VulkanDevice {
     pub(crate) framebuffers: Slab<vk::Framebuffer>,
     pub(crate) pipeline_layouts: Slab<PlEntry>,
 
+    // P1.2: Shader module storage (handle → (vk::ShaderModule, stage))
+    pub(crate) shader_modules: Slab<(vk::ShaderModule, vk::ShaderStageFlags)>,
+
+    // P1.4: Pipeline cache
+    pub(crate) pipeline_cache: vk::PipelineCache,
+
     // Render pass metadata
     pub(crate) rp_has_depth: HashMap<u32, bool>,
 
@@ -209,6 +215,8 @@ impl VulkanDevice {
             render_passes: Slab::new(),
             framebuffers: Slab::new(),
             pipeline_layouts: Slab::new(),
+            shader_modules: Slab::new(),
+            pipeline_cache: vk::PipelineCache::null(),
             rp_has_depth: HashMap::new(),
             desc_set_layout_0: None,
             desc_pool: None,
@@ -332,6 +340,59 @@ fn compare_op(s: &Option<String>) -> vk::CompareOp {
         Some("greater") => vk::CompareOp::GREATER,
         Some("always") => vk::CompareOp::ALWAYS,
         _ => vk::CompareOp::ALWAYS,
+    }
+}
+
+/// Create a Vulkan shader module from SPIR-V bytecode.
+///
+/// # Safety
+///
+/// - `d` must be a valid [`AshDevice`] that has not been destroyed.
+/// - `spv` must contain valid SPIR-V binary data (word-aligned, correctly
+///   sized for the targeted shader stage).
+/// Map a resource kind string to a `VkDescriptorType`.
+fn resource_kind_to_descriptor_type(kind: &str) -> vk::DescriptorType {
+    match kind {
+        "uniform_buffer" => vk::DescriptorType::UNIFORM_BUFFER,
+        "storage_buffer" => vk::DescriptorType::STORAGE_BUFFER,
+        "sampler" | "combined_image_sampler" => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        "sampled_image" => vk::DescriptorType::SAMPLED_IMAGE,
+        "storage_image" => vk::DescriptorType::STORAGE_IMAGE,
+        "uniform_texel_buffer" => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+        "storage_texel_buffer" => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+        "input_attachment" => vk::DescriptorType::INPUT_ATTACHMENT,
+        _ => vk::DescriptorType::UNIFORM_BUFFER,
+    }
+}
+
+fn parse_topology(s: &Option<String>) -> vk::PrimitiveTopology {
+    match s.as_deref() {
+        Some("point_list") => vk::PrimitiveTopology::POINT_LIST,
+        Some("line_list") => vk::PrimitiveTopology::LINE_LIST,
+        Some("line_strip") => vk::PrimitiveTopology::LINE_STRIP,
+        Some("triangle_strip") => vk::PrimitiveTopology::TRIANGLE_STRIP,
+        Some("triangle_fan") => vk::PrimitiveTopology::TRIANGLE_FAN,
+        _ => vk::PrimitiveTopology::TRIANGLE_LIST,
+    }
+}
+
+fn parse_polygon_mode(s: &Option<String>) -> vk::PolygonMode {
+    match s.as_deref() {
+        Some("line") => vk::PolygonMode::LINE,
+        Some("point") => vk::PolygonMode::POINT,
+        _ => vk::PolygonMode::FILL,
+    }
+}
+
+fn parse_sample_count(s: Option<u8>) -> vk::SampleCountFlags {
+    match s {
+        Some(2) => vk::SampleCountFlags::TYPE_2,
+        Some(4) => vk::SampleCountFlags::TYPE_4,
+        Some(8) => vk::SampleCountFlags::TYPE_8,
+        Some(16) => vk::SampleCountFlags::TYPE_16,
+        Some(32) => vk::SampleCountFlags::TYPE_32,
+        Some(64) => vk::SampleCountFlags::TYPE_64,
+        _ => vk::SampleCountFlags::TYPE_1,
     }
 }
 

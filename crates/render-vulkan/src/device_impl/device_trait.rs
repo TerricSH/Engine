@@ -18,8 +18,10 @@ use render_core::{
 use crate::allocator::{AllocationCreateDesc, AllocationScheme, MemoryLocation};
 
 use super::{
-    encoder::VkCmdEncoder, slab::{BufEntry, PipeEntry, PlEntry}, compare_op, default_dep,
-    mk_sm, vfmt, VulkanDevice,
+    blend_attachment_from_mode, compare_op, default_dep, mk_sm,
+    parse_polygon_mode, parse_sample_count, parse_topology,
+    resource_kind_to_descriptor_type, vfmt,
+    encoder::VkCmdEncoder, slab::{BufEntry, PipeEntry, PlEntry}, VulkanDevice,
 };
 
 impl render_core::Device for VulkanDevice {
@@ -141,11 +143,26 @@ impl render_core::Device for VulkanDevice {
 
     fn create_shader_module(
         &mut self,
-        _: &ShaderModuleDescriptor,
+        _desc: &ShaderModuleDescriptor,
     ) -> Result<ShaderModuleHandle, render_core::RhiError> {
-        Err(render_core::RhiError::Backend {
-            detail: "not in Phase 2".into(),
-        })
+        let d = &self.logical_device.device;
+        // Get SPIR-V bytes.  The descriptor does not carry inline SPIR-V yet
+        // (Phase 2), so fall back to the embedded MVP vertex shader as a
+        // placeholder.  This establishes the storage pipeline.
+        let spv = self.mvp_vert_spv.ok_or_else(|| {
+            render_core::RhiError::Backend {
+                detail: "create_shader_module: no embedded shaders available".into(),
+            }
+        })?;
+        // SAFETY: `d` is a valid AshDevice; `spv` is valid SPIR-V.
+        let sm = (unsafe { mk_sm(d, spv) }).map_err(|e| {
+            render_core::RhiError::Backend {
+                detail: format!("create_shader_module: {e}"),
+            }
+        })?;
+        // Default to VERTEX stage; the descriptor does not carry stage info yet.
+        let (idx, gen) = self.shader_modules.insert((sm, vk::ShaderStageFlags::VERTEX));
+        Ok(ShaderModuleHandle::new(idx, gen))
     }
 
     fn create_render_pass(
@@ -324,20 +341,53 @@ impl render_core::Device for VulkanDevice {
                 size: pc.size,
             })
             .collect();
-        // Include the per-frame descriptor set layout (set=0 UBO per FD-041)
-        // and the shadow map descriptor set layout (set=1) when available.
+
+        // ── Gather descriptor set layouts ──────────────────────────────
+        // If the descriptor provides explicit bind_group_layouts, create
+        // VkDescriptorSetLayout objects from them.  Otherwise fall back to
+        // the existing per-frame (set=0) + shadow (set=1) layouts.
         let mut set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
-        if let Some(dsl) = self.desc_set_layout_0 {
-            set_layouts.push(dsl);
+        let mut owned_set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+
+        if desc.bind_group_layouts.is_empty() {
+            // Fallback: use existing per-frame + shadow layouts
+            if let Some(dsl) = self.desc_set_layout_0 {
+                set_layouts.push(dsl);
+            }
+            if let Some(sdl) = self.shadow_desc_layout {
+                set_layouts.push(sdl);
+            }
+        } else {
+            for bg in &desc.bind_group_layouts {
+                let vk_bindings: Vec<vk::DescriptorSetLayoutBinding> = bg
+                    .bindings
+                    .iter()
+                    .map(|b| {
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(b.binding)
+                            .descriptor_type(resource_kind_to_descriptor_type(&b.resource_kind))
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                    })
+                    .collect();
+                let info = vk::DescriptorSetLayoutCreateInfo::default()
+                    .bindings(&vk_bindings);
+                // SAFETY: `d` is a valid AshDevice; `info` describes a valid
+                // descriptor set layout; `None` means no custom allocator.
+                let sl = unsafe { d.create_descriptor_set_layout(&info, None) }.map_err(|r| {
+                    render_core::RhiError::Backend {
+                        detail: format!("create descriptor set layout: {r:?}"),
+                    }
+                })?;
+                owned_set_layouts.push(sl);
+                // Ensure the vector is large enough for this set_index
+                while (set_layouts.len() as u8) <= bg.set_index {
+                    set_layouts.push(vk::DescriptorSetLayout::null());
+                }
+                set_layouts[bg.set_index as usize] = sl;
+            }
         }
-        if let Some(sdl) = self.shadow_desc_layout {
-            set_layouts.push(sdl);
-        }
-        // Also add any from the descriptor
-        for _bg in &desc.bind_group_layouts {
-            // For now, bind_group_layouts from descriptor are ignored
-            // since set=0 is always the per-frame layout
-        }
+
         let info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
             .push_constant_ranges(&pc_ranges);
@@ -351,6 +401,7 @@ impl render_core::Device for VulkanDevice {
         })?;
         let (idx, gen) = self.pipeline_layouts.insert(PlEntry {
             layout,
+            set_layouts: owned_set_layouts,
             _device: d.clone(),
         });
         Ok(PipelineLayoutHandle::new(idx, gen))
@@ -361,34 +412,65 @@ impl render_core::Device for VulkanDevice {
         desc: &PipelineDescriptor,
     ) -> Result<PipelineHandle, render_core::RhiError> {
         let d = &self.logical_device.device;
-        let (vert, frag) = (self.mvp_vert_spv, self.mvp_frag_spv);
-        let (vs, fs) = (
-            vert.ok_or_else(|| render_core::RhiError::Backend {
-                detail: "no vert spv".into(),
-            })?,
-            frag.ok_or_else(|| render_core::RhiError::Backend {
-                detail: "no frag spv".into(),
-            })?,
-        );
-        // SAFETY: `d` is a valid AshDevice; `vs` contains valid SPIR-V code.
-        let vm = (unsafe { mk_sm(d, vs) }).map_err(|e| render_core::RhiError::Backend {
-            detail: format!("{e}"),
-        })?;
-        // SAFETY: `d` is a valid AshDevice; `fs` contains valid SPIR-V code.
-        let fm = (unsafe { mk_sm(d, fs) }).map_err(|e| render_core::RhiError::Backend {
-            detail: format!("{e}"),
-        })?;
         let main = c"main";
-        let sr = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vm)
-                .name(main),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fm)
-                .name(main),
-        ];
+
+        // ── Shader stages ──────────────────────────────────────────────
+        // If the descriptor provides shader module handles, resolve them
+        // from the shader_modules slab.  Otherwise fall back to the
+        // embedded MVP vertex/fragment SPIR-V.
+        let (sr, destroy_temp_modules) = if desc.shader_modules.is_empty() {
+            // Fallback: use mvp_vert_spv / mvp_frag_spv
+            let (vert, frag) = (self.mvp_vert_spv, self.mvp_frag_spv);
+            let (vs, fs) = (
+                vert.ok_or_else(|| render_core::RhiError::Backend {
+                    detail: "no vert spv".into(),
+                })?,
+                frag.ok_or_else(|| render_core::RhiError::Backend {
+                    detail: "no frag spv".into(),
+                })?,
+            );
+            // SAFETY: `d` is a valid AshDevice; `vs`/`fs` contain valid SPIR-V.
+            let vm = (unsafe { mk_sm(d, vs) }).map_err(|e| {
+                render_core::RhiError::Backend { detail: format!("{e}") }
+            })?;
+            let fm = (unsafe { mk_sm(d, fs) }).map_err(|e| {
+                render_core::RhiError::Backend { detail: format!("{e}") }
+            })?;
+            let stages: Vec<vk::PipelineShaderStageCreateInfo> = vec![
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vm)
+                    .name(main),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(fm)
+                    .name(main),
+            ];
+            // These temp modules must be destroyed after pipeline creation.
+            let temp_modules = vec![vm, fm];
+            (stages, Some(temp_modules))
+        } else {
+            // Resolve shader modules from handles
+            let stages: Vec<vk::PipelineShaderStageCreateInfo> = desc
+                .shader_modules
+                .iter()
+                .map(|handle| {
+                    let (sm, stage) = self
+                        .shader_modules
+                        .get(handle.index, handle.generation)
+                        .copied()
+                        .ok_or(render_core::RhiError::InvalidHandle)?;
+                    Ok(vk::PipelineShaderStageCreateInfo::default()
+                        .stage(stage)
+                        .module(sm)
+                        .name(main))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            // Modules are owned by the slab; do NOT destroy them here.
+            (stages, None)
+        };
+
+        // ── Vertex input state ─────────────────────────────────────────
         let stride = desc.vertex_layout.stride_bytes;
         let vb = [vk::VertexInputBindingDescription::default()
             .binding(0)
@@ -398,8 +480,9 @@ impl render_core::Device for VulkanDevice {
             .vertex_layout
             .attributes
             .iter()
-            .map(|a| vk::VertexInputAttributeDescription {
-                location: 0,
+            .enumerate()
+            .map(|(i, a)| vk::VertexInputAttributeDescription {
+                location: i as u32,
                 binding: 0,
                 format: vfmt(&a.format),
                 offset: a.offset_bytes,
@@ -408,68 +491,106 @@ impl render_core::Device for VulkanDevice {
         let vi = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&vb)
             .vertex_attribute_descriptions(&va);
+
+        // ── Input assembly (topology from descriptor) ─────────────────
         let ia = vk::PipelineInputAssemblyStateCreateInfo::default()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            .topology(parse_topology(&desc.topology));
+
+        // ── Viewport state ─────────────────────────────────────────────
         let vs2 = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
+
+        // ── Rasterization state (polygon mode + cull mode from desc) ──
+        let cull_mode = match desc.raster_state.cull_mode.as_deref() {
+            Some("front") => vk::CullModeFlags::FRONT,
+            Some("back") => vk::CullModeFlags::BACK,
+            Some("none") | None => vk::CullModeFlags::NONE,
+            _ => vk::CullModeFlags::NONE,
+        };
+        let front_face = match desc.raster_state.front_face.as_deref() {
+            Some("clockwise") => vk::FrontFace::CLOCKWISE,
+            _ => vk::FrontFace::COUNTER_CLOCKWISE,
+        };
         let rs = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .polygon_mode(parse_polygon_mode(&desc.polygon_mode))
+            .cull_mode(cull_mode)
+            .front_face(front_face)
             .line_width(1.0);
+
+        // ── Multisample state (sample count from desc) ─────────────────
         let ms = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let cba = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)];
+            .rasterization_samples(parse_sample_count(desc.sample_count));
+
+        // ── Color blend state ──────────────────────────────────────────
+        let blend_attachment = match &desc.blend_state.mode {
+            Some(mode) => blend_attachment_from_mode(mode),
+            None => blend_attachment_from_mode("Opaque"),
+        };
+        let cba = [blend_attachment];
         let cb = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(&cba);
+
+        // ── Dynamic state ──────────────────────────────────────────────
         let dyns = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let ds = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyns);
-        // Get or create a render pass for this pipeline
-        let rp = if let Some(rp_) = self.mvp_rp {
-            rp_
-        } else {
-            // Create a default render pass from the descriptor's render targets
-            let fmt = match desc.render_targets.first() {
-                Some(TextureFormat::Bgra8Unorm) => vk::Format::B8G8R8A8_UNORM,
-                Some(TextureFormat::Rgba8Unorm) => vk::Format::R8G8B8A8_UNORM,
-                _ => vk::Format::B8G8R8A8_SRGB,
-            };
-            let at = vk::AttachmentDescription::default()
-                .format(fmt)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
-            let cr = vk::AttachmentReference::default()
-                .attachment(0)
-                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-            let crs = [cr];
-            let atts = [at];
-            let sp = vk::SubpassDescription::default()
-                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                .color_attachments(&crs);
-            let sps = [sp];
-            let dep = default_dep();
-            let deps = [dep];
-            let rpi = vk::RenderPassCreateInfo::default()
-                .attachments(&atts)
-                .subpasses(&sps)
-                .dependencies(&deps);
-            // SAFETY: `d` is a valid AshDevice; `rpi` describes a valid render
-            // pass; `None` means no custom allocator.
-            unsafe { d.create_render_pass(&rpi, None) }.map_err(|r| {
-                render_core::RhiError::Backend {
-                    detail: format!("{r:?}"),
+
+        // ── Render pass ────────────────────────────────────────────────
+        // If the descriptor carries a handle, resolve it; otherwise create
+        // an inline render pass from the descriptor's render targets.
+        let rp = match desc.render_pass {
+            Some(h) => self
+                .render_passes
+                .get(h.index, h.generation)
+                .copied()
+                .ok_or(render_core::RhiError::InvalidHandle)?,
+            None => {
+                // Check cached mvp_rp first, then create inline
+                if let Some(rp_) = self.mvp_rp {
+                    rp_
+                } else {
+                    let fmt = match desc.render_targets.first() {
+                        Some(TextureFormat::Bgra8Unorm) => vk::Format::B8G8R8A8_UNORM,
+                        Some(TextureFormat::Rgba8Unorm) => vk::Format::R8G8B8A8_UNORM,
+                        _ => vk::Format::B8G8R8A8_SRGB,
+                    };
+                    let at = vk::AttachmentDescription::default()
+                        .format(fmt)
+                        .samples(parse_sample_count(desc.sample_count))
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED)
+                        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+                    let cr = vk::AttachmentReference::default()
+                        .attachment(0)
+                        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                    let crs = [cr];
+                    let atts = [at];
+                    let sp = vk::SubpassDescription::default()
+                        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                        .color_attachments(&crs);
+                    let sps = [sp];
+                    let dep = default_dep();
+                    let deps = [dep];
+                    let rpi = vk::RenderPassCreateInfo::default()
+                        .attachments(&atts)
+                        .subpasses(&sps)
+                        .dependencies(&deps);
+                    // SAFETY: `d` is a valid AshDevice; `rpi` describes a
+                    // valid render pass; `None` means no custom allocator.
+                    unsafe { d.create_render_pass(&rpi, None) }.map_err(|r| {
+                        render_core::RhiError::Backend {
+                            detail: format!("{r:?}"),
+                        }
+                    })?
                 }
-            })?
+            }
         };
+
+        // ── Pipeline layout ────────────────────────────────────────────
         let pll = match desc.pipeline_layout {
             Some(h) => self
                 .pipeline_layouts
@@ -478,12 +599,16 @@ impl render_core::Device for VulkanDevice {
                 .unwrap_or(vk::PipelineLayout::null()),
             None => vk::PipelineLayout::null(),
         };
-        // Depth stencil state
-        let depth_enabled = desc.depth_state.write_enabled || desc.depth_state.compare.is_some();
+
+        // ── Depth stencil state ────────────────────────────────────────
+        let depth_enabled =
+            desc.depth_state.write_enabled || desc.depth_state.compare.is_some();
         let ds_state = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(depth_enabled)
             .depth_write_enable(desc.depth_state.write_enabled)
             .depth_compare_op(compare_op(&desc.depth_state.compare));
+
+        // ── Build the pipeline ─────────────────────────────────────────
         let pinfo = vk::GraphicsPipelineCreateInfo::default()
             .stages(&sr)
             .vertex_input_state(&vi)
@@ -497,20 +622,24 @@ impl render_core::Device for VulkanDevice {
             .layout(pll)
             .render_pass(rp)
             .subpass(0);
-        // SAFETY: `d` is a valid AshDevice; `pinfo` describes a valid graphics
-        // pipeline; `vk::PipelineCache::null()` is allowed; `None` means no
-        // custom allocator.
+        // SAFETY: `d` is a valid AshDevice; `pinfo` describes a valid
+        // graphics pipeline; `self.pipeline_cache` may be null; `None` means
+        // no custom allocator.
         let pipeline =
-            unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[pinfo], None) }
+            unsafe { d.create_graphics_pipelines(self.pipeline_cache, &[pinfo], None) }
                 .map_err(|(_, r)| render_core::RhiError::Backend {
                     detail: format!("{r:?}"),
                 })?[0];
-        // SAFETY: `vm` and `fm` were created by this device and are no longer
-        // needed after pipeline creation; `None` means no custom allocator.
-        unsafe {
-            d.destroy_shader_module(vm, None);
-            d.destroy_shader_module(fm, None);
+
+        // Destroy temporary shader modules created in the fallback path.
+        if let Some(modules) = destroy_temp_modules {
+            // SAFETY: modules were created by this device and are no longer
+            // needed after pipeline creation; `None` means no custom allocator.
+            for m in modules {
+                unsafe { d.destroy_shader_module(m, None); }
+            }
         }
+
         let (idx, gen) = self.pipelines.insert(PipeEntry { pipeline });
         Ok(PipelineHandle::new(idx, gen))
     }

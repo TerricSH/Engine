@@ -63,6 +63,10 @@ pub(crate) struct PipeEntry {
 
 pub(crate) struct PlEntry {
     pub(crate) layout: vk::PipelineLayout,
+    /// Descriptor set layouts owned by this pipeline layout (created from
+    /// PipelineLayoutDescriptor::bind_group_layouts).  Destroyed when the
+    /// pipeline layout is destroyed.
+    pub(crate) set_layouts: Vec<vk::DescriptorSetLayout>,
     pub(crate) _device: AshDevice,
 }
 
