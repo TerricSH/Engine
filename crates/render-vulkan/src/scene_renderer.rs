@@ -13,16 +13,17 @@
 //! * No material system – a flat white material is assumed.
 //! * No texture loading, skeletal animation, or multi-pass optimisation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use engine_renderer::{
-    render_graph, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, RenderFrameInput,
+    render_graph, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, MaterialBinding,
+    PipelineCache, PipelineCacheKey, RenderFrameInput,
 };
 use render_core::{
     self, BufferDescriptor, BufferHandle, CommandEncoder, Device, IndexFormat, MemoryHint,
     PipelineDescriptor, PipelineHandle, PipelineLayoutDescriptor, PipelineLayoutHandle,
-    PushConstantRange, RenderPassDescriptor, RenderPassHandle, SwapchainDescriptor,
-    SwapchainHandle, TextureFormat, VertexAttribute, VertexLayout,
+    PipelineVariantKey, PushConstantRange, RenderPassDescriptor, RenderPassHandle,
+    SwapchainDescriptor, SwapchainHandle, TextureFormat, VertexAttribute, VertexLayout,
 };
 
 use crate::device_impl::VulkanDevice;

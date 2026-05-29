@@ -72,8 +72,8 @@ impl Renderer {
         }
 
         if let Some(backend) = self.backend.as_mut() {
-            // Build the render graph from the frame input
-            let graph = render_graph::RenderGraph::build(input);
+            // Build the render graph from the frame input (DAG-based builder)
+            let graph = crate::render_graph2::RenderGraph::build(input).to_legacy();
 
             let mut stats = FrameStats::default();
 

@@ -127,6 +127,9 @@ impl Drop for VulkanDevice {
             }
         }
 
+        // Save pipeline cache data to disk before destroying.
+        self.save_pipeline_cache();
+
         // Destroy pipeline cache if it was created (non-null).
         if self.pipeline_cache != vk::PipelineCache::null() {
             // SAFETY: `self.pipeline_cache` was created by this device.

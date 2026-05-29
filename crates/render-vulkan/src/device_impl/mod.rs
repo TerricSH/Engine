@@ -87,8 +87,10 @@ pub struct VulkanDevice {
     // P1.2: Shader module storage (handle → (vk::ShaderModule, stage))
     pub(crate) shader_modules: Slab<(vk::ShaderModule, vk::ShaderStageFlags)>,
 
-    // P1.4: Pipeline cache
+    // PSO cache (Vulkan pipeline cache for faster subsequent compilations)
     pub(crate) pipeline_cache: vk::PipelineCache,
+    /// Path to the PSO cache file (empty = no persistence).
+    pub(crate) pso_cache_path: Option<std::path::PathBuf>,
 
     // Render pass metadata
     pub(crate) rp_has_depth: HashMap<u32, bool>,
@@ -217,6 +219,7 @@ impl VulkanDevice {
             pipeline_layouts: Slab::new(),
             shader_modules: Slab::new(),
             pipeline_cache: vk::PipelineCache::null(),
+            pso_cache_path: None,
             rp_has_depth: HashMap::new(),
             desc_set_layout_0: None,
             desc_pool: None,
@@ -243,6 +246,68 @@ impl VulkanDevice {
             shadow_desc_pool: None,
             shadow_bind_layout: None,
         })
+    }
+
+    /// Initialize the pipeline cache, optionally loading from a file.
+    pub fn init_pipeline_cache(&mut self, cache_dir: Option<&std::path::Path>) {
+        let mut initial_data = Vec::new();
+        let d = &self.logical_device.device;
+
+        if let Some(dir) = cache_dir {
+            let path = dir.join("pso_cache.bin");
+            if let Ok(data) = std::fs::read(&path) {
+                // Validate header: first 4 bytes should be "PSC\0" or similar
+                // For now just try to use whatever was on disk; corrupt data
+                // will be rejected by the driver at creation time.
+                if data.len() >= 4 {
+                    initial_data = data;
+                }
+                tracing::info!(size = initial_data.len(), "loaded PSO cache from disk");
+            } else {
+                tracing::debug!("no existing PSO cache file, starting fresh");
+            }
+            self.pso_cache_path = Some(path);
+        }
+
+        let ci = vk::PipelineCacheCreateInfo::default()
+            .initial_data(&initial_data);
+        // SAFETY: `d` is a valid device; `ci` is correctly constructed.
+        match unsafe { d.create_pipeline_cache(&ci, None) } {
+            Ok(cache) => {
+                self.pipeline_cache = cache;
+                tracing::info!("pipeline cache created");
+            }
+            Err(r) => {
+                tracing::warn!(error = %r, "failed to create pipeline cache, continuing without");
+                self.pipeline_cache = vk::PipelineCache::null();
+            }
+        }
+    }
+
+    /// Save the pipeline cache to disk (call on shutdown or after bulk compiles).
+    pub fn save_pipeline_cache(&self) {
+        let Some(ref path) = self.pso_cache_path else {
+            return;
+        };
+        if self.pipeline_cache == vk::PipelineCache::null() {
+            return;
+        }
+        let d = &self.logical_device.device;
+        // SAFETY: `d` is a valid device; `self.pipeline_cache` is valid or null.
+        let data = match unsafe { d.get_pipeline_cache_data(self.pipeline_cache) } {
+            Ok(d) => d,
+            Err(r) => {
+                tracing::warn!(error = %r, "failed to get pipeline cache data");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(path, &data) {
+            Ok(_) => tracing::info!(bytes = data.len(), "PSO cache saved"),
+            Err(e) => tracing::warn!(error = %e, "failed to save PSO cache"),
+        }
     }
 
     pub fn set_mvp_shaders(&mut self, vert: &'static [u8], frag: &'static [u8]) {

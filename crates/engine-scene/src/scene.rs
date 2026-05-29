@@ -1,4 +1,4 @@
-use engine_renderer::ToneMapping;
+use engine_renderer::{PassGraphConfig, ToneMapping};
 use engine_serialize::{
     AssetId, ComponentTypeId, Diagnostic, DiagnosticSeverity, EngineVersion, PersistentId,
     SchemaVersion, Value,
@@ -50,6 +50,7 @@ pub struct SceneSettings {
     pub ambient: [f32; 4],
     pub environment_map: Option<AssetId>,
     pub tone_mapping: ToneMapping,
+    pub pass_graph_config: PassGraphConfig,
 }
 
 impl Default for SceneSettings {
@@ -62,6 +63,7 @@ impl Default for SceneSettings {
             ambient: [0.03, 0.03, 0.03, 1.0],
             environment_map: None,
             tone_mapping: ToneMapping::Aces,
+            pass_graph_config: PassGraphConfig::default(),
         }
     }
 }

@@ -274,6 +274,40 @@ pub struct RendererStatistics {
 }
 
 // ============================================================================
+// Pipeline variant key  (FD-040)
+// ============================================================================
+
+/// Bit-packed variant key for shader pipeline permutations (per FD-040).
+///
+/// Engine-reserved bits:
+///   bit 0: SKINNED
+///   bit 1: INSTANCED
+///   bit 2: SHADOW_PASS
+///   bits 3-7: MAX_LIGHTS_<N> (3 bits = 0-7)
+///   bits 8+: material-defined
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PipelineVariantKey(pub u64);
+
+impl PipelineVariantKey {
+    pub const NONE: Self = Self(0);
+    pub const SKINNED: Self = Self(1 << 0);
+    pub const INSTANCED: Self = Self(1 << 1);
+    pub const SHADOW_PASS: Self = Self(1 << 2);
+
+    pub const fn new(key: u64) -> Self { Self(key) }
+    pub fn with_bit(mut self, bit: u64) -> Self { self.0 |= bit; self }
+
+    /// Combine this key with another by OR-ing their bitmasks.
+    pub fn with(mut self, flag: Self) -> Self { self.0 |= flag.0; self }
+
+    /// Returns `true` if all bits in `other` are set in `self`.
+    pub fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
+
+    /// Returns the raw bitmask value.
+    pub fn bits(&self) -> u64 { self.0 }
+}
+
+// ============================================================================
 // Pipeline sub-types
 // ============================================================================
 
