@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{BoneIndex, BoneTransform, Pose, Skeleton};
+use crate::skeleton::Skeleton;
+use crate::{BoneIndex, BoneTransform, Pose};
 
 // ---------------------------------------------------------------------------
 // Keyframe

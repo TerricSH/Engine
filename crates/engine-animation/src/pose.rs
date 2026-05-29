@@ -1,6 +1,7 @@
 use glam::Mat4;
 
-use crate::{BoneIndex, BoneTransform, Skeleton};
+use crate::skeleton::Skeleton;
+use crate::{BoneIndex, BoneTransform};
 
 // ---------------------------------------------------------------------------
 // Pose — per-bone local-space transforms, with helpers to compute global

@@ -809,7 +809,10 @@ dependencies = [
 name = "engine-animation"
 version = "0.1.0"
 dependencies = [
- "crossbeam-channel",
+ "bincode",
+ "engine-asset",
+ "engine-renderer",
+ "engine-scene",
  "engine-serialize",
  "glam",
  "serde",
@@ -931,8 +934,13 @@ name = "engine-physics"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "engine-renderer",
+ "engine-scene",
+ "engine-serialize",
  "glam",
  "rapier3d",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
 ]

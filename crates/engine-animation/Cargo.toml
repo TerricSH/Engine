@@ -17,8 +17,11 @@ target-mobile = []
 subsystem-scripting-csharp = []
 
 [dependencies]
-crossbeam-channel.workspace = true
+engine-scene = { path = "../engine-scene" }
+engine-renderer = { path = "../engine-renderer" }
 engine-serialize = { path = "../engine-serialize" }
+engine-asset = { path = "../engine-asset" }
+bincode.workspace = true
 glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true
