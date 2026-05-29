@@ -299,8 +299,8 @@ fn parse_error_lines(output: &str) -> Vec<String> {
 
     for line in output.lines() {
         let trimmed = line.trim();
-        // Match MSBuild error pattern: contains " : error "
-        if trimmed.contains(" : error ") {
+        // Match MSBuild error pattern: contains ": error " (with optional leading space)
+        if trimmed.contains(": error ") {
             errors.push(trimmed.to_string());
         }
         // Also catch lines starting with "error" (e.g. from dotnet CLI)
