@@ -31,6 +31,7 @@
 mod api_compat;
 mod component;
 mod engine;
+pub mod extension;
 mod host;
 mod lifecycle;
 pub mod mobile_subset;
@@ -52,6 +53,12 @@ pub use engine::ScriptEngine;
 pub use component::{ScriptComponent, ScriptInstanceState, ScriptManager};
 pub use protocol::ScriptMessage;
 pub use process_host::{ProcessHost, ProcessScriptInstance};
+
+// Script API extension surface.
+pub use extension::{
+    ProvidedMethod, ProvidedType, ScriptApiExtensionMeta, ScriptApiExtensionRegistry,
+    ScriptApiProvider,
+};
 
 // Mobile-safe API subset (data-only, no scripting backend dependency).
 pub use mobile_subset::{mobile_subset_v0, ScriptApiSubset, UnsupportedPattern};

@@ -66,6 +66,8 @@ pub struct EditorDisabled {
 #[cfg(feature = "tooling-editor")]
 mod panels;
 #[cfg(feature = "tooling-editor")]
+pub mod plugin;
+#[cfg(feature = "tooling-editor")]
 mod editor_ui;
 #[cfg(feature = "tooling-editor")]
 mod editor_core;
@@ -112,6 +114,10 @@ pub use script_build::{ScriptBuildManager, BuildResult};
 pub use diagnostics::{DiagnosticsPanel, DiagnosticEntry};
 #[cfg(feature = "tooling-editor")]
 pub use build::{build_csharp_project, BuildError};
+#[cfg(feature = "tooling-editor")]
+pub use plugin::{
+    ComponentInspector, EditorPlugin, EditorPluginMeta, EditorPluginRegistry, PanelFactory,
+};
 // Note: `build::BuildResult` is intentionally not re-exported here because
 // `script_build::BuildResult` already provides a similar type.  Use
 // `engine_editor::build::BuildResult` to access the build module's version.
