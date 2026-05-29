@@ -1,5 +1,7 @@
 //! Drop impl for VulkanDevice — destroys all GPU resources in the correct order.
 
+use ash::vk;
+
 use super::VulkanDevice;
 
 impl Drop for VulkanDevice {
@@ -106,12 +108,31 @@ impl Drop for VulkanDevice {
         }
         for s in self.pipeline_layouts.slots.drain(..) {
             if let Some((_, e)) = s {
-                // SAFETY: `e.layout` was created by this device.
+                // SAFETY: `e.layout` and `e.set_layouts` were created by
+                // this device.
+                for sl in e.set_layouts {
+                    unsafe { d.destroy_descriptor_set_layout(sl, None); }
+                }
                 unsafe {
                     d.destroy_pipeline_layout(e.layout, None);
                 }
             }
         }
+
+        // Destroy shader modules stored in the handle slab.
+        for s in self.shader_modules.slots.drain(..) {
+            if let Some((_, (sm, _))) = s {
+                // SAFETY: `sm` was created by this device.
+                unsafe { d.destroy_shader_module(sm, None); }
+            }
+        }
+
+        // Destroy pipeline cache if it was created (non-null).
+        if self.pipeline_cache != vk::PipelineCache::null() {
+            // SAFETY: `self.pipeline_cache` was created by this device.
+            unsafe { d.destroy_pipeline_cache(self.pipeline_cache, None); }
+        }
+
         self.destroy_shadow_resources();
         self.destroy_descriptor_infra();
         self.destroy_depth_texture();

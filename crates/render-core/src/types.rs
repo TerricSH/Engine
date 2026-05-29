@@ -234,6 +234,31 @@ pub struct PipelineDescriptor {
     pub blend_state: BlendState,
     pub render_targets: Vec<TextureFormat>,
     pub debug_label: Option<String>,
+    // P1.2+: Pipeline topology, polygon mode, sample count, render pass
+    pub topology: Option<String>,
+    pub polygon_mode: Option<String>,
+    pub sample_count: Option<u8>,
+    pub render_pass: Option<RenderPassHandle>,
+}
+
+impl Default for PipelineDescriptor {
+    fn default() -> Self {
+        Self {
+            shader_modules: Vec::new(),
+            vertex_layout: VertexLayout::default(),
+            bind_layouts: Vec::new(),
+            pipeline_layout: None,
+            raster_state: RasterState::default(),
+            depth_state: DepthState::default(),
+            blend_state: BlendState::default(),
+            render_targets: vec![],
+            debug_label: None,
+            topology: Some("triangle_list".into()),
+            polygon_mode: Some("fill".into()),
+            sample_count: Some(1),
+            render_pass: None,
+        }
+    }
 }
 
 // ============================================================================

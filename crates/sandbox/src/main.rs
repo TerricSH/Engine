@@ -392,6 +392,10 @@ fn run_static_lit_scene() {
                 blend_state: render_core::BlendState { mode: None },
                 render_targets: vec![TextureFormat::Bgra8Unorm],
                 debug_label: Some("scene-pl".into()),
+                topology: Some("triangle_list".into()),
+                polygon_mode: Some("fill".into()),
+                sample_count: Some(1),
+                render_pass: None,
             };
             let pl = self.device.create_pipeline(&pl_desc).map_err(|e| {
                 vec![Diagnostic::new(
