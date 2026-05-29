@@ -2,12 +2,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use ash::khr::swapchain;
-use ash::vk;
-use ash::{Device as AshDevice, Instance as AshInstance};
 use crate::adapter::AdapterSelection;
 use crate::allocator::{SharedAllocator, VulkanAllocator};
 use crate::error::{VkResult, VulkanError};
+use ash::khr::swapchain;
+use ash::vk;
+use ash::{Device as AshDevice, Instance as AshInstance};
 
 pub struct Device {
     pub device: AshDevice,

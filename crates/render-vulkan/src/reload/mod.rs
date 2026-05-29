@@ -193,11 +193,8 @@ impl GpuReloadCoordinator {
                         // Swap the shadow map if this reload targets it.
                         match req.target {
                             ReloadTarget::ShadowMap => {
-                                let old = device.replace_shadow_map(
-                                    new_image,
-                                    new_view,
-                                    new_allocation,
-                                );
+                                let old =
+                                    device.replace_shadow_map(new_image, new_view, new_allocation);
                                 if let Some((old_img, old_vw, old_alloc)) = old {
                                     self.retiring.push(RetiringResource {
                                         resource: GpuResource::Texture {
@@ -215,11 +212,7 @@ impl GpuReloadCoordinator {
                                 // The texture reload did not match a known
                                 // texture target — destroy the new resource
                                 // immediately to avoid a leak.
-                                device.destroy_sampled_texture(
-                                    new_image,
-                                    new_view,
-                                    new_allocation,
-                                );
+                                device.destroy_sampled_texture(new_image, new_view, new_allocation);
                                 tracing::warn!(
                                     target: "vulkan::reload",
                                     "texture reload target not matched for shadow map; discarding"
@@ -420,5 +413,3 @@ fn target_from_asset_id(id: &str) -> ReloadTarget {
         ReloadTarget::ModelPipeline
     }
 }
-
-

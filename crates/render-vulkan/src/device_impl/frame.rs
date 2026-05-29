@@ -7,14 +7,20 @@ use ash::vk;
 
 use crate::error::{VkResult, VulkanError};
 
-use super::{VulkanDevice, slab::FrameSync};
+use super::{slab::FrameSync, VulkanDevice};
 
 impl VulkanDevice {
     /// Ensure a swapchain exists (lazily create one if absent).
     pub(crate) fn ensure_sc(&mut self) -> VkResult<()> {
         if self.swapchain.is_none() {
-            let instance = self.instance.as_ref().ok_or(VulkanError::Loader("instance not initialized".into()))?;
-            let surface = self.surface.as_ref().ok_or(VulkanError::Loader("surface not initialized".into()))?;
+            let instance = self
+                .instance
+                .as_ref()
+                .ok_or(VulkanError::Loader("instance not initialized".into()))?;
+            let surface = self
+                .surface
+                .as_ref()
+                .ok_or(VulkanError::Loader("surface not initialized".into()))?;
             // SAFETY: all handles (instance, device, physical device, surface)
             // are valid; `Swapchain::new` takes ownership of the cloned device.
             match unsafe {
@@ -50,17 +56,23 @@ impl VulkanDevice {
     }
 
     /// Acquire the next swapchain image.
-    pub(crate) fn acquire(&self, fi: usize) -> VkResult<(u32, bool)> {
-        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
-        let f = &self.frame_sync[fi];
+    pub(crate) fn acquire(&mut self, fi: usize) -> VkResult<(u32, bool)> {
+        let frame_sync = &self.frame_sync[fi];
+        let in_flight_fence = frame_sync.in_flight_fence;
+        let image_available = frame_sync.image_available;
         // SAFETY: `f.in_flight_fence` is a valid fence created by this device;
         // waiting with `u64::MAX` timeout is safe.
         unsafe {
             self.logical_device
                 .device
-                .wait_for_fences(&[f.in_flight_fence], true, u64::MAX)
+                .wait_for_fences(&[in_flight_fence], true, u64::MAX)
                 .map_err(|r| VulkanError::vk("wf", r))?;
         }
+        self.drain_retired_pipelines(fi);
+        let sc = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
         // SAFETY: `sc.loader` is a valid swapchain loader; `sc.swapchain` is a
         // valid VkSwapchainKHR; `f.image_available` is a valid semaphore;
         // timeout parameters are standard Vulkan.
@@ -68,7 +80,7 @@ impl VulkanDevice {
             sc.loader.acquire_next_image(
                 sc.swapchain,
                 u64::MAX,
-                f.image_available,
+                image_available,
                 vk::Fence::null(),
             )
         }
@@ -84,7 +96,7 @@ impl VulkanDevice {
         unsafe {
             self.logical_device
                 .device
-                .reset_fences(&[f.in_flight_fence])
+                .reset_fences(&[in_flight_fence])
                 .map_err(|r| VulkanError::vk("rf", r))?;
         }
         Ok((ii, sub))
@@ -118,7 +130,10 @@ impl VulkanDevice {
     pub(crate) fn submit_and_present(&self, fi: usize, ii: u32) -> VkResult<bool> {
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
-        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let sc = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
         // SAFETY: command buffer is in recording state; `end_command_buffer`
         // transitions it to completed state for submission.
         unsafe {

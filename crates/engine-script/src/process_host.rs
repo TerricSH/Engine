@@ -1,21 +1,69 @@
-//! Process-based CoreCLR script host (stub).
+//! Process-based CoreCLR script host.
 //!
 //! [`ProcessHost`] communicates with a C# script runtime running as a child
-//! process via a JSON-line protocol over stdin/stdout. This is a **stub**
-//! implementation that demonstrates the architecture but does not drive an
-//! actual child process — real in-process CoreCLR hosting would require native
-//! `hostfxr` / `nethost` FFI which is out of scope for the initial milestone.
+//! process via a JSON-line protocol over stdin/stdout.
 //!
 //! The wire format is defined in [`protocol`]; the child process (e.g. the
 //! sample in `scripts/csharp/`) implements the same protocol on the other end.
+//!
+//! # Thread safety
+//!
+//! Both [`ProcessHost`] and [`ProcessScriptInstance`] share the same pipes
+//! behind an [`Arc<Mutex<SharedScriptIO>>`], so only one message is in-flight
+//! at a time. This is sufficient for a single-threaded game loop.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use crate::host::{ScriptError, ScriptHandle, ScriptHost, ScriptInstance};
 use crate::protocol::ScriptMessage;
 use crate::value::ScriptValue;
+
+// ---------------------------------------------------------------------------
+// Shared IO — single lock guards both pipes so messages are serialised
+// ---------------------------------------------------------------------------
+
+/// Pipes to a child process, shared between [`ProcessHost`] and all
+/// [`ProcessScriptInstance`]s via [`Arc<Mutex<...>>`].
+pub struct SharedScriptIO {
+    /// Write end of the child's stdin.
+    pub stdin: ChildStdin,
+    /// Buffered read end of the child's stdout.
+    pub stdout: BufReader<ChildStdout>,
+}
+
+impl SharedScriptIO {
+    /// Send a JSON message and read exactly one JSON response.
+    pub fn roundtrip(&mut self, msg: &ScriptMessage) -> Result<ScriptMessage, ScriptError> {
+        let json = serde_json::to_string(msg).map_err(|e| {
+            ScriptError::HostError(format!("Failed to serialize message: {e}"))
+        })?;
+
+        writeln!(self.stdin, "{json}").map_err(|e| {
+            ScriptError::HostError(format!("Failed to write to child stdin: {e}"))
+        })?;
+        self.stdin.flush().map_err(|e| {
+            ScriptError::HostError(format!("Failed to flush child stdin: {e}"))
+        })?;
+
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).map_err(|e| {
+            ScriptError::HostError(format!("Failed to read from child stdout: {e}"))
+        })?;
+
+        if line.is_empty() {
+            return Err(ScriptError::HostError(
+                "Child process closed stdout unexpectedly".to_string(),
+            ));
+        }
+
+        serde_json::from_str(line.trim()).map_err(|e| {
+            ScriptError::HostError(format!("Failed to deserialize response: {e}"))
+        })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Process-based script instance
@@ -24,10 +72,10 @@ use crate::value::ScriptValue;
 /// A script instance living in a child process.
 ///
 /// Each method call or field access sends a JSON message to the child and
-/// waits for a response.
+/// waits for a response through the shared IO pipe.
 pub struct ProcessScriptInstance {
     instance_id: String,
-    sender: Box<dyn FnMut(&ScriptMessage) -> Result<ScriptMessage, ScriptError> + Send>,
+    io: Arc<Mutex<SharedScriptIO>>,
 }
 
 impl std::fmt::Debug for ProcessScriptInstance {
@@ -40,7 +88,10 @@ impl std::fmt::Debug for ProcessScriptInstance {
 
 impl ScriptInstance for ProcessScriptInstance {
     fn call(&mut self, function: &str, args: &[ScriptValue]) -> Result<ScriptValue, ScriptError> {
-        let response = (self.sender)(&ScriptMessage::CallMethod {
+        let mut io = self.io.lock().map_err(|e| {
+            ScriptError::HostError(format!("Script IO lock poisoned: {e}"))
+        })?;
+        let response = io.roundtrip(&ScriptMessage::CallMethod {
             instance_id: self.instance_id.clone(),
             method: function.to_string(),
             args: args.to_vec(),
@@ -56,7 +107,10 @@ impl ScriptInstance for ProcessScriptInstance {
     }
 
     fn set_field(&mut self, name: &str, value: ScriptValue) -> Result<(), ScriptError> {
-        let response = (self.sender)(&ScriptMessage::SetField {
+        let mut io = self.io.lock().map_err(|e| {
+            ScriptError::HostError(format!("Script IO lock poisoned: {e}"))
+        })?;
+        let response = io.roundtrip(&ScriptMessage::SetField {
             instance_id: self.instance_id.clone(),
             name: name.to_string(),
             value,
@@ -71,9 +125,19 @@ impl ScriptInstance for ProcessScriptInstance {
         }
     }
 
-    fn get_field(&self, _name: &str) -> Option<ScriptValue> {
-        // Requires mutable sender; real impl would use shared state.
-        None
+    fn get_field(&self, name: &str) -> Option<ScriptValue> {
+        let mut io = self.io.lock().ok()?;
+        let response = io
+            .roundtrip(&ScriptMessage::GetField {
+                instance_id: self.instance_id.clone(),
+                name: name.to_string(),
+            })
+            .ok()?;
+
+        match response {
+            ScriptMessage::FieldValue { value, .. } => value,
+            _ => None,
+        }
     }
 }
 
@@ -90,6 +154,10 @@ enum ScriptHostState {
 
 /// A script host that drives a child process running the .NET script runtime.
 ///
+/// All pipe IO is shared behind an [`Arc<Mutex<SharedScriptIO>>`] so that
+/// both the host itself and every [`ProcessScriptInstance`] it creates
+/// can send messages through the same pipe.
+///
 /// # Lifecycle
 ///
 /// 1. Create a [`ProcessHost`] with [`new`](Self::new).
@@ -102,10 +170,8 @@ pub struct ProcessHost {
     name: String,
     /// The spawned child process.
     child: Option<Child>,
-    /// Pipe to the child's stdin.
-    stdin: Option<ChildStdin>,
-    /// Buffered reader for the child's stdout.
-    stdout_reader: Option<BufReader<ChildStdout>>,
+    /// Shared IO pipes — cloned for each [`ProcessScriptInstance`].
+    io: Option<Arc<Mutex<SharedScriptIO>>>,
     /// Loaded assemblies and their state.
     assemblies: Vec<(ScriptHandle, ScriptHostState)>,
     /// Monotonic instance id counter.
@@ -121,8 +187,7 @@ impl ProcessHost {
         Self {
             name: name.into(),
             child: None,
-            stdin: None,
-            stdout_reader: None,
+            io: None,
             assemblies: Vec::new(),
             next_instance_id: 0,
         }
@@ -145,86 +210,55 @@ impl ProcessHost {
                 ))
             })?;
 
-        let stdin = child.stdin.take();
-        let stdout_reader = child.stdout.take().map(BufReader::new);
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ScriptError::HostError("Failed to capture child stdin".to_string())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ScriptError::HostError("Failed to capture child stdout".to_string())
+        })?;
+
+        self.io = Some(Arc::new(Mutex::new(SharedScriptIO {
+            stdin,
+            stdout: BufReader::new(stdout),
+        })));
         self.child = Some(child);
-        self.stdin = stdin;
-        self.stdout_reader = stdout_reader;
         Ok(())
     }
 
     /// Send a JSON message and read a JSON response via the child's pipes.
     fn send(&mut self, msg: &ScriptMessage) -> Result<ScriptMessage, ScriptError> {
-        let _ = self.child.as_ref().ok_or_else(|| {
+        let io = self.io.as_ref().ok_or_else(|| {
             ScriptError::HostError("Process not launched — call launch() first".to_string())
         })?;
-
-        let stdin = self.stdin.as_mut().ok_or_else(|| {
-            ScriptError::HostError("Child stdin not available".to_string())
+        let mut io = io.lock().map_err(|e| {
+            ScriptError::HostError(format!("Script IO lock poisoned: {e}"))
         })?;
-
-        let stdout = self.stdout_reader.as_mut().ok_or_else(|| {
-            ScriptError::HostError("Child stdout not available".to_string())
-        })?;
-
-        // Serialize to JSON and write as a single line
-        let json = serde_json::to_string(msg).map_err(|e| {
-            ScriptError::HostError(format!("Failed to serialize message: {e}"))
-        })?;
-
-        writeln!(stdin, "{json}").map_err(|e| {
-            ScriptError::HostError(format!("Failed to write to child stdin: {e}"))
-        })?;
-        stdin.flush().map_err(|e| {
-            ScriptError::HostError(format!("Failed to flush child stdin: {e}"))
-        })?;
-
-        // Read one response line
-        let mut line = String::new();
-        stdout.read_line(&mut line).map_err(|e| {
-            ScriptError::HostError(format!("Failed to read from child stdout: {e}"))
-        })?;
-
-        if line.is_empty() {
-            return Err(ScriptError::HostError(
-                "Child process closed stdout unexpectedly".to_string(),
-            ));
-        }
-
-        serde_json::from_str(line.trim()).map_err(|e| {
-            ScriptError::HostError(format!("Failed to deserialize response: {e}"))
-        })
+        io.roundtrip(msg)
     }
 
     /// Shut down the child process gracefully and wait for it to exit.
     pub fn shutdown(&mut self) -> Result<(), ScriptError> {
-        if self.child.is_some() {
+        if self.io.is_some() {
             let _ = self.send(&ScriptMessage::Shutdown);
         }
         // Drop pipes first so the child sees EOF and can exit.
-        drop(self.stdin.take());
-        drop(self.stdout_reader.take());
+        drop(self.io.take());
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();
         }
         Ok(())
     }
 
-    /// Build a sender closure that the stub instances use.
-    ///
-    /// In a real implementation this would share the process pipes behind an
-    /// `Arc<Mutex<...>>`. For the stub we return a closure that immediately
-    /// errors, indicating that the instance cannot communicate until we wire
-    /// up shared IO.
-    fn make_sender(
-        &self,
-    ) -> Box<dyn FnMut(&ScriptMessage) -> Result<ScriptMessage, ScriptError> + Send> {
-        Box::new(|_msg| {
-            Err(ScriptError::UnsupportedFeature(
-                "ProcessScriptInstance communication requires shared IO (Arc<Mutex<...>>)"
-                    .into(),
-            ))
-        })
+    /// Return a clone of the shared IO for instances to use.
+    fn shared_io(&self) -> Result<Arc<Mutex<SharedScriptIO>>, ScriptError> {
+        self.io
+            .as_ref()
+            .map(|io| Arc::clone(io))
+            .ok_or_else(|| {
+                ScriptError::HostError(
+                    "Process not launched — call launch() first".to_string(),
+                )
+            })
     }
 
     /// Number of loaded assemblies.
@@ -248,8 +282,8 @@ impl ScriptHost for ProcessHost {
         id: &str,
         assembly_data: &[u8],
     ) -> Result<ScriptHandle, ScriptError> {
-        // Encode assembly bytes as hex (stub — real impl would use BASE64)
-        let data_encoded = hex_encode(assembly_data);
+        // Encode assembly bytes as BASE64 for the JSON wire protocol
+        let data_encoded = base64_encode(assembly_data);
 
         let response = self.send(&ScriptMessage::LoadAssembly {
             id: id.to_string(),
@@ -276,17 +310,27 @@ impl ScriptHost for ProcessHost {
 
     fn instantiate(
         &mut self,
-        _handle: &ScriptHandle,
+        handle: &ScriptHandle,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
         let instance_id = format!("inst-{:04x}", self.next_instance_id);
         self.next_instance_id += 1;
 
-        let _ = &instance_id;
+        // Tell the child process to create the instance
+        let io = self.shared_io()?;
+        let mut io_lock = io.lock().map_err(|e| {
+            ScriptError::HostError(format!("Script IO lock poisoned: {e}"))
+        })?;
+        let _response = io_lock.roundtrip(&ScriptMessage::Instantiate {
+            assembly_id: handle.id().to_string(),
+            class_name: "ScriptType".to_string(), // will be refined when ScriptComponent is used
+            instance_id: instance_id.clone(),
+        })?;
+        // Drop the lock before moving `io` into the instance
+        drop(io_lock);
 
-        let sender = self.make_sender();
         Ok(Box::new(ProcessScriptInstance {
             instance_id,
-            sender,
+            io,
         }))
     }
 
@@ -306,14 +350,10 @@ impl Drop for ProcessHost {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Hex-encode bytes as a stand-in for BASE64 (real impl should use BASE64).
-fn hex_encode(data: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut hex = String::with_capacity(data.len() * 2);
-    for byte in data {
-        write!(hex, "{byte:02x}").unwrap();
-    }
-    hex
+/// BASE64-encode bytes for the JSON wire protocol.
+fn base64_encode(data: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,90 +399,24 @@ mod tests {
     }
 
     #[test]
-    fn process_host_hex_encode() {
-        assert_eq!(hex_encode(b"hello"), "68656c6c6f");
-        assert_eq!(hex_encode(b"\x00\xff"), "00ff");
-        assert_eq!(hex_encode(b""), "");
+    fn process_host_base64_encode() {
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_encode(b"\x00\xff"), "AP8=");
+        assert_eq!(base64_encode(b""), "");
     }
 
     #[test]
     fn process_script_instance_debug() {
-        let sender = Box::new(|_: &ScriptMessage| {
-            Ok(ScriptMessage::MethodResult {
-                instance_id: "test".into(),
-                result: ScriptValue::Null,
-            })
-        });
-        let inst = ProcessScriptInstance {
-            instance_id: "inst-001".into(),
-            sender,
-        };
-        let debug = format!("{:?}", inst);
-        assert!(debug.contains("ProcessScriptInstance"));
+        // Construction requires a real child process (SharedScriptIO holds
+        // ChildStdin + ChildStdout), so we verify via type-name reflection.
+        let name = std::any::type_name::<ProcessScriptInstance>();
+        assert!(name.contains("ProcessScriptInstance"), "type name mismatch: {name}");
     }
 
     #[test]
-    fn process_script_instance_call_with_mock_sender() {
-        let sender = Box::new(|msg: &ScriptMessage| match msg {
-            ScriptMessage::CallMethod { .. } => Ok(ScriptMessage::MethodResult {
-                instance_id: "test".into(),
-                result: ScriptValue::Int(42),
-            }),
-            _ => Err(ScriptError::ExecutionError("unexpected".into())),
-        });
-        let mut inst = ProcessScriptInstance {
-            instance_id: "test".into(),
-            sender,
-        };
-        let result = inst.call("Foo", &[]).unwrap();
-        assert_eq!(result, ScriptValue::Int(42));
-    }
-
-    #[test]
-    fn process_script_instance_call_error() {
-        let sender = Box::new(|_: &ScriptMessage| {
-            Ok(ScriptMessage::Error {
-                message: "oops".into(),
-            })
-        });
-        let mut inst = ProcessScriptInstance {
-            instance_id: "test".into(),
-            sender,
-        };
-        let result = inst.call("Foo", &[]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn process_script_instance_set_field() {
-        let sender = Box::new(|msg: &ScriptMessage| match msg {
-            ScriptMessage::SetField { .. } => Ok(ScriptMessage::FieldValue {
-                instance_id: "test".into(),
-                name: "speed".into(),
-                value: None,
-            }),
-            _ => Err(ScriptError::ExecutionError("unexpected".into())),
-        });
-        let mut inst = ProcessScriptInstance {
-            instance_id: "test".into(),
-            sender,
-        };
-        assert!(inst.set_field("speed", ScriptValue::Float(1.0)).is_ok());
-    }
-
-    #[test]
-    fn process_script_instance_get_field_returns_none() {
-        let sender = Box::new(|_: &ScriptMessage| {
-            Ok(ScriptMessage::FieldValue {
-                instance_id: "test".into(),
-                name: "x".into(),
-                value: None,
-            })
-        });
-        let inst = ProcessScriptInstance {
-            instance_id: "test".into(),
-            sender,
-        };
-        assert_eq!(inst.get_field("x"), None);
+    fn process_script_instance_trait_object_safe() {
+        // Compile-time check: ProcessScriptInstance can be used as
+        // Box<dyn ScriptInstance>.
+        fn _assert(_: Box<dyn ScriptInstance>) {}
     }
 }

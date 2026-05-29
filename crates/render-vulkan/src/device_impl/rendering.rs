@@ -115,9 +115,16 @@ impl VulkanDevice {
         self.begin_cb(fi)?;
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
-        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
-        let rp = self.mvp_rp.ok_or(VulkanError::Loader("MVP render pass not initialized".into()))?;
-        let pl = self.mvp_pipeline.ok_or(VulkanError::Loader("MVP pipeline not initialized".into()))?;
+        let sc = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let rp = self.mvp_rp.ok_or(VulkanError::Loader(
+            "MVP render pass not initialized".into(),
+        ))?;
+        let pl = self
+            .mvp_pipeline
+            .ok_or(VulkanError::Loader("MVP pipeline not initialized".into()))?;
         let cc = [vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.02, 0.02, 0.06, 1.0],
@@ -175,10 +182,19 @@ impl VulkanDevice {
         // NOTE: command buffer is already started by render_model_frame
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
-        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
-        let rp = self.model_rp.ok_or(VulkanError::Loader("model render pass not initialized".into()))?;
-        let pl = self.model_pipeline.ok_or(VulkanError::Loader("model pipeline not initialized".into()))?;
-        let pll = self.model_pipeline_layout.ok_or(VulkanError::Loader("model pipeline layout not initialized".into()))?;
+        let sc = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let rp = self.model_rp.ok_or(VulkanError::Loader(
+            "model render pass not initialized".into(),
+        ))?;
+        let pl = self
+            .model_pipeline
+            .ok_or(VulkanError::Loader("model pipeline not initialized".into()))?;
+        let pll = self.model_pipeline_layout.ok_or(VulkanError::Loader(
+            "model pipeline layout not initialized".into(),
+        ))?;
 
         // Look up Vulkan buffer handles from the slab
         let vk_vb = self

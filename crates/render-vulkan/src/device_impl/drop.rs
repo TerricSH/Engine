@@ -9,6 +9,7 @@ impl Drop for VulkanDevice {
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures it is not dropped before this destructor runs).
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
+        self.drain_all_retired_pipelines();
         let d = &self.logical_device.device;
         for fb in self.mvp_framebuffers.drain(..) {
             // SAFETY: `fb` was created by this device and is not yet destroyed.
@@ -111,7 +112,9 @@ impl Drop for VulkanDevice {
                 // SAFETY: `e.layout` and `e.set_layouts` were created by
                 // this device.
                 for sl in e.set_layouts {
-                    unsafe { d.destroy_descriptor_set_layout(sl, None); }
+                    unsafe {
+                        d.destroy_descriptor_set_layout(sl, None);
+                    }
                 }
                 unsafe {
                     d.destroy_pipeline_layout(e.layout, None);
@@ -123,7 +126,9 @@ impl Drop for VulkanDevice {
         for s in self.shader_modules.slots.drain(..) {
             if let Some((_, (sm, _))) = s {
                 // SAFETY: `sm` was created by this device.
-                unsafe { d.destroy_shader_module(sm, None); }
+                unsafe {
+                    d.destroy_shader_module(sm, None);
+                }
             }
         }
 
@@ -133,7 +138,9 @@ impl Drop for VulkanDevice {
         // Destroy pipeline cache if it was created (non-null).
         if self.pipeline_cache != vk::PipelineCache::null() {
             // SAFETY: `self.pipeline_cache` was created by this device.
-            unsafe { d.destroy_pipeline_cache(self.pipeline_cache, None); }
+            unsafe {
+                d.destroy_pipeline_cache(self.pipeline_cache, None);
+            }
         }
 
         self.destroy_shadow_resources();

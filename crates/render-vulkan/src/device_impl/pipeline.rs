@@ -4,7 +4,7 @@ use ash::vk;
 
 use crate::error::{VkResult, VulkanError};
 
-use super::{VulkanDevice, mk_sm, default_dep, blend_attachment_from_mode};
+use super::{blend_attachment_from_mode, default_dep, mk_sm, VulkanDevice};
 
 impl VulkanDevice {
     /// Destroy all MVP and model pipeline resources (used on resize / suboptimal
@@ -74,7 +74,10 @@ impl VulkanDevice {
         let frag = self
             .mvp_frag_spv
             .ok_or(VulkanError::MissingShader("mvp.frag"))?;
-        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let sc = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
         let fmt = sc.format;
         let ext = self.swapchain_extent;
         let d = &self.logical_device.device;
@@ -207,7 +210,10 @@ impl VulkanDevice {
         let frag = self
             .mvp_frag_spv
             .ok_or(VulkanError::MissingShader("model.frag"))?;
-        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let sc = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
         let fmt = sc.format;
         let ext = self.swapchain_extent;
         let d = &self.logical_device.device;
@@ -287,9 +293,7 @@ impl VulkanDevice {
             .map_err(|r| VulkanError::vk("crp_model", r))?;
 
         // --- Framebuffers (one per swapchain image, color + depth) ---
-        let depth_view = self
-            .depth_image_view
-            .unwrap_or(vk::ImageView::null());
+        let depth_view = self.depth_image_view.unwrap_or(vk::ImageView::null());
         let mut fbs = Vec::new();
         for iv in &sc.image_views {
             let att_views = [*iv, depth_view];

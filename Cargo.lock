@@ -868,6 +868,7 @@ version = "0.1.0"
 dependencies = [
  "engine-renderer",
  "engine-scene",
+ "engine-script",
  "engine-serialize",
 ]
 
@@ -886,6 +887,14 @@ dependencies = [
  "ron",
  "serde",
  "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "engine-ffi"
+version = "0.1.0"
+dependencies = [
+ "engine-serialize",
  "tracing",
 ]
 
@@ -973,6 +982,7 @@ dependencies = [
 name = "engine-script"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "crossbeam-channel",
  "engine-serialize",
  "serde",

@@ -1,8 +1,8 @@
 //! Device resources used by the Gate 2 textured-object validation path.
 
+use crate::allocator::{Allocation, AllocationCreateDesc, AllocationScheme, MemoryLocation};
 use ash::vk;
 use ash::Device as AshDevice;
-use crate::allocator::{Allocation, AllocationCreateDesc, AllocationScheme, MemoryLocation};
 
 use crate::allocator::SharedAllocator;
 use crate::device::Device;
@@ -141,7 +141,8 @@ impl BufferResource {
         let requirements = unsafe { device.device.get_buffer_memory_requirements(buffer) };
         let allocator = device.allocator();
         let mut allocation = allocator
-            .lock().map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
+            .lock()
+            .map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
             .allocate(&AllocationCreateDesc {
                 name,
                 requirements,
@@ -194,10 +195,9 @@ impl BufferResource {
     }
 
     fn write(&mut self, data: &[u8], name: &'static str) -> VkResult<()> {
-        let allocation = self
-            .allocation
-            .as_mut()
-            .ok_or(VulkanError::Loader("buffer allocation not initialized".into()))?;
+        let allocation = self.allocation.as_mut().ok_or(VulkanError::Loader(
+            "buffer allocation not initialized".into(),
+        ))?;
         let Some(slice) = allocation.mapped_slice_mut() else {
             return Err(VulkanError::MemoryNotMapped(name));
         };
@@ -261,7 +261,8 @@ impl TextureResource {
         let requirements = unsafe { device.device.get_image_memory_requirements(image) };
         let allocator = device.allocator();
         let allocation = allocator
-            .lock().map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
+            .lock()
+            .map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
             .allocate(&AllocationCreateDesc {
                 name: "gate2 textured quad image",
                 requirements,

@@ -19,9 +19,7 @@ use std::mem::ManuallyDrop;
 use ash::vk;
 use ash::Device as AshDevice;
 
-use render_core::{
-    self, AdapterInfo, BackendKind, ResourceLimits, ShaderFormat, TextureFormat,
-};
+use render_core::{self, AdapterInfo, BackendKind, ResourceLimits, ShaderFormat, TextureFormat};
 
 use crate::device::Device as VkLogicalDevice;
 use crate::error::{VkResult, VulkanError};
@@ -72,10 +70,10 @@ pub struct VulkanDevice {
 
     pub(crate) frame_sync: Vec<FrameSync>,
     pub(crate) current_frame: usize,
+    pub(crate) retired_pipelines: Vec<Vec<vk::Pipeline>>,
     pub(crate) cached_adapter_info: AdapterInfo,
     /// Last swapchain image index acquired (used by read_pixels).
     last_image_index: u32,
-
 
     // Phase 2: handle tables
     pub(crate) buffers: Slab<BufEntry>,
@@ -210,6 +208,7 @@ impl VulkanDevice {
             model_framebuffers: Vec::new(),
             frame_sync: Vec::new(),
             current_frame: 0,
+            retired_pipelines: vec![Vec::new(), Vec::new()],
             cached_adapter_info: info,
             last_image_index: 0,
             buffers: Slab::new(),
@@ -269,8 +268,7 @@ impl VulkanDevice {
             self.pso_cache_path = Some(path);
         }
 
-        let ci = vk::PipelineCacheCreateInfo::default()
-            .initial_data(&initial_data);
+        let ci = vk::PipelineCacheCreateInfo::default().initial_data(&initial_data);
         // SAFETY: `d` is a valid device; `ci` is correctly constructed.
         match unsafe { d.create_pipeline_cache(&ci, None) } {
             Ok(cache) => {
@@ -332,6 +330,46 @@ impl VulkanDevice {
         self.write_ubo(self.current_frame, data, offset);
     }
 
+    pub(crate) fn retire_pipeline(&mut self, pipeline: vk::Pipeline) {
+        if pipeline == vk::Pipeline::null() {
+            return;
+        }
+
+        if self.frame_sync.is_empty() || self.retired_pipelines.is_empty() {
+            // SAFETY: `pipeline` was created by this device and there are no
+            // in-flight frames that could still reference it.
+            unsafe {
+                self.logical_device.device.destroy_pipeline(pipeline, None);
+            }
+            return;
+        }
+
+        let retire_index = self.current_frame % self.retired_pipelines.len();
+        self.retired_pipelines[retire_index].push(pipeline);
+    }
+
+    pub(crate) fn drain_retired_pipelines(&mut self, frame_index: usize) {
+        let Some(slot) = self.retired_pipelines.get_mut(frame_index) else {
+            return;
+        };
+
+        let retired = std::mem::take(slot);
+        for pipeline in retired {
+            // SAFETY: the fence for `frame_index` has already completed when
+            // this queue is drained, so no in-flight submission can still
+            // reference the retired pipeline.
+            unsafe {
+                self.logical_device.device.destroy_pipeline(pipeline, None);
+            }
+        }
+    }
+
+    pub(crate) fn drain_all_retired_pipelines(&mut self) {
+        for frame_index in 0..self.retired_pipelines.len() {
+            self.drain_retired_pipelines(frame_index);
+        }
+    }
+
     pub fn resize(&mut self, w: u32, h: u32) {
         self.window_width = w.max(1);
         self.window_height = h.max(1);
@@ -346,9 +384,7 @@ impl VulkanDevice {
         // ensures VkLogicalDevice is not dropped before VulkanDevice).
         let _ = unsafe { self.logical_device.device.device_wait_idle() };
     }
-
 }
-
 
 // ============================================================================
 // Helpers
@@ -359,14 +395,34 @@ impl VulkanDevice {
 /// Supported modes: `"Alpha"`, `"Additive"`, `"Multiply"`, or `None` / `"Opaque"`.
 fn blend_attachment_from_mode(mode: &str) -> vk::PipelineColorBlendAttachmentState {
     let (enable, src_color, dst_color, src_alpha, dst_alpha) = match mode {
-        "Alpha" => (true, vk::BlendFactor::SRC_ALPHA, vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
-                    vk::BlendFactor::ONE, vk::BlendFactor::ONE_MINUS_SRC_ALPHA),
-        "Additive" => (true, vk::BlendFactor::SRC_ALPHA, vk::BlendFactor::ONE,
-                       vk::BlendFactor::ONE, vk::BlendFactor::ONE),
-        "Multiply" => (true, vk::BlendFactor::ZERO, vk::BlendFactor::SRC_COLOR,
-                       vk::BlendFactor::ZERO, vk::BlendFactor::SRC_ALPHA),
-        _ => (false, vk::BlendFactor::ONE, vk::BlendFactor::ZERO,
-              vk::BlendFactor::ONE, vk::BlendFactor::ZERO),
+        "Alpha" => (
+            true,
+            vk::BlendFactor::SRC_ALPHA,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        ),
+        "Additive" => (
+            true,
+            vk::BlendFactor::SRC_ALPHA,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE,
+        ),
+        "Multiply" => (
+            true,
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::SRC_COLOR,
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::SRC_ALPHA,
+        ),
+        _ => (
+            false,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ZERO,
+        ),
     };
     vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(enable)

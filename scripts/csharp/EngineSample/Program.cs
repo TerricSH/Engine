@@ -1,5 +1,5 @@
 /// <summary>
-/// Engine Script Protocol Host — sample implementation.
+/// Engine Script Protocol Host — .NET runtime implementation.
 ///
 /// This program implements the JSON-line protocol that the engine's
 /// <c>ProcessHost</c> uses to communicate with a .NET script runtime.
@@ -13,6 +13,7 @@
 /// Run (standalone test):
 ///   echo '{"type":"Shutdown"}' | dotnet run
 /// </summary>
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -203,31 +204,124 @@ public class ScriptMessageConverter : JsonConverter<ScriptMessage>
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime instance — wraps a .NET object with its type for reflection
+// ---------------------------------------------------------------------------
+
 /// <summary>
-/// Represents a script object instance with modifiable fields.
+/// A script instance backed by a real .NET object, with lazy reflection
+/// for method invocation and field access.
 /// </summary>
 class ScriptInstance
 {
     public string InstanceId { get; }
-    public string AssemblyId { get; }
-    public string ClassName { get; }
-    public Dictionary<string, ScriptValue> Fields { get; } = new();
+    public Type Type { get; }
+    public object Instance { get; }
 
-    public ScriptInstance(string instanceId, string assemblyId, string className)
+    public ScriptInstance(string instanceId, Type type, object instance)
     {
         InstanceId = instanceId;
-        AssemblyId = assemblyId;
-        ClassName = className;
+        Type = type;
+        Instance = instance;
     }
 
     public ScriptValue CallMethod(string method, List<ScriptValue> args)
     {
-        // TODO: In a real host, this would use reflection to invoke
-        // the actual method on a compiled script type.
-        Console.Error.WriteLine($"[ScriptHost] Call {ClassName}.{method}({args.Count} args)");
+        var methodInfo = Type.GetMethod(method, BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        if (methodInfo == null)
+        {
+            // If the method doesn't exist, return null gracefully rather than
+            // erroring — lifecycle methods (OnCreate, OnStart, etc.) are
+            // optional.
+            Console.Error.WriteLine($"[ScriptHost] Method '{method}' not found on {Type.Name}, returning null");
+            return ScriptValue.Null();
+        }
+
+        var parameters = methodInfo.GetParameters();
+        var convertedArgs = new object?[parameters.Length];
+
+        for (int i = 0; i < parameters.Length; i++)
+        {
+            if (i < args.Count)
+                convertedArgs[i] = ConvertScriptValueToObject(args[i], parameters[i].ParameterType);
+            else
+                convertedArgs[i] = parameters[i].DefaultValue;
+        }
+
+        var result = methodInfo.Invoke(Instance, convertedArgs);
+        return ConvertObjectToScriptValue(result);
+    }
+
+    public ScriptValue GetField(string name)
+    {
+        var field = Type.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        if (field != null)
+            return ConvertObjectToScriptValue(field.GetValue(Instance));
+
+        var prop = Type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        if (prop != null)
+            return ConvertObjectToScriptValue(prop.GetValue(Instance));
+
         return ScriptValue.Null();
     }
+
+    public void SetField(string name, ScriptValue value)
+    {
+        var field = Type.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        if (field != null)
+        {
+            field.SetValue(Instance, ConvertScriptValueToObject(value, field.FieldType));
+            return;
+        }
+
+        var prop = Type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        if (prop != null)
+        {
+            prop.SetValue(Instance, ConvertScriptValueToObject(value, prop.PropertyType));
+        }
+    }
+
+    // ── Value conversion helpers ──────────────────────────────────────────
+
+    static object? ConvertScriptValueToObject(ScriptValue sv, Type targetType)
+    {
+        if (sv.Type == "Null" || sv.Value == null)
+            return targetType.IsValueType ? Activator.CreateInstance(targetType) : null;
+
+        return sv.Type switch
+        {
+            "Bool" => Convert.ChangeType(sv.Value, targetType),
+            "Int" => Convert.ChangeType(sv.Value, targetType),
+            "Float" => Convert.ChangeType(sv.Value, targetType),
+            "String" => sv.Value.ToString(),
+            _ => Convert.ChangeType(sv.Value, targetType)
+        };
+    }
+
+    static ScriptValue ConvertObjectToScriptValue(object? obj)
+    {
+        if (obj == null)
+            return ScriptValue.Null();
+
+        var type = obj.GetType();
+        if (type == typeof(bool))
+            return ScriptValue.FromBool((bool)obj);
+        if (type == typeof(int) || type == typeof(long) || type == typeof(short) || type == typeof(byte))
+            return ScriptValue.FromInt(Convert.ToInt64(obj));
+        if (type == typeof(float) || type == typeof(double) || type == typeof(decimal))
+            return ScriptValue.FromFloat(Convert.ToDouble(obj));
+        if (type == typeof(string))
+            return ScriptValue.FromString((string)obj);
+        if (type == typeof(char))
+            return ScriptValue.FromString(((char)obj).ToString());
+
+        return ScriptValue.FromString(obj.ToString() ?? "");
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Protocol host — reads JSON lines from stdin, dispatches to handlers
+// ---------------------------------------------------------------------------
 
 /// <summary>
 /// Main protocol host — reads JSON lines from stdin, dispatches them to
@@ -235,8 +329,10 @@ class ScriptInstance
 /// </summary>
 class ScriptProtocolHost
 {
+    /// Loaded assemblies: assembly_id → Assembly
+    private readonly Dictionary<string, Assembly> _assemblies = new();
+    /// Runtime instances: instance_id → ScriptInstance
     private readonly Dictionary<string, ScriptInstance> _instances = new();
-    private readonly List<string> _loadedTypes = new();
 
     public void Run()
     {
@@ -277,39 +373,73 @@ class ScriptProtocolHost
         var id = msg.Id ?? "unknown";
         var data = msg.DataBase64 ?? "";
 
-        // In a real host we would load the assembly from the base64-decoded bytes.
-        // For the sample, we just acknowledge the load.
-        Console.Error.WriteLine($"[ScriptHost] LoadAssembly: {id} ({data.Length} chars)");
-
-        // Simulate discovering types in the assembly
-        _loadedTypes.Add($"{id}.ScriptType");
-
-        return new ScriptMessage
+        try
         {
-            Type = "AssemblyLoaded",
-            Id = id,
-            Types = new List<string>(_loadedTypes)
-        };
+            var bytes = Convert.FromBase64String(data);
+            var assembly = Assembly.Load(bytes);
+            _assemblies[id] = assembly;
+
+            // Discover all public types in the assembly
+            var types = assembly.GetExportedTypes()
+                .Select(t => t.FullName ?? t.Name)
+                .ToList();
+
+            Console.Error.WriteLine($"[ScriptHost] LoadAssembly: {id} ({types.Count} types)");
+
+            return new ScriptMessage
+            {
+                Type = "AssemblyLoaded",
+                Id = id,
+                Types = types
+            };
+        }
+        catch (Exception ex)
+        {
+            return MakeError($"Failed to load assembly '{id}': {ex.Message}");
+        }
     }
 
     ScriptMessage HandleInstantiate(ScriptMessage msg)
     {
         var instanceId = msg.InstanceId ?? Guid.NewGuid().ToString();
-        var assemblyId = msg.AssemblyId ?? "unknown";
-        var className = msg.ClassName ?? "Unknown";
+        var assemblyId = msg.AssemblyId ?? "";
+        var className = msg.ClassName ?? "";
 
-        var instance = new ScriptInstance(instanceId, assemblyId, className);
-        _instances[instanceId] = instance;
+        if (!_assemblies.TryGetValue(assemblyId, out var assembly))
+            return MakeError($"Assembly not found: {assemblyId}");
 
-        Console.Error.WriteLine($"[ScriptHost] Instantiated {className} as {instanceId}");
-
-        // Return a MethodResult (with null) to acknowledge creation
-        return new ScriptMessage
+        var type = assembly.GetType(className);
+        if (type == null)
         {
-            Type = "MethodResult",
-            InstanceId = instanceId,
-            Result = ScriptValue.Null()
-        };
+            // Try searching all types in the assembly
+            type = assembly.GetExportedTypes()
+                .FirstOrDefault(t => t.FullName == className || t.Name == className);
+            if (type == null)
+                return MakeError($"Type '{className}' not found in assembly '{assemblyId}'");
+        }
+
+        try
+        {
+            var instance = Activator.CreateInstance(type);
+            if (instance == null)
+                return MakeError($"Failed to create instance of '{className}'");
+
+            var scriptInstance = new ScriptInstance(instanceId, type, instance);
+            _instances[instanceId] = scriptInstance;
+
+            Console.Error.WriteLine($"[ScriptHost] Instantiated {className} as {instanceId}");
+
+            return new ScriptMessage
+            {
+                Type = "MethodResult",
+                InstanceId = instanceId,
+                Result = ScriptValue.Null()
+            };
+        }
+        catch (Exception ex)
+        {
+            return MakeError($"Failed to instantiate '{className}': {ex.Message}");
+        }
     }
 
     ScriptMessage HandleCallMethod(ScriptMessage msg)
@@ -321,13 +451,20 @@ class ScriptProtocolHost
         if (!_instances.TryGetValue(instanceId, out var instance))
             return MakeError($"Instance not found: {instanceId}");
 
-        var result = instance.CallMethod(method, args);
-        return new ScriptMessage
+        try
         {
-            Type = "MethodResult",
-            InstanceId = instanceId,
-            Result = result
-        };
+            var result = instance.CallMethod(method, args);
+            return new ScriptMessage
+            {
+                Type = "MethodResult",
+                InstanceId = instanceId,
+                Result = result
+            };
+        }
+        catch (Exception ex)
+        {
+            return MakeError($"Method '{method}' failed: {ex.Message}");
+        }
     }
 
     ScriptMessage HandleSetField(ScriptMessage msg)
@@ -339,15 +476,21 @@ class ScriptProtocolHost
         if (!_instances.TryGetValue(instanceId, out var instance))
             return MakeError($"Instance not found: {instanceId}");
 
-        instance.Fields[name] = value;
-
-        return new ScriptMessage
+        try
         {
-            Type = "FieldValue",
-            InstanceId = instanceId,
-            Name = name,
-            Value = value
-        };
+            instance.SetField(name, value);
+            return new ScriptMessage
+            {
+                Type = "FieldValue",
+                InstanceId = instanceId,
+                Name = name,
+                Value = value
+            };
+        }
+        catch (Exception ex)
+        {
+            return MakeError($"SetField '{name}' failed: {ex.Message}");
+        }
     }
 
     ScriptMessage HandleGetField(ScriptMessage msg)
@@ -358,15 +501,21 @@ class ScriptProtocolHost
         if (!_instances.TryGetValue(instanceId, out var instance))
             return MakeError($"Instance not found: {instanceId}");
 
-        instance.Fields.TryGetValue(name, out var value);
-
-        return new ScriptMessage
+        try
         {
-            Type = "FieldValue",
-            InstanceId = instanceId,
-            Name = name,
-            Value = value
-        };
+            var value = instance.GetField(name);
+            return new ScriptMessage
+            {
+                Type = "FieldValue",
+                InstanceId = instanceId,
+                Name = name,
+                Value = value
+            };
+        }
+        catch (Exception ex)
+        {
+            return MakeError($"GetField '{name}' failed: {ex.Message}");
+        }
     }
 
     ScriptMessage HandleShutdown()

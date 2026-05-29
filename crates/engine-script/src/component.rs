@@ -52,6 +52,18 @@ impl ScriptComponent {
         self.fields.insert(name.into(), value);
         self
     }
+
+    /// Add multiple fields at once.
+    pub fn with_fields(mut self, fields: BTreeMap<String, ScriptValue>) -> Self {
+        self.fields.extend(fields);
+        self
+    }
+
+    /// Set the enabled flag.
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------

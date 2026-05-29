@@ -18,10 +18,12 @@ use render_core::{
 use crate::allocator::{AllocationCreateDesc, AllocationScheme, MemoryLocation};
 
 use super::{
-    blend_attachment_from_mode, compare_op, default_dep, mk_sm,
-    parse_polygon_mode, parse_sample_count, parse_topology,
-    resource_kind_to_descriptor_type, vfmt,
-    encoder::VkCmdEncoder, slab::{BufEntry, PipeEntry, PlEntry}, VulkanDevice,
+    blend_attachment_from_mode, compare_op, default_dep,
+    encoder::VkCmdEncoder,
+    mk_sm, parse_polygon_mode, parse_sample_count, parse_topology,
+    resource_kind_to_descriptor_type,
+    slab::{BufEntry, PipeEntry, PlEntry},
+    vfmt, VulkanDevice,
 };
 
 impl render_core::Device for VulkanDevice {
@@ -67,7 +69,8 @@ impl render_core::Device for VulkanDevice {
         let alloc_handle = d.allocator();
         let location = MemoryLocation::CpuToGpu;
         let mut allocation = alloc_handle
-            .lock().map_err(|e| render_core::RhiError::Backend {
+            .lock()
+            .map_err(|e| render_core::RhiError::Backend {
                 detail: format!("allocator lock: {e}"),
             })?
             .allocate(&AllocationCreateDesc {
@@ -149,19 +152,19 @@ impl render_core::Device for VulkanDevice {
         // Get SPIR-V bytes.  The descriptor does not carry inline SPIR-V yet
         // (Phase 2), so fall back to the embedded MVP vertex shader as a
         // placeholder.  This establishes the storage pipeline.
-        let spv = self.mvp_vert_spv.ok_or_else(|| {
-            render_core::RhiError::Backend {
+        let spv = self
+            .mvp_vert_spv
+            .ok_or_else(|| render_core::RhiError::Backend {
                 detail: "create_shader_module: no embedded shaders available".into(),
-            }
-        })?;
+            })?;
         // SAFETY: `d` is a valid AshDevice; `spv` is valid SPIR-V.
-        let sm = (unsafe { mk_sm(d, spv) }).map_err(|e| {
-            render_core::RhiError::Backend {
-                detail: format!("create_shader_module: {e}"),
-            }
+        let sm = (unsafe { mk_sm(d, spv) }).map_err(|e| render_core::RhiError::Backend {
+            detail: format!("create_shader_module: {e}"),
         })?;
         // Default to VERTEX stage; the descriptor does not carry stage info yet.
-        let (idx, gen) = self.shader_modules.insert((sm, vk::ShaderStageFlags::VERTEX));
+        let (idx, gen) = self
+            .shader_modules
+            .insert((sm, vk::ShaderStageFlags::VERTEX));
         Ok(ShaderModuleHandle::new(idx, gen))
     }
 
@@ -367,11 +370,12 @@ impl render_core::Device for VulkanDevice {
                             .binding(b.binding)
                             .descriptor_type(resource_kind_to_descriptor_type(&b.resource_kind))
                             .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                            .stage_flags(
+                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            )
                     })
                     .collect();
-                let info = vk::DescriptorSetLayoutCreateInfo::default()
-                    .bindings(&vk_bindings);
+                let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&vk_bindings);
                 // SAFETY: `d` is a valid AshDevice; `info` describes a valid
                 // descriptor set layout; `None` means no custom allocator.
                 let sl = unsafe { d.create_descriptor_set_layout(&info, None) }.map_err(|r| {
@@ -430,11 +434,11 @@ impl render_core::Device for VulkanDevice {
                 })?,
             );
             // SAFETY: `d` is a valid AshDevice; `vs`/`fs` contain valid SPIR-V.
-            let vm = (unsafe { mk_sm(d, vs) }).map_err(|e| {
-                render_core::RhiError::Backend { detail: format!("{e}") }
+            let vm = (unsafe { mk_sm(d, vs) }).map_err(|e| render_core::RhiError::Backend {
+                detail: format!("{e}"),
             })?;
-            let fm = (unsafe { mk_sm(d, fs) }).map_err(|e| {
-                render_core::RhiError::Backend { detail: format!("{e}") }
+            let fm = (unsafe { mk_sm(d, fs) }).map_err(|e| render_core::RhiError::Backend {
+                detail: format!("{e}"),
             })?;
             let stages: Vec<vk::PipelineShaderStageCreateInfo> = vec![
                 vk::PipelineShaderStageCreateInfo::default()
@@ -601,8 +605,7 @@ impl render_core::Device for VulkanDevice {
         };
 
         // ── Depth stencil state ────────────────────────────────────────
-        let depth_enabled =
-            desc.depth_state.write_enabled || desc.depth_state.compare.is_some();
+        let depth_enabled = desc.depth_state.write_enabled || desc.depth_state.compare.is_some();
         let ds_state = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(depth_enabled)
             .depth_write_enable(desc.depth_state.write_enabled)
@@ -625,23 +628,30 @@ impl render_core::Device for VulkanDevice {
         // SAFETY: `d` is a valid AshDevice; `pinfo` describes a valid
         // graphics pipeline; `self.pipeline_cache` may be null; `None` means
         // no custom allocator.
-        let pipeline =
-            unsafe { d.create_graphics_pipelines(self.pipeline_cache, &[pinfo], None) }
-                .map_err(|(_, r)| render_core::RhiError::Backend {
-                    detail: format!("{r:?}"),
-                })?[0];
+        let pipeline = unsafe { d.create_graphics_pipelines(self.pipeline_cache, &[pinfo], None) }
+            .map_err(|(_, r)| render_core::RhiError::Backend {
+                detail: format!("{r:?}"),
+            })?[0];
 
         // Destroy temporary shader modules created in the fallback path.
         if let Some(modules) = destroy_temp_modules {
             // SAFETY: modules were created by this device and are no longer
             // needed after pipeline creation; `None` means no custom allocator.
             for m in modules {
-                unsafe { d.destroy_shader_module(m, None); }
+                unsafe {
+                    d.destroy_shader_module(m, None);
+                }
             }
         }
 
         let (idx, gen) = self.pipelines.insert(PipeEntry { pipeline });
         Ok(PipelineHandle::new(idx, gen))
+    }
+
+    fn destroy_pipeline(&mut self, handle: PipelineHandle) {
+        if let Some(entry) = self.pipelines.remove(handle.index, handle.generation) {
+            self.retire_pipeline(entry.pipeline);
+        }
     }
 
     fn begin_frame(
@@ -838,7 +848,8 @@ impl render_core::Device for VulkanDevice {
         let req = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
         let alloc_handle = d.allocator();
         let mut staging_alloc = alloc_handle
-            .lock().map_err(|e| render_core::RhiError::Backend {
+            .lock()
+            .map_err(|e| render_core::RhiError::Backend {
                 detail: format!("allocator lock: {e}"),
             })?
             .allocate(&AllocationCreateDesc {
@@ -869,7 +880,9 @@ impl render_core::Device for VulkanDevice {
         } {
             // SAFETY: buffer/allocation were just created and are not in use
             // after the failed bind; cleanup is safe.
-            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+            if let Ok(mut guard) = alloc_handle.lock() {
+                let _ = guard.free(&mut staging_alloc);
+            }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             return Err(render_core::RhiError::Backend {
                 detail: format!("bind staging: {r:?}"),
@@ -890,7 +903,9 @@ impl render_core::Device for VulkanDevice {
             )
         }
         .map_err(|r| {
-            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+            if let Ok(mut guard) = alloc_handle.lock() {
+                let _ = guard.free(&mut staging_alloc);
+            }
             // SAFETY: cleanup only happen on error; all handles are valid.
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
@@ -911,7 +926,9 @@ impl render_core::Device for VulkanDevice {
         .map_err(|r| {
             // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+            if let Ok(mut guard) = alloc_handle.lock() {
+                let _ = guard.free(&mut staging_alloc);
+            }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("alloc cb: {r:?}"),
@@ -933,7 +950,9 @@ impl render_core::Device for VulkanDevice {
         .map_err(|r| {
             // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+            if let Ok(mut guard) = alloc_handle.lock() {
+                let _ = guard.free(&mut staging_alloc);
+            }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("begin cb: {r:?}"),
@@ -1043,7 +1062,9 @@ impl render_core::Device for VulkanDevice {
         unsafe { device.end_command_buffer(cmd_buffer) }.map_err(|r| {
             // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+            if let Ok(mut guard) = alloc_handle.lock() {
+                let _ = guard.free(&mut staging_alloc);
+            }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("end cb: {r:?}"),
@@ -1059,7 +1080,9 @@ impl render_core::Device for VulkanDevice {
             unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|r| {
                 // SAFETY: cleanup only on error; all handles are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
-                if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+                if let Ok(mut guard) = alloc_handle.lock() {
+                    let _ = guard.free(&mut staging_alloc);
+                }
                 unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
                     detail: format!("create fence: {r:?}"),
@@ -1075,7 +1098,9 @@ impl render_core::Device for VulkanDevice {
             // SAFETY: cleanup only on error; all handles are valid.
             unsafe { device.destroy_fence(fence, None) };
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+            if let Ok(mut guard) = alloc_handle.lock() {
+                let _ = guard.free(&mut staging_alloc);
+            }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("queue submit: {r:?}"),
@@ -1088,7 +1113,9 @@ impl render_core::Device for VulkanDevice {
             // SAFETY: cleanup only on error; all handles are valid.
             unsafe { device.destroy_fence(fence, None) };
             unsafe { device.destroy_command_pool(cmd_pool, None) };
-            if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+            if let Ok(mut guard) = alloc_handle.lock() {
+                let _ = guard.free(&mut staging_alloc);
+            }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
                 detail: format!("wait fence: {r:?}"),
@@ -1107,7 +1134,9 @@ impl render_core::Device for VulkanDevice {
             None => {
                 // SAFETY: cleanup only on error; all handles are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
-                if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+                if let Ok(mut guard) = alloc_handle.lock() {
+                    let _ = guard.free(&mut staging_alloc);
+                }
                 unsafe { device.destroy_buffer(staging_buffer, None) };
                 return Err(render_core::RhiError::Backend {
                     detail: "staging buffer is not CPU mapped".into(),
@@ -1136,7 +1165,9 @@ impl render_core::Device for VulkanDevice {
         // SAFETY: all objects were created from this device and are no longer
         // in use after fence wait; reverse order of creation is respected.
         unsafe { device.destroy_command_pool(cmd_pool, None) };
-        if let Ok(mut guard) = alloc_handle.lock() { let _ = guard.free(&mut staging_alloc); }
+        if let Ok(mut guard) = alloc_handle.lock() {
+            let _ = guard.free(&mut staging_alloc);
+        }
         unsafe { device.destroy_buffer(staging_buffer, None) };
 
         Ok(result)
