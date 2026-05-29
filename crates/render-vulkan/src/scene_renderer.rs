@@ -109,10 +109,12 @@ pub struct SceneRenderer {
     /// Cache of loaded meshes indexed by their [`AssetId`](engine_serialize::AssetId) string.
     meshes: BTreeMap<String, GpuMesh>,
 
-    // Cached pipeline handles (created once via the Device trait).
+    // Cached pipeline handles (created via the Device trait).
     rp: Option<RenderPassHandle>,
     pll: Option<PipelineLayoutHandle>,
-    pl: Option<PipelineHandle>,
+
+    /// Material-to-pipeline cache (variant-aware, supports hot-reload).
+    pipeline_cache: PipelineCache,
 
     // Frame lifecycle state (stored between begin_frame / execute_pass / end_frame).
     cur_sc: Option<SwapchainHandle>,
@@ -136,7 +138,7 @@ impl SceneRenderer {
             meshes: BTreeMap::new(),
             rp: None,
             pll: None,
-            pl: None,
+            pipeline_cache: PipelineCache::new(),
             cur_sc: None,
             cur_ii: None,
             cur_enc: None,
@@ -213,7 +215,7 @@ impl SceneRenderer {
             )]
         })?;
 
-        // --- Graphics pipeline  (forward-shaded) ---
+        // --- Graphics pipeline descriptor  (forward-shaded) ---
         let pl_desc = PipelineDescriptor {
             shader_modules: vec![],
             vertex_layout: VertexLayout {
@@ -250,18 +252,13 @@ impl SceneRenderer {
             sample_count: Some(1),
             render_pass: None,
         };
-        let pl = self.device.create_pipeline(&pl_desc).map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0202",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                &format!("create_pipeline: {e:?}"),
-            )]
-        })?;
+
+        // Register the forward-shaded pipeline descriptor in the variant cache.
+        self.pipeline_cache
+            .register_descriptor("forward_pbr", pl_desc);
 
         self.rp = Some(rp);
         self.pll = Some(pll);
-        self.pl = Some(pl);
         self.initialized = true;
         Ok(())
     }
@@ -417,13 +414,21 @@ impl BackendRenderer for SceneRenderer {
         encoder.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
         encoder.set_scissor(0, 0, self.width, self.height);
 
-        if let Some(pl) = self.pl {
-            encoder.bind_pipeline(pl);
-        }
-
+        // Bind descriptor sets once (shared by all pipelines with this layout).
         if let Some(pll) = self.pll {
             encoder.bind_descriptor_sets(pll, 0, &[], &[]);
         }
+
+        // Build material lookup: material_id → MaterialBinding
+        let material_map: HashMap<&str, &MaterialBinding> =
+            input.materials.iter().map(|m| (m.material_id.id.as_str(), m)).collect();
+
+        // Build set of skinned material IDs for variant resolution.
+        let skinned_materials: HashSet<&str> =
+            input.skinned_items.iter().map(|s| s.material.id.as_str()).collect();
+
+        let device = &mut self.device;
+        let cache = &mut self.pipeline_cache;
 
         let mut draw_calls: u32 = 0;
         let mut triangles: u64 = 0;
@@ -444,6 +449,45 @@ impl BackendRenderer for SceneRenderer {
                     continue;
                 }
             };
+
+            // ── Resolve pipeline via variant cache ──────────────────────
+            let is_skinned = skinned_materials.contains(drawable.material.id.as_str());
+            let base_variant = if is_skinned {
+                PipelineVariantKey::SKINNED
+            } else {
+                PipelineVariantKey::NONE
+            };
+
+            let pipeline_result = match material_map.get(drawable.material.id.as_str()) {
+                Some(mat) => {
+                    let key = PipelineCacheKey {
+                        pipeline_asset: mat.pipeline.id.clone(),
+                        variant_key: PipelineVariantKey::new(mat.variant_key | base_variant.bits()),
+                    };
+                    cache.get_or_create(&key, device)
+                }
+                None => {
+                    // No material binding – fall back to the default forward PBR descriptor.
+                    let key = PipelineCacheKey {
+                        pipeline_asset: "forward_pbr".into(),
+                        variant_key: base_variant,
+                    };
+                    cache.get_or_create(&key, device)
+                }
+            };
+
+            let pl = match pipeline_result {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "scene_renderer",
+                        error = ?e,
+                        "pipeline resolution failed for drawable, skipping"
+                    );
+                    continue;
+                }
+            };
+            encoder.bind_pipeline(pl);
 
             // Push the world transform as push constants (placeholder MVP).
             if let Some(pll) = self.pll {
@@ -466,7 +510,7 @@ impl BackendRenderer for SceneRenderer {
 
         encoder.end_render_pass();
 
-        let stats = self.device.end_frame(sc_h, encoder, ii).map_err(|e| {
+        let stats = device.end_frame(sc_h, encoder, ii).map_err(|e| {
             vec![Diagnostic::new(
                 "RV0209",
                 DiagnosticSeverity::Error,
@@ -533,13 +577,19 @@ impl BackendRenderer for SceneRenderer {
                 );
                 encoder.set_scissor(0, 0, self.width, self.height);
 
-                if let Some(pl) = self.pl {
-                    encoder.bind_pipeline(pl);
-                }
-
+                // Bind descriptor sets once (shared by all pipelines).
                 if let Some(pll) = self.pll {
                     encoder.bind_descriptor_sets(pll, 0, &[], &[]);
                 }
+
+                // Build material and skinned-item lookups (same as render_frame).
+                let material_map: HashMap<&str, &MaterialBinding> =
+                    input.materials.iter().map(|m| (m.material_id.id.as_str(), m)).collect();
+                let skinned_materials: HashSet<&str> =
+                    input.skinned_items.iter().map(|s| s.material.id.as_str()).collect();
+
+                let device = &mut self.device;
+                let cache = &mut self.pipeline_cache;
 
                 for drawable in &input.drawables {
                     let mesh_id = &drawable.mesh.id;
@@ -556,6 +606,46 @@ impl BackendRenderer for SceneRenderer {
                             continue;
                         }
                     };
+
+                    // ── Resolve pipeline via variant cache ──────────────
+                    let is_skinned = skinned_materials.contains(drawable.material.id.as_str());
+                    let base_variant = if is_skinned {
+                        PipelineVariantKey::SKINNED
+                    } else {
+                        PipelineVariantKey::NONE
+                    };
+
+                    let pipeline_result = match material_map.get(drawable.material.id.as_str()) {
+                        Some(mat) => {
+                            let key = PipelineCacheKey {
+                                pipeline_asset: mat.pipeline.id.clone(),
+                                variant_key: PipelineVariantKey::new(
+                                    mat.variant_key | base_variant.bits(),
+                                ),
+                            };
+                            cache.get_or_create(&key, device)
+                        }
+                        None => {
+                            let key = PipelineCacheKey {
+                                pipeline_asset: "forward_pbr".into(),
+                                variant_key: base_variant,
+                            };
+                            cache.get_or_create(&key, device)
+                        }
+                    };
+
+                    let pl = match pipeline_result {
+                        Ok(h) => h,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "scene_renderer",
+                                error = ?e,
+                                "pipeline resolution failed in execute_pass, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    encoder.bind_pipeline(pl);
 
                     if let Some(pll) = self.pll {
                         let world = &drawable.world_transform;
