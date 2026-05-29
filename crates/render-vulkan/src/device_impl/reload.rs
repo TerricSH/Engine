@@ -48,9 +48,7 @@ impl VulkanDevice {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            )
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `d` is a valid AshDevice; `image_info` describes a valid
         // 2D image; `None` means no custom allocator.
@@ -99,8 +97,10 @@ impl VulkanDevice {
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         // SAFETY: `staging_buf` created by this device; allocation valid.
-        unsafe { d.bind_buffer_memory(staging_buf, staging_alloc.memory(), staging_alloc.offset()) }
-            .map_err(|r| VulkanError::vk("bind_staging (reload)", r))?;
+        unsafe {
+            d.bind_buffer_memory(staging_buf, staging_alloc.memory(), staging_alloc.offset())
+        }
+        .map_err(|r| VulkanError::vk("bind_staging (reload)", r))?;
 
         // Copy pixel data into staging buffer.
         if let Some(slice) = staging_alloc.mapped_slice_mut() {
@@ -181,7 +181,13 @@ impl VulkanDevice {
                     height,
                     depth: 1,
                 });
-            d.cmd_copy_buffer_to_image(cb, staging_buf, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            d.cmd_copy_buffer_to_image(
+                cb,
+                staging_buf,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
 
             // Transition image: TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
             let barrier_post = vk::ImageMemoryBarrier::default()
@@ -217,8 +223,7 @@ impl VulkanDevice {
         let fence = unsafe { d.create_fence(&fence_info, None) }
             .map_err(|r| VulkanError::vk("create_fence (reload)", r))?;
         let cmd_bufs = [cb];
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(&cmd_bufs);
+        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
         // SAFETY: queue is valid; submit info is correctly structured.
         unsafe {
             d.queue_submit(self.logical_device.queue, &[submit_info], fence)
@@ -346,15 +351,13 @@ impl VulkanDevice {
         let old_pipeline = self
             .mvp_pipeline
             .ok_or(VulkanError::Loader("MVP pipeline not created yet".into()))?;
-        let old_layout = self
-            .mvp_pipeline_layout
-            .ok_or(VulkanError::Loader("MVP pipeline layout not created".into()))?;
+        let old_layout = self.mvp_pipeline_layout.ok_or(VulkanError::Loader(
+            "MVP pipeline layout not created".into(),
+        ))?;
 
         // Leak the SPIR-V so the device can store `&'static` references.
-        let vert_static: &'static [u8] =
-            Box::leak(vert_spirv.to_vec().into_boxed_slice());
-        let frag_static: &'static [u8] =
-            Box::leak(frag_spirv.to_vec().into_boxed_slice());
+        let vert_static: &'static [u8] = Box::leak(vert_spirv.to_vec().into_boxed_slice());
+        let frag_static: &'static [u8] = Box::leak(frag_spirv.to_vec().into_boxed_slice());
 
         let saved_vert = self.mvp_vert_spv.replace(vert_static);
         let saved_frag = self.mvp_frag_spv.replace(frag_static);
@@ -384,15 +387,13 @@ impl VulkanDevice {
         let old_pipeline = self
             .model_pipeline
             .ok_or(VulkanError::Loader("model pipeline not created yet".into()))?;
-        let old_layout = self
-            .model_pipeline_layout
-            .ok_or(VulkanError::Loader("model pipeline layout not created".into()))?;
+        let old_layout = self.model_pipeline_layout.ok_or(VulkanError::Loader(
+            "model pipeline layout not created".into(),
+        ))?;
 
         // Leak the SPIR-V so the device can store `&'static` references.
-        let vert_static: &'static [u8] =
-            Box::leak(vert_spirv.to_vec().into_boxed_slice());
-        let frag_static: &'static [u8] =
-            Box::leak(frag_spirv.to_vec().into_boxed_slice());
+        let vert_static: &'static [u8] = Box::leak(vert_spirv.to_vec().into_boxed_slice());
+        let frag_static: &'static [u8] = Box::leak(frag_spirv.to_vec().into_boxed_slice());
 
         let saved_vert = self.mvp_vert_spv.replace(vert_static);
         let saved_frag = self.mvp_frag_spv.replace(frag_static);
@@ -418,12 +419,12 @@ impl VulkanDevice {
         vert_spirv: &[u8],
         frag_spirv: &[u8],
     ) -> VkResult<(vk::Pipeline, vk::PipelineLayout)> {
-        let old_pipeline = self
-            .shadow_pipeline
-            .ok_or(VulkanError::Loader("shadow pipeline not created yet".into()))?;
-        let old_layout = self
-            .shadow_pipeline_layout
-            .ok_or(VulkanError::Loader("shadow pipeline layout not created".into()))?;
+        let old_pipeline = self.shadow_pipeline.ok_or(VulkanError::Loader(
+            "shadow pipeline not created yet".into(),
+        ))?;
+        let old_layout = self.shadow_pipeline_layout.ok_or(VulkanError::Loader(
+            "shadow pipeline layout not created".into(),
+        ))?;
 
         // ── Create new shader modules ──────────────────────────────────
         let d = &self.logical_device.device;
@@ -442,8 +443,7 @@ impl VulkanDevice {
             offset: 0,
             size: 64,
         }];
-        let pll_info = vk::PipelineLayoutCreateInfo::default()
-            .push_constant_ranges(&pc_range);
+        let pll_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_range);
         // SAFETY: `d` is a valid AshDevice.
         let new_layout = unsafe { d.create_pipeline_layout(&pll_info, None) }
             .map_err(|r| VulkanError::vk("cpl_shadow_reload", r))?;

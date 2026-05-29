@@ -1,57 +1,95 @@
-use render_core::{PipelineDescriptor, PipelineVariantKey};
+use render_core::{
+    BindGroupLayoutDescriptor, BlendState, DepthState, PipelineDescriptor, PipelineLayoutHandle,
+    PipelineVariantKey, RasterState, RenderPassHandle, ShaderModuleHandle, TextureFormat,
+    VertexLayout,
+};
 
-use crate::pipeline_library::{PipelineCacheKey, PipelineLibrary};
-use crate::MaterialBinding;
+use crate::pipeline_library::{hash_vertex_layout, PipelineCacheKey, PipelineLibrary};
+use crate::{MaterialBinding, Transparency};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterialPipelineContext {
+    pub shader_modules: Vec<ShaderModuleHandle>,
+    pub vertex_layout: VertexLayout,
+    pub bind_layouts: Vec<BindGroupLayoutDescriptor>,
+    pub pipeline_layout: PipelineLayoutHandle,
+    pub render_pass: RenderPassHandle,
+    pub render_targets: Vec<TextureFormat>,
+    pub depth_format: Option<TextureFormat>,
+    pub depth_write_enabled: bool,
+    pub depth_compare: Option<String>,
+    pub front_face: Option<String>,
+    pub topology: Option<String>,
+    pub polygon_mode: Option<String>,
+    pub sample_count: u8,
+}
 
 /// Resolved material → pipeline mapping.
-///
-/// Maps a [`MaterialBinding`] + [`PipelineVariantKey`] pair to a cached
-/// pipeline.  The resolver is the bridge between high-level material data
-/// and the low-level pipeline cache.
 pub struct MaterialResolver {
     library: PipelineLibrary,
 }
 
 impl MaterialResolver {
     /// Create a new material resolver.
-    ///
-    /// `max_pipelines` controls the capacity of the underlying pipeline cache.
     pub fn new(max_pipelines: usize) -> Self {
         Self {
             library: PipelineLibrary::new(max_pipelines),
         }
     }
 
-    /// Resolve a pipeline for the given material binding.
-    ///
-    /// Returns a `(PipelineCacheKey, PipelineDescriptor)` pair that the
-    /// caller should pass to [`get_or_create`](PipelineLibrary::get_or_create).
-    ///
-    /// The returned key is built from:
-    /// - `shader_asset_id`: the material's `pipeline` asset ID
-    /// - `vertex_layout_hash`: `0` (caller should replace with the actual
-    ///   mesh vertex-layout hash before calling `get_or_create`)
-    /// - `variant_key`: the supplied variant flags
-    ///
-    /// The returned descriptor is a default template with the debug label
-    /// set to the material's pipeline asset ID.
+    /// Resolve a pipeline descriptor and cache key for the given material.
     pub fn resolve(
         &self,
         material: &MaterialBinding,
+        context: &MaterialPipelineContext,
         variant_key: PipelineVariantKey,
     ) -> (PipelineCacheKey, PipelineDescriptor) {
-        let key = PipelineCacheKey {
-            shader_asset_id: material.pipeline.id.clone(),
-            vertex_layout_hash: 0, // caller should override with the mesh's layout hash
-            variant_key,
+        let combined_variant = PipelineVariantKey::new(material.variant_key).with(variant_key);
+        let blend_mode = match material.transparency {
+            Transparency::Blend => Some("Alpha".to_string()),
+            Transparency::Opaque | Transparency::Masked { .. } => None,
+        };
+        let cull_mode = if material.double_sided {
+            Some("none".to_string())
+        } else {
+            Some("back".to_string())
         };
 
-        let mut desc = PipelineDescriptor::default();
-        desc.debug_label = Some(format!(
-            "material:{} variant:{:016x}",
-            material.pipeline.id,
-            variant_key.bits()
-        ));
+        let desc = PipelineDescriptor {
+            shader_modules: context.shader_modules.clone(),
+            vertex_layout: context.vertex_layout.clone(),
+            bind_layouts: context.bind_layouts.clone(),
+            pipeline_layout: Some(context.pipeline_layout),
+            raster_state: RasterState {
+                cull_mode,
+                front_face: context.front_face.clone(),
+            },
+            depth_state: DepthState {
+                format: context.depth_format,
+                write_enabled: context.depth_write_enabled,
+                compare: context.depth_compare.clone(),
+            },
+            blend_state: BlendState {
+                mode: blend_mode.clone(),
+            },
+            render_targets: context.render_targets.clone(),
+            debug_label: Some(format!(
+                "material:{} variant:{:016x}",
+                material.pipeline.id,
+                combined_variant.bits()
+            )),
+            topology: context.topology.clone(),
+            polygon_mode: context.polygon_mode.clone(),
+            sample_count: Some(context.sample_count),
+            render_pass: Some(context.render_pass),
+        };
+
+        let key = PipelineCacheKey::from_descriptor(
+            material.pipeline.id.clone(),
+            combined_variant,
+            hash_vertex_layout(&context.vertex_layout),
+            &desc,
+        );
 
         (key, desc)
     }
@@ -70,7 +108,7 @@ impl MaterialResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use render_core::PipelineVariantKey;
+    use render_core::{RenderPassHandle, VertexAttribute};
 
     fn dummy_material() -> MaterialBinding {
         MaterialBinding {
@@ -88,53 +126,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_produces_correct_key() {
-        let resolver = MaterialResolver::new(16);
-        let material = dummy_material();
-        let variant = PipelineVariantKey::SKINNED;
-
-        let (key, _desc) = resolver.resolve(&material, variant);
-
-        assert_eq!(key.shader_asset_id, "shader_pbr");
-        assert_eq!(key.vertex_layout_hash, 0);
-        assert_eq!(key.variant_key, PipelineVariantKey::SKINNED);
+    fn dummy_context() -> MaterialPipelineContext {
+        MaterialPipelineContext {
+            shader_modules: Vec::new(),
+            vertex_layout: VertexLayout {
+                stride_bytes: 24,
+                attributes: vec![
+                    VertexAttribute {
+                        semantic: "POSITION".into(),
+                        format: "float32x3".into(),
+                        offset_bytes: 0,
+                    },
+                    VertexAttribute {
+                        semantic: "NORMAL".into(),
+                        format: "float32x3".into(),
+                        offset_bytes: 12,
+                    },
+                ],
+            },
+            bind_layouts: Vec::new(),
+            pipeline_layout: PipelineLayoutHandle::new(3, 1),
+            render_pass: RenderPassHandle::new(5, 1),
+            render_targets: vec![TextureFormat::Bgra8Unorm],
+            depth_format: Some(TextureFormat::Depth32Float),
+            depth_write_enabled: true,
+            depth_compare: Some("less".into()),
+            front_face: Some("counter_clockwise".into()),
+            topology: Some("triangle_list".into()),
+            polygon_mode: Some("fill".into()),
+            sample_count: 1,
+        }
     }
 
     #[test]
-    fn resolve_with_multiple_variant_flags() {
+    fn resolve_produces_complete_key_and_descriptor() {
         let resolver = MaterialResolver::new(16);
         let material = dummy_material();
-        let variant = PipelineVariantKey::NONE
-            .with(PipelineVariantKey::INSTANCED)
-            .with(PipelineVariantKey::SHADOW_PASS);
+        let context = dummy_context();
 
-        let (key, _desc) = resolver.resolve(&material, variant);
+        let (key, desc) = resolver.resolve(&material, &context, PipelineVariantKey::SKINNED);
+
+        assert_eq!(key.shader_asset_id, "shader_pbr");
+        assert_eq!(key.vertex_layout_hash, hash_vertex_layout(&context.vertex_layout));
+        assert_eq!(key.pipeline_layout, Some(context.pipeline_layout));
+        assert_eq!(key.render_pass, Some(context.render_pass));
+        assert_eq!(key.variant_key, PipelineVariantKey::SKINNED);
+        assert_eq!(desc.pipeline_layout, Some(context.pipeline_layout));
+        assert_eq!(desc.render_pass, Some(context.render_pass));
+        assert_eq!(desc.render_targets, context.render_targets);
+        assert_eq!(desc.raster_state.cull_mode.as_deref(), Some("back"));
+        assert!(desc.debug_label.as_ref().is_some_and(|label| label.contains("shader_pbr")));
+    }
+
+    #[test]
+    fn resolve_combines_material_and_callsite_variant_flags() {
+        let resolver = MaterialResolver::new(16);
+        let mut material = dummy_material();
+        material.variant_key = PipelineVariantKey::INSTANCED.bits();
+        let context = dummy_context();
+
+        let (key, _desc) = resolver.resolve(&material, &context, PipelineVariantKey::SHADOW_PASS);
 
         assert!(key.variant_key.contains(PipelineVariantKey::INSTANCED));
         assert!(key.variant_key.contains(PipelineVariantKey::SHADOW_PASS));
-        assert!(!key.variant_key.contains(PipelineVariantKey::SKINNED));
     }
 
     #[test]
-    fn descriptor_has_debug_label() {
+    fn transparent_double_sided_material_changes_pipeline_state() {
         let resolver = MaterialResolver::new(16);
-        let material = dummy_material();
-        let variant = PipelineVariantKey::new();
+        let mut material = dummy_material();
+        material.transparency = crate::Transparency::Blend;
+        material.double_sided = true;
+        let context = dummy_context();
 
-        let (_key, desc) = resolver.resolve(&material, variant);
+        let (key, desc) = resolver.resolve(&material, &context, PipelineVariantKey::NONE);
 
-        assert!(
-            desc.debug_label.is_some(),
-            "resolve should set a debug label"
-        );
-        let label = desc.debug_label.as_ref().unwrap();
-        assert!(label.contains("shader_pbr"), "label should mention the shader asset");
+        assert_eq!(desc.blend_state.mode.as_deref(), Some("Alpha"));
+        assert_eq!(desc.raster_state.cull_mode.as_deref(), Some("none"));
+        assert_eq!(key.blend_state.mode.as_deref(), Some("Alpha"));
     }
 
     #[test]
     fn different_materials_produce_different_keys() {
         let resolver = MaterialResolver::new(16);
+        let context = dummy_context();
 
         let mat_a = MaterialBinding {
             pipeline: crate::AssetId::new("shader_a"),
@@ -145,43 +220,10 @@ mod tests {
             ..dummy_material()
         };
 
-        let (key_a, _) = resolver.resolve(&mat_a, PipelineVariantKey::NONE);
-        let (key_b, _) = resolver.resolve(&mat_b, PipelineVariantKey::NONE);
+        let (key_a, _) = resolver.resolve(&mat_a, &context, PipelineVariantKey::NONE);
+        let (key_b, _) = resolver.resolve(&mat_b, &context, PipelineVariantKey::NONE);
 
-        assert_ne!(key_a.shader_asset_id, key_b.shader_asset_id);
-    }
-
-    #[test]
-    fn variant_key_bit_operations() {
-        // Test the PipelineVariantKey bit operations directly
-        let vk = PipelineVariantKey::NONE;
-        assert_eq!(vk.bits(), 0);
-
-        let vk = vk.with(PipelineVariantKey::SKINNED);
-        assert!(vk.contains(PipelineVariantKey::SKINNED));
-        assert!(!vk.contains(PipelineVariantKey::INSTANCED));
-
-        let vk = vk.with(PipelineVariantKey::INSTANCED);
-        assert!(vk.contains(PipelineVariantKey::SKINNED));
-        assert!(vk.contains(PipelineVariantKey::INSTANCED));
-
-        // SHADOW_PASS is a separate bit
-        assert!(!vk.contains(PipelineVariantKey::SHADOW_PASS));
-
-        // Combining multiple flags
-        let combined = PipelineVariantKey::NONE
-            .with(PipelineVariantKey::SKINNED)
-            .with(PipelineVariantKey::SHADOW_PASS);
-        assert!(combined.contains(PipelineVariantKey::SKINNED));
-        assert!(combined.contains(PipelineVariantKey::SHADOW_PASS));
-        assert!(!combined.contains(PipelineVariantKey::INSTANCED));
-
-        // Using `new` with explicit bitmask
-        let combined2 = PipelineVariantKey::new(
-            PipelineVariantKey::SKINNED.bits() | PipelineVariantKey::INSTANCED.bits(),
-        );
-        assert!(combined2.contains(PipelineVariantKey::SKINNED));
-        assert!(combined2.contains(PipelineVariantKey::INSTANCED));
+        assert_ne!(key_a, key_b);
     }
 
     #[test]

@@ -238,11 +238,6 @@ impl LogicAsset {
             }
         }
 
-        // Check for cycles in state machines.
-        if matches!(self.kind, LogicAssetKind::StateMachine) {
-            self.detect_cycles(&node_ids, &mut errors);
-        }
-
         errors
     }
 
@@ -285,97 +280,6 @@ impl LogicAsset {
         }
     }
 
-    /// Simple cycle detection for state machines using DFS.
-    fn detect_cycles(&self, node_ids: &HashSet<&str>, errors: &mut Vec<String>) {
-        // Build adjacency list: node_id → list of target_node IDs from transitions.
-        let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for id in node_ids.iter() {
-            adj.entry(id).or_default();
-        }
-        for node in &self.nodes {
-            for t in &node.transitions {
-                if node_ids.contains(t.target_node.as_str()) {
-                    adj.entry(node.id.as_str())
-                        .or_default()
-                        .push(t.target_node.as_str());
-                }
-            }
-        }
-
-        // Standard DFS cycle detection with three-colour marking.
-        // Uses indices into a Vec rather than lifetime-heavy BTreeMap borrows
-        // to avoid nested-function lifetime issues.
-        let node_list: Vec<&str> = node_ids.iter().copied().collect();
-
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        enum Color {
-            White,
-            Gray,
-            Black,
-        }
-
-        let mut color: Vec<Color> = vec![Color::White; node_list.len()];
-        let mut dfs_path: Vec<String> = Vec::new();
-
-        // Build adjacency list as index-based Vec.
-        let mut adj_idx: Vec<Vec<usize>> = vec![Vec::new(); node_list.len()];
-        for node in &self.nodes {
-            if let Some(from) = node_list.iter().position(|&id| id == node.id) {
-                for t in &node.transitions {
-                    if let Some(to) = node_list.iter().position(|&id| *id == t.target_node) {
-                        if from != to {
-                            adj_idx[from].push(to);
-                        }
-                    }
-                }
-            }
-        }
-
-        fn dfs_idx(
-            u: usize,
-            adj: &[Vec<usize>],
-            color: &mut Vec<Color>,
-            path: &mut Vec<String>,
-            node_list: &[&str],
-            errors: &mut Vec<String>,
-        ) {
-            color[u] = Color::Gray;
-            path.push(node_list[u].to_string());
-
-            for &v in &adj[u] {
-                match color[v] {
-                    Color::Gray => {
-                        // Found a cycle — report it.
-                        let cycle_start = path
-                            .iter()
-                            .position(|n| n.as_str() == node_list[v])
-                            .unwrap_or(0);
-                        let cycle_path: Vec<&str> = path[cycle_start..]
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect();
-                        errors.push(format!(
-                            "StateMachine cycle detected: {}",
-                            cycle_path.join(" → ")
-                        ));
-                    }
-                    Color::White => {
-                        dfs_idx(v, adj, color, path, node_list, errors);
-                    }
-                    Color::Black => {}
-                }
-            }
-
-            path.pop();
-            color[u] = Color::Black;
-        }
-
-        for i in 0..color.len() {
-            if color[i] == Color::White {
-                dfs_idx(i, &adj_idx, &mut color, &mut dfs_path, &node_list, errors);
-            }
-        }
-    }
 }
 
 // ── Cook entry point ─────────────────────────────────────────────────────
@@ -705,15 +609,12 @@ mod tests {
     }
 
     #[test]
-    fn state_machine_cycle_detected() {
+    fn state_machine_cycle_allowed() {
         let mut asset = sample_state_machine();
-        // Introduce a cycle: closed → opening → closed (direct back-edge).
+        // State machines are expected to support revisiting earlier states.
         asset.nodes[1].transitions[0].target_node = "closed".into();
         let errors = asset.validate();
-        assert!(
-            errors.iter().any(|e| e.contains("cycle")),
-            "expected cycle detection error, got: {errors:?}"
-        );
+        assert!(errors.is_empty(), "expected FSM cycles to be allowed, got: {errors:?}");
     }
 
     #[test]

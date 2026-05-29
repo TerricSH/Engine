@@ -44,7 +44,12 @@ impl SecondaryPool {
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }
             .map_err(|r| VulkanError::vk("secondary_cmd_pool", r))?;
-        Ok(Self { pool, free: Vec::new(), slots: Vec::new(), device: device.clone() })
+        Ok(Self {
+            pool,
+            free: Vec::new(),
+            slots: Vec::new(),
+            device: device.clone(),
+        })
     }
 
     /// Allocate or recycle a secondary command buffer.
@@ -76,7 +81,9 @@ impl SecondaryPool {
 
 impl Drop for SecondaryPool {
     fn drop(&mut self) {
-        unsafe { self.device.destroy_command_pool(self.pool, None); }
+        unsafe {
+            self.device.destroy_command_pool(self.pool, None);
+        }
     }
 }
 
@@ -93,7 +100,11 @@ impl SecondaryBufferHandle {
     ///
     /// # Safety
     /// Must be called from a single thread at a time for this buffer.
-    pub unsafe fn begin(&self, device: &AshDevice, inherit: &vk::CommandBufferInheritanceInfo) -> VkResult<()> {
+    pub unsafe fn begin(
+        &self,
+        device: &AshDevice,
+        inherit: &vk::CommandBufferInheritanceInfo,
+    ) -> VkResult<()> {
         let info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
             .inheritance_info(inherit);
@@ -121,7 +132,12 @@ impl FrameContext {
             frames.push(frame);
         }
         let secondary_pool = unsafe { SecondaryPool::new(&device, queue_family_index) }?;
-        Ok(Self { frames, current: 0, device, secondary_pool: Mutex::new(secondary_pool) })
+        Ok(Self {
+            frames,
+            current: 0,
+            device,
+            secondary_pool: Mutex::new(secondary_pool),
+        })
     }
 
     pub fn _current_frame(&self) -> &Frame {
@@ -136,7 +152,11 @@ impl FrameContext {
     pub fn allocate_secondary(&self) -> VkResult<SecondaryBufferHandle> {
         let mut pool = self.secondary_pool.lock().unwrap();
         let (index, generation, vk_buffer) = pool.alloc()?;
-        Ok(SecondaryBufferHandle { index, generation, vk_buffer })
+        Ok(SecondaryBufferHandle {
+            index,
+            generation,
+            vk_buffer,
+        })
     }
 
     /// Return a secondary buffer to the pool after execution.

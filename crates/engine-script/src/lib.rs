@@ -33,6 +33,7 @@ mod component;
 mod engine;
 pub mod extension;
 mod host;
+pub mod ilruntime_host;
 mod lifecycle;
 pub mod mobile_subset;
 mod process_host;
@@ -52,6 +53,7 @@ pub use host::{
 pub use engine::ScriptEngine;
 pub use component::{ScriptComponent, ScriptInstanceState, ScriptManager};
 pub use protocol::ScriptMessage;
+pub use ilruntime_host::{ILRuntimeHost, ILRuntimeInstance};
 pub use process_host::{ProcessHost, ProcessScriptInstance};
 
 // Script API extension surface.

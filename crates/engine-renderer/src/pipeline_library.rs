@@ -1,105 +1,152 @@
-use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
-use std::time::Instant;
+use std::collections::HashMap;
 
-use render_core::{Device, PipelineDescriptor, PipelineHandle, PipelineVariantKey, RhiError};
+use render_core::{
+    BindGroupLayoutDescriptor, BlendState, DepthState, Device, PipelineDescriptor,
+    PipelineHandle, PipelineLayoutHandle, PipelineVariantKey, RasterState, RenderPassHandle,
+    RhiError, ShaderModuleHandle, TextureFormat,
+};
 
 /// Key for identifying a unique pipeline in the cache.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PipelineCacheKey {
     pub shader_asset_id: String,
+    pub shader_modules: Vec<ShaderModuleHandle>,
     pub vertex_layout_hash: u64,
+    pub bind_layouts: Vec<BindGroupLayoutDescriptor>,
+    pub pipeline_layout: Option<PipelineLayoutHandle>,
+    pub raster_state: RasterState,
+    pub depth_state: DepthState,
+    pub blend_state: BlendState,
+    pub render_targets: Vec<TextureFormat>,
+    pub topology: Option<String>,
+    pub polygon_mode: Option<String>,
+    pub sample_count: Option<u8>,
+    pub render_pass: Option<RenderPassHandle>,
     pub variant_key: PipelineVariantKey,
 }
 
-/// A cached pipeline entry with LRU tracking.
+impl PipelineCacheKey {
+    /// Build a cache key from the descriptor fields that materially affect
+    /// pipeline creation on the backend.
+    pub fn from_descriptor(
+        shader_asset_id: impl Into<String>,
+        variant_key: PipelineVariantKey,
+        vertex_layout_hash: u64,
+        desc: &PipelineDescriptor,
+    ) -> Self {
+        Self {
+            shader_asset_id: shader_asset_id.into(),
+            shader_modules: desc.shader_modules.clone(),
+            vertex_layout_hash,
+            bind_layouts: desc.bind_layouts.clone(),
+            pipeline_layout: desc.pipeline_layout,
+            raster_state: desc.raster_state.clone(),
+            depth_state: desc.depth_state.clone(),
+            blend_state: desc.blend_state.clone(),
+            render_targets: desc.render_targets.clone(),
+            topology: desc.topology.clone(),
+            polygon_mode: desc.polygon_mode.clone(),
+            sample_count: desc.sample_count,
+            render_pass: desc.render_pass,
+            variant_key,
+        }
+    }
+}
+
 struct PipelineEntry {
     handle: PipelineHandle,
-    last_used: Instant,
+    last_used_tick: u64,
 }
 
 /// Pipeline library that lazily creates and caches pipelines.
-///
-/// Maps `(shader_asset_id, vertex_layout_hash, variant_key)` to a
-/// `PipelineHandle`.  On cache miss the caller-provided `Device` is used
-/// to create a new pipeline; the result is stored for future lookups.
 pub struct PipelineLibrary {
-    cache: BTreeMap<PipelineCacheKey, PipelineEntry>,
+    cache: HashMap<PipelineCacheKey, PipelineEntry>,
     max_entries: usize,
+    next_use_tick: u64,
 }
 
 impl PipelineLibrary {
     /// Create a new pipeline library.
     ///
-    /// `max_entries` controls how many pipelines are retained before the
-    /// least-recently-used entry is evicted.
+    /// `max_entries == 0` disables caching while still allowing pipeline
+    /// creation through this API.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            cache: BTreeMap::new(),
+            cache: HashMap::new(),
             max_entries,
+            next_use_tick: 1,
         }
     }
 
+    fn touch(&mut self) -> u64 {
+        let tick = self.next_use_tick;
+        self.next_use_tick = self.next_use_tick.wrapping_add(1);
+        if self.next_use_tick == 0 {
+            self.next_use_tick = 1;
+        }
+        tick
+    }
+
+    fn remove_lru(&mut self) -> Option<PipelineHandle> {
+        let oldest_key = self
+            .cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_tick)
+            .map(|(key, _)| key.clone())?;
+
+        self.cache.remove(&oldest_key).map(|entry| entry.handle)
+    }
+
     /// Get or create a pipeline for the given key and descriptor.
-    ///
-    /// Returns a cached handle if one exists, otherwise calls
-    /// `device.create_pipeline(desc)` and stores the result.
     pub fn get_or_create(
         &mut self,
         device: &mut dyn Device,
         key: PipelineCacheKey,
         desc: &PipelineDescriptor,
     ) -> Result<PipelineHandle, RhiError> {
-        // Cache hit — update last_used and return
+        if self.max_entries == 0 {
+            return device.create_pipeline(desc);
+        }
+
+        let hit_tick = self.touch();
         if let Some(entry) = self.cache.get_mut(&key) {
-            entry.last_used = Instant::now();
+            entry.last_used_tick = hit_tick;
             return Ok(entry.handle);
         }
 
-        // Cache miss — create a new pipeline
         let handle = device.create_pipeline(desc)?;
 
-        // Evict if we are at capacity (before inserting, so we never exceed max)
         if self.cache.len() >= self.max_entries {
-            self.evict_lru();
+            let _ = self.evict_lru(device);
         }
 
+        let insert_tick = self.touch();
         self.cache.insert(
             key,
             PipelineEntry {
                 handle,
-                last_used: Instant::now(),
+                last_used_tick: insert_tick,
             },
         );
 
-        // After insertion, handle the edge case where max_entries == 0
-        // (we just inserted into a zero-capacity map — evict immediately)
-        if self.max_entries == 0 {
-            self.evict_lru();
-        }
-
-        // Re-fetch the handle from the entry we just inserted
-        // (safe unwrap: we just inserted it, or evict_lru removed it and we need
-        //  to return the handle anyway)
         Ok(handle)
     }
 
-    /// Evict the least-recently-used entry (the one with the oldest
-    /// `last_used` timestamp).
-    pub fn evict_lru(&mut self) {
-        if let Some(oldest_key) = self
-            .cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone())
-        {
-            self.cache.remove(&oldest_key);
-        }
+    /// Evict the least-recently-used entry and destroy its backend pipeline.
+    pub fn evict_lru(&mut self, device: &mut dyn Device) -> Option<PipelineHandle> {
+        let handle = self.remove_lru()?;
+        device.destroy_pipeline(handle);
+        Some(handle)
     }
 
-    /// Clear all cached pipelines.
-    pub fn clear(&mut self) {
-        self.cache.clear();
+    /// Clear all cached pipelines and destroy their backend resources.
+    pub fn clear(&mut self, device: &mut dyn Device) -> usize {
+        let cached = std::mem::take(&mut self.cache);
+        let count = cached.len();
+        for entry in cached.into_values() {
+            device.destroy_pipeline(entry.handle);
+        }
+        count
     }
 
     /// Number of cached pipelines.
@@ -113,32 +160,40 @@ impl PipelineLibrary {
     }
 }
 
-/// Compute a hash for a `VertexLayout` (for use in `PipelineCacheKey`).
-///
-/// Uses `std::collections::hash_map::DefaultHasher` (SipHash-2-4) so the
-/// result is stable within a single process execution but **not** stable
-/// across different versions of the compiler / standard library.
+/// Compute a stable hash for a `VertexLayout`.
 pub fn hash_vertex_layout(layout: &render_core::VertexLayout) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    layout.stride_bytes.hash(&mut hasher);
-    for attr in &layout.attributes {
-        attr.semantic.hash(&mut hasher);
-        attr.format.hash(&mut hasher);
-        attr.offset_bytes.hash(&mut hasher);
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    fn hash_bytes(state: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *state ^= u64::from(*byte);
+            *state = state.wrapping_mul(FNV_PRIME);
+        }
     }
-    hasher.finish()
+
+    let mut hash = FNV_OFFSET;
+    hash_bytes(&mut hash, &layout.stride_bytes.to_le_bytes());
+    for attr in &layout.attributes {
+        hash_bytes(&mut hash, attr.semantic.as_bytes());
+        hash_bytes(&mut hash, &[0xff]);
+        hash_bytes(&mut hash, attr.format.as_bytes());
+        hash_bytes(&mut hash, &[0xfe]);
+        hash_bytes(&mut hash, &attr.offset_bytes.to_le_bytes());
+        hash_bytes(&mut hash, &[0xfd]);
+    }
+    hash
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use render_core::{VertexAttribute, VertexLayout};
-
-    // ── Mock device that returns sequential handles ──
+    use render_core::{RenderPassHandle, VertexAttribute, VertexLayout};
 
     struct MockDevice {
         next_index: u32,
         fail: bool,
+        destroyed: Vec<PipelineHandle>,
     }
 
     impl MockDevice {
@@ -146,6 +201,7 @@ mod tests {
             Self {
                 next_index: 1,
                 fail: false,
+                destroyed: Vec::new(),
             }
         }
     }
@@ -168,6 +224,10 @@ mod tests {
             self.next_index += 1;
             Ok(handle)
         }
+
+        fn destroy_pipeline(&mut self, handle: PipelineHandle) {
+            self.destroyed.push(handle);
+        }
     }
 
     fn dummy_desc() -> PipelineDescriptor {
@@ -175,23 +235,19 @@ mod tests {
     }
 
     fn dummy_key(label: &str) -> PipelineCacheKey {
-        PipelineCacheKey {
-            shader_asset_id: label.to_string(),
-            vertex_layout_hash: 42,
-            variant_key: PipelineVariantKey::NONE,
-        }
+        PipelineCacheKey::from_descriptor(label, PipelineVariantKey::NONE, 42, &dummy_desc())
     }
-
-    // ── Tests ──
 
     #[test]
     fn cache_miss_creates_pipeline() {
         let mut lib = PipelineLibrary::new(16);
         let mut device = MockDevice::new();
         let key = dummy_key("miss");
+
         let handle = lib
-            .get_or_create(&mut device, key.clone(), &dummy_desc())
+            .get_or_create(&mut device, key, &dummy_desc())
             .expect("create should succeed");
+
         assert_eq!(handle.index, 1);
         assert_eq!(lib.len(), 1);
     }
@@ -201,13 +257,15 @@ mod tests {
         let mut lib = PipelineLibrary::new(16);
         let mut device = MockDevice::new();
         let key = dummy_key("hit");
-        let h1 = lib
+
+        let first = lib
             .get_or_create(&mut device, key.clone(), &dummy_desc())
             .expect("first create");
-        let h2 = lib
-            .get_or_create(&mut device, key.clone(), &dummy_desc())
+        let second = lib
+            .get_or_create(&mut device, key, &dummy_desc())
             .expect("second get");
-        assert_eq!(h1, h2, "cache hit should return identical handle");
+
+        assert_eq!(first, second);
         assert_eq!(lib.len(), 1);
     }
 
@@ -215,55 +273,62 @@ mod tests {
     fn different_keys_produce_different_handles() {
         let mut lib = PipelineLibrary::new(16);
         let mut device = MockDevice::new();
-        let k1 = dummy_key("a");
-        let k2 = dummy_key("b");
-        let h1 = lib
-            .get_or_create(&mut device, k1, &dummy_desc())
+
+        let first = lib
+            .get_or_create(&mut device, dummy_key("a"), &dummy_desc())
             .expect("first");
-        let h2 = lib
-            .get_or_create(&mut device, k2, &dummy_desc())
+        let second = lib
+            .get_or_create(&mut device, dummy_key("b"), &dummy_desc())
             .expect("second");
-        assert_ne!(h1, h2);
+
+        assert_ne!(first, second);
         assert_eq!(lib.len(), 2);
+    }
+
+    #[test]
+    fn key_includes_descriptor_state() {
+        let mut opaque = dummy_desc();
+        opaque.render_pass = Some(RenderPassHandle::new(1, 1));
+
+        let mut alpha = opaque.clone();
+        alpha.blend_state.mode = Some("Alpha".into());
+
+        let opaque_key =
+            PipelineCacheKey::from_descriptor("scene", PipelineVariantKey::NONE, 42, &opaque);
+        let alpha_key =
+            PipelineCacheKey::from_descriptor("scene", PipelineVariantKey::NONE, 42, &alpha);
+
+        assert_ne!(opaque_key, alpha_key);
     }
 
     #[test]
     fn evict_lru_removes_oldest() {
         let mut lib = PipelineLibrary::new(3);
         let mut device = MockDevice::new();
-
         let k1 = dummy_key("k1");
         let k2 = dummy_key("k2");
         let k3 = dummy_key("k3");
 
-        // Fill the cache
-        lib.get_or_create(&mut device, k1.clone(), &dummy_desc())
+        let h1 = lib
+            .get_or_create(&mut device, k1.clone(), &dummy_desc())
             .expect("k1");
-        lib.get_or_create(&mut device, k2.clone(), &dummy_desc())
+        let h2 = lib
+            .get_or_create(&mut device, k2.clone(), &dummy_desc())
             .expect("k2");
         lib.get_or_create(&mut device, k3.clone(), &dummy_desc())
             .expect("k3");
-        assert_eq!(lib.len(), 3);
 
-        // Touch k1 to make it most recent, then k2 is now oldest
         lib.get_or_create(&mut device, k1.clone(), &dummy_desc())
             .expect("k1 touch");
 
-        // Evict one — should remove k2
-        lib.evict_lru();
+        let evicted = lib.evict_lru(&mut device);
+        assert_eq!(evicted, Some(h2));
+        assert_eq!(device.destroyed, vec![h2]);
         assert_eq!(lib.len(), 2);
-        assert!(
-            lib.cache.contains_key(&k1),
-            "k1 should be present (most recent)"
-        );
-        assert!(
-            lib.cache.contains_key(&k3),
-            "k3 should be present"
-        );
-        assert!(
-            !lib.cache.contains_key(&k2),
-            "k2 should have been evicted (oldest)"
-        );
+        assert!(lib.cache.contains_key(&k1));
+        assert!(lib.cache.contains_key(&k3));
+        assert!(!lib.cache.contains_key(&k2));
+        assert!(!device.destroyed.contains(&h1));
     }
 
     #[test]
@@ -271,49 +336,43 @@ mod tests {
         let mut lib = PipelineLibrary::new(2);
         let mut device = MockDevice::new();
 
-        let k1 = dummy_key("k1");
-        let k2 = dummy_key("k2");
-        let k3 = dummy_key("k3");
-
-        lib.get_or_create(&mut device, k1.clone(), &dummy_desc())
+        let first = lib
+            .get_or_create(&mut device, dummy_key("k1"), &dummy_desc())
             .expect("k1");
-        lib.get_or_create(&mut device, k2.clone(), &dummy_desc())
+        lib.get_or_create(&mut device, dummy_key("k2"), &dummy_desc())
             .expect("k2");
-        // Insertion of k3 should evict k1 (oldest)
-        lib.get_or_create(&mut device, k3.clone(), &dummy_desc())
+        lib.get_or_create(&mut device, dummy_key("k3"), &dummy_desc())
             .expect("k3");
 
         assert_eq!(lib.len(), 2);
-        assert!(!lib.cache.contains_key(&k1), "k1 should be evicted");
-        assert!(lib.cache.contains_key(&k2), "k2 should remain");
-        assert!(lib.cache.contains_key(&k3), "k3 should remain");
+        assert_eq!(device.destroyed, vec![first]);
+        assert!(!lib.cache.contains_key(&dummy_key("k1")));
     }
 
     #[test]
-    fn clear_empties_cache() {
+    fn clear_empties_cache_and_destroys_pipelines() {
         let mut lib = PipelineLibrary::new(16);
         let mut device = MockDevice::new();
-
-        lib.get_or_create(&mut device, dummy_key("x"), &dummy_desc())
+        let first = lib
+            .get_or_create(&mut device, dummy_key("x"), &dummy_desc())
             .expect("create");
-        assert_eq!(lib.len(), 1);
 
-        lib.clear();
-        assert_eq!(lib.len(), 0);
+        let cleared = lib.clear(&mut device);
+
+        assert_eq!(cleared, 1);
+        assert_eq!(device.destroyed, vec![first]);
         assert!(lib.is_empty());
     }
 
     #[test]
-    fn create_propagation_error() {
+    fn create_propagates_device_error() {
         let mut lib = PipelineLibrary::new(16);
         let mut device = MockDevice::new();
         device.fail = true;
 
         let result = lib.get_or_create(&mut device, dummy_key("fail"), &dummy_desc());
-        assert!(
-            result.is_err(),
-            "should propagate device error"
-        );
+
+        assert!(result.is_err());
         assert_eq!(lib.len(), 0);
     }
 
@@ -334,21 +393,7 @@ mod tests {
                 },
             ],
         };
-        let layout_b = VertexLayout {
-            stride_bytes: 32,
-            attributes: vec![
-                VertexAttribute {
-                    semantic: "POSITION".into(),
-                    format: "float32x3".into(),
-                    offset_bytes: 0,
-                },
-                VertexAttribute {
-                    semantic: "NORMAL".into(),
-                    format: "float32x3".into(),
-                    offset_bytes: 12,
-                },
-            ],
-        };
+        let layout_b = layout_a.clone();
         let layout_c = VertexLayout {
             stride_bytes: 48,
             attributes: vec![
@@ -365,32 +410,40 @@ mod tests {
             ],
         };
 
-        assert_eq!(
-            hash_vertex_layout(&layout_a),
-            hash_vertex_layout(&layout_b),
-            "identical layouts should produce the same hash"
-        );
-        assert_ne!(
-            hash_vertex_layout(&layout_a),
-            hash_vertex_layout(&layout_c),
-            "different layouts should produce different hashes (collision unlikely)"
-        );
+        assert_eq!(hash_vertex_layout(&layout_a), hash_vertex_layout(&layout_b));
+        assert_ne!(hash_vertex_layout(&layout_a), hash_vertex_layout(&layout_c));
     }
 
     #[test]
-    fn zero_capacity_evicts_immediately() {
+    fn zero_capacity_disables_caching_without_destroying_handles() {
         let mut lib = PipelineLibrary::new(0);
         let mut device = MockDevice::new();
 
-        let handle = lib
+        let first = lib
             .get_or_create(&mut device, dummy_key("z"), &dummy_desc())
-            .expect("create should still work");
-        assert_eq!(
-            lib.len(),
-            0,
-            "zero-capacity cache should be empty after insert"
-        );
-        // The handle is still valid even though the entry was evicted
-        assert_eq!(handle.index, 1);
+            .expect("first create");
+        let second = lib
+            .get_or_create(&mut device, dummy_key("z"), &dummy_desc())
+            .expect("second create");
+
+        assert_ne!(first, second);
+        assert!(lib.is_empty());
+        assert!(device.destroyed.is_empty());
+    }
+
+    #[test]
+    fn over_capacity_destroys_evicted_pipeline() {
+        let mut lib = PipelineLibrary::new(2);
+        let mut device = MockDevice::new();
+
+        let first = lib
+            .get_or_create(&mut device, dummy_key("first"), &dummy_desc())
+            .expect("first");
+        lib.get_or_create(&mut device, dummy_key("second"), &dummy_desc())
+            .expect("second");
+        lib.get_or_create(&mut device, dummy_key("third"), &dummy_desc())
+            .expect("third");
+
+        assert_eq!(device.destroyed, vec![first]);
     }
 }

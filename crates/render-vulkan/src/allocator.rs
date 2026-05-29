@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 // ---------------------------------------------------------------------------
 
 pub type SharedAllocator = Arc<Mutex<VulkanAllocator>>;
-pub use self::inner::{Allocation, AllocationCreateDesc, AllocationScheme, MemoryLocation, VulkanAllocator};
+pub use self::inner::{
+    Allocation, AllocationCreateDesc, AllocationScheme, MemoryLocation, VulkanAllocator,
+};
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -57,8 +59,6 @@ mod inner {
         _name: &'static str,
     }
 
-
-
     impl Allocation {
         pub fn memory(&self) -> vk::DeviceMemory {
             self.memory
@@ -85,14 +85,14 @@ mod inner {
             device: AshDevice,
             memory_properties: vk::PhysicalDeviceMemoryProperties,
         ) -> Self {
-            Self { device, memory_properties }
+            Self {
+                device,
+                memory_properties,
+            }
         }
 
         /// Allocate device memory.
-        pub fn allocate(
-            &mut self,
-            desc: &AllocationCreateDesc,
-        ) -> Result<Allocation, String> {
+        pub fn allocate(&mut self, desc: &AllocationCreateDesc) -> Result<Allocation, String> {
             let mt = self
                 .find_memory_type(desc.requirements.memory_type_bits, desc.location)
                 .ok_or_else(|| format!("no suitable memory type for {}", desc.name))?;
@@ -120,13 +120,21 @@ mod inner {
                 }
             };
 
-            Ok(Allocation { memory, size, offset: 0, mapped_ptr, _name: desc.name })
+            Ok(Allocation {
+                memory,
+                size,
+                offset: 0,
+                mapped_ptr,
+                _name: desc.name,
+            })
         }
 
         /// Free memory.
         pub fn free(&mut self, alloc: &mut Allocation) {
             if alloc.memory != vk::DeviceMemory::null() {
-                unsafe { self.device.free_memory(alloc.memory, None); }
+                unsafe {
+                    self.device.free_memory(alloc.memory, None);
+                }
                 alloc.memory = vk::DeviceMemory::null();
                 alloc.mapped_ptr = None;
                 alloc.size = 0;
@@ -142,7 +150,8 @@ mod inner {
                 let need = match location {
                     MemoryLocation::GpuOnly => vk::MemoryPropertyFlags::DEVICE_LOCAL,
                     MemoryLocation::CpuToGpu => {
-                        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT
                     }
                     MemoryLocation::GpuToCpu => {
                         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED

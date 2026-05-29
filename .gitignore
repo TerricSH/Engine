@@ -6,3 +6,5 @@
 .yly-project-memory/
 .omo/
 .opencode/
+scripts/csharp/**/bin/
+scripts/csharp/**/obj/

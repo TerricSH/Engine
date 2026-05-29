@@ -1,0 +1,11 @@
+[package]
+name = "engine-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FFI bridge between Rust engine and C# scripting layer"
+
+[dependencies]
+engine-serialize = { path = "../engine-serialize" }
+tracing.workspace = true

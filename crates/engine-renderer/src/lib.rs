@@ -12,7 +12,7 @@ mod traits;
 mod validation;
 
 pub use debug_draw::{DebugDrawBuffer, DebugDrawProvider, DebugDrawRegistry, DebugLabel, DebugLine, DebugShape};
-pub use material_resolver::MaterialResolver;
+pub use material_resolver::{MaterialPipelineContext, MaterialResolver};
 pub use pipeline_library::{hash_vertex_layout, PipelineCacheKey, PipelineLibrary};
 pub use render_extension::{RenderExtensionProducer, RenderExtensionRegistry};
 pub use render_graph2::{PassGraphConfig, PassConfigEntry, PassKind as PassKind2};

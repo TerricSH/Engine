@@ -45,14 +45,16 @@ impl CmdEncoderTrait for VkCmdEncoder {
         clear: [f32; 4],
         _depth: Option<f32>,
     ) {
-        let rp_ = self
-            .render_pass_cache
-            .get(rp.index as usize)
-            .and_then(|s| s.as_ref().filter(|(g, _)| *g == rp.generation).map(|(_, v)| *v));
-        let fb_ = self
-            .framebuffer_cache
-            .get(fb.index as usize)
-            .and_then(|s| s.as_ref().filter(|(g, _)| *g == fb.generation).map(|(_, v)| *v));
+        let rp_ = self.render_pass_cache.get(rp.index as usize).and_then(|s| {
+            s.as_ref()
+                .filter(|(g, _)| *g == rp.generation)
+                .map(|(_, v)| *v)
+        });
+        let fb_ = self.framebuffer_cache.get(fb.index as usize).and_then(|s| {
+            s.as_ref()
+                .filter(|(g, _)| *g == fb.generation)
+                .map(|(_, v)| *v)
+        });
         if let (Some(rp_), Some(fb_)) = (rp_, fb_) {
             let cc = vk::ClearValue {
                 color: vk::ClearColorValue { float32: clear },
@@ -79,17 +81,14 @@ impl CmdEncoderTrait for VkCmdEncoder {
         }
     }
     fn bind_pipeline(&mut self, p: PipelineHandle) {
-        if let Some(&pipeline) = self
-            .pipeline_cache
-            .get(p.index as usize)
-            .and_then(|s| s.as_ref().filter(|(g, _)| *g == p.generation).map(|(_, v)| v))
-        {
+        if let Some(&pipeline) = self.pipeline_cache.get(p.index as usize).and_then(|s| {
+            s.as_ref()
+                .filter(|(g, _)| *g == p.generation)
+                .map(|(_, v)| v)
+        }) {
             unsafe {
-                self.device.cmd_bind_pipeline(
-                    self.cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline,
-                );
+                self.device
+                    .cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
             }
         }
     }
@@ -97,9 +96,11 @@ impl CmdEncoderTrait for VkCmdEncoder {
         let v: Vec<vk::Buffer> = bufs
             .iter()
             .filter_map(|h| {
-                self.buffer_cache
-                    .get(h.index as usize)
-                    .and_then(|s| s.as_ref().filter(|(g, _)| *g == h.generation).map(|(_, b)| *b))
+                self.buffer_cache.get(h.index as usize).and_then(|s| {
+                    s.as_ref()
+                        .filter(|(g, _)| *g == h.generation)
+                        .map(|(_, b)| *b)
+                })
             })
             .collect();
         if !v.is_empty() {
@@ -109,11 +110,11 @@ impl CmdEncoderTrait for VkCmdEncoder {
         }
     }
     fn bind_index_buffer(&mut self, buf: BufferHandle, o: u64, f: IndexFormat) {
-        if let Some(&buffer) = self
-            .buffer_cache
-            .get(buf.index as usize)
-            .and_then(|s| s.as_ref().filter(|(g, _)| *g == buf.generation).map(|(_, b)| b))
-        {
+        if let Some(&buffer) = self.buffer_cache.get(buf.index as usize).and_then(|s| {
+            s.as_ref()
+                .filter(|(g, _)| *g == buf.generation)
+                .map(|(_, b)| b)
+        }) {
             unsafe {
                 self.device.cmd_bind_index_buffer(
                     self.cmd,
@@ -137,7 +138,11 @@ impl CmdEncoderTrait for VkCmdEncoder {
         if let Some(&layout) = self
             .pipeline_layout_cache
             .get(pl.index as usize)
-            .and_then(|s| s.as_ref().filter(|(g, _)| *g == pl.generation).map(|(_, l)| l))
+            .and_then(|s| {
+                s.as_ref()
+                    .filter(|(g, _)| *g == pl.generation)
+                    .map(|(_, l)| l)
+            })
         {
             let set = self.current_desc_set;
             if set != vk::DescriptorSet::null() {
@@ -200,7 +205,11 @@ impl CmdEncoderTrait for VkCmdEncoder {
         if let Some(&layout) = self
             .pipeline_layout_cache
             .get(pl.index as usize)
-            .and_then(|s| s.as_ref().filter(|(g, _)| *g == pl.generation).map(|(_, l)| l))
+            .and_then(|s| {
+                s.as_ref()
+                    .filter(|(g, _)| *g == pl.generation)
+                    .map(|(_, l)| l)
+            })
         {
             unsafe {
                 self.device.cmd_push_constants(

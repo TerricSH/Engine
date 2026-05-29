@@ -77,7 +77,7 @@ pub struct AdapterInfo {
     pub capabilities: BackendCapabilities,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BackendCapabilities {
     pub max_texture_dimension_2d: u32,
     pub max_color_attachments: u8,
@@ -89,7 +89,7 @@ pub struct BackendCapabilities {
     pub limits: ResourceLimits,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub max_buffer_bytes: u64,
     pub max_texture_array_layers: u32,
@@ -102,7 +102,6 @@ pub struct ResourceLimits {
 // ============================================================================
 // Usage flags
 // ============================================================================
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferUsage(pub u32);
 
@@ -324,32 +323,32 @@ pub struct VertexAttribute {
     pub offset_bytes: u32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BindGroupLayoutDescriptor {
     pub set_index: u8,
     pub bindings: Vec<BindGroupLayoutBinding>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BindGroupLayoutBinding {
     pub binding: u32,
     pub resource_kind: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RasterState {
     pub cull_mode: Option<String>,
     pub front_face: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DepthState {
     pub format: Option<TextureFormat>,
     pub write_enabled: bool,
     pub compare: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlendState {
     pub mode: Option<String>,
 }

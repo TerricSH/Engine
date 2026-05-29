@@ -17,6 +17,7 @@ target-mobile = []
 subsystem-scripting-csharp = []
 
 [dependencies]
+base64.workspace = true
 crossbeam-channel.workspace = true
 engine-serialize = { path = "../engine-serialize" }
 serde.workspace = true

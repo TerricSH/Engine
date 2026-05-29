@@ -190,10 +190,9 @@ impl VulkanRenderer {
                 "triangle.frag.spv",
             ),
             VulkanSceneKind::TexturedQuad => {
-                let textured_quad = self
-                    .textured_quad
-                    .as_ref()
-                    .ok_or(VulkanError::Loader("textured resources not initialized".into()))?;
+                let textured_quad = self.textured_quad.as_ref().ok_or(VulkanError::Loader(
+                    "textured resources not initialized".into(),
+                ))?;
                 (
                     PipelineKind::TexturedQuad {
                         descriptor_set_layout: textured_quad.descriptor_set_layout,
@@ -226,9 +225,18 @@ impl VulkanRenderer {
     }
 
     unsafe fn record_and_submit(&mut self) -> VkResult<()> {
-        let swapchain = self.swapchain.as_ref().ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
-        let pipeline = self.pipeline.as_ref().ok_or(VulkanError::Loader("pipeline not initialized".into()))?;
-        let frames = self.frames.as_mut().ok_or(VulkanError::Loader("frames not initialized".into()))?;
+        let swapchain = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .ok_or(VulkanError::Loader("pipeline not initialized".into()))?;
+        let frames = self
+            .frames
+            .as_mut()
+            .ok_or(VulkanError::Loader("frames not initialized".into()))?;
         let device = &self.device.device;
 
         let frame = &frames.frames[frames.current];
@@ -330,10 +338,9 @@ impl VulkanRenderer {
                     device.cmd_draw(frame.command_buffer, 3, 1, 0, 0);
                 }
                 VulkanSceneKind::TexturedQuad => {
-                    let textured_quad = self
-                        .textured_quad
-                        .as_ref()
-                        .ok_or(VulkanError::Loader("textured resources not initialized".into()))?;
+                    let textured_quad = self.textured_quad.as_ref().ok_or(VulkanError::Loader(
+                        "textured resources not initialized".into(),
+                    ))?;
                     let vertex_buffers = [textured_quad.vertex_buffer.buffer];
                     let offsets = [0_u64];
                     let descriptor_sets = [textured_quad.descriptor_set];

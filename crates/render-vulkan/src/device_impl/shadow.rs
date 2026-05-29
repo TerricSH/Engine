@@ -4,7 +4,7 @@ use ash::vk;
 
 use crate::error::{VkResult, VulkanError};
 
-use super::{VulkanDevice, mk_sm};
+use super::{mk_sm, VulkanDevice};
 
 impl VulkanDevice {
     /// Ensure shadow mapping resources exist (idempotent).
@@ -44,7 +44,8 @@ impl VulkanDevice {
         // requirements for a valid image is safe.
         let req = unsafe { d.get_image_memory_requirements(image) };
         let allocation = allocator
-            .lock().map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
+            .lock()
+            .map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
             .allocate(&crate::allocator::AllocationCreateDesc {
                 name: "shadow-map",
                 requirements: req,
@@ -143,8 +144,7 @@ impl VulkanDevice {
             offset: 0,
             size: 64,
         }];
-        let pll_info = vk::PipelineLayoutCreateInfo::default()
-            .push_constant_ranges(&pc_range);
+        let pll_info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_range);
         // SAFETY: `d` is a valid AshDevice; `pll_info` describes a valid
         // pipeline layout with push constants; `None` means no custom allocator.
         let pll = unsafe { d.create_pipeline_layout(&pll_info, None) }
@@ -316,8 +316,7 @@ impl VulkanDevice {
 
         // ---- 10. Bind-only pipeline layout (set=1 only, for early binding in begin_frame) ----
         let bind_set_layouts = [ds_layout];
-        let bind_pli = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&bind_set_layouts);
+        let bind_pli = vk::PipelineLayoutCreateInfo::default().set_layouts(&bind_set_layouts);
         // SAFETY: `d` is a valid AshDevice; `bind_pli` describes a valid layout;
         // `None` means no custom allocator.
         let bind_pll = unsafe { d.create_pipeline_layout(&bind_pli, None) }
@@ -334,43 +333,63 @@ impl VulkanDevice {
         // Descriptor pool automatically frees its descriptor sets
         if let Some(pool) = self.shadow_desc_pool.take() {
             // SAFETY: `pool` was created by this device and is still alive.
-            unsafe { d.destroy_descriptor_pool(pool, None); }
+            unsafe {
+                d.destroy_descriptor_pool(pool, None);
+            }
         }
         if let Some(layout) = self.shadow_desc_layout.take() {
             // SAFETY: `layout` was created by this device and is still alive.
-            unsafe { d.destroy_descriptor_set_layout(layout, None); }
+            unsafe {
+                d.destroy_descriptor_set_layout(layout, None);
+            }
         }
         if let Some(layout) = self.shadow_bind_layout.take() {
             // SAFETY: `layout` was created by this device and is still alive.
-            unsafe { d.destroy_pipeline_layout(layout, None); }
+            unsafe {
+                d.destroy_pipeline_layout(layout, None);
+            }
         }
         if let Some(fb) = self.shadow_fb.take() {
             // SAFETY: `fb` was created by this device and is still alive.
-            unsafe { d.destroy_framebuffer(fb, None); }
+            unsafe {
+                d.destroy_framebuffer(fb, None);
+            }
         }
         if let Some(p) = self.shadow_pipeline.take() {
             // SAFETY: `p` was created by this device and is still alive.
-            unsafe { d.destroy_pipeline(p, None); }
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
         }
         if let Some(l) = self.shadow_pipeline_layout.take() {
             // SAFETY: `l` was created by this device and is still alive.
-            unsafe { d.destroy_pipeline_layout(l, None); }
+            unsafe {
+                d.destroy_pipeline_layout(l, None);
+            }
         }
         if let Some(rp) = self.shadow_rp.take() {
             // SAFETY: `rp` was created by this device and is still alive.
-            unsafe { d.destroy_render_pass(rp, None); }
+            unsafe {
+                d.destroy_render_pass(rp, None);
+            }
         }
         if let Some(s) = self.shadow_sampler.take() {
             // SAFETY: `s` was created by this device and is still alive.
-            unsafe { d.destroy_sampler(s, None); }
+            unsafe {
+                d.destroy_sampler(s, None);
+            }
         }
         if let Some(iv) = self.shadow_map_view.take() {
             // SAFETY: `iv` was created by this device and is still alive.
-            unsafe { d.destroy_image_view(iv, None); }
+            unsafe {
+                d.destroy_image_view(iv, None);
+            }
         }
         if let Some(img) = self.shadow_map.take() {
             // SAFETY: `img` was created by this device and is still alive.
-            unsafe { d.destroy_image(img, None); }
+            unsafe {
+                d.destroy_image(img, None);
+            }
         }
         if let Some(mut a) = self.shadow_allocation.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
@@ -384,8 +403,7 @@ impl VulkanDevice {
         let light_dir = glam::Vec3::new(0.5, -0.707, 0.5).normalize();
         // Position the light far away, looking at the origin
         let light_pos = -light_dir * 10.0;
-        let view =
-            glam::Mat4::look_at_rh(light_pos, glam::Vec3::ZERO, glam::Vec3::Y);
+        let view = glam::Mat4::look_at_rh(light_pos, glam::Vec3::ZERO, glam::Vec3::Y);
         let ortho = glam::Mat4::orthographic_rh(-5.0, 5.0, -5.0, 5.0, 0.1, 20.0);
         let light_mvp = ortho * view;
         light_mvp.to_cols_array_2d()
@@ -407,9 +425,15 @@ impl VulkanDevice {
     ) -> VkResult<()> {
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
-        let rp = self.shadow_rp.ok_or(VulkanError::Loader("shadow render pass not initialized".into()))?;
-        let pl = self.shadow_pipeline.ok_or(VulkanError::Loader("shadow pipeline not initialized".into()))?;
-        let pll = self.shadow_pipeline_layout.ok_or(VulkanError::Loader("shadow pipeline layout not initialized".into()))?;
+        let rp = self.shadow_rp.ok_or(VulkanError::Loader(
+            "shadow render pass not initialized".into(),
+        ))?;
+        let pl = self.shadow_pipeline.ok_or(VulkanError::Loader(
+            "shadow pipeline not initialized".into(),
+        ))?;
+        let pll = self.shadow_pipeline_layout.ok_or(VulkanError::Loader(
+            "shadow pipeline layout not initialized".into(),
+        ))?;
         const SHADOW_SIZE: u32 = 2048;
 
         // Look up Vulkan buffer handles
@@ -434,7 +458,9 @@ impl VulkanDevice {
         let clear_values = [clear_depth];
         let rpbi = vk::RenderPassBeginInfo::default()
             .render_pass(rp)
-            .framebuffer(self.shadow_fb.ok_or(VulkanError::Loader("shadow framebuffer not initialized".into()))?)
+            .framebuffer(self.shadow_fb.ok_or(VulkanError::Loader(
+                "shadow framebuffer not initialized".into(),
+            ))?)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: vk::Extent2D {
@@ -505,7 +531,9 @@ impl VulkanDevice {
         // Pipeline barrier: make shadow depth writes visible to fragment shader reads
         // in the subsequent forward render pass.
         let barrier = vk::ImageMemoryBarrier::default()
-            .image(self.shadow_map.ok_or(VulkanError::Loader("shadow map image not initialized".into()))?)
+            .image(self.shadow_map.ok_or(VulkanError::Loader(
+                "shadow map image not initialized".into(),
+            ))?)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::DEPTH,
                 base_mip_level: 0,
