@@ -1,386 +1,374 @@
-use crossbeam_channel::{Receiver, Sender};
-use rapier3d::na;
-use rapier3d::prelude::*;
-use tracing::{debug, info};
+use std::sync::{Arc, Mutex};
 
-use crate::convert::{from_rapier_isometry, to_rapier_isometry};
-use crate::types::{ColliderHandle, ColliderShape, ContactEventData, PhysicsError, RayHit, RigidBodyHandle};
+use tracing::debug;
 
-// ── Event handler ───────────────────────────────────────────────────────────
+use crate::backend::{RapierBackend, RaycastHit};
+use crate::components::{ColliderShape, RigidBody};
+use crate::debug::{ColliderDebugInfo, PhysicsDebugDraw};
+use crate::events::{CollisionEvent, PhysicsEvents};
+use crate::{Collider, Entity, PhysicsMaterial, Transform};
 
-struct PhysicsEventHandler {
-    contact_tx: Sender<ContactEventData>,
-}
+// ── PhysicsCommand ──────────────────────────────────────────────────────────
 
-impl EventHandler for PhysicsEventHandler {
-    fn handle_collision_event(
-        &self,
-        _bodies: &RigidBodySet,
-        _colliders: &ColliderSet,
-        event: CollisionEvent,
-        _contact_pair: Option<&ContactPair>,
-    ) {
-        let _ = self.contact_tx.send(ContactEventData {
-            collider1: ColliderHandle(event.collider1()),
-            collider2: ColliderHandle(event.collider2()),
-            started: event.started(),
-        });
-    }
-
-    fn handle_contact_force_event(
-        &self,
-        _dt: f32,
-        _bodies: &RigidBodySet,
-        _colliders: &ColliderSet,
-        _contact_pair: &ContactPair,
-        _total_force_magnitude: f32,
-    ) {
-        // Intentionally not forwarded in this version.
-    }
+/// Commands that can be queued for safe execution during the next physics step.
+///
+/// These are accumulated during a frame and executed at the start of the
+/// next `PhysicsWorld::step()` call, avoiding mid-frame mutation of backend
+/// state.
+#[derive(Clone, Debug)]
+pub enum PhysicsCommand {
+    /// Apply a continuous force at the centre of mass.
+    ApplyForce {
+        entity: Entity,
+        force: glam::Vec3,
+    },
+    /// Apply an instantaneous impulse at the centre of mass.
+    ApplyImpulse {
+        entity: Entity,
+        impulse: glam::Vec3,
+    },
+    /// Teleport the body to a new position.
+    SetBodyPosition {
+        entity: Entity,
+        position: glam::Vec3,
+    },
+    /// Teleport the body to a new rotation.
+    SetBodyRotation {
+        entity: Entity,
+        rotation: glam::Quat,
+    },
 }
 
 // ── PhysicsWorld ────────────────────────────────────────────────────────────
 
-/// A Rapier 3D physics simulation world.
+/// The main physics simulation world.
 ///
-/// Owns all simulation state (rigid bodies, colliders, joints, broad-phase,
-/// narrow-phase) and exposes an engine-idiomatic API using `glam` types on
-/// the public boundary. No `rapier3d` or `nalgebra` types leak into the
-/// public API (per FD-030 / FD-031).
-///
-/// Gravity defaults to `(0.0, -9.81, 0.0)` per FD-031 in a right-handed +Y up
-/// coordinate system with metres as the unit of distance.
+/// Owns a [`RapierBackend`] and coordinates:
+/// - Fixed-timestep simulation with accumulated delta time
+/// - Bidirectional ECS synchronisation (`sync_from_ecs` / `sync_to_ecs`)
+/// - A command queue for safe mid-frame mutation
+/// - Collision event collection
+/// - Debug draw data propagation
 pub struct PhysicsWorld {
+    pub(crate) backend: RapierBackend,
     gravity: glam::Vec3,
-    integration_parameters: IntegrationParameters,
-    pipeline: PhysicsPipeline,
-    island_manager: IslandManager,
-    broad_phase: BroadPhaseMultiSap,
-    narrow_phase: NarrowPhase,
-    bodies: RigidBodySet,
-    colliders: ColliderSet,
-    impulse_joints: ImpulseJointSet,
-    multibody_joints: MultibodyJointSet,
-    ccd_solver: CCDSolver,
-    query_pipeline: QueryPipeline,
-    contact_tx: Sender<ContactEventData>,
-    contact_rx: Receiver<ContactEventData>,
+    fixed_timestep: f32,
+    accumulator: f32,
+    pending_commands: Vec<PhysicsCommand>,
+    pending_events: Vec<CollisionEvent>,
+    debug_colliders: Arc<Mutex<Vec<ColliderDebugInfo>>>,
 }
 
 impl PhysicsWorld {
-    /// Create a new physics world with the given gravity vector.
-    ///
-    /// Per FD-031 the engine convention is `(0.0, -9.81, 0.0)` in +Y up.
+    /// Create a new physics world with default gravity (0, -9.81, 0).
     pub fn new(gravity: glam::Vec3) -> Self {
-        let (contact_tx, contact_rx) = crossbeam_channel::unbounded();
-        info!(?gravity, "Creating PhysicsWorld");
         Self {
+            backend: RapierBackend::new(gravity),
             gravity,
-            integration_parameters: IntegrationParameters::default(),
-            pipeline: PhysicsPipeline::new(),
-            island_manager: IslandManager::new(),
-            broad_phase: BroadPhaseMultiSap::new(),
-            narrow_phase: NarrowPhase::new(),
-            bodies: RigidBodySet::new(),
-            colliders: ColliderSet::new(),
-            impulse_joints: ImpulseJointSet::new(),
-            multibody_joints: MultibodyJointSet::new(),
-            ccd_solver: CCDSolver::new(),
-            query_pipeline: QueryPipeline::new(),
-            contact_tx,
-            contact_rx,
+            fixed_timestep: 1.0 / 60.0,
+            accumulator: 0.0,
+            pending_commands: Vec::new(),
+            pending_events: Vec::new(),
+            debug_colliders: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Advance the simulation by one fixed-timestep tick.
-    ///
-    /// `fixed_dt` is a delta-time in seconds (e.g. `1.0 / 60.0`).
-    /// Contact events generated during this step are queued into the channel
-    /// returned by [`contact_receiver`](Self::contact_receiver).
-    pub fn step(&mut self, fixed_dt: f32) {
-        self.integration_parameters.dt = fixed_dt;
-
-        debug!(
-            dt = fixed_dt,
-            body_count = self.bodies.len(),
-            collider_count = self.colliders.len(),
-            "Physics step starting"
-        );
-
-        // Drain stale events from the previous step to avoid accumulation.
-        while self.contact_rx.try_recv().is_ok() {}
-
-        let event_handler = PhysicsEventHandler {
-            contact_tx: self.contact_tx.clone(),
-        };
-
-        let rapier_gravity = na::Vector3::new(self.gravity.x, self.gravity.y, self.gravity.z);
-
-        self.pipeline.step(
-            &rapier_gravity,
-            &self.integration_parameters,
-            &mut self.island_manager,
-            &mut self.broad_phase,
-            &mut self.narrow_phase,
-            &mut self.bodies,
-            &mut self.colliders,
-            &mut self.impulse_joints,
-            &mut self.multibody_joints,
-            &mut self.ccd_solver,
-            Some(&mut self.query_pipeline),
-            &(),
-            &event_handler,
-        );
-
-        debug!("Physics step complete");
+    /// Create a `PhysicsWorld` that shares its debug collider data with the
+    /// given `PhysicsDebugDraw` provider.
+    pub fn with_debug_draw(gravity: glam::Vec3, debug: &PhysicsDebugDraw) -> Self {
+        Self {
+            debug_colliders: debug.shared_data(),
+            ..Self::new(gravity)
+        }
     }
 
-    // ── Gravity ─────────────────────────────────────────────────────────────
+    // ── Configuration ───────────────────────────────────────────────────
 
-    /// Set the gravity vector at runtime.
+    /// Set the gravity vector.
     pub fn set_gravity(&mut self, gravity: glam::Vec3) {
-        debug!(?gravity, "Setting gravity");
         self.gravity = gravity;
+        self.backend.gravity = glam_to_rapier_vec(gravity);
     }
 
-    /// Return the current gravity vector.
+    /// Current gravity vector.
     pub fn gravity(&self) -> glam::Vec3 {
         self.gravity
     }
 
-    // ── Rigid body management ───────────────────────────────────────────────
-
-    /// Add a new dynamic (simulated) rigid body at the given position.
-    pub fn add_dynamic_body(
-        &mut self,
-        translation: glam::Vec3,
-        rotation: glam::Quat,
-    ) -> RigidBodyHandle {
-        let iso = to_rapier_isometry(translation, rotation);
-        let body = RigidBodyBuilder::dynamic().position(iso).build();
-        let handle = self.bodies.insert(body);
-        debug!(?handle, "Added dynamic rigid body");
-        RigidBodyHandle(handle)
+    /// Set the fixed timestep in seconds (default: 1/60).
+    pub fn set_fixed_timestep(&mut self, dt: f32) {
+        self.fixed_timestep = dt;
     }
 
-    /// Add a new static (immovable) rigid body at the given position.
-    pub fn add_static_body(
-        &mut self,
-        translation: glam::Vec3,
-        rotation: glam::Quat,
-    ) -> RigidBodyHandle {
-        let iso = to_rapier_isometry(translation, rotation);
-        let body = RigidBodyBuilder::fixed().position(iso).build();
-        let handle = self.bodies.insert(body);
-        debug!(?handle, "Added static rigid body");
-        RigidBodyHandle(handle)
+    /// Get the current fixed timestep.
+    pub fn fixed_timestep(&self) -> f32 {
+        self.fixed_timestep
     }
 
-    /// Set the position (translation + rotation) of a rigid body.
+    // ── Command queue ───────────────────────────────────────────────────
+
+    /// Queue a command for execution during the next physics step.
     ///
-    /// Returns [`PhysicsError::InvalidHandle`] if the body has been removed.
-    pub fn set_body_position(
-        &mut self,
-        body: RigidBodyHandle,
-        translation: glam::Vec3,
-        rotation: glam::Quat,
-    ) -> Result<(), PhysicsError> {
-        let body_ref = self
-            .bodies
-            .get_mut(body.0)
-            .ok_or(PhysicsError::InvalidHandle)?;
-        body_ref.set_position(to_rapier_isometry(translation, rotation), true);
-        Ok(())
+    /// This is the safe way to apply forces, impulses, or teleport bodies
+    /// from game code running outside the physics step.
+    pub fn queue_command(&mut self, cmd: PhysicsCommand) {
+        self.pending_commands.push(cmd);
     }
 
-    /// Read back the world-space position of a rigid body.
-    ///
-    /// Returns `None` if the handle is invalid or the body has been removed.
-    pub fn body_position(&self, body: RigidBodyHandle) -> Option<(glam::Vec3, glam::Quat)> {
-        let body_ref = self.bodies.get(body.0)?;
-        Some(from_rapier_isometry(body_ref.position()))
-    }
-
-    // ── Collider management ─────────────────────────────────────────────────
-
-    /// Attach a collider with the given shape to a rigid body.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `body` is not a valid rigid body handle in this world.
-    pub fn add_collider(
-        &mut self,
-        body: RigidBodyHandle,
-        shape: ColliderShape,
-    ) -> ColliderHandle {
-        let shared_shape = match shape {
-            ColliderShape::Cuboid { hx, hy, hz } => SharedShape::cuboid(hx, hy, hz),
-            ColliderShape::Sphere { radius } => SharedShape::ball(radius),
-            ColliderShape::Capsule {
-                half_height,
-                radius,
-            } => {
-                // Capsule segment aligned with local +Y.
-                let a = na::Point3::new(0.0, -half_height, 0.0);
-                let b = na::Point3::new(0.0, half_height, 0.0);
-                SharedShape::capsule(a, b, radius)
+    /// Drain and execute all queued commands.
+    fn execute_pending_commands(&mut self) {
+        let commands = std::mem::take(&mut self.pending_commands);
+        for cmd in commands {
+            match cmd {
+                PhysicsCommand::ApplyForce { entity, force } => {
+                    self.backend.apply_force(entity.index(), force);
+                }
+                PhysicsCommand::ApplyImpulse { entity, impulse } => {
+                    self.backend.apply_impulse(entity.index(), impulse);
+                }
+                PhysicsCommand::SetBodyPosition { entity, position } => {
+                    if let Some((_, rot)) = self.backend.sync_body_transform(entity.index()) {
+                        self.backend
+                            .set_body_transform(entity.index(), position, rot);
+                    }
+                }
+                PhysicsCommand::SetBodyRotation { entity, rotation } => {
+                    if let Some((pos, _)) = self.backend.sync_body_transform(entity.index()) {
+                        self.backend
+                            .set_body_transform(entity.index(), pos, rotation);
+                    }
+                }
             }
-        };
-
-        let collider = ColliderBuilder::new(shared_shape).build();
-        let handle = self
-            .colliders
-            .insert_with_parent(collider, body.0, &mut self.bodies);
-
-        debug!(?handle, ?body, "Added collider to rigid body");
-        ColliderHandle(handle)
+        }
     }
 
-    // ── Body removal ────────────────────────────────────────────────────────
+    // ── Simulation ──────────────────────────────────────────────────────
 
-    /// Remove a rigid body (and all attached colliders) from the world.
+    /// Advance the simulation by `dt` seconds using a fixed timestep
+    /// accumulator.
     ///
-    /// Returns `true` if the body existed and was removed, `false` if the
-    /// handle was already invalid.
-    pub fn remove_body(&mut self, body: RigidBodyHandle) -> bool {
-        if !self.bodies.contains(body.0) {
-            return false;
+    /// Processes queued commands, runs ECS → physics sync, steps the
+    /// simulation the required number of times, and collects collision
+    /// events.
+    pub fn step(&mut self, dt: f32, world: &mut crate::World) {
+        // 1. Execute pending commands.
+        self.execute_pending_commands();
+
+        // 2. Synchronise ECS → physics (creates/updates bodies and colliders).
+        self.sync_from_ecs_internal(world);
+
+        // 3. Fixed timestep accumulator.
+        self.accumulator += dt;
+        let max_steps = 8; // safety limit to prevent spiral of death
+        let mut steps_taken = 0;
+
+        while self.accumulator >= self.fixed_timestep && steps_taken < max_steps {
+            self.backend.integration.dt = self.fixed_timestep;
+
+            // Run one physics step and capture events.
+            let events = self.backend.step();
+            self.pending_events.extend(events);
+
+            self.accumulator -= self.fixed_timestep;
+            steps_taken += 1;
         }
-        let removed = self.bodies.remove(
-            body.0,
-            &mut self.island_manager,
-            &mut self.colliders,
-            &mut self.impulse_joints,
-            &mut self.multibody_joints,
-            true,
+
+        // Clamp accumulator to prevent large catch-up after a pause.
+        if self.accumulator > self.fixed_timestep * 4.0 {
+            self.accumulator = 0.0;
+        }
+
+        // 4. Sync physics → ECS (write back transforms).
+        self.sync_to_ecs_internal(world);
+
+        // 5. Update debug collider data.
+        if let Ok(mut debug) = self.debug_colliders.lock() {
+            *debug = self
+                .backend
+                .collider_debug_info()
+                .into_iter()
+                .map(|(shape, pos, rot)| ColliderDebugInfo {
+                    shape,
+                    position: pos,
+                    rotation: rot,
+                })
+                .collect();
+        }
+
+        debug!(
+            dt = self.fixed_timestep,
+            steps = steps_taken,
+            bodies = self.backend.bodies.len(),
+            colliders = self.backend.colliders.len(),
+            events = self.pending_events.len(),
+            "Physics step complete"
         );
-        let ok = removed.is_some();
-        if ok {
-            debug!(?body, "Removed rigid body");
-        }
-        ok
     }
 
-    // ── Ray-cast queries ────────────────────────────────────────────────────
+    // ── ECS synchronisation ─────────────────────────────────────────────
 
-    /// Cast a ray against all colliders and return the closest hit, if any.
+    /// Synchronise ECS components → Rapier backend.
     ///
-    /// The `direction` vector should be normalised before calling.
-    /// Sensor colliders are excluded from results.
+    /// Creates bodies/colliders for entities that have the relevant
+    /// components but are not yet registered in the backend. Removes
+    /// bodies/colliders for entities that no longer have the components.
+    pub fn sync_from_ecs(&mut self, world: &crate::World) {
+        self.sync_from_ecs_internal(world);
+        self.backend.sync_query_pipeline();
+    }
+
+    fn sync_from_ecs_internal(&mut self, world: &crate::World) {
+        // Collect all entity indices that have RigidBody components.
+        let mut seen_bodies: Vec<u32> = Vec::new();
+
+        for (entity, rigid_body) in world.query::<RigidBody>() {
+            let idx = entity.index();
+            seen_bodies.push(idx);
+
+            if !self.backend.has_body(idx) {
+                // Get the Transform for positioning.
+                let transform = world
+                    .get::<Transform>(entity)
+                    .cloned()
+                    .unwrap_or_default();
+                self.backend.create_body(idx, rigid_body, &transform);
+            }
+        }
+
+        // Remove bodies for entities that no longer have RigidBody.
+        let to_remove_bodies: Vec<u32> = self
+            .backend
+            .body_map
+            .keys()
+            .copied()
+            .filter(|idx| !seen_bodies.contains(idx))
+            .collect();
+        for idx in to_remove_bodies {
+            self.backend.remove_body(idx);
+        }
+
+        // Collect all entity indices that have Collider components.
+        let mut seen_colliders: Vec<u32> = Vec::new();
+
+        for (entity, collider) in world.query::<Collider>() {
+            let idx = entity.index();
+            seen_colliders.push(idx);
+
+            if !self.backend.has_collider(idx) {
+                // Find the parent body entity. A collider should be attached
+                // to the same entity's rigid body, or we search for the first
+                // ancestor with a RigidBody.
+                let body_entity = if self.backend.has_body(idx) {
+                    idx
+                } else {
+                    // Search for a parent entity with a RigidBody
+                    // (simple: same entity or parent chain — we use same entity for now)
+                    idx
+                };
+
+                let material = world
+                    .get::<PhysicsMaterial>(entity);
+                self.backend
+                    .create_collider(idx, collider, body_entity, material);
+            }
+        }
+
+        // Remove colliders for entities that no longer have Collider.
+        let to_remove_colliders: Vec<u32> = self
+            .backend
+            .collider_map
+            .keys()
+            .copied()
+            .filter(|idx| !seen_colliders.contains(idx))
+            .collect();
+        for idx in to_remove_colliders {
+            self.backend.remove_collider(idx);
+        }
+    }
+
+    /// Synchronise Rapier backend → ECS components.
+    ///
+    /// Writes the world-space position of each physics body back into the
+    /// entity's `Transform` component.
+    pub fn sync_to_ecs(&mut self, world: &mut crate::World) {
+        self.sync_to_ecs_internal(world);
+    }
+
+    fn sync_to_ecs_internal(&mut self, world: &mut crate::World) {
+        let body_indices: Vec<u32> = self.backend.body_map.keys().copied().collect();
+
+        for idx in body_indices {
+            let entity = Entity::new(idx, 0);
+
+            // Only sync if the entity is still alive and has a Transform.
+            if !world.is_alive(entity) {
+                continue;
+            }
+
+            if let Some((pos, rot)) = self.backend.sync_body_transform(idx) {
+                if let Some(transform) = world.get_mut::<Transform>(entity) {
+                    transform.translation = pos;
+                    transform.rotation = rot;
+                }
+            }
+        }
+    }
+
+    // ── Collision events ────────────────────────────────────────────────
+
+    /// Drain all collision events that were collected during the last step.
+    pub fn drain_events(&mut self) -> PhysicsEvents {
+        PhysicsEvents {
+            events: std::mem::take(&mut self.pending_events),
+        }
+    }
+
+    /// Read (without draining) the pending collision events.
+    pub fn pending_events(&self) -> &[CollisionEvent] {
+        &self.pending_events
+    }
+
+    // ── Queries ─────────────────────────────────────────────────────────
+
+    /// Cast a ray and return the closest hit.
+    pub fn raycast(
+        &self,
+        origin: glam::Vec3,
+        direction: glam::Vec3,
+        max_distance: f32,
+    ) -> Option<RaycastHit> {
+        self.backend.raycast(origin, direction, max_distance)
+    }
+
+    /// Alias for `raycast`, used by engine-character.
     pub fn cast_ray(
         &self,
         origin: glam::Vec3,
         direction: glam::Vec3,
         max_distance: f32,
-    ) -> Option<RayHit> {
-        let ray = Ray::new(
-            na::Point3::new(origin.x, origin.y, origin.z),
-            na::Vector3::new(direction.x, direction.y, direction.z),
-        );
-        let filter = QueryFilter::default().exclude_sensors();
-        let (collider_handle, intersection) = self
-            .query_pipeline
-            .cast_ray_and_get_normal(
-                &self.bodies,
-                &self.colliders,
-                &ray,
-                max_distance,
-                true,
-                filter,
-            )?;
-
-        let collider = self.colliders.get(collider_handle)?;
-        let body_handle = collider.parent()?;
-
-        Some(RayHit {
-            point: origin + direction * intersection.time_of_impact,
-            normal: crate::convert::from_rapier_vec(intersection.normal),
-            distance: intersection.time_of_impact,
-            body_handle: RigidBodyHandle(body_handle),
-        })
+    ) -> Option<RaycastHit> {
+        self.backend.raycast(origin, direction, max_distance)
     }
 
-    /// Cast a ray and return **all** hits along the ray, sorted by distance
-    /// (closest first).
-    ///
-    /// Sensor colliders are excluded from results.
-    pub fn cast_ray_all(
+    /// Find all entities whose colliders overlap with the given shape.
+    pub fn query_proximity(
         &self,
-        origin: glam::Vec3,
-        direction: glam::Vec3,
-        max_distance: f32,
-    ) -> Vec<RayHit> {
-        let ray = Ray::new(
-            na::Point3::new(origin.x, origin.y, origin.z),
-            na::Vector3::new(direction.x, direction.y, direction.z),
-        );
-        let filter = QueryFilter::default().exclude_sensors();
-        let mut hits: Vec<RayHit> = Vec::new();
-
-        self.query_pipeline.intersections_with_ray(
-            &self.bodies,
-            &self.colliders,
-            &ray,
-            max_distance,
-            true,
-            filter,
-            |collider_handle, intersection| {
-                if let Some(collider) = self.colliders.get(collider_handle) {
-                    if let Some(parent) = collider.parent() {
-                        hits.push(RayHit {
-                            point: origin + direction * intersection.time_of_impact,
-                            normal: crate::convert::from_rapier_vec(intersection.normal),
-                            distance: intersection.time_of_impact,
-                            body_handle: RigidBodyHandle(parent),
-                        });
-                    }
-                }
-                true
-            },
-        );
-
-        // Sort by distance (closest first) – rapier does not guarantee
-        // the callback invocation order for all hits.
-        hits.sort_unstable_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        hits
+        shape: &ColliderShape,
+        position: glam::Vec3,
+    ) -> Vec<Entity> {
+        self.backend.query_proximity(shape, position)
     }
 
-    // ── Point query ─────────────────────────────────────────────────────────
+    // ── Debug draw ──────────────────────────────────────────────────────
 
-    /// Find all colliders that contain the given world-space point.
-    ///
-    /// Sensor colliders are excluded from results.
-    pub fn intersect_point(&self, point: glam::Vec3) -> Vec<ColliderHandle> {
-        let rapier_point = na::Point3::new(point.x, point.y, point.z);
-        let filter = QueryFilter::default().exclude_sensors();
-        let mut handles: Vec<ColliderHandle> = Vec::new();
-
-        self.query_pipeline.intersections_with_point(
-            &self.bodies,
-            &self.colliders,
-            &rapier_point,
-            filter,
-            |collider_handle| {
-                handles.push(ColliderHandle(collider_handle));
-                true
-            },
-        );
-
-        handles
+    /// Return a reference to the shared debug collider data.
+    pub fn debug_colliders(&self) -> Arc<Mutex<Vec<ColliderDebugInfo>>> {
+        self.debug_colliders.clone()
     }
+}
 
-    // ── Contact event channel ───────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
-    /// Returns a reference to the contact event receiver.
-    ///
-    /// Contact events from [`step`](Self::step) are sent to this channel.
-    /// Drain it between steps to avoid stale events building up.
-    pub fn contact_receiver(&self) -> &Receiver<ContactEventData> {
-        &self.contact_rx
-    }
+fn glam_to_rapier_vec(v: glam::Vec3) -> rapier3d::na::Vector3<f32> {
+    rapier3d::na::Vector3::new(v.x, v.y, v.z)
 }

@@ -18,7 +18,14 @@ subsystem-scripting-csharp = []
 
 [dependencies]
 crossbeam-channel.workspace = true
+engine-scene = { path = "../engine-scene" }
+engine-renderer = { path = "../engine-renderer" }
+engine-serialize = { path = "../engine-serialize" }
 glam.workspace = true
 rapier3d.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
