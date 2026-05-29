@@ -6,9 +6,9 @@ use crate::handles::{
 };
 use crate::types::{
     AdapterInfo, BackendKind, BufferDescriptor, DeviceDescriptor, FramebufferDescriptor,
-    IndexFormat, PipelineDescriptor, PipelineLayoutDescriptor, PipelineVariantKey,
-    RenderPassDescriptor, RendererStatistics, ShaderModuleDescriptor, SurfaceDescriptor,
-    SwapchainDescriptor, TextureDescriptor,
+    IndexFormat, PipelineDescriptor, PipelineLayoutDescriptor, RenderPassDescriptor,
+    RendererStatistics, ShaderModuleDescriptor, SurfaceDescriptor, SwapchainDescriptor,
+    TextureDescriptor,
 };
 
 // ============================================================================
@@ -183,20 +183,6 @@ pub trait Device: Send + Sync {
         Err(RhiError::Backend {
             detail: "pipeline creation is not implemented by this device".to_string(),
         })
-    }
-
-    /// Create a pipeline with a variant key (per FD-040).
-    ///
-    /// The default implementation ignores the variant key and delegates to
-    /// [`create_pipeline`](Self::create_pipeline). Backends that support
-    /// shader permutation variants (e.g. SKINNED, INSTANCED, SHADOW_PASS)
-    /// should override this method.
-    fn create_pipeline_variant(
-        &mut self,
-        descriptor: &PipelineDescriptor,
-        _variant_key: PipelineVariantKey,
-    ) -> Result<PipelineHandle, RhiError> {
-        self.create_pipeline(descriptor)
     }
 
     // --- Frame lifecycle ---
