@@ -3,10 +3,13 @@
 //! Contains the [`CharacterController`] struct, the [`CharacterState`] enum
 //! implementing the **State** design pattern, and the [`CharacterError`] type.
 
+use engine_physics::PhysicsWorld;
 use engine_scene::Component;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::CharacterMovement;
 
 // ── Error type ───────────────────────────────────────────────────────────────
 
@@ -300,5 +303,24 @@ impl CharacterController {
 impl Default for CharacterController {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Frame update ──────────────────────────────────────────────────────────
+
+impl CharacterController {
+    /// Run one frame of character movement.
+    ///
+    /// Applies gravity, horizontal acceleration, collision resolution,
+    /// ground detection, and state transitions.  Mutates the controller
+    /// in place — no manual output-sync required.
+    ///
+    /// Returns `true` if the character's position changed this frame.
+    pub fn update(&mut self, input: &CharacterMovement, physics: Option<&PhysicsWorld>) -> bool {
+        let output = crate::movement::process_movement(self, input, physics);
+        self.position = output.new_position;
+        self.velocity = output.new_velocity;
+        self.state = output.state;
+        output.moved
     }
 }
