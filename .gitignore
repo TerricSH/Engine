@@ -1,6 +1,5 @@
 /target/
 **/*.rs.bk
-/design/
 
 # Project memory
 .yly-project-memory/

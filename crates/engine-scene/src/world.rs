@@ -98,7 +98,10 @@ impl World {
     /// # Panics
     /// Panics if the entity is stale.
     pub fn add_component<T: Component>(&mut self, entity: Entity, component: T) {
-        assert!(self.is_alive(entity), "cannot add component to stale entity");
+        assert!(
+            self.is_alive(entity),
+            "cannot add component to stale entity"
+        );
         let storage = self
             .storages
             .entry(T::TYPE_ID)
@@ -179,10 +182,7 @@ impl World {
             // Wrap into a boxed iterator for type-erased return.
             // We need to copy the entity index from dense entries and
             // reconstruct Entity handles (without generation tracking here).
-            let items: Vec<_> = set
-                .iter()
-                .map(|(entity, comp)| (entity, comp))
-                .collect();
+            let items: Vec<_> = set.iter().collect();
             items.into_iter()
         } else {
             vec![].into_iter()
@@ -196,10 +196,7 @@ impl World {
                 .as_any_mut()
                 .downcast_mut::<SparseSet<T>>()
                 .expect("storage type mismatch");
-            let items: Vec<_> = set
-                .iter_mut()
-                .map(|(entity, comp)| (entity, comp))
-                .collect();
+            let items: Vec<_> = set.iter_mut().collect();
             items.into_iter()
         } else {
             vec![].into_iter()
@@ -282,12 +279,12 @@ impl World {
                 );
                 fields.insert("scale".to_string(), Value::Vec3(transform.scale.into()));
                 if let Some(parent) = &transform.parent {
-                    if let Some(parent_pid) =
-                        self.entity_to_persistent.get(parent.index() as usize)
+                    if let Some(pid) = self
+                        .entity_to_persistent
+                        .get(parent.index() as usize)
+                        .and_then(|p| p.as_ref())
                     {
-                        if let Some(pid) = parent_pid {
-                            fields.insert("parent".to_string(), Value::Entity(pid.clone()));
-                        }
+                        fields.insert("parent".to_string(), Value::Entity(pid.clone()));
                     }
                 }
                 components.insert(
@@ -357,7 +354,10 @@ impl World {
                     "render_layer_mask".to_string(),
                     Value::UInt(camera.render_layer_mask as u64),
                 );
-                fields.insert("clear_flags".to_string(), Value::UInt(camera.clear_flags as u64));
+                fields.insert(
+                    "clear_flags".to_string(),
+                    Value::UInt(camera.clear_flags as u64),
+                );
                 fields.insert("clear_color".to_string(), Value::Color(camera.clear_color));
                 fields.insert("priority".to_string(), Value::Int(camera.priority as i64));
                 fields.insert(
@@ -438,9 +438,7 @@ impl World {
             scene_entities.push(EntityRecord {
                 persistent_id: persistent_id.clone(),
                 parent: self.resolve_parent_to_persistent(entity),
-                name: self
-                    .get::<Name>(entity)
-                    .map(|n| n.0.clone()),
+                name: self.get::<Name>(entity).map(|n| n.0.clone()),
                 enabled: true,
                 components,
             });
@@ -491,8 +489,7 @@ impl World {
 
         // Second pass: populate components with resolved references.
         for entity_record in &scene.entities {
-            let Some(&entity) = world.persistent_to_entity.get(&entity_record.persistent_id)
-            else {
+            let Some(&entity) = world.persistent_to_entity.get(&entity_record.persistent_id) else {
                 continue;
             };
 
@@ -620,14 +617,12 @@ impl World {
                     _ => Camera::default().ortho_half_height,
                 };
                 let viewport_rect = match fields.get("viewport_rect") {
-                    Some(Value::List(items)) if items.len() == 4 => {
-                        Some([
-                            Self::value_as_f32(&items[0]),
-                            Self::value_as_f32(&items[1]),
-                            Self::value_as_f32(&items[2]),
-                            Self::value_as_f32(&items[3]),
-                        ])
-                    }
+                    Some(Value::List(items)) if items.len() == 4 => Some([
+                        Self::value_as_f32(&items[0]),
+                        Self::value_as_f32(&items[1]),
+                        Self::value_as_f32(&items[2]),
+                        Self::value_as_f32(&items[3]),
+                    ]),
                     _ => None,
                 };
                 let render_layer_mask = match fields.get("render_layer_mask") {
@@ -752,7 +747,13 @@ impl World {
                     Some(Value::Vec3(h)) => *h,
                     _ => [0.5, 0.5, 0.5],
                 };
-                self.add_component(entity, Bounds { center, half_extents });
+                self.add_component(
+                    entity,
+                    Bounds {
+                        center,
+                        half_extents,
+                    },
+                );
             }
             _ => {
                 // Unknown component type — skip (future extensibility).
@@ -843,10 +844,7 @@ mod tests {
         world.add_component(e1, Name("First".to_string()));
         world.add_component(e2, Name("Second".to_string()));
 
-        let names: Vec<_> = world
-            .query::<Name>()
-            .map(|(_, n)| n.0.clone())
-            .collect();
+        let names: Vec<_> = world.query::<Name>().map(|(_, n)| n.0.clone()).collect();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"First".to_string()));
         assert!(names.contains(&"Second".to_string()));
@@ -878,10 +876,7 @@ mod tests {
         assert_eq!(world.alive_count(), 2);
 
         // Verify Name components
-        let names: Vec<_> = world
-            .query::<Name>()
-            .map(|(_, n)| n.0.clone())
-            .collect();
+        let names: Vec<_> = world.query::<Name>().map(|(_, n)| n.0.clone()).collect();
         assert!(names.contains(&"Main Camera".to_string()));
         assert!(names.contains(&"Cube".to_string()));
 

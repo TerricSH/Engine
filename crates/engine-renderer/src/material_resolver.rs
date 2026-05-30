@@ -167,7 +167,10 @@ mod tests {
         let (key, desc) = resolver.resolve(&material, &context, PipelineVariantKey::SKINNED);
 
         assert_eq!(key.shader_asset_id, "shader_pbr");
-        assert_eq!(key.vertex_layout_hash, hash_vertex_layout(&context.vertex_layout));
+        assert_eq!(
+            key.vertex_layout_hash,
+            hash_vertex_layout(&context.vertex_layout)
+        );
         assert_eq!(key.pipeline_layout, Some(context.pipeline_layout));
         assert_eq!(key.render_pass, Some(context.render_pass));
         assert_eq!(key.variant_key, PipelineVariantKey::SKINNED);
@@ -175,7 +178,10 @@ mod tests {
         assert_eq!(desc.render_pass, Some(context.render_pass));
         assert_eq!(desc.render_targets, context.render_targets);
         assert_eq!(desc.raster_state.cull_mode.as_deref(), Some("back"));
-        assert!(desc.debug_label.as_ref().is_some_and(|label| label.contains("shader_pbr")));
+        assert!(desc
+            .debug_label
+            .as_ref()
+            .is_some_and(|label| label.contains("shader_pbr")));
     }
 
     #[test]

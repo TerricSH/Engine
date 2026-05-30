@@ -23,9 +23,9 @@ use crate::path::asset_path;
 ///
 /// * `graph`    – the dependency graph produced by the cook pipeline.
 /// * `source_dir` – path to the `assets/source/` directory where source
-///                  manifests and raw source files live.
+///   manifests and raw source files live.
 /// * `cooked_dir` – path to the `assets/cooked/` directory where cooked
-///                  artifacts are written.
+///   artifacts are written.
 ///
 /// # Returns
 ///
@@ -45,35 +45,31 @@ pub fn validate_assets(
     for (id, _node) in graph.iter() {
         let source_path = resolve_source_path(id, source_dir);
         if !source_path.exists() {
-            diagnostics.push(
-                {
-                    let mut d = Diagnostic::new(
-                        "COOK_SOURCE_MISSING",
-                        DiagnosticSeverity::Error,
-                        "cook",
-                        format!("source file not found: {:?}", source_path.display()),
-                    );
-                    d.asset = Some(id.clone());
-                    d
-                }
-            );
+            diagnostics.push({
+                let mut d = Diagnostic::new(
+                    "COOK_SOURCE_MISSING",
+                    DiagnosticSeverity::Error,
+                    "cook",
+                    format!("source file not found: {:?}", source_path.display()),
+                );
+                d.asset = Some(id.clone());
+                d
+            });
         }
 
         // 3. Check cooked artifact existence and staleness.
         let cooked_path = resolve_cooked_path(id, cooked_dir);
         if !cooked_path.exists() {
-            diagnostics.push(
-                {
-                    let mut d = Diagnostic::new(
-                        "COOK_ARTIFACT_MISSING",
-                        DiagnosticSeverity::Warning,
-                        "cook",
-                        format!("cooked artifact not found: {:?}", cooked_path.display()),
-                    );
-                    d.asset = Some(id.clone());
-                    d
-                }
-            );
+            diagnostics.push({
+                let mut d = Diagnostic::new(
+                    "COOK_ARTIFACT_MISSING",
+                    DiagnosticSeverity::Warning,
+                    "cook",
+                    format!("cooked artifact not found: {:?}", cooked_path.display()),
+                );
+                d.asset = Some(id.clone());
+                d
+            });
         } else {
             // Stale detection: compare source file hash with stored hash.
             if source_path.exists() {
@@ -81,8 +77,7 @@ pub fn validate_assets(
                     Ok(current_hash) => {
                         // We can't check without loading the artifact, so
                         // we emit an info-level diagnostic showing the hash.
-                        diagnostics.push(
-                        {
+                        diagnostics.push({
                             let mut d = Diagnostic::new(
                                 "COOK_SOURCE_HASH",
                                 DiagnosticSeverity::Info,
@@ -95,12 +90,10 @@ pub fn validate_assets(
                             );
                             d.asset = Some(id.clone());
                             d
-                        }
-                        );
+                        });
                     }
                     Err(e) => {
-                        diagnostics.push(
-                        {
+                        diagnostics.push({
                             let mut d = Diagnostic::new(
                                 "COOK_HASH_FAILED",
                                 DiagnosticSeverity::Error,
@@ -109,8 +102,7 @@ pub fn validate_assets(
                             );
                             d.asset = Some(id.clone());
                             d
-                        }
-                        );
+                        });
                     }
                 }
             }

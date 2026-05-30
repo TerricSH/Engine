@@ -14,29 +14,24 @@ public static class ImageLoader
     /// </summary>
     public static AsyncHandle LoadAsync(string url, Action<byte[]>? onLoaded = null)
     {
-        var handle = new AsyncHandle(0); // TODO: get real handle from FFI
-
         // Register completion callback
         FfiAsyncCallback callback = (id, data, len, userData) =>
         {
             var bytes = new byte[len];
             Marshal.Copy(data, bytes, 0, (int)len);
 
-            var ownedHandle = AsyncHandleRegistry.Get((ulong)userData);
+            var ownedHandle = AsyncHandleRegistry.Get(id);
             ownedHandle?.Complete(bytes);
 
             onLoaded?.Invoke(bytes);
         };
 
-        unsafe
-        {
-            var gcHandle = GCHandle.Alloc(handle);
-            var id = EngineAPI.ffi_async_load_image(
-                url,
-                callback,
-                (ulong)GCHandle.ToIntPtr(gcHandle));
-            AsyncHandleRegistry.Register(id, handle);
-        }
+        var ffiHandle = EngineAPI.ffi_async_load_image(
+            url,
+            callback,
+            0);
+        var handle = new AsyncHandle(ffiHandle);
+        AsyncHandleRegistry.Register(ffiHandle, handle);
 
         return handle;
     }

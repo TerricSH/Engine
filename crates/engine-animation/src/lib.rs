@@ -1,32 +1,32 @@
 #![forbid(unsafe_code)]
 
 // ── Internal runtime modules (kept for backward compat) ────────────────
-mod skeleton;
-pub(crate) mod pose;
 mod clip;
+pub(crate) mod pose;
+mod skeleton;
 // Old player module replaced by the new Gate 10 player below.
 
 // ── Gate 10 modules ────────────────────────────────────────────────────
 pub mod assets;
 pub mod components;
+pub mod debug;
+pub mod extract;
 pub mod loader;
 pub mod player;
-pub mod extract;
-pub mod debug;
 
 // ── Re-exports: old public API (from skeleton, clip, pose) ────────────
-pub use skeleton::{AnimationError, BoneIndex, BoneTransform};
-pub use pose::Pose;
 pub use clip::{AnimationClip as RuntimeAnimationClip, Keyframe as RuntimeKeyframe};
+pub use pose::Pose;
+pub use skeleton::{AnimationError, BoneIndex, BoneTransform};
 // Old player types are no longer re-exported — use the Gate 10 player instead.
 
 // ── Re-exports: new Gate 10 public API ─────────────────────────────────
-pub use assets::{AnimationClip, AnimationChannel, Joint, JointTransform, Keyframe, Skeleton};
+pub use assets::{AnimationChannel, AnimationClip, Joint, JointTransform, Keyframe, Skeleton};
 pub use components::{AnimationPlayer, SkeletonComponent};
+pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
+pub use extract::{PendingSkinnedItem, SkinnedExtractProducer};
 pub use loader::{load_animation_clip, load_skeleton, register_asset_types};
 pub use player::{update_animation, AnimationEvaluator};
-pub use extract::{PendingSkinnedItem, SkinnedExtractProducer};
-pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
 
 // ── Registration (Gate 9 extension surfaces) ──────────────────────────
 

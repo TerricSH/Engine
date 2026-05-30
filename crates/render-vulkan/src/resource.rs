@@ -159,7 +159,7 @@ impl BufferResource {
         };
         if let Err(result) = bind_result {
             if let Ok(mut guard) = allocator.lock() {
-                let _ = guard.free(&mut allocation);
+                guard.free(&mut allocation);
             }
             // SAFETY: buffer was created above and is not bound to live resources.
             unsafe { device.device.destroy_buffer(buffer, None) };
@@ -212,7 +212,7 @@ impl Drop for BufferResource {
         unsafe { self.device.destroy_buffer(self.buffer, None) };
         if let Some(mut allocation) = self.allocation.take() {
             if let Ok(mut guard) = self.allocator.lock() {
-                let _ = guard.free(&mut allocation);
+                guard.free(&mut allocation);
             }
         }
     }
@@ -325,7 +325,7 @@ impl Drop for TextureResource {
         }
         if let Some(mut allocation) = self.allocation.take() {
             if let Ok(mut guard) = self.allocator.lock() {
-                let _ = guard.free(&mut allocation);
+                guard.free(&mut allocation);
             }
         }
     }

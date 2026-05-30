@@ -226,7 +226,7 @@ impl PackageCache {
 
             // Remove active (but not if it's the current active).
             if let Some(active) = self.active_package() {
-                if active.package_id() != &id {
+                if active.package_id() != id {
                     let active_dir = self.active_dir(&id);
                     if active_dir.exists() {
                         std::fs::remove_dir_all(&active_dir)?;

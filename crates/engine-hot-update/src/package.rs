@@ -143,8 +143,7 @@ pub(crate) fn sha256_hash(data: &[u8]) -> HashDigest {
 mod tests {
     use super::*;
     use engine_serialize::{
-        AssetId, HotUpdateManifest, PlatformKind, PlatformPayload, RollbackMetadata,
-        SchemaVersion,
+        AssetId, HotUpdateManifest, PlatformKind, PlatformPayload, RollbackMetadata, SchemaVersion,
     };
 
     fn sample_manifest() -> HotUpdateManifest {

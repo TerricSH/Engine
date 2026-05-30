@@ -394,8 +394,7 @@ impl Default for GpuReloadCoordinator {
 /// | `shader-shadow-*`    | `ShadowPipeline`    |
 /// | `texture-shadow*`    | `ShadowMap`         |
 fn target_from_asset_id(id: &str) -> ReloadTarget {
-    if id.starts_with("shader-") {
-        let rest = &id[7..]; // after "shader-"
+    if let Some(rest) = id.strip_prefix("shader-") {
         if rest.starts_with("mvp") || rest.starts_with("triangle") {
             ReloadTarget::MvpPipeline
         } else if rest.starts_with("model") || rest.starts_with("forward") {

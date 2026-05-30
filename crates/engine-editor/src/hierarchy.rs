@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use engine_scene::{EntityRecord, Scene};
 use engine_serialize::PersistentId;
 
-use crate::commands::{Command, AddEntity, RemoveEntity, SetEntityName};
+use crate::commands::{AddEntity, Command, RemoveEntity, SetEntityName};
 use crate::editor_ui::EditorUi;
 
 // -------------------------------------------------------------------
@@ -112,13 +112,7 @@ impl HierarchyPanel {
         // ── Render root entities ─────────────────────────────────
         if let Some(roots) = children.get(&None) {
             for entity in roots {
-                self.render_entity(
-                    ui,
-                    entity,
-                    &children,
-                    0,
-                    &mut commands,
-                );
+                self.render_entity(ui, entity, &children, 0, &mut commands);
             }
         }
 
@@ -167,7 +161,11 @@ impl HierarchyPanel {
         if self.rename_target.as_deref() == Some(&entity.persistent_id) {
             let current_name = entity.name.clone().unwrap_or_default();
             if let Some(edited) = ui.text_field("##rename", &current_name) {
-                let new_name = if edited.is_empty() { None } else { Some(edited) };
+                let new_name = if edited.is_empty() {
+                    None
+                } else {
+                    Some(edited)
+                };
                 commands.push(Box::new(SetEntityName::new(
                     entity.persistent_id.clone(),
                     new_name,

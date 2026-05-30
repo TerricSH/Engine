@@ -46,9 +46,7 @@ impl Verifier {
         }
 
         // 3. Compatibility.
-        if let Err(e) =
-            Self::verify_compatibility(manifest, engine_ver, script_api_ver)
-        {
+        if let Err(e) = Self::verify_compatibility(manifest, engine_ver, script_api_ver) {
             errors.push(e);
         }
 
@@ -78,9 +76,7 @@ impl Verifier {
     /// signature (i.e. `signature.is_some()`) but where the algorithm is
     /// unrecognised.  Dev-mode manifests with no signature at all are
     /// accepted.
-    pub fn verify_signature(
-        manifest: &HotUpdateManifest,
-    ) -> Result<(), UpdateError> {
+    pub fn verify_signature(manifest: &HotUpdateManifest) -> Result<(), UpdateError> {
         match &manifest.signature {
             None => {
                 // No signature — dev mode; accept.
@@ -247,17 +243,16 @@ impl Verifier {
                 continue;
             }
 
-            let header: engine_asset::cook::CookedAssetHeader =
-                match bincode::deserialize(&buf) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        errors.push(UpdateError::CacheCorrupt(format!(
-                            "invalid cooked header in {}: {e}",
-                            ph.path
-                        )));
-                        continue;
-                    }
-                };
+            let header: engine_asset::cook::CookedAssetHeader = match bincode::deserialize(&buf) {
+                Ok(h) => h,
+                Err(e) => {
+                    errors.push(UpdateError::CacheCorrupt(format!(
+                        "invalid cooked header in {}: {e}",
+                        ph.path
+                    )));
+                    continue;
+                }
+            };
 
             if !header.is_valid() {
                 errors.push(UpdateError::CacheCorrupt(format!(
@@ -282,6 +277,7 @@ impl Verifier {
 /// Verify that the data at `staged_dir` matches the manifest's payload
 /// hashes for the given platform.  Returns the list of payload paths that
 /// exist on disk.
+#[expect(dead_code)]
 pub(crate) fn verify_and_collect_payloads(
     manifest: &HotUpdateManifest,
     staged_dir: &Path,
@@ -323,11 +319,11 @@ pub(crate) fn verify_and_collect_payloads(
         }
     }
 
-        if errors.is_empty() {
-            Ok(present)
-        } else {
-            Err(errors)
-        }
+    if errors.is_empty() {
+        Ok(present)
+    } else {
+        Err(errors)
+    }
 }
 
 #[cfg(test)]
@@ -505,7 +501,7 @@ mod tests {
         let result = Verifier::verify_payload_hashes(&manifest, &dir);
         assert!(result.is_err());
         // Should have at least one error (b.bundle missing)
-        assert!(result.unwrap_err().len() >= 1);
+        assert!(!result.unwrap_err().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -678,7 +674,7 @@ mod tests {
         .unwrap();
 
         // Hash must be computed from the entire written file (header + payload).
-        let file_data = std::fs::read(&dir.join("mesh.cooked")).unwrap();
+        let file_data = std::fs::read(dir.join("mesh.cooked")).unwrap();
         let hash: HashDigest = Sha256::digest(&file_data).into();
 
         manifest.payload_hashes = vec![PayloadHash {
@@ -687,13 +683,7 @@ mod tests {
             hash,
         }];
 
-        let result = Verifier::verify(
-            &manifest,
-            &dir,
-            &PlatformKind::Desktop,
-            "1.5.0",
-            (1, 5),
-        );
+        let result = Verifier::verify(&manifest, &dir, &PlatformKind::Desktop, "1.5.0", (1, 5));
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -712,13 +702,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         create_temp_payload(&dir, "data.bin", b"does not match");
 
-        let result = Verifier::verify(
-            &manifest,
-            &dir,
-            &PlatformKind::Desktop,
-            "1.5.0",
-            (1, 5),
-        );
+        let result = Verifier::verify(&manifest, &dir, &PlatformKind::Desktop, "1.5.0", (1, 5));
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -64,8 +64,8 @@ pub fn cook_texture(source: &Path, output: &Path) -> Result<CookResult, CookErro
     };
 
     // 5. Serialize and write.
-    let payload = bincode::serialize(&cooked)
-        .map_err(|e| CookError::InvalidAsset(e.to_string()))?;
+    let payload =
+        bincode::serialize(&cooked).map_err(|e| CookError::InvalidAsset(e.to_string()))?;
 
     let result = write_cooked_artifact(
         output,
@@ -162,7 +162,7 @@ fn mip_level_offset(level: u32, _data: &[u8], base_w: u32, base_h: u32) -> usize
     let mut h = base_h as u64;
 
     for _ in 0..level {
-        offset += (w * h * 4) as u64;
+        offset += w * h * 4;
         w = (w / 2).max(1);
         h = (h / 2).max(1);
     }
@@ -225,7 +225,7 @@ mod tests {
         // 4x4 → max_dim=4, ilog2=2 → mips = 3 (4, 2, 1)
         assert_eq!(mip_count, 3);
 
-        let expected_size = (4 * 4 + 2 * 2 + 1 * 1) * 4;
+        let expected_size = (4 * 4 + 2 * 2 + 1) * 4;
         assert_eq!(data.len(), expected_size);
     }
 }

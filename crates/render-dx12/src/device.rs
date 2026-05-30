@@ -89,7 +89,8 @@ impl Backend for DirectX12Backend {
                 windows = { version = \"0.58\", features = [\n    \
                     \"Win32_Graphics_Direct3D12\",\n    \
                     \"Win32_Graphics_Dxgi\",\n] }\
-            ".to_string(),
+            "
+            .to_string(),
         })
     }
 }
@@ -136,10 +137,7 @@ impl Device for Dx12Device {
         })
     }
 
-    fn create_buffer(
-        &mut self,
-        _descriptor: &BufferDescriptor,
-    ) -> Result<BufferHandle, RhiError> {
+    fn create_buffer(&mut self, _descriptor: &BufferDescriptor) -> Result<BufferHandle, RhiError> {
         Err(RhiError::Backend {
             detail: "DX12 backend: not implemented without windows-rs".to_string(),
         })

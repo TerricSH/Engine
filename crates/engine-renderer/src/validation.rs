@@ -62,7 +62,9 @@ pub fn validate_frame_input(input: &RenderFrameInput) -> Vec<Diagnostic> {
     for (light_idx, light) in input.lights.iter().enumerate() {
         // ShadowMode::Hard or Soft on point/spot lights produces diagnostic
         // and is downgraded (the frame never aborts — Warning only)
-        if matches!(light.kind, LightKind::Point | LightKind::Spot) && matches!(light.shadow_mode, ShadowMode::Hard | ShadowMode::Soft) {
+        if matches!(light.kind, LightKind::Point | LightKind::Spot)
+            && matches!(light.shadow_mode, ShadowMode::Hard | ShadowMode::Soft)
+        {
             let entity_id = light
                 .entity
                 .as_ref()

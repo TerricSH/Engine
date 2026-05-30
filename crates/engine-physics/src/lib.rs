@@ -17,8 +17,8 @@ pub use queries::{OverlapQuery, QueryResults, RaycastQuery, SweepQuery};
 pub use world::{PhysicsCommand, PhysicsWorld};
 
 // Re-export key types from engine-scene for convenience
-pub use engine_scene::{Component, ComponentStorageDyn, Entity, SparseSet, World};
 pub use engine_scene::components::Transform;
+pub use engine_scene::{Component, ComponentStorageDyn, Entity, SparseSet, World};
 
 use engine_renderer::debug_draw::DebugDrawRegistry;
 use engine_scene::registry::ComponentRegistry;
@@ -34,7 +34,7 @@ pub fn register_physics_extensions(
     _editor_registry: Option<&mut ()>,
     _script_registry: Option<&mut ()>,
 ) {
-    use crate::{SparseSet, ComponentStorageDyn};
+    use crate::{ComponentStorageDyn, SparseSet};
     use engine_scene::registry::{ComponentExtension, ComponentMeta};
 
     // ── RigidBody ──────────────────────────────────────────────────────

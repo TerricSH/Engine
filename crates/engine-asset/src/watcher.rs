@@ -39,14 +39,13 @@ impl FileWatcher {
     pub fn watch(path: &Path) -> Result<Self, AssetError> {
         let (tx, rx) = crossbeam_channel::unbounded();
 
-        let mut watcher = notify::recommended_watcher(
-            move |event: Result<notify::Event, notify::Error>| {
+        let mut watcher =
+            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                 if let Ok(ev) = event {
                     let _ = tx.send(ev);
                 }
-            },
-        )
-        .map_err(|e| AssetError::WatcherFailed(e.to_string()))?;
+            })
+            .map_err(|e| AssetError::WatcherFailed(e.to_string()))?;
 
         // Import the Watcher trait so we can call `.watch()`.
         use notify::Watcher;
@@ -72,8 +71,8 @@ impl FileWatcher {
 
 /// File extensions that the hot-reload system should react to.
 const RELOAD_EXTENSIONS: &[&str] = &[
-    "asset", "manifest", "gltf", "glb", "png", "jpg", "jpeg", "bmp", "tga",
-    "vert", "frag", "comp", "geom", "tesc", "tese",
+    "asset", "manifest", "gltf", "glb", "png", "jpg", "jpeg", "bmp", "tga", "vert", "frag", "comp",
+    "geom", "tesc", "tese",
 ];
 
 /// Returns `true` if `path` has an extension that is relevant for hot-reload.
@@ -90,10 +89,12 @@ fn is_relevant_extension(path: &Path) -> bool {
 
 /// A debounced file-system event emitted by [`DebouncedWatcher`].
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub struct DebouncedEvent {
     /// The path of the file that changed.
     pub path: PathBuf,
     /// When the event was first detected (before debounce).
+    #[expect(dead_code)]
     pub detected_at: Instant,
 }
 
@@ -135,6 +136,7 @@ pub struct DebouncedWatcher {
     debounce: std::time::Duration,
 }
 
+#[expect(dead_code)]
 impl DebouncedWatcher {
     /// Create a new `DebouncedWatcher` watching `path` recursively.
     ///
@@ -195,10 +197,7 @@ impl DebouncedWatcher {
         use notify::EventKind;
 
         // Only react to modifications and new files.
-        let should_track = matches!(
-            event.kind,
-            EventKind::Modify(_) | EventKind::Create(_)
-        );
+        let should_track = matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_));
         if !should_track {
             return;
         }
@@ -213,6 +212,24 @@ impl DebouncedWatcher {
             self.pending
                 .entry(path.clone())
                 .or_insert_with(Instant::now);
+        }
+    }
+}
+
+impl DebouncedWatcher {
+    /// Create a `DebouncedWatcher` for testing with a dummy inner
+    /// `FileWatcher`. The inner watcher watches a temp directory so it
+    /// does not panic on drop.
+    #[cfg(test)]
+    fn create_for_test(debounce: std::time::Duration) -> Self {
+        let dir = std::env::temp_dir().join("debounce_test_inner");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner = FileWatcher::watch(&dir).expect("test FileWatcher creation failed");
+        Self {
+            inner,
+            pending: HashMap::new(),
+            debounce,
         }
     }
 }
@@ -309,23 +326,5 @@ mod tests {
         let emitted = dw.poll();
         assert!(emitted.is_empty());
         assert_eq!(dw.pending_count(), 1);
-    }
-}
-
-impl DebouncedWatcher {
-    /// Create a `DebouncedWatcher` for testing with a dummy inner
-    /// `FileWatcher`. The inner watcher watches a temp directory so it
-    /// does not panic on drop.
-    #[cfg(test)]
-    fn create_for_test(debounce: std::time::Duration) -> Self {
-        let dir = std::env::temp_dir().join("debounce_test_inner");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let inner = FileWatcher::watch(&dir).expect("test FileWatcher creation failed");
-        Self {
-            inner,
-            pending: HashMap::new(),
-            debounce,
-        }
     }
 }

@@ -1,8 +1,7 @@
 use crate::error::RhiError;
 use crate::handles::{
-    BufferHandle, DescriptorSetHandle, FramebufferHandle, PipelineHandle,
-    PipelineLayoutHandle, RenderPassHandle, ShaderModuleHandle, SurfaceHandle,
-    SwapchainHandle, TextureHandle,
+    BufferHandle, DescriptorSetHandle, FramebufferHandle, PipelineHandle, PipelineLayoutHandle,
+    RenderPassHandle, ShaderModuleHandle, SurfaceHandle, SwapchainHandle, TextureHandle,
 };
 use crate::types::{
     AdapterInfo, BackendKind, BufferDescriptor, DeviceDescriptor, FramebufferDescriptor,

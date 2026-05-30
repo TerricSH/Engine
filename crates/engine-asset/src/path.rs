@@ -52,7 +52,11 @@ pub fn asset_path(id: &AssetId) -> Option<PathBuf> {
             "skeleton" => "skeletons",
             other => other,
         };
-        Some(PathBuf::from("assets").join(dir).join(format!("{name}.asset")))
+        Some(
+            PathBuf::from("assets")
+                .join(dir)
+                .join(format!("{name}.asset")),
+        )
     } else {
         Some(PathBuf::from("assets").join(format!("{}.asset", id_str)))
     }

@@ -25,8 +25,8 @@ use winit::window::{Window, WindowAttributes, WindowId};
 pub use winit;
 
 // ── Gate 7: Platform profiles & adapter ──────────────────────────────────
-pub mod profile;
 pub mod adapter;
+pub mod profile;
 
 pub use adapter::{PlatformAdapter, TouchEvent, TouchPhase};
 pub use profile::{PlatformFamily, PlatformProfile, ANDROID_PROFILE, DESKTOP_PROFILE, IOS_PROFILE};
@@ -71,27 +71,13 @@ pub enum PlatformEvent {
     CloseRequested,
 
     // ── Keyboard ──
-    KeyPressed {
-        key: KeyCode,
-        modifiers: Modifiers,
-    },
-    KeyReleased {
-        key: KeyCode,
-        modifiers: Modifiers,
-    },
+    KeyPressed { key: KeyCode, modifiers: Modifiers },
+    KeyReleased { key: KeyCode, modifiers: Modifiers },
 
     // ── Mouse ──
     MouseMoved { x: f64, y: f64 },
-    MousePressed {
-        button: MouseButton,
-        x: f64,
-        y: f64,
-    },
-    MouseReleased {
-        button: MouseButton,
-        x: f64,
-        y: f64,
-    },
+    MousePressed { button: MouseButton, x: f64, y: f64 },
+    MouseReleased { button: MouseButton, x: f64, y: f64 },
     MouseWheelScrolled { delta: (f32, f32) },
 
     // ── Text input ──
@@ -124,13 +110,70 @@ mod input_types {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     #[allow(dead_code)]
     pub enum KeyCode {
-        Escape, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
-        Key0, Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9,
-        A, B, C, D, E, F, G, H, I, J, K, L, M,
-        N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
-        Space, Enter, Backspace, Tab, Delete,
-        Left, Right, Up, Down,
-        LShift, RShift, LControl, RControl, LAlt, RAlt,
+        Escape,
+        F1,
+        F2,
+        F3,
+        F4,
+        F5,
+        F6,
+        F7,
+        F8,
+        F9,
+        F10,
+        F11,
+        F12,
+        Key0,
+        Key1,
+        Key2,
+        Key3,
+        Key4,
+        Key5,
+        Key6,
+        Key7,
+        Key8,
+        Key9,
+        A,
+        B,
+        C,
+        D,
+        E,
+        F,
+        G,
+        H,
+        I,
+        J,
+        K,
+        L,
+        M,
+        N,
+        O,
+        P,
+        Q,
+        R,
+        S,
+        T,
+        U,
+        V,
+        W,
+        X,
+        Y,
+        Z,
+        Space,
+        Enter,
+        Backspace,
+        Tab,
+        Delete,
+        Left,
+        Right,
+        Up,
+        Down,
+        LShift,
+        RShift,
+        LControl,
+        RControl,
+        LAlt,
+        RAlt,
         Other(u32),
     }
 
@@ -217,7 +260,10 @@ mod input_types {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     #[allow(dead_code)]
     pub enum MouseButton {
-        Left, Right, Middle, Other(u16),
+        Left,
+        Right,
+        Middle,
+        Other(u16),
     }
 
     impl From<winit::event::MouseButton> for MouseButton {
@@ -230,7 +276,6 @@ mod input_types {
             }
         }
     }
-
 }
 
 /// Returned from [`WindowApp::on_event`] to request continuation or exit.
@@ -351,29 +396,26 @@ impl<A: WindowApp> Wrapper<A> {
             // ── Keyboard ──────────────────────────────────────────────
             WinitWindowEvent::KeyboardInput { event: ke, .. } => {
                 let modifiers = Modifiers {
-                    shift: false, ctrl: false, alt: false, logo: false,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                    logo: false,
                 };
                 let key = match ke.physical_key {
                     winit::keyboard::PhysicalKey::Code(c) => c as u32,
                     _ => 0,
                 };
                 match ke.state {
-                    WinitState::Pressed => {
-                        Some(PlatformEvent::KeyPressed { key, modifiers })
-                    }
-                    WinitState::Released => {
-                        Some(PlatformEvent::KeyReleased { key, modifiers })
-                    }
+                    WinitState::Pressed => Some(PlatformEvent::KeyPressed { key, modifiers }),
+                    WinitState::Released => Some(PlatformEvent::KeyReleased { key, modifiers }),
                 }
             }
 
             // ── Mouse ─────────────────────────────────────────────────
-            WinitWindowEvent::CursorMoved { position, .. } => {
-                Some(PlatformEvent::MouseMoved {
-                    x: position.x,
-                    y: position.y,
-                })
-            }
+            WinitWindowEvent::CursorMoved { position, .. } => Some(PlatformEvent::MouseMoved {
+                x: position.x,
+                y: position.y,
+            }),
             WinitWindowEvent::MouseInput { state, button, .. } => {
                 let btn = match button {
                     winit::event::MouseButton::Left => MouseButton::Left,
@@ -383,10 +425,14 @@ impl<A: WindowApp> Wrapper<A> {
                 };
                 match state {
                     WinitState::Pressed => Some(PlatformEvent::MousePressed {
-                        button: btn, x: 0.0, y: 0.0,
+                        button: btn,
+                        x: 0.0,
+                        y: 0.0,
                     }),
                     WinitState::Released => Some(PlatformEvent::MouseReleased {
-                        button: btn, x: 0.0, y: 0.0,
+                        button: btn,
+                        x: 0.0,
+                        y: 0.0,
                     }),
                 }
             }
@@ -525,9 +571,18 @@ mod tests {
     #[test]
     fn platform_event_debug() {
         assert_eq!(format!("{:?}", PlatformEvent::Redraw), "Redraw");
-        assert_eq!(format!("{:?}", PlatformEvent::CloseRequested), "CloseRequested");
         assert_eq!(
-            format!("{:?}", PlatformEvent::Resized { width: 100, height: 200 }),
+            format!("{:?}", PlatformEvent::CloseRequested),
+            "CloseRequested"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                PlatformEvent::Resized {
+                    width: 100,
+                    height: 200
+                }
+            ),
             "Resized { width: 100, height: 200 }"
         );
     }

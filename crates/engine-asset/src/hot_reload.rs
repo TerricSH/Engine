@@ -56,10 +56,7 @@ impl<'a> HotReload<'a> {
     ///
     /// The returned [`HotReload`] borrows the registry; call
     /// [`poll`](Self::poll) periodically to process file-system events.
-    pub fn watch(
-        asset_dir: &Path,
-        registry: &'a mut AssetRegistry,
-    ) -> Result<Self, AssetError> {
+    pub fn watch(asset_dir: &Path, registry: &'a mut AssetRegistry) -> Result<Self, AssetError> {
         let watcher = FileWatcher::watch(asset_dir)?;
         tracing::info!(dir = %asset_dir.display(), "hot-reload watcher started");
         Ok(Self {
@@ -106,10 +103,7 @@ impl<'a> HotReload<'a> {
 
         // Only react to modifications and new files – ignore removals,
         // access notifications, and meta-events.
-        let should_reload = matches!(
-            event.kind,
-            EventKind::Modify(_) | EventKind::Create(_)
-        );
+        let should_reload = matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_));
         if !should_reload {
             return;
         }

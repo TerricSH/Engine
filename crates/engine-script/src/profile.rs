@@ -314,26 +314,44 @@ mod tests {
 
     #[test]
     fn feature_desktop_allows_all() {
-        assert!(is_feature_available(PlatformProfile::Desktop, "Reflection_Emit"));
+        assert!(is_feature_available(
+            PlatformProfile::Desktop,
+            "Reflection_Emit"
+        ));
         assert!(is_feature_available(PlatformProfile::Desktop, "OnUpdate"));
-        assert!(is_feature_available(PlatformProfile::Desktop, "Fictional_Feature_XYZ"));
+        assert!(is_feature_available(
+            PlatformProfile::Desktop,
+            "Fictional_Feature_XYZ"
+        ));
     }
 
     #[test]
     fn feature_android_blocks_desktop_only() {
-        assert!(!is_feature_available(PlatformProfile::Android, "Reflection_Emit"));
-        assert!(!is_feature_available(PlatformProfile::Android, "Assembly_LoadFrom"));
+        assert!(!is_feature_available(
+            PlatformProfile::Android,
+            "Reflection_Emit"
+        ));
+        assert!(!is_feature_available(
+            PlatformProfile::Android,
+            "Assembly_LoadFrom"
+        ));
         assert!(is_feature_available(PlatformProfile::Android, "OnUpdate"));
         assert!(is_feature_available(PlatformProfile::Android, "EntityRef"));
     }
 
     #[test]
     fn feature_ios_only_mobile_safe() {
-        assert!(!is_feature_available(PlatformProfile::Ios, "Reflection_Emit"));
+        assert!(!is_feature_available(
+            PlatformProfile::Ios,
+            "Reflection_Emit"
+        ));
         assert!(is_feature_available(PlatformProfile::Ios, "OnUpdate"));
         assert!(is_feature_available(PlatformProfile::Ios, "OnCreate"));
         assert!(!is_feature_available(PlatformProfile::Ios, "DynamicCode"));
-        assert!(!is_feature_available(PlatformProfile::Ios, "Unsafe_CodePtr"));
+        assert!(!is_feature_available(
+            PlatformProfile::Ios,
+            "Unsafe_CodePtr"
+        ));
     }
 
     // ── PlatformConstraints ────────────────────────────────────────────────
@@ -364,10 +382,7 @@ mod tests {
         assert!(c.max_assembly_size_bytes <= 64 * 1024 * 1024);
         assert!(!c.allowed_script_api_features.is_empty());
         assert!(!c.blocked_reflection_patterns.is_empty());
-        assert!(c
-            .notes
-            .iter()
-            .any(|n| n.contains("NativeAOT")));
+        assert!(c.notes.iter().any(|n| n.contains("NativeAOT")));
     }
 
     #[test]

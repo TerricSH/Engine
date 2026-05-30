@@ -18,15 +18,9 @@ use crate::{Collider, Entity, PhysicsMaterial, Transform};
 #[derive(Clone, Debug)]
 pub enum PhysicsCommand {
     /// Apply a continuous force at the centre of mass.
-    ApplyForce {
-        entity: Entity,
-        force: glam::Vec3,
-    },
+    ApplyForce { entity: Entity, force: glam::Vec3 },
     /// Apply an instantaneous impulse at the centre of mass.
-    ApplyImpulse {
-        entity: Entity,
-        impulse: glam::Vec3,
-    },
+    ApplyImpulse { entity: Entity, impulse: glam::Vec3 },
     /// Teleport the body to a new position.
     SetBodyPosition {
         entity: Entity,
@@ -227,10 +221,7 @@ impl PhysicsWorld {
 
             if !self.backend.has_body(idx) {
                 // Get the Transform for positioning.
-                let transform = world
-                    .get::<Transform>(entity)
-                    .cloned()
-                    .unwrap_or_default();
+                let transform = world.get::<Transform>(entity).cloned().unwrap_or_default();
                 self.backend.create_body(idx, rigid_body, &transform);
             }
         }
@@ -266,8 +257,7 @@ impl PhysicsWorld {
                     idx
                 };
 
-                let material = world
-                    .get::<PhysicsMaterial>(entity);
+                let material = world.get::<PhysicsMaterial>(entity);
                 self.backend
                     .create_collider(idx, collider, body_entity, material);
             }
@@ -351,11 +341,7 @@ impl PhysicsWorld {
     }
 
     /// Find all entities whose colliders overlap with the given shape.
-    pub fn query_proximity(
-        &self,
-        shape: &ColliderShape,
-        position: glam::Vec3,
-    ) -> Vec<Entity> {
+    pub fn query_proximity(&self, shape: &ColliderShape, position: glam::Vec3) -> Vec<Entity> {
         self.backend.query_proximity(shape, position)
     }
 

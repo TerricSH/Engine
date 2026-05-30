@@ -1,4 +1,7 @@
-use crate::{render_graph, validate_frame_input, Diagnostic, DiagnosticSeverity, FrameStats, RenderFrameInput};
+use crate::{
+    render_graph, validate_frame_input, Diagnostic, DiagnosticSeverity, FrameStats,
+    RenderFrameInput,
+};
 
 /// Backend renderer trait — implemented by concrete rendering backends
 /// (Vulkan, OpenGL, DX12) to bridge scene input to GPU execution.

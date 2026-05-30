@@ -8,7 +8,7 @@ impl Drop for VulkanDevice {
     fn drop(&mut self) {
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures it is not dropped before this destructor runs).
-        let _ = unsafe { self.logical_device.device.device_wait_idle() };
+        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
         self.drain_all_retired_pipelines();
         let d = &self.logical_device.device;
         for fb in self.mvp_framebuffers.drain(..) {
@@ -70,65 +70,53 @@ impl Drop for VulkanDevice {
                 d.destroy_command_pool(fs.command_pool, None);
             }
         }
-        for s in self.pipelines.slots.drain(..) {
-            if let Some((_, e)) = s {
-                // SAFETY: `e.pipeline` was created by this device.
-                unsafe {
-                    d.destroy_pipeline(e.pipeline, None);
+        for (_, e) in self.pipelines.slots.drain(..).flatten() {
+            // SAFETY: `e.pipeline` was created by this device.
+            unsafe {
+                d.destroy_pipeline(e.pipeline, None);
+            }
+        }
+        for (_, mut e) in self.buffers.slots.drain(..).flatten() {
+            // SAFETY: `e.buffer` was created by this device.
+            unsafe {
+                d.destroy_buffer(e.buffer, None);
+            }
+            if let Some(mut a) = e.allocation.take() {
+                if let Ok(mut guard) = e.allocator.lock() {
+                    guard.free(&mut a);
                 }
             }
         }
-        for s in self.buffers.slots.drain(..) {
-            if let Some((_, mut e)) = s {
-                // SAFETY: `e.buffer` was created by this device.
-                unsafe {
-                    d.destroy_buffer(e.buffer, None);
-                }
-                if let Some(mut a) = e.allocation.take() {
-                    if let Ok(mut guard) = e.allocator.lock() {
-                        let _ = guard.free(&mut a);
-                    }
-                }
+        for (_, rp) in self.render_passes.slots.drain(..).flatten() {
+            // SAFETY: `rp` was created by this device.
+            unsafe {
+                d.destroy_render_pass(rp, None);
             }
         }
-        for s in self.render_passes.slots.drain(..) {
-            if let Some((_, rp)) = s {
-                // SAFETY: `rp` was created by this device.
-                unsafe {
-                    d.destroy_render_pass(rp, None);
-                }
+        for (_, fb) in self.framebuffers.slots.drain(..).flatten() {
+            // SAFETY: `fb` was created by this device.
+            unsafe {
+                d.destroy_framebuffer(fb, None);
             }
         }
-        for s in self.framebuffers.slots.drain(..) {
-            if let Some((_, fb)) = s {
-                // SAFETY: `fb` was created by this device.
+        for (_, e) in self.pipeline_layouts.slots.drain(..).flatten() {
+            // SAFETY: `e.layout` and `e.set_layouts` were created by
+            // this device.
+            for sl in e.set_layouts {
                 unsafe {
-                    d.destroy_framebuffer(fb, None);
+                    d.destroy_descriptor_set_layout(sl, None);
                 }
             }
-        }
-        for s in self.pipeline_layouts.slots.drain(..) {
-            if let Some((_, e)) = s {
-                // SAFETY: `e.layout` and `e.set_layouts` were created by
-                // this device.
-                for sl in e.set_layouts {
-                    unsafe {
-                        d.destroy_descriptor_set_layout(sl, None);
-                    }
-                }
-                unsafe {
-                    d.destroy_pipeline_layout(e.layout, None);
-                }
+            unsafe {
+                d.destroy_pipeline_layout(e.layout, None);
             }
         }
 
         // Destroy shader modules stored in the handle slab.
-        for s in self.shader_modules.slots.drain(..) {
-            if let Some((_, (sm, _))) = s {
-                // SAFETY: `sm` was created by this device.
-                unsafe {
-                    d.destroy_shader_module(sm, None);
-                }
+        for (_, (sm, _)) in self.shader_modules.slots.drain(..).flatten() {
+            // SAFETY: `sm` was created by this device.
+            unsafe {
+                d.destroy_shader_module(sm, None);
             }
         }
 

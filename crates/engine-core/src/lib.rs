@@ -8,15 +8,16 @@ use engine_scene::{extract_renderer_input, Scene};
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
 
 pub mod coroutine;
+pub mod ffi_init;
 
 // ── Optional script subsystem ─────────────────────────────────────────────
 
 #[cfg(feature = "subsystem-scripting-csharp")]
 pub mod script;
 #[cfg(feature = "subsystem-scripting-csharp")]
-use script::{collect_scene_scripts, script_engine_state_summary};
-#[cfg(feature = "subsystem-scripting-csharp")]
 use engine_script::{ScriptEngine, ScriptError, ScriptHost};
+#[cfg(feature = "subsystem-scripting-csharp")]
+use script::{collect_scene_scripts, script_engine_state_summary};
 
 // ── Engine config ─────────────────────────────────────────────────────────
 
@@ -50,6 +51,11 @@ pub struct EngineRuntime {
 
 impl EngineRuntime {
     pub fn new(config: EngineConfig) -> Self {
+        // Initialise the FFI callback registry so extern "C" entry points
+        // can dispatch to real implementations immediately.  The world
+        // pointer will be set later when a scene is loaded.
+        ffi_init::initialise(std::ptr::null_mut());
+
         Self {
             config,
             renderer: Renderer::new(),
@@ -282,7 +288,10 @@ mod tests {
         let config = EngineConfig::default();
         let runtime = EngineRuntime::new(config);
         let rd = runtime.runtime_diagnostics();
-        assert!(rd.script_engine_state.contains("coroutines=0"), "missing coroutines=0");
+        assert!(
+            rd.script_engine_state.contains("coroutines=0"),
+            "missing coroutines=0"
+        );
         assert!(rd.reload_queue.is_none());
     }
 
@@ -314,10 +323,10 @@ mod tests {
     #[cfg(feature = "subsystem-scripting-csharp")]
     #[test]
     fn engine_runtime_load_scene_with_scripts() {
-        use engine_script::MockHost;
-        use std::collections::BTreeMap;
         use engine_scene::ComponentRecord;
+        use engine_script::MockHost;
         use engine_serialize::SchemaVersion;
+        use std::collections::BTreeMap;
 
         let config = EngineConfig::default();
         let mut runtime = EngineRuntime::new(config);
@@ -327,8 +336,14 @@ mod tests {
 
         // Create a minimal scene with a script component
         let mut script_fields = BTreeMap::new();
-        script_fields.insert("assembly_id".into(), engine_serialize::Value::Str("asm".into()));
-        script_fields.insert("class_name".into(), engine_serialize::Value::Str("MyScript".into()));
+        script_fields.insert(
+            "assembly_id".into(),
+            engine_serialize::Value::Str("asm".into()),
+        );
+        script_fields.insert(
+            "class_name".into(),
+            engine_serialize::Value::Str("MyScript".into()),
+        );
 
         let mut components = BTreeMap::new();
         components.insert(

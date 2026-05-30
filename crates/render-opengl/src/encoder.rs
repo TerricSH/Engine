@@ -75,9 +75,13 @@ impl CommandEncoder for OpenGlCommandEncoder {
         let fb = self.resolve_framebuffer(framebuffer);
 
         unsafe {
-            self.gl
-                .bind_framebuffer(glow::FRAMEBUFFER, fb);
-            self.gl.clear_color(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, fb);
+            self.gl.clear_color(
+                clear_color[0],
+                clear_color[1],
+                clear_color[2],
+                clear_color[3],
+            );
             if let Some(d) = clear_depth {
                 self.gl.clear_depth_f64(d as f64);
             }
@@ -134,15 +138,7 @@ impl CommandEncoder for OpenGlCommandEncoder {
         tracing::trace!(target: "opengl", "bind_descriptor_sets (stub)");
     }
 
-    fn set_viewport(
-        &mut self,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        _min_depth: f32,
-        _max_depth: f32,
-    ) {
+    fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, _min_depth: f32, _max_depth: f32) {
         unsafe {
             self.gl.viewport(x as i32, y as i32, w as i32, h as i32);
         }
@@ -170,11 +166,8 @@ impl CommandEncoder for OpenGlCommandEncoder {
                     instance_count as i32,
                 );
             } else {
-                self.gl.draw_arrays(
-                    glow::TRIANGLES,
-                    first_vertex as i32,
-                    vertex_count as i32,
-                );
+                self.gl
+                    .draw_arrays(glow::TRIANGLES, first_vertex as i32, vertex_count as i32);
             }
         }
     }

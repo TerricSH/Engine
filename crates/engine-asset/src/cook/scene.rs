@@ -49,8 +49,8 @@ pub fn cook_scene(
         data: scene_bytes,
     };
 
-    let payload = bincode::serialize(&cooked)
-        .map_err(|e| CookError::InvalidAsset(e.to_string()))?;
+    let payload =
+        bincode::serialize(&cooked).map_err(|e| CookError::InvalidAsset(e.to_string()))?;
 
     let result = write_cooked_artifact(
         output,

@@ -29,6 +29,16 @@ internal static class EngineAPI
     [return: MarshalAs(UnmanagedType.I1)]
     internal static extern bool ffi_entity_is_alive(IntPtr world, EntityId entity);
 
+    // ── Component access (pointer-based via registry) ───────────────
+
+    [DllImport("engine_ffi")]
+    internal static extern IntPtr ffi_component_get(
+        IntPtr world, EntityId entity, int typeId);
+
+    [DllImport("engine_ffi")]
+    internal static extern void ffi_component_set(
+        IntPtr world, EntityId entity, int typeId, byte[] data, int length);
+
     // ── Async I/O ───────────────────────────────────────────────────
 
     [DllImport("engine_ffi")]
@@ -50,6 +60,10 @@ internal static class EngineAPI
 
     [DllImport("engine_ffi")]
     internal static extern void ffi_coroutine_cancel(ulong handle);
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool ffi_async_is_complete(ulong handle);
 
     // ── Engine services ─────────────────────────────────────────────
 

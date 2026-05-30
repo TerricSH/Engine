@@ -114,9 +114,9 @@ impl<T: Component> SparseSet<T> {
 
     /// Iterate over all `(Entity, &mut T)` pairs in arbitrary order.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> + '_ {
-        self.dense.iter_mut().map(|(idx, comp)| {
-            (Entity::new(*idx, 0), comp)
-        })
+        self.dense
+            .iter_mut()
+            .map(|(idx, comp)| (Entity::new(*idx, 0), comp))
     }
 
     /// Remove all components from this storage.
@@ -171,6 +171,11 @@ pub trait ComponentStorageDyn: Send {
 
     /// Number of component entries.
     fn len(&self) -> usize;
+
+    /// Returns `true` if the storage is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Downcast to `&dyn std::any::Any` for typed access.
     fn as_any(&self) -> &dyn std::any::Any;

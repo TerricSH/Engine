@@ -26,6 +26,7 @@ impl Swapchain {
     ///
     /// # Safety
     /// All handles in scope must remain valid.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         instance: &AshInstance,
         device: AshDevice,

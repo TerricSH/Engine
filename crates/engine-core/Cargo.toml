@@ -7,13 +7,6 @@ license.workspace = true
 
 [features]
 default = []
-backend-vulkan = []
-backend-opengl = []
-backend-dx12 = []
-tooling-editor = []
-tooling-hot-reload = []
-target-desktop = []
-target-mobile = []
 subsystem-scripting-csharp = ["dep:engine-script"]
 
 [dependencies]
@@ -21,3 +14,5 @@ engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
 engine-script = { path = "../engine-script", optional = true }
 engine-serialize = { path = "../engine-serialize" }
+engine-ffi = { path = "../engine-ffi" }
+tracing.workspace = true

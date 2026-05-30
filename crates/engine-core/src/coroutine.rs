@@ -122,12 +122,8 @@ impl CoroutineSystem {
                 Some(YieldInstruction::WaitForSeconds(s)) => {
                     now.duration_since(c.wait_start).as_secs_f32() >= *s
                 }
-                Some(YieldInstruction::WaitForAsync(handle)) => {
-                    ffi_async_is_complete(*handle)
-                }
-                Some(YieldInstruction::WaitUntil(cond_id)) => {
-                    ffi_condition_check(*cond_id)
-                }
+                Some(YieldInstruction::WaitForAsync(handle)) => ffi_async_is_complete(*handle),
+                Some(YieldInstruction::WaitUntil(cond_id)) => ffi_condition_check(*cond_id),
             };
 
             if can_advance {

@@ -7,7 +7,7 @@ use glam::Vec3;
 
 use crate::clip::AudioClip;
 use crate::{
-    _compute_stereo_pan, _distance_attenuation, AudioCommand, AudioListener, _MAX_VOICES,
+    AudioCommand, AudioListener, _compute_stereo_pan, _distance_attenuation, _MAX_VOICES,
     _VOLUME_RAMP_SECS,
 };
 
@@ -98,10 +98,8 @@ impl MixerState {
                         slot.target_volume = volume;
                         slot.current_volume = 0.0;
                         slot.voice_volume = volume;
-                        slot.volume_ramp_delta =
-                            volume / (sr as f32 * _VOLUME_RAMP_SECS).max(1.0);
-                        slot.ramp_samples_remaining =
-                            (sr as f32 * _VOLUME_RAMP_SECS) as u32;
+                        slot.volume_ramp_delta = volume / (sr as f32 * _VOLUME_RAMP_SECS).max(1.0);
+                        slot.ramp_samples_remaining = (sr as f32 * _VOLUME_RAMP_SECS) as u32;
                         slot.loop_enabled = loop_enabled;
                         slot.paused = false;
                         slot.finished = finished;
@@ -145,8 +143,7 @@ impl MixerState {
                 AudioCommand::SetPosition { id, pos_frame } => {
                     if let Some(slot) = self.find_voice(id) {
                         if let Some(ref clip) = slot.clip {
-                            let max_frame =
-                                clip.samples().len() / clip.channels() as usize;
+                            let max_frame = clip.samples().len() / clip.channels() as usize;
                             slot.read_frame = pos_frame.min(max_frame.saturating_sub(1));
                         }
                     }
@@ -231,7 +228,8 @@ impl MixerState {
                         self.listener.up,
                     );
                     let dist = v.emitter_position.distance(self.listener.position);
-                    let atten = _distance_attenuation(dist, v.emitter_max_distance, v.emitter_rolloff);
+                    let atten =
+                        _distance_attenuation(dist, v.emitter_max_distance, v.emitter_rolloff);
                     left_sum += left * pan_l * atten;
                     right_sum += right * pan_r * atten;
                 } else {
@@ -301,8 +299,7 @@ impl MixerVoice {
         self.voice_volume = clamped;
         let ramp_frames = (sample_rate as f32 * _VOLUME_RAMP_SECS) as u32;
         if ramp_frames > 0 {
-            self.volume_ramp_delta =
-                (clamped - self.current_volume) / ramp_frames as f32;
+            self.volume_ramp_delta = (clamped - self.current_volume) / ramp_frames as f32;
             self.ramp_samples_remaining = ramp_frames;
         } else {
             self.current_volume = clamped;

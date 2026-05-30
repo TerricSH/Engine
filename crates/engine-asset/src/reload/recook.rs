@@ -14,14 +14,14 @@ use std::path::{Path, PathBuf};
 use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, HashDigest};
 use sha2::{Digest, Sha256};
 
+use super::watch::WatchEvent;
 use crate::cook::dependency::DependencyGraph;
 use crate::cook::manifest::{AssetType, SourceAssetEntry, SourceManifest};
 use crate::cook::{
-    cook_mesh, cook_texture, cook_shader, cook_scene, CookResult, write_cooked_artifact,
+    cook_mesh, cook_scene, cook_shader, cook_texture, write_cooked_artifact, CookResult,
 };
 use crate::hot_reload::path_to_asset_id;
 use crate::registry::AssetRegistry;
-use super::watch::WatchEvent;
 
 // ---------------------------------------------------------------------------
 // Incremental recook
@@ -222,7 +222,9 @@ fn category_to_asset_type(id_str: &str) -> AssetType {
 
 /// Scan all `.manifest` files in `source_dir` and build a map from
 /// [`AssetId`] to [`SourceAssetEntry`].
-pub(super) fn scan_manifests(source_dir: &Path) -> std::collections::BTreeMap<AssetId, SourceAssetEntry> {
+pub(super) fn scan_manifests(
+    source_dir: &Path,
+) -> std::collections::BTreeMap<AssetId, SourceAssetEntry> {
     let mut entries = std::collections::BTreeMap::new();
 
     let dir = match std::fs::read_dir(source_dir) {
@@ -403,17 +405,8 @@ mod tests {
 
     #[test]
     fn determine_shader_stage_by_extension() {
-        assert_eq!(
-            determine_shader_stage(Path::new("shader.vert")),
-            "vertex"
-        );
-        assert_eq!(
-            determine_shader_stage(Path::new("shader.frag")),
-            "fragment"
-        );
-        assert_eq!(
-            determine_shader_stage(Path::new("shader.comp")),
-            "compute"
-        );
+        assert_eq!(determine_shader_stage(Path::new("shader.vert")), "vertex");
+        assert_eq!(determine_shader_stage(Path::new("shader.frag")), "fragment");
+        assert_eq!(determine_shader_stage(Path::new("shader.comp")), "compute");
     }
 }

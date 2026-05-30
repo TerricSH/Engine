@@ -113,9 +113,10 @@ impl ReloadTracker {
     /// If the asset is not yet tracked, a new [`ReloadInfo`] is created.
     /// The `updated_at` timestamp is refreshed on every transition.
     pub fn transition(&mut self, id: &AssetId, state: ReloadState) {
-        let info = self.assets.entry(id.clone()).or_insert_with(|| {
-            ReloadInfo::new(id.clone(), None)
-        });
+        let info = self
+            .assets
+            .entry(id.clone())
+            .or_insert_with(|| ReloadInfo::new(id.clone(), None));
         info.state = state;
         info.updated_at = std::time::Instant::now();
         if let ReloadState::Failed(ref err) = &info.state {
@@ -125,15 +126,11 @@ impl ReloadTracker {
 
     /// Register or transition an asset to a new state, also setting its
     /// filesystem path.
-    pub fn transition_with_path(
-        &mut self,
-        id: &AssetId,
-        state: ReloadState,
-        path: Option<String>,
-    ) {
-        let info = self.assets.entry(id.clone()).or_insert_with(|| {
-            ReloadInfo::new(id.clone(), path.clone())
-        });
+    pub fn transition_with_path(&mut self, id: &AssetId, state: ReloadState, path: Option<String>) {
+        let info = self
+            .assets
+            .entry(id.clone())
+            .or_insert_with(|| ReloadInfo::new(id.clone(), path.clone()));
         info.state = state;
         info.updated_at = std::time::Instant::now();
         if path.is_some() {
@@ -321,14 +318,8 @@ mod tests {
         let mut tracker = ReloadTracker::new();
         tracker.mark_failed(&id("mesh-cube"), "compiler error".into());
         let info = tracker.get(&id("mesh-cube")).unwrap();
-        assert_eq!(
-            info.state,
-            ReloadState::Failed("compiler error".into())
-        );
-        assert_eq!(
-            info.error_message,
-            Some("compiler error".into())
-        );
+        assert_eq!(info.state, ReloadState::Failed("compiler error".into()));
+        assert_eq!(info.error_message, Some("compiler error".into()));
     }
 
     #[test]
@@ -379,10 +370,7 @@ mod tests {
     fn reload_state_display() {
         assert_eq!(ReloadState::Detected.to_string(), "Detected");
         assert_eq!(ReloadState::Recooking.to_string(), "Recooking");
-        assert_eq!(
-            ReloadState::Failed("err".into()).to_string(),
-            "Failed(err)"
-        );
+        assert_eq!(ReloadState::Failed("err".into()).to_string(), "Failed(err)");
     }
 
     #[test]
@@ -394,9 +382,6 @@ mod tests {
             Some("assets/meshes/cube.asset".into()),
         );
         let info = tracker.get(&id("mesh-cube")).unwrap();
-        assert_eq!(
-            info.path,
-            Some("assets/meshes/cube.asset".into())
-        );
+        assert_eq!(info.path, Some("assets/meshes/cube.asset".into()));
     }
 }

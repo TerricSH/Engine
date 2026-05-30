@@ -105,10 +105,7 @@ pub enum LogicCondition {
     /// Always fires (unconditional).
     Always,
     /// Compare a boolean field against an expected value.
-    BoolCompare {
-        field: String,
-        expected: bool,
-    },
+    BoolCompare { field: String, expected: bool },
     /// Compare a float field against a value using an operator.
     FloatCompare {
         field: String,
@@ -116,9 +113,7 @@ pub enum LogicCondition {
         value: f32,
     },
     /// True when the runtime has a specific asset loaded.
-    HasAsset {
-        asset: AssetId,
-    },
+    HasAsset { asset: AssetId },
 }
 
 // ── CompareOp ─────────────────────────────────────────────────────────────
@@ -286,10 +281,8 @@ impl LogicAsset {
                             .iter()
                             .position(|n| n.as_str() == node_list[v])
                             .unwrap_or(0);
-                        let cycle: Vec<&str> = path[cycle_start..]
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect();
+                        let cycle: Vec<&str> =
+                            path[cycle_start..].iter().map(|s| s.as_str()).collect();
                         errors.push(format!(
                             "Circular child dependency detected: {}",
                             cycle.join(" → ")
@@ -620,7 +613,7 @@ mod tests {
         let values = vec![
             LogicValue::Bool(true),
             LogicValue::Int(-42),
-            LogicValue::Float(3.14),
+            LogicValue::Float(std::f64::consts::PI),
             LogicValue::Str("hello".into()),
             LogicValue::Asset(AssetId::new("some_asset")),
         ];

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use render_core::{
-    BindGroupLayoutDescriptor, BlendState, DepthState, Device, PipelineDescriptor,
-    PipelineHandle, PipelineLayoutHandle, PipelineVariantKey, RasterState, RenderPassHandle,
-    RhiError, ShaderModuleHandle, TextureFormat,
+    BindGroupLayoutDescriptor, BlendState, DepthState, Device, PipelineDescriptor, PipelineHandle,
+    PipelineLayoutHandle, PipelineVariantKey, RasterState, RenderPassHandle, RhiError,
+    ShaderModuleHandle, TextureFormat,
 };
 
 /// Key for identifying a unique pipeline in the cache.

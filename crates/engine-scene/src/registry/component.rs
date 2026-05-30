@@ -20,7 +20,7 @@ pub struct ComponentMeta {
 }
 
 // ---------------------------------------------------------------------------
-/// Type aliases for extension hooks
+// Type aliases for extension hooks
 // ---------------------------------------------------------------------------
 
 /// Storage factory: creates a new `SparseSet` for this component type.

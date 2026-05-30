@@ -20,12 +20,14 @@ pub fn cook_mesh(source: &Path, output: &Path) -> Result<CookResult, CookError> 
     let mesh_data = crate::mesh::load_mesh_from_gltf(source).map_err(|e| match e {
         crate::mesh::MeshError::GltfLoad(msg) => CookError::Parse(msg),
         crate::mesh::MeshError::UnsupportedFormat(msg) => CookError::UnsupportedFormat(msg),
-        crate::mesh::MeshError::NoPositions => CookError::InvalidAsset("mesh has no positions".into()),
+        crate::mesh::MeshError::NoPositions => {
+            CookError::InvalidAsset("mesh has no positions".into())
+        }
     })?;
 
     // 2. Serialize with bincode.
-    let payload = bincode::serialize(&mesh_data)
-        .map_err(|e| CookError::InvalidAsset(e.to_string()))?;
+    let payload =
+        bincode::serialize(&mesh_data).map_err(|e| CookError::InvalidAsset(e.to_string()))?;
 
     // 3. Write cooked artifact with header.
     let result = write_cooked_artifact(
@@ -47,12 +49,17 @@ pub fn cook_meshes(source: &Path, output_base: &Path) -> Result<Vec<CookResult>,
     let meshes = crate::mesh::load_meshes_from_gltf(source).map_err(|e| match e {
         crate::mesh::MeshError::GltfLoad(msg) => CookError::Parse(msg),
         crate::mesh::MeshError::UnsupportedFormat(msg) => CookError::UnsupportedFormat(msg),
-        crate::mesh::MeshError::NoPositions => CookError::InvalidAsset("mesh has no positions".into()),
+        crate::mesh::MeshError::NoPositions => {
+            CookError::InvalidAsset("mesh has no positions".into())
+        }
     })?;
 
     let mut results = Vec::new();
     let parent = output_base.parent().unwrap_or(Path::new(""));
-    let stem = output_base.file_stem().unwrap_or_default().to_string_lossy();
+    let stem = output_base
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
 
     for (i, (name, mesh_data)) in meshes.iter().enumerate() {
         let safe_name = if name.is_empty() {
@@ -62,8 +69,8 @@ pub fn cook_meshes(source: &Path, output_base: &Path) -> Result<Vec<CookResult>,
         };
         let output_path = parent.join(format!("{safe_name}.cooked"));
 
-        let payload = bincode::serialize(mesh_data)
-            .map_err(|e| CookError::InvalidAsset(e.to_string()))?;
+        let payload =
+            bincode::serialize(mesh_data).map_err(|e| CookError::InvalidAsset(e.to_string()))?;
 
         let result = write_cooked_artifact(
             &output_path,
@@ -85,7 +92,11 @@ mod tests {
     /// Create a minimal mesh for serialisation roundtrip testing.
     fn make_test_mesh() -> MeshData {
         MeshData {
-            positions: vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)],
+            positions: vec![
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
             normals: vec![Vec3::Z, Vec3::Z, Vec3::Z],
             uvs: vec![],
             indices: vec![0, 1, 2],

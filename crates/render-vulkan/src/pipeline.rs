@@ -29,6 +29,7 @@ impl Pipeline {
     /// # Safety
     /// `device`, `image_views`, and the SPIR-V byte slices must remain
     /// valid for the duration of this call.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         device: AshDevice,
         format: vk::Format,

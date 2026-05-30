@@ -33,9 +33,7 @@ impl RollbackManager {
         // Determine which package ID is in the previous directory by
         // scanning for subdirectories.
         let entries: Vec<_> = std::fs::read_dir(&previous_dir)
-            .map_err(|e| {
-                UpdateError::RollbackFailed(format!("cannot read previous dir: {e}"))
-            })?
+            .map_err(|e| UpdateError::RollbackFailed(format!("cannot read previous dir: {e}")))?
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .collect();
@@ -150,10 +148,7 @@ impl RollbackManager {
     ///
     /// This removes all traces: metadata, staged, active, and previous
     /// directories.
-    pub fn remove_package(
-        cache: &PackageCache,
-        package_id: &str,
-    ) -> Result<(), UpdateError> {
+    pub fn remove_package(cache: &PackageCache, package_id: &str) -> Result<(), UpdateError> {
         info!("removing package: {package_id}");
 
         // Metadata.
@@ -222,7 +217,6 @@ mod tests {
         AssetId, PlatformKind, PlatformPayload, RollbackMetadata, SchemaVersion,
     };
 
-
     fn sample_manifest() -> engine_serialize::HotUpdateManifest {
         engine_serialize::HotUpdateManifest {
             manifest_version: SchemaVersion::new(0, 1, 0),
@@ -255,7 +249,7 @@ mod tests {
         let manifest = sample_manifest();
         let staging_dir = tmp.path().join("download");
         std::fs::create_dir_all(&staging_dir).unwrap();
-        std::fs::write(&staging_dir.join("data.bin"), b"payload").unwrap();
+        std::fs::write(staging_dir.join("data.bin"), b"payload").unwrap();
 
         let mut pkg = crate::install::Installer::stage(&manifest, &staging_dir, &cache).unwrap();
         crate::install::Installer::activate(&mut pkg, &cache).unwrap();
@@ -311,7 +305,7 @@ mod tests {
         let m1 = sample_manifest();
         let s1 = tmp.path().join("dl1");
         std::fs::create_dir_all(&s1).unwrap();
-        std::fs::write(&s1.join("data.bin"), b"version1").unwrap();
+        std::fs::write(s1.join("data.bin"), b"version1").unwrap();
         let mut p1 = crate::install::Installer::stage(&m1, &s1, &cache).unwrap();
         crate::install::Installer::activate(&mut p1, &cache).unwrap();
 
@@ -320,7 +314,7 @@ mod tests {
         m2.created_at = "2026-06-01T00:00:00Z".into();
         let s2 = tmp.path().join("dl2");
         std::fs::create_dir_all(&s2).unwrap();
-        std::fs::write(&s2.join("data.bin"), b"version2").unwrap();
+        std::fs::write(s2.join("data.bin"), b"version2").unwrap();
         let mut p2 = crate::install::Installer::stage(&m2, &s2, &cache).unwrap();
         crate::install::Installer::activate(&mut p2, &cache).unwrap();
 
@@ -373,7 +367,7 @@ mod tests {
         let m1 = sample_manifest();
         let s1 = tmp.path().join("dl_r1");
         std::fs::create_dir_all(&s1).unwrap();
-        std::fs::write(&s1.join("data.bin"), b"v1").unwrap();
+        std::fs::write(s1.join("data.bin"), b"v1").unwrap();
         let mut p1 = crate::install::Installer::stage(&m1, &s1, &cache).unwrap();
         crate::install::Installer::activate(&mut p1, &cache).unwrap();
         let id1 = p1.package_id().to_string();
@@ -382,7 +376,7 @@ mod tests {
         m2.created_at = "2026-07-01T00:00:00Z".into();
         let s2 = tmp.path().join("dl_r2");
         std::fs::create_dir_all(&s2).unwrap();
-        std::fs::write(&s2.join("data.bin"), b"v2").unwrap();
+        std::fs::write(s2.join("data.bin"), b"v2").unwrap();
         let mut p2 = crate::install::Installer::stage(&m2, &s2, &cache).unwrap();
         crate::install::Installer::activate(&mut p2, &cache).unwrap();
 

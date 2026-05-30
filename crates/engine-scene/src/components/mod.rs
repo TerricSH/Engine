@@ -1,15 +1,15 @@
 //! Core ECS component types for the engine.
 
-mod name;
-mod transform;
-mod renderable;
+mod bounds;
 mod camera;
 mod light;
-mod bounds;
+mod name;
+mod renderable;
+mod transform;
 
-pub use name::Name;
-pub use transform::Transform;
-pub use renderable::Renderable;
+pub use bounds::Bounds;
 pub use camera::{Camera, CameraProjection};
 pub use light::{Light, LightKind};
-pub use bounds::Bounds;
+pub use name::Name;
+pub use renderable::Renderable;
+pub use transform::Transform;

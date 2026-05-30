@@ -41,8 +41,7 @@ impl ScriptEngine {
     /// subsequent [`load_script`](Self::load_script) calls.
     pub fn register_host(&mut self, host: Box<dyn ScriptHost>) {
         let host_name = host.name().to_string();
-        self.managers
-            .push(ScriptManager::new(host_name, host));
+        self.managers.push(ScriptManager::new(host_name, host));
     }
 
     /// Return the number of registered script hosts.
@@ -137,11 +136,7 @@ impl ScriptEngine {
 
     /// Detach all script instances for an entity from the named host.
     pub fn detach_script(&mut self, entity_id: &str, host_name: &str) {
-        if let Some(manager) = self
-            .managers
-            .iter_mut()
-            .find(|m| m.host_name == host_name)
-        {
+        if let Some(manager) = self.managers.iter_mut().find(|m| m.host_name == host_name) {
             manager.detach(entity_id);
         }
     }
@@ -213,9 +208,7 @@ impl ScriptEngine {
 
     /// Find a manager by host name (mutable).
     pub fn find_manager_mut(&mut self, host_name: &str) -> Option<&mut ScriptManager> {
-        self.managers
-            .iter_mut()
-            .find(|m| m.host_name == host_name)
+        self.managers.iter_mut().find(|m| m.host_name == host_name)
     }
 }
 
@@ -291,13 +284,9 @@ mod tests {
     fn script_engine_attach_and_create() {
         let mut engine = ScriptEngine::new();
         engine.register_host(Box::new(MockHost::new()));
-        engine
-            .load_script("asm", "mock", b"data")
-            .unwrap();
+        engine.load_script("asm", "mock", b"data").unwrap();
         let comp = ScriptComponent::new("asm", "MyScript");
-        engine
-            .attach_script("entity_1", "mock", &comp)
-            .unwrap();
+        engine.attach_script("entity_1", "mock", &comp).unwrap();
         let diags = engine.create_instances();
         assert!(diags.is_empty());
     }
@@ -308,11 +297,7 @@ mod tests {
         engine.register_host(Box::new(MockHost::new()));
         engine.load_script("asm", "mock", b"data").unwrap();
         engine
-            .attach_script(
-                "entity_1",
-                "mock",
-                &ScriptComponent::new("asm", "MyScript"),
-            )
+            .attach_script("entity_1", "mock", &ScriptComponent::new("asm", "MyScript"))
             .unwrap();
         engine.create_instances();
         let diags = engine.update(0.016);
@@ -325,11 +310,7 @@ mod tests {
         engine.register_host(Box::new(MockHost::new()));
         engine.load_script("asm", "mock", b"data").unwrap();
         engine
-            .attach_script(
-                "entity_1",
-                "mock",
-                &ScriptComponent::new("asm", "MyScript"),
-            )
+            .attach_script("entity_1", "mock", &ScriptComponent::new("asm", "MyScript"))
             .unwrap();
         engine.create_instances();
         let diags = engine.destroy_instances();
@@ -342,11 +323,7 @@ mod tests {
         engine.register_host(Box::new(MockHost::new()));
         engine.load_script("asm", "mock", b"data").unwrap();
         engine
-            .attach_script(
-                "entity_1",
-                "mock",
-                &ScriptComponent::new("asm", "MyScript"),
-            )
+            .attach_script("entity_1", "mock", &ScriptComponent::new("asm", "MyScript"))
             .unwrap();
         assert_eq!(engine.managers()[0].instance_count(), 1);
         engine.detach_script("entity_1", "mock");
@@ -360,9 +337,7 @@ mod tests {
         engine.load_script("asm", "mock", b"data").unwrap();
         let comp = ScriptComponent::new("asm", "MyScript")
             .with_field("speed", crate::value::ScriptValue::Float(50.0));
-        engine
-            .attach_script("entity_1", "mock", &comp)
-            .unwrap();
+        engine.attach_script("entity_1", "mock", &comp).unwrap();
         let fields = engine.capture_fields("entity_1", "MyScript", "mock");
         assert!(fields.is_some());
     }

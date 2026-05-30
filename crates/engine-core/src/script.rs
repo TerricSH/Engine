@@ -58,9 +58,7 @@ pub fn script_value_to_serialize(sv: &ScriptValue) -> Value {
         ScriptValue::Vec3(arr) => Value::Vec3(*arr),
         ScriptValue::Vec4(arr) => Value::Quat(*arr),
         ScriptValue::EntityId(e) => Value::Entity(e.clone()),
-        ScriptValue::AssetIdWrapper(id) => {
-            Value::Asset(AssetId::new(id.clone()))
-        }
+        ScriptValue::AssetIdWrapper(id) => Value::Asset(AssetId::new(id.clone())),
         ScriptValue::Array(items) => {
             Value::List(items.iter().map(script_value_to_serialize).collect())
         }
@@ -87,9 +85,7 @@ const RESERVED_SCRIPT_KEYS: &[&str] = &["assembly_id", "class_name"];
 ///
 /// Returns `None` if the entity does not carry a component with type ID
 /// [`SCRIPT_COMPONENT_TYPE`].
-pub fn extract_script_component(
-    entity: &EntityRecord,
-) -> Option<ScriptComponent> {
+pub fn extract_script_component(entity: &EntityRecord) -> Option<ScriptComponent> {
     let comp = entity.components.get(SCRIPT_COMPONENT_TYPE)?;
 
     // Pull structured fields
@@ -119,9 +115,7 @@ pub fn extract_script_component(
 
 /// Iterate every entity in a scene and collect all script components,
 /// returning `(entity_id, ScriptComponent)` pairs.
-pub fn collect_scene_scripts(
-    scene: &Scene,
-) -> Vec<(String, ScriptComponent)> {
+pub fn collect_scene_scripts(scene: &Scene) -> Vec<(String, ScriptComponent)> {
     let mut result = Vec::new();
     for entity in &scene.entities {
         if let Some(sc) = extract_script_component(entity) {
@@ -145,9 +139,7 @@ pub fn script_engine_state_summary(engine: &ScriptEngine) -> String {
         total_assemblies += mgr.assembly_count();
         total_instances += mgr.instance_count();
     }
-    format!(
-        "hosts={host_count} assemblies={total_assemblies} instances={total_instances}"
-    )
+    format!("hosts={host_count} assemblies={total_assemblies} instances={total_instances}")
 }
 
 // ---------------------------------------------------------------------------
@@ -160,10 +152,7 @@ mod tests {
     use engine_scene::{ComponentRecord, SceneSettings};
     use engine_serialize::SchemaVersion;
 
-    fn make_entity(
-        eid: &str,
-        script_fields: BTreeMap<String, Value>,
-    ) -> EntityRecord {
+    fn make_entity(eid: &str, script_fields: BTreeMap<String, Value>) -> EntityRecord {
         let mut components = BTreeMap::new();
         components.insert(
             SCRIPT_COMPONENT_TYPE.to_string(),

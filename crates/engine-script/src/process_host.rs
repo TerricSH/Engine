@@ -37,16 +37,14 @@ pub struct SharedScriptIO {
 impl SharedScriptIO {
     /// Send a JSON message and read exactly one JSON response.
     pub fn roundtrip(&mut self, msg: &ScriptMessage) -> Result<ScriptMessage, ScriptError> {
-        let json = serde_json::to_string(msg).map_err(|e| {
-            ScriptError::HostError(format!("Failed to serialize message: {e}"))
-        })?;
+        let json = serde_json::to_string(msg)
+            .map_err(|e| ScriptError::HostError(format!("Failed to serialize message: {e}")))?;
 
-        writeln!(self.stdin, "{json}").map_err(|e| {
-            ScriptError::HostError(format!("Failed to write to child stdin: {e}"))
-        })?;
-        self.stdin.flush().map_err(|e| {
-            ScriptError::HostError(format!("Failed to flush child stdin: {e}"))
-        })?;
+        writeln!(self.stdin, "{json}")
+            .map_err(|e| ScriptError::HostError(format!("Failed to write to child stdin: {e}")))?;
+        self.stdin
+            .flush()
+            .map_err(|e| ScriptError::HostError(format!("Failed to flush child stdin: {e}")))?;
 
         let mut line = String::new();
         self.stdout.read_line(&mut line).map_err(|e| {
@@ -59,9 +57,8 @@ impl SharedScriptIO {
             ));
         }
 
-        serde_json::from_str(line.trim()).map_err(|e| {
-            ScriptError::HostError(format!("Failed to deserialize response: {e}"))
-        })
+        serde_json::from_str(line.trim())
+            .map_err(|e| ScriptError::HostError(format!("Failed to deserialize response: {e}")))
     }
 }
 
@@ -88,9 +85,10 @@ impl std::fmt::Debug for ProcessScriptInstance {
 
 impl ScriptInstance for ProcessScriptInstance {
     fn call(&mut self, function: &str, args: &[ScriptValue]) -> Result<ScriptValue, ScriptError> {
-        let mut io = self.io.lock().map_err(|e| {
-            ScriptError::HostError(format!("Script IO lock poisoned: {e}"))
-        })?;
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|e| ScriptError::HostError(format!("Script IO lock poisoned: {e}")))?;
         let response = io.roundtrip(&ScriptMessage::CallMethod {
             instance_id: self.instance_id.clone(),
             method: function.to_string(),
@@ -107,9 +105,10 @@ impl ScriptInstance for ProcessScriptInstance {
     }
 
     fn set_field(&mut self, name: &str, value: ScriptValue) -> Result<(), ScriptError> {
-        let mut io = self.io.lock().map_err(|e| {
-            ScriptError::HostError(format!("Script IO lock poisoned: {e}"))
-        })?;
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|e| ScriptError::HostError(format!("Script IO lock poisoned: {e}")))?;
         let response = io.roundtrip(&ScriptMessage::SetField {
             instance_id: self.instance_id.clone(),
             name: name.to_string(),
@@ -210,12 +209,14 @@ impl ProcessHost {
                 ))
             })?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            ScriptError::HostError("Failed to capture child stdin".to_string())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ScriptError::HostError("Failed to capture child stdout".to_string())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ScriptError::HostError("Failed to capture child stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ScriptError::HostError("Failed to capture child stdout".to_string()))?;
 
         self.io = Some(Arc::new(Mutex::new(SharedScriptIO {
             stdin,
@@ -230,9 +231,9 @@ impl ProcessHost {
         let io = self.io.as_ref().ok_or_else(|| {
             ScriptError::HostError("Process not launched — call launch() first".to_string())
         })?;
-        let mut io = io.lock().map_err(|e| {
-            ScriptError::HostError(format!("Script IO lock poisoned: {e}"))
-        })?;
+        let mut io = io
+            .lock()
+            .map_err(|e| ScriptError::HostError(format!("Script IO lock poisoned: {e}")))?;
         io.roundtrip(msg)
     }
 
@@ -251,14 +252,9 @@ impl ProcessHost {
 
     /// Return a clone of the shared IO for instances to use.
     fn shared_io(&self) -> Result<Arc<Mutex<SharedScriptIO>>, ScriptError> {
-        self.io
-            .as_ref()
-            .map(|io| Arc::clone(io))
-            .ok_or_else(|| {
-                ScriptError::HostError(
-                    "Process not launched — call launch() first".to_string(),
-                )
-            })
+        self.io.as_ref().map(Arc::clone).ok_or_else(|| {
+            ScriptError::HostError("Process not launched — call launch() first".to_string())
+        })
     }
 
     /// Number of loaded assemblies.
@@ -295,9 +291,7 @@ impl ScriptHost for ProcessHost {
                 let handle = ScriptHandle::new(&resp_id);
                 self.assemblies.push((
                     handle.clone(),
-                    ScriptHostState::Loaded {
-                        id: id.to_string(),
-                    },
+                    ScriptHostState::Loaded { id: id.to_string() },
                 ));
                 Ok(handle)
             }
@@ -317,9 +311,9 @@ impl ScriptHost for ProcessHost {
 
         // Tell the child process to create the instance
         let io = self.shared_io()?;
-        let mut io_lock = io.lock().map_err(|e| {
-            ScriptError::HostError(format!("Script IO lock poisoned: {e}"))
-        })?;
+        let mut io_lock = io
+            .lock()
+            .map_err(|e| ScriptError::HostError(format!("Script IO lock poisoned: {e}")))?;
         let _response = io_lock.roundtrip(&ScriptMessage::Instantiate {
             assembly_id: handle.id().to_string(),
             class_name: "ScriptType".to_string(), // will be refined when ScriptComponent is used
@@ -328,10 +322,7 @@ impl ScriptHost for ProcessHost {
         // Drop the lock before moving `io` into the instance
         drop(io_lock);
 
-        Ok(Box::new(ProcessScriptInstance {
-            instance_id,
-            io,
-        }))
+        Ok(Box::new(ProcessScriptInstance { instance_id, io }))
     }
 
     fn unload(&mut self, handle: &ScriptHandle) -> Result<(), ScriptError> {
@@ -410,7 +401,10 @@ mod tests {
         // Construction requires a real child process (SharedScriptIO holds
         // ChildStdin + ChildStdout), so we verify via type-name reflection.
         let name = std::any::type_name::<ProcessScriptInstance>();
-        assert!(name.contains("ProcessScriptInstance"), "type name mismatch: {name}");
+        assert!(
+            name.contains("ProcessScriptInstance"),
+            "type name mismatch: {name}"
+        );
     }
 
     #[test]

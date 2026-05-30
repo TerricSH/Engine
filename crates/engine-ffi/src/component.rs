@@ -51,13 +51,22 @@ pub fn register_component_type(name: &str) -> FfiComponentTypeId {
     reg.next_id += 1;
     reg.name_to_id.insert(name.to_string(), id);
     reg.id_to_name.insert(id, name.to_string());
-    tracing::info!(component = name, type_id = id.0, "Registered component type");
+    tracing::info!(
+        component = name,
+        type_id = id.0,
+        "Registered component type"
+    );
     id
 }
 
 /// Look up a component type ID by name.
 pub fn lookup_component_type(name: &str) -> Option<FfiComponentTypeId> {
-    COMPONENT_REGISTRY.read().unwrap().name_to_id.get(name).copied()
+    COMPONENT_REGISTRY
+        .read()
+        .unwrap()
+        .name_to_id
+        .get(name)
+        .copied()
 }
 
 /// Look up a component type name by ID (for debug / diagnostics).
@@ -77,8 +86,14 @@ pub fn lookup_component_name(type_id: FfiComponentTypeId) -> Option<String> {
 /// Look up a component type ID by name from C#.
 ///
 /// Returns 0 (INVALID) if the component type is not registered.
+///
+/// # Safety
+///
+/// `name` must be a valid, null-terminated C string pointer or null.
 #[no_mangle]
-pub extern "C" fn ffi_component_type_id(name: *const std::ffi::c_char) -> FfiComponentTypeId {
+pub unsafe extern "C" fn ffi_component_type_id(
+    name: *const std::ffi::c_char,
+) -> FfiComponentTypeId {
     if name.is_null() {
         return FfiComponentTypeId::INVALID;
     }
@@ -120,10 +135,7 @@ mod tests {
 
     #[test]
     fn lookup_missing() {
-        assert_eq!(
-            lookup_component_type("NonexistentComponent"),
-            None
-        );
+        assert_eq!(lookup_component_type("NonexistentComponent"), None);
     }
 
     #[test]
@@ -137,7 +149,7 @@ mod tests {
 
     #[test]
     fn ffi_lookup_null_safe() {
-        let id = ffi_component_type_id(std::ptr::null());
+        let id = unsafe { ffi_component_type_id(std::ptr::null()) };
         assert_eq!(id, FfiComponentTypeId::INVALID);
     }
 
@@ -145,7 +157,7 @@ mod tests {
     fn ffi_lookup_by_name() {
         register_component_type("FFIComponent");
         let c_name = CString::new("FFIComponent").unwrap();
-        let id = ffi_component_type_id(c_name.as_ptr());
+        let id = unsafe { ffi_component_type_id(c_name.as_ptr()) };
         assert_ne!(id, FfiComponentTypeId::INVALID);
     }
 }

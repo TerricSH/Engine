@@ -131,6 +131,7 @@ impl VulkanDevice {
         width: u32,
         height: u32,
         enable_validation: bool,
+        cache_dir: Option<&std::path::Path>,
     ) -> Result<Self, VulkanError> {
         // SAFETY: `Instance::new` wraps the Vulkan C entry-point creation; the
         // returned value owns the instance handle.
@@ -183,7 +184,7 @@ impl VulkanDevice {
                 },
             },
         };
-        Ok(Self {
+        let mut device = Self {
             instance: Some(instance),
             surface: Some(surface),
             adapter,
@@ -244,7 +245,31 @@ impl VulkanDevice {
             shadow_desc_layout: None,
             shadow_desc_pool: None,
             shadow_bind_layout: None,
-        })
+        };
+
+        // Phase 3.3: Initialize PSO cache (load from disk if cache_dir provided).
+        device.init_pipeline_cache(cache_dir);
+
+        Ok(device)
+    }
+
+    /// Create a new VulkanDevice without PSO cache persistence.
+    /// Convenience wrapper that passes `cache_dir: None`.
+    pub fn new_without_cache(
+        display_handle: raw_window_handle::RawDisplayHandle,
+        window_handle: raw_window_handle::RawWindowHandle,
+        width: u32,
+        height: u32,
+        enable_validation: bool,
+    ) -> Result<Self, VulkanError> {
+        Self::new(
+            display_handle,
+            window_handle,
+            width,
+            height,
+            enable_validation,
+            None,
+        )
     }
 
     /// Initialize the pipeline cache, optionally loading from a file.
@@ -376,13 +401,13 @@ impl VulkanDevice {
         self.minimized = w == 0 || h == 0;
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures VkLogicalDevice is not dropped before VulkanDevice).
-        let _ = unsafe { self.logical_device.device.device_wait_idle() };
+        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
         self.destroy_mvp();
     }
     pub fn wait_idle(&self) {
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures VkLogicalDevice is not dropped before VulkanDevice).
-        let _ = unsafe { self.logical_device.device.device_wait_idle() };
+        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
     }
 }
 
@@ -471,6 +496,7 @@ fn compare_op(s: &Option<String>) -> vk::CompareOp {
 /// - `d` must be a valid [`AshDevice`] that has not been destroyed.
 /// - `spv` must contain valid SPIR-V binary data (word-aligned, correctly
 ///   sized for the targeted shader stage).
+///
 /// Map a resource kind string to a `VkDescriptorType`.
 fn resource_kind_to_descriptor_type(kind: &str) -> vk::DescriptorType {
     match kind {

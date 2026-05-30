@@ -217,8 +217,8 @@ mod tests {
         let source_dir = dir.join("source");
         let staging_dir = dir.join("staging");
 
-        std::fs::create_dir_all(&source_dir.join("data")).unwrap();
-        std::fs::write(&source_dir.join("data/patch.bundle"), b"test data").unwrap();
+        std::fs::create_dir_all(source_dir.join("data")).unwrap();
+        std::fs::write(source_dir.join("data/patch.bundle"), b"test data").unwrap();
 
         let result = Downloader::download_local(&manifest, &source_dir, &staging_dir);
         assert!(result.is_ok(), "download_local failed: {result:?}");
@@ -265,8 +265,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let result =
-            Downloader::download_local(&manifest, &dir, &dir.join("staging"));
+        let result = Downloader::download_local(&manifest, &dir, &dir.join("staging"));
         assert!(result.is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -275,21 +274,19 @@ mod tests {
     #[test]
     fn download_local_creates_subdirectories() {
         let mut manifest = sample_manifest();
-        manifest.payload_hashes = vec![
-            PayloadHash {
-                path: "a/deep/nested/file.bin".into(),
-                algorithm: "sha256".into(),
-                hash: [0u8; 32],
-            },
-        ];
+        manifest.payload_hashes = vec![PayloadHash {
+            path: "a/deep/nested/file.bin".into(),
+            algorithm: "sha256".into(),
+            hash: [0u8; 32],
+        }];
 
         let dir = std::env::temp_dir().join("dl_local_nested");
         let _ = std::fs::remove_dir_all(&dir);
 
         let source_dir = dir.join("source");
         let staging_dir = dir.join("staging");
-        std::fs::create_dir_all(&source_dir.join("a/deep/nested")).unwrap();
-        std::fs::write(&source_dir.join("a/deep/nested/file.bin"), b"nested").unwrap();
+        std::fs::create_dir_all(source_dir.join("a/deep/nested")).unwrap();
+        std::fs::write(source_dir.join("a/deep/nested/file.bin"), b"nested").unwrap();
 
         let result = Downloader::download_local(&manifest, &source_dir, &staging_dir);
         assert!(result.is_ok());
@@ -326,9 +323,9 @@ mod tests {
         let source_dir = dir.join("source");
         let staging_dir = dir.join("staging");
         std::fs::create_dir_all(&source_dir).unwrap();
-        std::fs::write(&source_dir.join("file1.bin"), b"one").unwrap();
-        std::fs::write(&source_dir.join("file2.bin"), b"two").unwrap();
-        std::fs::write(&source_dir.join("file3.bin"), b"three").unwrap();
+        std::fs::write(source_dir.join("file1.bin"), b"one").unwrap();
+        std::fs::write(source_dir.join("file2.bin"), b"two").unwrap();
+        std::fs::write(source_dir.join("file3.bin"), b"three").unwrap();
 
         let result = Downloader::download_local(&manifest, &source_dir, &staging_dir);
         assert!(result.is_ok());
@@ -362,7 +359,7 @@ mod tests {
         let source_dir = dir.join("source");
         let staging_dir = dir.join("staging");
         std::fs::create_dir_all(&source_dir).unwrap();
-        std::fs::write(&source_dir.join("present.bin"), b"data").unwrap();
+        std::fs::write(source_dir.join("present.bin"), b"data").unwrap();
 
         let result = Downloader::download_local(&manifest, &source_dir, &staging_dir);
         assert!(result.is_err());

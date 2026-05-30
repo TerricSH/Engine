@@ -43,7 +43,11 @@ impl SandboxDiagnostics {
     /// Refresh the snapshot from the runtime diagnostics and reload coordinator.
     ///
     /// Call this once per frame after rendering to capture the latest state.
-    pub fn update(&mut self, runtime_diags: &RuntimeDiagnostics, reload_coordinator: &ReloadCoordinator) {
+    pub fn update(
+        &mut self,
+        runtime_diags: &RuntimeDiagnostics,
+        reload_coordinator: &ReloadCoordinator,
+    ) {
         let collector = &runtime_diags.collector;
 
         // Capture the most recent frame stats snapshot, if any.
@@ -126,6 +130,7 @@ impl SandboxDiagnostics {
     }
 
     /// Total number of diagnostics across all categories (excluding frame snapshot).
+    #[expect(dead_code)]
     pub fn len(&self) -> usize {
         let mut count = self.scene_validation.len()
             + self.reload_status.len()
@@ -138,6 +143,7 @@ impl SandboxDiagnostics {
     }
 
     /// Returns `true` if no diagnostics are present.
+    #[expect(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.scene_validation.is_empty()
             && self.reload_status.is_empty()

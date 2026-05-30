@@ -91,10 +91,7 @@ impl UpdateApplier {
     /// Currently the logic asset payload path is derived from the logic
     /// asset ID (mapped to a file name).  A future gate will use proper
     /// mapping metadata.
-    pub fn apply_logic_assets(
-        manifest: &HotUpdateManifest,
-        active_dir: &Path,
-    ) -> Vec<Diagnostic> {
+    pub fn apply_logic_assets(manifest: &HotUpdateManifest, active_dir: &Path) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         for payload in &manifest.platform_payloads {
@@ -196,9 +193,7 @@ impl UpdateApplier {
 
         // Find Android payload with optional assembly.
         for payload in &manifest.platform_payloads {
-            if payload.platform != PlatformKind::Android
-                && payload.platform != PlatformKind::All
-            {
+            if payload.platform != PlatformKind::Android && payload.platform != PlatformKind::All {
                 continue;
             }
 
@@ -235,11 +230,8 @@ impl UpdateApplier {
                     continue;
                 }
 
-                let target = target_dir.join(
-                    Path::new(&assembly.path)
-                        .file_name()
-                        .unwrap_or_default(),
-                );
+                let target =
+                    target_dir.join(Path::new(&assembly.path).file_name().unwrap_or_default());
 
                 match std::fs::copy(&source, &target) {
                     Ok(n) => {
@@ -274,14 +266,12 @@ impl UpdateApplier {
         }
 
         if diagnostics.is_empty() {
-            diagnostics.push(
-                Diagnostic::new(
-                    "HOT_UPDATE_ASSEMBLY_NOOP",
-                    DiagnosticSeverity::Info,
-                    "hot-update",
-                    "no Android assembly to apply",
-                ),
-            );
+            diagnostics.push(Diagnostic::new(
+                "HOT_UPDATE_ASSEMBLY_NOOP",
+                DiagnosticSeverity::Info,
+                "hot-update",
+                "no Android assembly to apply",
+            ));
         }
 
         diagnostics
@@ -292,7 +282,7 @@ impl UpdateApplier {
 mod tests {
     use super::*;
     use engine_serialize::{
-        AssetId, AssemblyPayload, PlatformPayload, RollbackMetadata, SchemaVersion,
+        AssemblyPayload, AssetId, PlatformPayload, RollbackMetadata, SchemaVersion,
     };
 
     fn sample_manifest() -> HotUpdateManifest {
@@ -369,8 +359,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join("apply_logic_copy");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir.join("logic")).unwrap();
-        std::fs::write(&dir.join("logic/test-script.lua"), b"return 42").unwrap();
+        std::fs::create_dir_all(dir.join("logic")).unwrap();
+        std::fs::write(dir.join("logic/test-script.lua"), b"return 42").unwrap();
 
         let diags = UpdateApplier::apply_logic_assets(&manifest, &dir);
 
@@ -426,8 +416,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join("apply_asm_copy");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir.join("bin")).unwrap();
-        std::fs::write(&dir.join("bin/GameAssembly.dll"), b"assembly data").unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/GameAssembly.dll"), b"assembly data").unwrap();
 
         let diags = UpdateApplier::apply_android_assembly(&manifest, &dir);
         assert!(diags.iter().any(|d| d.code == "HOT_UPDATE_ASSEMBLY_OK"));
@@ -457,7 +447,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let diags = UpdateApplier::apply_android_assembly(&manifest, &dir);
-        assert!(diags.iter().any(|d| d.code == "HOT_UPDATE_ASSEMBLY_MISSING"));
+        assert!(diags
+            .iter()
+            .any(|d| d.code == "HOT_UPDATE_ASSEMBLY_MISSING"));
     }
 
     #[test]
@@ -477,8 +469,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join("apply_asm_all");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir.join("all")).unwrap();
-        std::fs::write(&dir.join("all/asm.dll"), b"assembly").unwrap();
+        std::fs::create_dir_all(dir.join("all")).unwrap();
+        std::fs::write(dir.join("all/asm.dll"), b"assembly").unwrap();
 
         let diags = UpdateApplier::apply_android_assembly(&manifest, &dir);
         // "All" platform is matched by the apply logic.

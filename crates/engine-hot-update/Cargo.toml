@@ -7,14 +7,6 @@ license.workspace = true
 
 [features]
 default = []
-backend-vulkan = []
-backend-opengl = []
-backend-dx12 = []
-tooling-editor = []
-tooling-hot-reload = []
-target-desktop = []
-target-mobile = []
-subsystem-scripting-csharp = []
 
 [dependencies]
 bincode.workspace = true

@@ -140,8 +140,7 @@ pub fn process_movement(
         let current_h = Vec3::new(velocity.x, 0.0, velocity.z);
         let proj_speed = current_h.dot(wish_dir_n);
 
-        let add_speed =
-            (controller.move_speed - proj_speed).clamp(0.0, accel * input.delta_time);
+        let add_speed = (controller.move_speed - proj_speed).clamp(0.0, accel * input.delta_time);
 
         velocity += wish_dir_n * add_speed;
     } else {
@@ -178,8 +177,7 @@ pub fn process_movement(
 
     // ── 5. Move & resolve collisions ────────────────────────────────────
     if let Some(pw) = physics {
-        let (resolved_pos, resolved_vel) =
-            resolve_collision(position, velocity, controller, pw);
+        let (resolved_pos, resolved_vel) = resolve_collision(position, velocity, controller, pw);
         position = resolved_pos;
         velocity = resolved_vel;
     } else {

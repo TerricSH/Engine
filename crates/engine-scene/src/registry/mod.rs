@@ -4,11 +4,11 @@
 //! asset types.  Subsystems (physics, animation, UI, audio, …) can add their
 //! own component or asset types without editing core `engine-scene` files.
 
-mod component;
 mod asset;
+mod component;
 
-pub use component::*;
 pub use asset::*;
+pub use component::*;
 
 #[cfg(test)]
 mod tests {
@@ -17,7 +17,7 @@ mod tests {
 
     // --- Dummy component for testing ---
 
-    struct DummyComponent(u32);
+    struct DummyComponent(#[expect(dead_code)] u32);
 
     impl Component for DummyComponent {
         const TYPE_ID: &'static str = "test.dummy";
@@ -91,14 +91,17 @@ mod tests {
 
         // They should appear in the expected order.
         let ids: Vec<&str> = reg.iter().map(|e| e.meta.type_id).collect();
-        assert_eq!(ids, vec![
-            "engine.name",
-            "engine.transform",
-            "engine.renderable",
-            "engine.camera",
-            "engine.light",
-            "engine.bounds",
-        ]);
+        assert_eq!(
+            ids,
+            vec![
+                "engine.name",
+                "engine.transform",
+                "engine.renderable",
+                "engine.camera",
+                "engine.light",
+                "engine.bounds",
+            ]
+        );
     }
 
     #[test]
@@ -116,7 +119,7 @@ mod tests {
         assert!(storages.contains_key("engine.bounds"));
 
         // Each storage should be empty.
-        for (_, storage) in &storages {
+        for storage in storages.values() {
             assert_eq!(storage.len(), 0);
         }
     }
@@ -142,11 +145,13 @@ mod tests {
                 source_extensions: vec!["glb", "gltf"],
                 display_name: "Mesh",
             },
-            cooker: Some(|source: &[u8], output: &mut Vec<u8>| -> Result<(), String> {
-                // Passthrough cooker for testing.
-                output.extend_from_slice(source);
-                Ok(())
-            }),
+            cooker: Some(
+                |source: &[u8], output: &mut Vec<u8>| -> Result<(), String> {
+                    // Passthrough cooker for testing.
+                    output.extend_from_slice(source);
+                    Ok(())
+                },
+            ),
             loader: None,
         };
 

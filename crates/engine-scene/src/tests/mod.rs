@@ -1,6 +1,4 @@
-use super::{
-    extract_renderer_input, sample_scene, validate_scene, EntityRecord, Scene,
-};
+use super::{extract_renderer_input, sample_scene, validate_scene, EntityRecord, Scene};
 use engine_serialize::SchemaVersion;
 use std::collections::BTreeMap;
 
@@ -216,7 +214,9 @@ fn scene_save_load_roundtrip() {
             assert_eq!(le.components.len(), orig_entity.components.len());
             // Check first component's fields match
             for (comp_type, orig_comp) in &orig_entity.components {
-                let loaded_comp = le.components.get(comp_type)
+                let loaded_comp = le
+                    .components
+                    .get(comp_type)
                     .expect("component type missing after round-trip");
                 assert_eq!(loaded_comp.fields, orig_comp.fields);
             }

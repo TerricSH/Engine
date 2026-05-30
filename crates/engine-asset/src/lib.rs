@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Asset registry and loading system for the engine.
 //!
 //! Provides runtime asset management including registration of typed loaders,
@@ -15,20 +17,20 @@
 //!   a [`crossbeam_channel`] receiver.
 
 pub mod cook;
-pub mod mesh;
-pub mod reload;
-mod registry;
-mod loader;
-mod watcher;
-mod path;
 pub mod hot_reload;
+mod loader;
+pub mod mesh;
+mod path;
+mod registry;
+pub mod reload;
+mod watcher;
 
-pub use registry::{AssetRegistry, AssetState, AssetInfo};
-pub use loader::{AssetLoader, AssetHandle, BincodeLoader, RawLoader, AssetError, CachedEntry};
-pub use watcher::FileWatcher;
-pub use path::asset_path;
 pub use hot_reload::HotReload;
+pub use loader::{AssetError, AssetHandle, AssetLoader, BincodeLoader, CachedEntry, RawLoader};
+pub use path::asset_path;
+pub use registry::{AssetInfo, AssetRegistry, AssetState};
 pub use reload::ReloadCoordinator;
+pub use watcher::FileWatcher;
 
 #[cfg(test)]
 mod tests {
@@ -71,7 +73,10 @@ mod tests {
     #[test]
     fn asset_error_not_found_display() {
         let err = AssetError::NotFound(AssetId::new("missing"));
-        assert_eq!(err.to_string(), "asset not found: AssetId { id: \"missing\", logical_path: None }");
+        assert_eq!(
+            err.to_string(),
+            "asset not found: AssetId { id: \"missing\", logical_path: None }"
+        );
     }
 
     #[test]

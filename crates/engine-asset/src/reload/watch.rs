@@ -149,10 +149,13 @@ impl WatchCoordinator {
                 // Coalesce: if we already have a buffered event for this
                 // path within the debounce window, keep the existing kind
                 // and just refresh the timestamp.
-                let is_coalesced = self.buffer.get(path).is_some_and(|(prev_time, _prev_kind)| {
-                    let elapsed = now.duration_since(*prev_time).as_millis() as u64;
-                    elapsed < self.debounce_ms
-                });
+                let is_coalesced = self
+                    .buffer
+                    .get(path)
+                    .is_some_and(|(prev_time, _prev_kind)| {
+                        let elapsed = now.duration_since(*prev_time).as_millis() as u64;
+                        elapsed < self.debounce_ms
+                    });
                 if !is_coalesced {
                     self.buffer.insert(path.clone(), (now, kind));
                 }
@@ -239,8 +242,7 @@ mod tests {
     #[test]
     fn watch_coordinator_new_fails_on_bad_path() {
         // A non-existent directory should produce an error.
-        let result =
-            WatchCoordinator::new(Path::new(r"\\?\__nonexistent__\__test__"));
+        let result = WatchCoordinator::new(Path::new(r"\\?\__nonexistent__\__test__"));
         assert!(result.is_err());
     }
 
@@ -285,7 +287,9 @@ mod tests {
         // Simulate two rapid events being buffered manually (the buffer
         // is ordinarily populated by poll_events draining the watcher).
         let now = Instant::now();
-        coord.buffer.insert(p.clone(), (now, WatchEventKind::Modified));
+        coord
+            .buffer
+            .insert(p.clone(), (now, WatchEventKind::Modified));
 
         // A second event within the debounce window should be coalesced
         // (not replace the existing entry).
@@ -295,7 +299,9 @@ mod tests {
                 // Coalesced — keep existing entry.
             }
             _ => {
-                coord.buffer.insert(p.clone(), (later, WatchEventKind::Created));
+                coord
+                    .buffer
+                    .insert(p.clone(), (later, WatchEventKind::Created));
             }
         }
 

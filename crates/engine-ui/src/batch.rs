@@ -104,7 +104,12 @@ pub(crate) fn add_border(batch: &mut UiBatch, rect: &UiRect, thickness: f32, col
     // Right edge
     add_quad(
         batch,
-        &UiRect::new(rect.x + rect.width - t, rect.y + t, t, rect.height - 2.0 * t),
+        &UiRect::new(
+            rect.x + rect.width - t,
+            rect.y + t,
+            t,
+            rect.height - 2.0 * t,
+        ),
         &[0.0, 0.0],
         &[1.0, 1.0],
         &color,
@@ -115,12 +120,7 @@ pub(crate) fn add_border(batch: &mut UiBatch, rect: &UiRect, thickness: f32, col
 ///
 /// The `border` UiRect represents [left, top, right, bottom] border sizes in
 /// both destination pixels and source UV fractions (see [`UiElementKind::NineSlice`]).
-pub(crate) fn add_nine_slice(
-    batch: &mut UiBatch,
-    rect: &UiRect,
-    border: &UiRect,
-    color: [u8; 4],
-) {
+pub(crate) fn add_nine_slice(batch: &mut UiBatch, rect: &UiRect, border: &UiRect, color: [u8; 4]) {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return;
     }
@@ -163,13 +163,7 @@ pub(crate) fn add_nine_slice(
     macro_rules! maybe_add {
         ($x:expr, $y:expr, $w:expr, $h:expr, $umin:expr, $umax:expr) => {
             if $w > 0.0 && $h > 0.0 {
-                add_quad(
-                    batch,
-                    &UiRect::new($x, $y, $w, $h),
-                    &$umin,
-                    &$umax,
-                    &color,
-                );
+                add_quad(batch, &UiRect::new($x, $y, $w, $h), &$umin, &$umax, &color);
             }
         };
     }
@@ -189,9 +183,23 @@ pub(crate) fn add_nine_slice(
 
     // Edges
     maybe_add!(inner_x, rect.y, inner_w, t, uv_tm_min, uv_tm_max);
-    maybe_add!(inner_x, rect.y + rect.height - b, inner_w, b, uv_bm_min, uv_bm_max);
+    maybe_add!(
+        inner_x,
+        rect.y + rect.height - b,
+        inner_w,
+        b,
+        uv_bm_min,
+        uv_bm_max
+    );
     maybe_add!(rect.x, inner_y, l, inner_h, uv_lm_min, uv_lm_max);
-    maybe_add!(rect.x + rect.width - r, inner_y, r, inner_h, uv_rm_min, uv_rm_max);
+    maybe_add!(
+        rect.x + rect.width - r,
+        inner_y,
+        r,
+        inner_h,
+        uv_rm_min,
+        uv_rm_max
+    );
 
     // Center
     maybe_add!(inner_x, inner_y, inner_w, inner_h, uv_c_min, uv_c_max);

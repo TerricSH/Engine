@@ -156,7 +156,9 @@ mod tests {
         };
         let json = msg.to_json().unwrap();
         let back = ScriptMessage::from_json(&json).unwrap();
-        assert!(matches!(back, ScriptMessage::Instantiate { instance_id, .. } if instance_id == "inst-001"));
+        assert!(
+            matches!(back, ScriptMessage::Instantiate { instance_id, .. } if instance_id == "inst-001")
+        );
     }
 
     #[test]
@@ -178,7 +180,9 @@ mod tests {
         };
         let json = msg.to_json().unwrap();
         let back = ScriptMessage::from_json(&json).unwrap();
-        assert!(matches!(back, ScriptMessage::Error { message } if message == "Something went wrong"));
+        assert!(
+            matches!(back, ScriptMessage::Error { message } if message == "Something went wrong")
+        );
     }
 
     #[test]
@@ -213,7 +217,9 @@ mod tests {
         };
         let json = msg.to_json().unwrap();
         let back = ScriptMessage::from_json(&json).unwrap();
-        assert!(matches!(back, ScriptMessage::FieldValue { value: Some(ScriptValue::Float(v)), .. } if (v - 200.0).abs() < f64::EPSILON));
+        assert!(
+            matches!(back, ScriptMessage::FieldValue { value: Some(ScriptValue::Float(v)), .. } if (v - 200.0).abs() < f64::EPSILON)
+        );
     }
 
     #[test]

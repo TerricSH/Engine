@@ -64,15 +64,15 @@ pub struct EditorDisabled {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tooling-editor")]
-mod panels;
+pub mod build;
 #[cfg(feature = "tooling-editor")]
-pub mod plugin;
+pub mod commands;
 #[cfg(feature = "tooling-editor")]
-mod editor_ui;
+pub mod diagnostics;
 #[cfg(feature = "tooling-editor")]
 mod editor_core;
 #[cfg(feature = "tooling-editor")]
-pub mod commands;
+mod editor_ui;
 #[cfg(feature = "tooling-editor")]
 pub mod hierarchy;
 #[cfg(feature = "tooling-editor")]
@@ -80,44 +80,49 @@ pub mod inspector;
 #[cfg(feature = "tooling-editor")]
 pub mod io;
 #[cfg(feature = "tooling-editor")]
+mod panels;
+#[cfg(feature = "tooling-editor")]
+pub mod plugin;
+#[cfg(feature = "tooling-editor")]
 pub mod scene_view;
 #[cfg(feature = "tooling-editor")]
 pub mod script_build;
 #[cfg(feature = "tooling-editor")]
-pub mod diagnostics;
-#[cfg(feature = "tooling-editor")]
 mod script_inspector;
-#[cfg(feature = "tooling-editor")]
-pub mod build;
 
 #[cfg(feature = "tooling-editor")]
-pub use panels::{EditorPanel, SceneViewPanel, InspectorPanel as LegacyInspectorPanel, AssetBrowserPanel};
+pub use build::{build_csharp_project, BuildError};
 #[cfg(feature = "tooling-editor")]
-pub use editor_ui::EditorUi;
+pub use commands::{
+    AddComponent, AddEntity, Command, CommandHistory, RemoveComponent, RemoveEntity,
+    SetComponentField, SetEntityName,
+};
+#[cfg(feature = "tooling-editor")]
+pub use diagnostics::{DiagnosticEntry, DiagnosticsPanel};
 #[cfg(feature = "tooling-editor")]
 pub use editor_core::Editor;
 #[cfg(feature = "tooling-editor")]
-pub use commands::{Command, CommandHistory, SetEntityName, SetComponentField, AddEntity, RemoveEntity, AddComponent, RemoveComponent};
+pub use editor_ui::EditorUi;
 #[cfg(feature = "tooling-editor")]
 pub use hierarchy::HierarchyPanel;
 #[cfg(feature = "tooling-editor")]
 pub use inspector::InspectorPanel;
 #[cfg(feature = "tooling-editor")]
-pub use io::{save_scene, load_scene, default_scene_path};
+pub use io::{default_scene_path, load_scene, save_scene};
 #[cfg(feature = "tooling-editor")]
-pub use scene_view::{orbit_view_matrix, orbit_projection_matrix};
-#[cfg(feature = "tooling-editor")]
-pub use script_inspector::ScriptInspector;
-#[cfg(feature = "tooling-editor")]
-pub use script_build::{ScriptBuildManager, BuildResult};
-#[cfg(feature = "tooling-editor")]
-pub use diagnostics::{DiagnosticsPanel, DiagnosticEntry};
-#[cfg(feature = "tooling-editor")]
-pub use build::{build_csharp_project, BuildError};
+pub use panels::{
+    AssetBrowserPanel, EditorPanel, InspectorPanel as LegacyInspectorPanel, SceneViewPanel,
+};
 #[cfg(feature = "tooling-editor")]
 pub use plugin::{
     ComponentInspector, EditorPlugin, EditorPluginMeta, EditorPluginRegistry, PanelFactory,
 };
+#[cfg(feature = "tooling-editor")]
+pub use scene_view::{orbit_projection_matrix, orbit_view_matrix};
+#[cfg(feature = "tooling-editor")]
+pub use script_build::{BuildResult, ScriptBuildManager};
+#[cfg(feature = "tooling-editor")]
+pub use script_inspector::ScriptInspector;
 // Note: `build::BuildResult` is intentionally not re-exported here because
 // `script_build::BuildResult` already provides a similar type.  Use
 // `engine_editor::build::BuildResult` to access the build module's version.
@@ -307,7 +312,7 @@ mod tests {
         ui.button("b");
         ui.separator();
         ui.reset(); // Should reset without error
-        // After reset, should behave like new
+                    // After reset, should behave like new
         assert_eq!(ui.text_field("c", "3"), None);
     }
 
@@ -384,11 +389,19 @@ mod tests {
         let mut cmd = SetEntityName::new(entity_id.clone(), Some("Renamed".to_string()));
         cmd.execute(&mut scene).unwrap();
 
-        let entity = scene.entities.iter().find(|e| e.persistent_id == entity_id).unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == entity_id)
+            .unwrap();
         assert_eq!(entity.name.as_deref(), Some("Renamed"));
 
         cmd.undo(&mut scene).unwrap();
-        let entity = scene.entities.iter().find(|e| e.persistent_id == entity_id).unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == entity_id)
+            .unwrap();
         assert_eq!(entity.name.as_deref(), Some("Main Camera"));
     }
 
@@ -410,12 +423,20 @@ mod tests {
         );
         cmd.execute(&mut scene).unwrap();
 
-        let entity = scene.entities.iter().find(|e| e.persistent_id == entity_id).unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == entity_id)
+            .unwrap();
         let comp = entity.components.get(&comp_type).unwrap();
         assert_eq!(comp.fields.get("visible"), Some(&Value::Bool(false)));
 
         cmd.undo(&mut scene).unwrap();
-        let entity = scene.entities.iter().find(|e| e.persistent_id == entity_id).unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == entity_id)
+            .unwrap();
         let comp = entity.components.get(&comp_type).unwrap();
         assert_eq!(comp.fields.get("visible"), Some(&Value::Bool(true)));
     }
@@ -441,11 +462,17 @@ mod tests {
         let mut cmd = AddEntity::new(entity);
         cmd.execute(&mut scene).unwrap();
         assert_eq!(scene.entities.len(), count_before + 1);
-        assert!(scene.entities.iter().any(|e| e.persistent_id == "new-entity"));
+        assert!(scene
+            .entities
+            .iter()
+            .any(|e| e.persistent_id == "new-entity"));
 
         cmd.undo(&mut scene).unwrap();
         assert_eq!(scene.entities.len(), count_before);
-        assert!(!scene.entities.iter().any(|e| e.persistent_id == "new-entity"));
+        assert!(!scene
+            .entities
+            .iter()
+            .any(|e| e.persistent_id == "new-entity"));
     }
 
     #[cfg(feature = "tooling-editor")]
@@ -489,11 +516,19 @@ mod tests {
         let mut cmd = AddComponent::new(entity_id.clone(), comp_type.clone(), comp);
         cmd.execute(&mut scene).unwrap();
 
-        let entity = scene.entities.iter().find(|e| e.persistent_id == entity_id).unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == entity_id)
+            .unwrap();
         assert!(entity.components.contains_key(&comp_type));
 
         cmd.undo(&mut scene).unwrap();
-        let entity = scene.entities.iter().find(|e| e.persistent_id == entity_id).unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == entity_id)
+            .unwrap();
         assert!(!entity.components.contains_key(&comp_type));
     }
 
@@ -509,11 +544,19 @@ mod tests {
         let mut cmd = RemoveComponent::new(entity_id.clone(), comp_type.clone());
         cmd.execute(&mut scene).unwrap();
 
-        let entity = scene.entities.iter().find(|e| e.persistent_id == entity_id).unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == entity_id)
+            .unwrap();
         assert!(!entity.components.contains_key(&comp_type));
 
         cmd.undo(&mut scene).unwrap();
-        let entity = scene.entities.iter().find(|e| e.persistent_id == entity_id).unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == entity_id)
+            .unwrap();
         assert!(entity.components.contains_key(&comp_type));
     }
 
@@ -527,17 +570,28 @@ mod tests {
         let mut scene = engine_scene::sample_scene();
         let mut history = CommandHistory::new();
 
-        let cmd = Box::new(SetEntityName::new("camera-main".to_string(), Some("Cam".to_string())));
+        let cmd = Box::new(SetEntityName::new(
+            "camera-main".to_string(),
+            Some("Cam".to_string()),
+        ));
         history.push(cmd, &mut scene).unwrap();
         assert!(history.can_undo());
         assert!(!history.can_redo());
         assert!(history.is_dirty());
 
-        let entity = scene.entities.iter().find(|e| e.persistent_id == "camera-main").unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == "camera-main")
+            .unwrap();
         assert_eq!(entity.name.as_deref(), Some("Cam"));
 
         history.undo(&mut scene).unwrap();
-        let entity = scene.entities.iter().find(|e| e.persistent_id == "camera-main").unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == "camera-main")
+            .unwrap();
         assert_eq!(entity.name.as_deref(), Some("Main Camera"));
 
         assert!(history.can_redo());
@@ -551,13 +605,20 @@ mod tests {
         let mut scene = engine_scene::sample_scene();
         let mut history = CommandHistory::new();
 
-        let cmd = Box::new(SetEntityName::new("camera-main".to_string(), Some("Cam".to_string())));
+        let cmd = Box::new(SetEntityName::new(
+            "camera-main".to_string(),
+            Some("Cam".to_string()),
+        ));
         history.push(cmd, &mut scene).unwrap();
 
         history.undo(&mut scene).unwrap();
         history.redo(&mut scene).unwrap();
 
-        let entity = scene.entities.iter().find(|e| e.persistent_id == "camera-main").unwrap();
+        let entity = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == "camera-main")
+            .unwrap();
         assert_eq!(entity.name.as_deref(), Some("Cam"));
     }
 
@@ -625,18 +686,30 @@ mod tests {
         editor_scene.execute(cmd).unwrap();
         assert!(editor_scene.is_dirty());
 
-        let entity = editor_scene.scene.entities.iter()
-            .find(|e| e.persistent_id == "camera-main").unwrap();
+        let entity = editor_scene
+            .scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == "camera-main")
+            .unwrap();
         assert_eq!(entity.name.as_deref(), Some("Renamed"));
 
         editor_scene.undo().unwrap();
-        let entity = editor_scene.scene.entities.iter()
-            .find(|e| e.persistent_id == "camera-main").unwrap();
+        let entity = editor_scene
+            .scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == "camera-main")
+            .unwrap();
         assert_eq!(entity.name.as_deref(), Some("Main Camera"));
 
         editor_scene.redo().unwrap();
-        let entity = editor_scene.scene.entities.iter()
-            .find(|e| e.persistent_id == "camera-main").unwrap();
+        let entity = editor_scene
+            .scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == "camera-main")
+            .unwrap();
         assert_eq!(entity.name.as_deref(), Some("Renamed"));
     }
 

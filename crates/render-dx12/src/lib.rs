@@ -26,7 +26,7 @@
 mod device;
 mod error;
 
-pub use device::{DirectX12Backend, Dx12Adapter, Dx12Device, backend, is_available};
+pub use device::{backend, is_available, DirectX12Backend, Dx12Adapter, Dx12Device};
 pub use error::Dx12Error;
 
 #[cfg(test)]
@@ -45,10 +45,7 @@ mod tests {
     #[test]
     fn dx12_error_device_creation_failed_display() {
         let err = Dx12Error::DeviceCreationFailed("driver not found".to_string());
-        assert_eq!(
-            err.to_string(),
-            "device creation failed: driver not found"
-        );
+        assert_eq!(err.to_string(), "device creation failed: driver not found");
     }
 
     #[test]

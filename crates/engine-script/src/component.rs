@@ -9,9 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use engine_serialize::Diagnostic;
 use serde::{Deserialize, Serialize};
 
-use crate::lifecycle::lifecycle;
-use crate::value::ScriptValue;
 use crate::host::{ScriptError, ScriptHandle, ScriptHost, ScriptInstance};
+use crate::lifecycle;
+use crate::value::ScriptValue;
 
 // ---------------------------------------------------------------------------
 // ScriptComponent — serialisable scene component
@@ -35,10 +35,7 @@ pub struct ScriptComponent {
 
 impl ScriptComponent {
     /// Create a new script component.
-    pub fn new(
-        assembly_id: impl Into<String>,
-        class_name: impl Into<String>,
-    ) -> Self {
+    pub fn new(assembly_id: impl Into<String>, class_name: impl Into<String>) -> Self {
         Self {
             assembly_id: assembly_id.into(),
             class_name: class_name.into(),
@@ -140,11 +137,7 @@ impl ScriptManager {
     // ── Assembly management ───────────────────────────────────────────────
 
     /// Load an assembly through the host and cache the handle.
-    pub fn load_assembly(
-        &mut self,
-        id: &str,
-        data: &[u8],
-    ) -> Result<ScriptHandle, ScriptError> {
+    pub fn load_assembly(&mut self, id: &str, data: &[u8]) -> Result<ScriptHandle, ScriptError> {
         if self.assemblies.contains_key(id) {
             return Ok(self.assemblies[id].clone());
         }
@@ -177,15 +170,12 @@ impl ScriptManager {
         entity_id: &str,
         component: &ScriptComponent,
     ) -> Result<(), ScriptError> {
-        let handle = self
-            .assemblies
-            .get(&component.assembly_id)
-            .ok_or_else(|| {
-                ScriptError::LoadFailed(format!(
-                    "Assembly '{}' has not been loaded. Call load_assembly first.",
-                    component.assembly_id
-                ))
-            })?;
+        let handle = self.assemblies.get(&component.assembly_id).ok_or_else(|| {
+            ScriptError::LoadFailed(format!(
+                "Assembly '{}' has not been loaded. Call load_assembly first.",
+                component.assembly_id
+            ))
+        })?;
 
         let mut instance = self.host.instantiate(handle)?;
 
@@ -239,7 +229,10 @@ impl ScriptManager {
                                 "SCRIPT_CREATE_FAILED",
                                 engine_serialize::DiagnosticSeverity::Error,
                                 "script",
-                                format!("OnCreate failed for '{}': {e}", state.component.class_name),
+                                format!(
+                                    "OnCreate failed for '{}': {e}",
+                                    state.component.class_name
+                                ),
                             );
                             diag.entity = Some(state.handle.id().to_string());
                             diagnostics.push(diag);
@@ -276,10 +269,7 @@ impl ScriptManager {
                                 "SCRIPT_START_FAILED",
                                 engine_serialize::DiagnosticSeverity::Error,
                                 "script",
-                                format!(
-                                    "OnStart failed for '{}': {e}",
-                                    state.component.class_name
-                                ),
+                                format!("OnStart failed for '{}': {e}", state.component.class_name),
                             );
                             diag.entity = Some(state.handle.id().to_string());
                             diagnostics.push(diag);
@@ -364,16 +354,12 @@ impl ScriptManager {
     }
 
     /// Iterate over all instances (entity_id, class_name, state).
-    pub fn iter_instances(
-        &self,
-    ) -> impl Iterator<Item = (&str, &str, &ScriptInstanceState)> {
-        self.instances
-            .iter()
-            .flat_map(|(eid, scripts)| {
-                scripts
-                    .iter()
-                    .map(move |(cn, state)| (eid.as_str(), cn.as_str(), state))
-            })
+    pub fn iter_instances(&self) -> impl Iterator<Item = (&str, &str, &ScriptInstanceState)> {
+        self.instances.iter().flat_map(|(eid, scripts)| {
+            scripts
+                .iter()
+                .map(move |(cn, state)| (eid.as_str(), cn.as_str(), state))
+        })
     }
 
     /// Get the serialisable fields from an instance (for scene save).
@@ -425,13 +411,9 @@ mod tests {
 
     #[test]
     fn script_component_with_field() {
-        let c = ScriptComponent::new("a", "B")
-            .with_field("speed", ScriptValue::Float(100.0));
+        let c = ScriptComponent::new("a", "B").with_field("speed", ScriptValue::Float(100.0));
         assert_eq!(c.fields.len(), 1);
-        assert_eq!(
-            c.fields.get("speed"),
-            Some(&ScriptValue::Float(100.0))
-        );
+        assert_eq!(c.fields.get("speed"), Some(&ScriptValue::Float(100.0)));
     }
 
     #[test]
@@ -531,8 +513,8 @@ mod tests {
     fn script_manager_capture_fields() {
         let mut m = make_manager();
         m.load_assembly("asm", b"data").unwrap();
-        let c = ScriptComponent::new("asm", "MyScript")
-            .with_field("speed", ScriptValue::Float(50.0));
+        let c =
+            ScriptComponent::new("asm", "MyScript").with_field("speed", ScriptValue::Float(50.0));
         m.attach("entity_1", &c).unwrap();
         let fields = m.capture_fields("entity_1", "MyScript");
         assert!(fields.is_some());

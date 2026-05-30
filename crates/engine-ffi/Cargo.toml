@@ -8,4 +8,5 @@ description = "FFI bridge between Rust engine and C# scripting layer"
 
 [dependencies]
 engine-serialize = { path = "../engine-serialize" }
+engine-scene = { path = "../engine-scene" }
 tracing.workspace = true

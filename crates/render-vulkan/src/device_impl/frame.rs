@@ -77,12 +77,8 @@ impl VulkanDevice {
         // valid VkSwapchainKHR; `f.image_available` is a valid semaphore;
         // timeout parameters are standard Vulkan.
         let (ii, sub) = unsafe {
-            sc.loader.acquire_next_image(
-                sc.swapchain,
-                u64::MAX,
-                image_available,
-                vk::Fence::null(),
-            )
+            sc.loader
+                .acquire_next_image(sc.swapchain, u64::MAX, image_available, vk::Fence::null())
         }
         .map_err(|r| {
             if r == vk::Result::ERROR_OUT_OF_DATE_KHR {

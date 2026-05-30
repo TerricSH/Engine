@@ -17,7 +17,7 @@
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,9 @@ impl<M: Message> ChannelBus<M> {
 
     /// Send a message (non-blocking).
     pub fn send(&self, msg: M) -> Result<(), MessageError> {
-        self.tx.send(msg).map_err(|e| MessageError::SendFailed(e.to_string()))
+        self.tx
+            .send(msg)
+            .map_err(|e| MessageError::SendFailed(e.to_string()))
     }
 
     /// Try to receive a message (non-blocking).
@@ -210,7 +212,9 @@ impl<M: Message> ChannelBus<M> {
 
     /// Block until a message arrives.
     pub fn recv(&self) -> Result<M, MessageError> {
-        self.rx.recv().map_err(|e| MessageError::SendFailed(e.to_string()))
+        self.rx
+            .recv()
+            .map_err(|e| MessageError::SendFailed(e.to_string()))
     }
 
     /// Drain all pending messages.
@@ -239,40 +243,58 @@ impl<M: Message> Default for ChannelBus<M> {
 // ---------------------------------------------------------------------------
 
 /// Re-export common platform types so downstream code only needs `engine-messaging`.
-pub use platform::{
-    KeyCode, MouseButton, PlatformEvent,
-    Modifiers,
-};
+pub use platform::{KeyCode, Modifiers, MouseButton, PlatformEvent};
 
 // ── Concrete message wrappers (each maps to one PlatformEvent variant) ──
 
 /// Emitted when a key is pressed.
 #[derive(Clone, Debug, PartialEq)]
-pub struct KeyPressed { pub key: KeyCode, pub modifiers: Modifiers }
+pub struct KeyPressed {
+    pub key: KeyCode,
+    pub modifiers: Modifiers,
+}
 
 /// Emitted when a key is released.
 #[derive(Clone, Debug, PartialEq)]
-pub struct KeyReleased { pub key: KeyCode, pub modifiers: Modifiers }
+pub struct KeyReleased {
+    pub key: KeyCode,
+    pub modifiers: Modifiers,
+}
 
 /// Emitted when the mouse moves.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MouseMoved { pub x: f64, pub y: f64 }
+pub struct MouseMoved {
+    pub x: f64,
+    pub y: f64,
+}
 
 /// Emitted when a mouse button is pressed.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MousePressed { pub button: MouseButton, pub x: f64, pub y: f64 }
+pub struct MousePressed {
+    pub button: MouseButton,
+    pub x: f64,
+    pub y: f64,
+}
 
 /// Emitted when a mouse button is released.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MouseReleased { pub button: MouseButton, pub x: f64, pub y: f64 }
+pub struct MouseReleased {
+    pub button: MouseButton,
+    pub x: f64,
+    pub y: f64,
+}
 
 /// Emitted when the scroll wheel moves.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MouseWheelScrolled { pub delta: (f32, f32) }
+pub struct MouseWheelScrolled {
+    pub delta: (f32, f32),
+}
 
 /// Emitted when a character is typed.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CharacterTyped { pub character: char }
+pub struct CharacterTyped {
+    pub character: char,
+}
 
 // ---------------------------------------------------------------------------
 // Bridge: PlatformEvent → MessageBus
@@ -286,25 +308,41 @@ pub struct CharacterTyped { pub character: char }
 pub fn dispatch_input(bus: &mut MessageBus, event: &PlatformEvent) {
     match event {
         PlatformEvent::KeyPressed { key, modifiers } => {
-            bus.publish(KeyPressed { key: *key, modifiers: *modifiers });
+            bus.publish(KeyPressed {
+                key: *key,
+                modifiers: *modifiers,
+            });
         }
         PlatformEvent::KeyReleased { key, modifiers } => {
-            bus.publish(KeyReleased { key: *key, modifiers: *modifiers });
+            bus.publish(KeyReleased {
+                key: *key,
+                modifiers: *modifiers,
+            });
         }
         PlatformEvent::MouseMoved { x, y } => {
             bus.publish(MouseMoved { x: *x, y: *y });
         }
         PlatformEvent::MousePressed { button, x, y } => {
-            bus.publish(MousePressed { button: *button, x: *x, y: *y });
+            bus.publish(MousePressed {
+                button: *button,
+                x: *x,
+                y: *y,
+            });
         }
         PlatformEvent::MouseReleased { button, x, y } => {
-            bus.publish(MouseReleased { button: *button, x: *x, y: *y });
+            bus.publish(MouseReleased {
+                button: *button,
+                x: *x,
+                y: *y,
+            });
         }
         PlatformEvent::MouseWheelScrolled { delta } => {
             bus.publish(MouseWheelScrolled { delta: *delta });
         }
         PlatformEvent::CharacterTyped { character } => {
-            bus.publish(CharacterTyped { character: *character });
+            bus.publish(CharacterTyped {
+                character: *character,
+            });
         }
         _ => {} // lifecycle events have no message wrapper
     }
@@ -318,8 +356,12 @@ pub fn dispatch_input(bus: &mut MessageBus, event: &PlatformEvent) {
 mod tests {
     use super::*;
 
-    struct TestMsg { value: i32 }
-    struct OtherMsg { label: String }
+    struct TestMsg {
+        value: i32,
+    }
+    struct OtherMsg {
+        label: String,
+    }
 
     #[test]
     fn subscribe_and_publish() {
@@ -345,7 +387,11 @@ mod tests {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
         bus.unsubscribe(h).unwrap();
         bus.publish(TestMsg { value: 2 });
-        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "should not receive after unsubscribe");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "should not receive after unsubscribe"
+        );
     }
 
     #[test]
@@ -355,11 +401,17 @@ mod tests {
         let other_vals = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
         let tv = std::sync::Arc::clone(&test_vals);
-        let _h1 = bus.subscribe::<TestMsg>(move |msg| { tv.store(msg.value, std::sync::atomic::Ordering::SeqCst); });
+        let _h1 = bus.subscribe::<TestMsg>(move |msg| {
+            tv.store(msg.value, std::sync::atomic::Ordering::SeqCst);
+        });
         let ov = std::sync::Arc::clone(&other_vals);
-        let _h2 = bus.subscribe::<OtherMsg>(move |msg| { *ov.lock().unwrap() = msg.label.clone(); });
+        let _h2 = bus.subscribe::<OtherMsg>(move |msg| {
+            *ov.lock().unwrap() = msg.label.clone();
+        });
 
-        bus.publish(OtherMsg { label: "hello".into() });
+        bus.publish(OtherMsg {
+            label: "hello".into(),
+        });
         assert_eq!(test_vals.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(*other_vals.lock().unwrap(), "hello");
     }
@@ -369,7 +421,9 @@ mod tests {
         let mut bus = MessageBus::new();
         let count = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
         let c = std::sync::Arc::clone(&count);
-        let _h = bus.subscribe::<TestMsg>(move |_| { c.fetch_add(1, std::sync::atomic::Ordering::SeqCst); });
+        let _h = bus.subscribe::<TestMsg>(move |_| {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
         bus.clear_handlers::<TestMsg>();
         bus.publish(TestMsg { value: 0 });
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
