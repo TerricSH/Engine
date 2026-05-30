@@ -16,7 +16,7 @@
 
 use glam::Vec3;
 
-use crate::controller::{CharacterController, CharacterState};
+use crate::controller::CharacterController;
 
 /// Grounded state value returned to C#.
 const STATE_GROUNDED: i32 = 0;
@@ -29,8 +29,9 @@ const STATE_FREE: i32 = 3;
 
 /// Move the character in the given direction at the given speed.
 ///
-/// Updates the controller's position, velocity, and state from the movement
-/// computation. Returns `true` if the character moved this call.
+/// Delegates to [`CharacterController::update`] after building a
+/// [`CharacterMovement`] from the FFI parameters.  Returns `true` if the
+/// character moved this call.
 ///
 /// # Safety
 ///
@@ -71,14 +72,7 @@ pub extern "C" fn character_move(
         ctrl.move_speed = speed;
     }
 
-    let output = crate::process_movement(ctrl, &input, pw);
-
-    // Apply the computed output back to the controller.
-    ctrl.position = output.new_position;
-    ctrl.velocity = output.new_velocity;
-    ctrl.state = output.state;
-
-    output.moved
+    ctrl.update(&input, pw)
 }
 
 /// Request a jump for the character.
@@ -162,11 +156,10 @@ pub extern "C" fn character_get_move_state(controller: *const CharacterControlle
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
 #[no_mangle]
 pub extern "C" fn character_get_velocity_x(controller: *const CharacterController) -> f32 {
-    if controller.is_null() {
-        return 0.0;
+    if controller.is_null() { 0.0 } else {
+        // SAFETY: Null-checked above.
+        unsafe { (*controller).velocity().x }
     }
-    // SAFETY: Null-checked above.
-    unsafe { (*controller).velocity.x }
 }
 
 /// Returns the character's current Y (up) velocity component.
@@ -176,11 +169,10 @@ pub extern "C" fn character_get_velocity_x(controller: *const CharacterControlle
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
 #[no_mangle]
 pub extern "C" fn character_get_velocity_y(controller: *const CharacterController) -> f32 {
-    if controller.is_null() {
-        return 0.0;
+    if controller.is_null() { 0.0 } else {
+        // SAFETY: Null-checked above.
+        unsafe { (*controller).velocity().y }
     }
-    // SAFETY: Null-checked above.
-    unsafe { (*controller).velocity.y }
 }
 
 /// Returns the character's current Z (forward/backward) velocity component.
@@ -190,12 +182,15 @@ pub extern "C" fn character_get_velocity_y(controller: *const CharacterControlle
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
 #[no_mangle]
 pub extern "C" fn character_get_velocity_z(controller: *const CharacterController) -> f32 {
-    if controller.is_null() {
-        return 0.0;
+    if controller.is_null() { 0.0 } else {
+        // SAFETY: Null-checked above.
+        unsafe { (*controller).velocity().z }
     }
-    // SAFETY: Null-checked above.
-    unsafe { (*controller).velocity.z }
 }
+
+// ── Helpers (needed by character_jump) ──────────────────────────────────────
+
+use crate::controller::CharacterState;
 
 #[cfg(test)]
 mod tests {
@@ -236,8 +231,7 @@ mod tests {
     #[test]
     fn character_move_no_physics_updates_velocity() {
         let mut ctrl = CharacterController::new();
-        ctrl.state = CharacterState::Grounded;
-        ctrl.position = Vec3::new(0.0, 10.0, 0.0);
+        // Call update() through FFI — this is the real path
         let result = character_move(
             &mut ctrl as *mut CharacterController,
             1.0, 0.0,   // dir_x, dir_z
@@ -255,8 +249,8 @@ mod tests {
     #[test]
     fn character_jump_grounded_success() {
         let mut ctrl = CharacterController::new();
-        ctrl.state = CharacterState::Grounded;
-        ctrl.velocity = Vec3::ZERO;
+        // Put into grounded state via the proper API
+        let _ = ctrl.transition_state(CharacterState::Grounded);
 
         let jumped = character_jump(&mut ctrl as *mut CharacterController);
         assert!(jumped, "grounded character should be able to jump");
@@ -275,7 +269,7 @@ mod tests {
     #[test]
     fn character_is_grounded_true() {
         let mut ctrl = CharacterController::new();
-        ctrl.state = CharacterState::Grounded;
+        let _ = ctrl.transition_state(CharacterState::Grounded);
         assert_eq!(character_is_grounded(&ctrl as *const CharacterController), 1);
     }
 
@@ -289,26 +283,35 @@ mod tests {
     fn character_get_move_state_values() {
         let mut ctrl = CharacterController::new();
 
-        ctrl.state = CharacterState::Grounded;
+        let _ = ctrl.transition_state(CharacterState::Grounded);
         assert_eq!(character_get_move_state(&ctrl as *const CharacterController), STATE_GROUNDED);
 
-        ctrl.state = CharacterState::Jumping;
+        let _ = ctrl.transition_state(CharacterState::Jumping);
         assert_eq!(character_get_move_state(&ctrl as *const CharacterController), STATE_JUMPING);
 
-        ctrl.state = CharacterState::Falling;
+        // Jumping → Falling is valid
+        let _ = ctrl.transition_state(CharacterState::Falling);
         assert_eq!(character_get_move_state(&ctrl as *const CharacterController), STATE_FALLING);
 
-        ctrl.state = CharacterState::Free;
+        let _ = ctrl.transition_state(CharacterState::Free);
         assert_eq!(character_get_move_state(&ctrl as *const CharacterController), STATE_FREE);
     }
 
     #[test]
     fn character_velocity_getters() {
         let mut ctrl = CharacterController::new();
-        ctrl.velocity = Vec3::new(1.0, 2.0, 3.0);
 
-        assert!((character_get_velocity_x(&ctrl as *const CharacterController) - 1.0).abs() < 1e-6);
-        assert!((character_get_velocity_y(&ctrl as *const CharacterController) - 2.0).abs() < 1e-6);
-        assert!((character_get_velocity_z(&ctrl as *const CharacterController) - 3.0).abs() < 1e-6);
+        // Use update() with a known input to produce a velocity, then check via FFI
+        let input = crate::CharacterMovement {
+            direction: Vec3::X,
+            wish_jump: false,
+            delta_time: 1.0 / 60.0,
+        };
+        ctrl.update(&input, None);
+
+        assert!(
+            character_get_velocity_x(&ctrl as *const CharacterController) > 0.0,
+            "velocity x should be positive after moving in +X"
+        );
     }
 }

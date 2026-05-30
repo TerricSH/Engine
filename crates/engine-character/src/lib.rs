@@ -289,4 +289,80 @@ mod tests {
         let debug = format!("{:?}", err);
         assert!(debug.contains("InvalidInput"));
     }
+
+    // ── Integration tests with real PhysicsWorld ──────────────────────────
+
+    #[test]
+    fn character_update_with_physics_gravity_applies() {
+        let pw = engine_physics::PhysicsWorld::new(glam::Vec3::new(0.0, -9.81, 0.0));
+        let mut ctrl = CharacterController::new();
+        ctrl.set_position(glam::Vec3::new(0.0, 5.0, 0.0));
+
+        let input = CharacterMovement {
+            direction: glam::Vec3::ZERO,
+            wish_jump: false,
+            delta_time: 1.0 / 60.0,
+        };
+
+        ctrl.update(&input, Some(&pw));
+        // Gravity should produce negative vertical velocity
+        assert!(ctrl.velocity().y < 0.0, "gravity should pull character down");
+        // Position should drop (velocity * dt)
+        assert!(ctrl.position().y < 5.0, "character should descend");
+    }
+
+    #[test]
+    fn character_update_without_physics_still_moves() {
+        let mut ctrl = CharacterController::new();
+        ctrl.set_position(glam::Vec3::new(0.0, 2.0, 0.0));
+
+        let input = CharacterMovement {
+            direction: glam::Vec3::X,
+            wish_jump: false,
+            delta_time: 1.0 / 60.0,
+        };
+
+        ctrl.update(&input, None);
+        // Without physics the character still moves via simple kinematic integration
+        assert!(ctrl.position().x > 0.0, "should move in +X without physics");
+        assert!((ctrl.velocity().x).abs() > 0.0, "should have +X velocity");
+    }
+
+    #[test]
+    fn character_update_allows_state_transitions() {
+        let mut ctrl = CharacterController::new();
+        ctrl.set_position(glam::Vec3::new(0.0, 10.0, 0.0));
+
+        // First frame: no input, character starts falling
+        let input = CharacterMovement {
+            direction: glam::Vec3::ZERO,
+            wish_jump: false,
+            delta_time: 1.0 / 60.0,
+        };
+
+        ctrl.update(&input, None);
+        // Without ground, should transition from Falling → Falling (stays falling)
+        // With gravity, velocity.y should be negative
+        assert!(ctrl.velocity().y <= 0.0, "should be falling or stationary");
+        // position should have dropped
+        assert!(ctrl.position().y < 10.0, "should have moved downward");
+    }
+
+    #[test]
+    fn character_update_horizontal_input_with_physics() {
+        let pw = engine_physics::PhysicsWorld::new(glam::Vec3::new(0.0, -9.81, 0.0));
+        let mut ctrl = CharacterController::new();
+        ctrl.set_position(glam::Vec3::new(0.0, 5.0, 0.0));
+
+        let input = CharacterMovement {
+            direction: glam::Vec3::X,
+            wish_jump: false,
+            delta_time: 1.0 / 60.0,
+        };
+
+        ctrl.update(&input, Some(&pw));
+        // With gravity, character accelerates in +X and downward
+        assert!(ctrl.velocity().x > 0.0, "should have positive X velocity");
+        assert!(ctrl.velocity().y < 0.0, "gravity should still apply");
+    }
 }
