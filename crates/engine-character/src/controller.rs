@@ -125,6 +125,35 @@ impl CharacterState {
     }
 }
 
+// ── Movement command ─────────────────────────────────────────────────────────
+
+/// A movement command issued by input, AI, or C# code.
+///
+/// Commands are pushed into [`CharacterController::pending_commands`] and
+/// consumed each frame by [`CharacterController::update`].  The controller
+/// owns movement resolution — callers express intent, not transforms.
+#[derive(Debug, Clone, Copy)]
+pub struct CharacterCommand {
+    /// Desired horizontal movement direction (normalised).
+    pub direction: Vec3,
+    /// Desired speed in m/s.  `0` or negative uses the controller's
+    /// built-in [`move_speed`](CharacterController::move_speed).
+    pub desired_speed: f32,
+    /// Whether the character should attempt a jump.
+    pub jump_requested: bool,
+}
+
+impl CharacterCommand {
+    /// Create a movement-only command.
+    pub fn move_towards(direction: Vec3) -> Self {
+        Self { direction, desired_speed: 0.0, jump_requested: false }
+    }
+    /// Create a jump command.
+    pub fn jump() -> Self {
+        Self { direction: Vec3::ZERO, desired_speed: 0.0, jump_requested: true }
+    }
+}
+
 // ── Character controller ─────────────────────────────────────────────────────
 
 /// A kinematic character controller.
@@ -201,6 +230,12 @@ pub struct CharacterController {
     /// purposes.
     pub slope_limit: f32,
 
+        // ── Command queue ────────────────────────────────────────────────────
+    /// Pending movement commands (queued by input/AI/C#).
+    /// Flushed each frame by [`update`](Self::update).
+    #[serde(skip)]
+    pub pending_commands: Vec<CharacterCommand>,
+
     // ── Internal state (crate-visible for FFI) ──────────────────────────
     pub(crate) state: CharacterState,
     pub(crate) position: Vec3,
@@ -227,6 +262,7 @@ impl CharacterController {
             max_fall_speed: 20.0,
             step_height: 0.3,
             slope_limit: 45.0,
+            pending_commands: Vec::new(),
             state: CharacterState::Falling,
             position: Vec3::ZERO,
             velocity: Vec3::ZERO,
@@ -309,15 +345,39 @@ impl Default for CharacterController {
 // ── Frame update ──────────────────────────────────────────────────────────
 
 impl CharacterController {
+    /// Push a movement command into the pending queue.
+    ///
+    /// Commands are consumed (in FIFO order) the next time
+    /// [`update`](Self::update) is called.  Multiple commands per
+    /// frame are merged — the last command's direction wins.
+    pub fn push_command(&mut self, cmd: CharacterCommand) {
+        self.pending_commands.push(cmd);
+    }
+
     /// Run one frame of character movement.
     ///
-    /// Applies gravity, horizontal acceleration, collision resolution,
-    /// ground detection, and state transitions.  Mutates the controller
-    /// in place — no manual output-sync required.
+    /// First drains any pending [`CharacterCommand`]s from the queue,
+    /// then applies gravity, horizontal acceleration, collision
+    /// resolution, ground detection, and state transitions.
+    /// Mutates the controller in place.
     ///
     /// Returns `true` if the character's position changed this frame.
     pub fn update(&mut self, input: &CharacterMovement, physics: Option<&PhysicsWorld>) -> bool {
-        let output = crate::movement::process_movement(self, input, physics);
+        // Merge pending commands into the input
+        let mut cmd = *input;
+        for pending in self.pending_commands.drain(..) {
+            if pending.direction.length_squared() > 0.0 {
+                cmd.direction = pending.direction;
+            }
+            if pending.desired_speed > 0.0 {
+                self.move_speed = pending.desired_speed;
+            }
+            if pending.jump_requested {
+                cmd.wish_jump = true;
+            }
+        }
+
+        let output = crate::movement::process_movement(self, &cmd, physics);
         self.position = output.new_position;
         self.velocity = output.new_velocity;
         self.state = output.state;
