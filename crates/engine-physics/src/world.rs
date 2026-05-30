@@ -7,9 +7,7 @@ use crate::components::{ColliderShape, RigidBody};
 use crate::debug::{ColliderDebugInfo, PhysicsDebugDraw};
 use crate::events::{CollisionEvent, PhysicsEvents};
 use crate::joints::{JointDescriptor, JointHandle};
-use crate::queries::{
-    OverlapQuery, QueryBatcher, QueryResults, RaycastQuery, SweepQuery,
-};
+use crate::queries::{OverlapQuery, QueryBatcher, QueryResults, RaycastQuery, SweepQuery};
 use crate::{Collider, Entity, PhysicsMaterial, Transform};
 
 // ── PhysicsCommand ──────────────────────────────────────────────────────────
@@ -395,7 +393,8 @@ impl PhysicsWorld {
     pub fn create_joint(&mut self, desc: JointDescriptor) -> Option<JointHandle> {
         let body_a_handle = *self.backend.body_map.get(&desc.entity_a)?;
         let body_b_handle = *self.backend.body_map.get(&desc.entity_b)?;
-        self.backend.create_joint(&desc, body_a_handle, body_b_handle)
+        self.backend
+            .create_joint(&desc, body_a_handle, body_b_handle)
     }
 
     /// Remove a joint by its handle.

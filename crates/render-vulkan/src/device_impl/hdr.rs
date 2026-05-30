@@ -550,8 +550,12 @@ impl VulkanDevice {
     /// Write the HDR image view + sampler into the tone-mapping descriptor set.
     pub(crate) fn update_tone_descriptor_set(&mut self) {
         let Some(ds) = self.tone_desc_set else { return };
-        let Some(sampler) = self.hdr_color_sampler else { return };
-        let Some(image_view) = self.hdr_color_view else { return };
+        let Some(sampler) = self.hdr_color_sampler else {
+            return;
+        };
+        let Some(image_view) = self.hdr_color_view else {
+            return;
+        };
         let d = &self.logical_device.device;
 
         let image_info = [vk::DescriptorImageInfo::default()
@@ -608,7 +612,9 @@ impl VulkanDevice {
         for fb in self.tone_framebuffers.drain(..) {
             let d = &self.logical_device.device;
             // SAFETY: `fb` was created by this device and is still alive.
-            unsafe { d.destroy_framebuffer(fb, None); }
+            unsafe {
+                d.destroy_framebuffer(fb, None);
+            }
         }
 
         let d = &self.logical_device.device;
@@ -616,53 +622,77 @@ impl VulkanDevice {
         // Forward HDR framebuffer
         if let Some(fb) = self.hdr_forward_fb.take() {
             // SAFETY: `fb` was created by this device.
-            unsafe { d.destroy_framebuffer(fb, None); }
+            unsafe {
+                d.destroy_framebuffer(fb, None);
+            }
         }
 
         // Tone pipeline + layout
         if let Some(p) = self.tone_pipeline.take() {
-            unsafe { d.destroy_pipeline(p, None); }
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
         }
         if let Some(l) = self.tone_pipeline_layout.take() {
-            unsafe { d.destroy_pipeline_layout(l, None); }
+            unsafe {
+                d.destroy_pipeline_layout(l, None);
+            }
         }
 
         // Forward HDR pipeline + layout
         if let Some(p) = self.hdr_forward_pipeline.take() {
-            unsafe { d.destroy_pipeline(p, None); }
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
         }
         if let Some(l) = self.hdr_forward_pipeline_layout.take() {
-            unsafe { d.destroy_pipeline_layout(l, None); }
+            unsafe {
+                d.destroy_pipeline_layout(l, None);
+            }
         }
 
         // Render passes
         if let Some(rp) = self.tone_rp.take() {
-            unsafe { d.destroy_render_pass(rp, None); }
+            unsafe {
+                d.destroy_render_pass(rp, None);
+            }
         }
         if let Some(rp) = self.hdr_forward_rp.take() {
-            unsafe { d.destroy_render_pass(rp, None); }
+            unsafe {
+                d.destroy_render_pass(rp, None);
+            }
         }
 
         // Tone descriptor set infrastructure
         if let Some(pool) = self.tone_desc_pool.take() {
             // Pool frees its descriptor sets automatically.
-            unsafe { d.destroy_descriptor_pool(pool, None); }
+            unsafe {
+                d.destroy_descriptor_pool(pool, None);
+            }
         }
         if let Some(layout) = self.tone_desc_layout.take() {
-            unsafe { d.destroy_descriptor_set_layout(layout, None); }
+            unsafe {
+                d.destroy_descriptor_set_layout(layout, None);
+            }
         }
 
         // HDR sampler
         if let Some(s) = self.hdr_color_sampler.take() {
-            unsafe { d.destroy_sampler(s, None); }
+            unsafe {
+                d.destroy_sampler(s, None);
+            }
         }
 
         // HDR color image view + image + allocation
         if let Some(iv) = self.hdr_color_view.take() {
-            unsafe { d.destroy_image_view(iv, None); }
+            unsafe {
+                d.destroy_image_view(iv, None);
+            }
         }
         if let Some(img) = self.hdr_color_image.take() {
-            unsafe { d.destroy_image(img, None); }
+            unsafe {
+                d.destroy_image(img, None);
+            }
         }
         if let Some(mut a) = self.hdr_color_allocation.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {

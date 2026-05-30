@@ -8,7 +8,9 @@ impl Drop for VulkanDevice {
     fn drop(&mut self) {
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures it is not dropped before this destructor runs).
-        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
+        unsafe {
+            let _ = self.logical_device.device.device_wait_idle();
+        };
         self.drain_all_retired_pipelines();
         let d = &self.logical_device.device;
         for fb in self.mvp_framebuffers.drain(..) {
@@ -123,7 +125,9 @@ impl Drop for VulkanDevice {
         if let Some(cp) = self.compute_pool.take() {
             // SAFETY: `cp` was created by this device; the command buffer
             // allocated from it is implicitly freed when the pool is destroyed.
-            unsafe { d.destroy_command_pool(cp, None); }
+            unsafe {
+                d.destroy_command_pool(cp, None);
+            }
         }
 
         // Save pipeline cache data to disk before destroying.
@@ -140,11 +144,15 @@ impl Drop for VulkanDevice {
         // Destroy material descriptor infra (set=2 pool + layout).
         if let Some(pool) = self.material_desc_pool.take() {
             // SAFETY: pool frees its descriptor sets automatically.
-            unsafe { d.destroy_descriptor_pool(pool, None); }
+            unsafe {
+                d.destroy_descriptor_pool(pool, None);
+            }
         }
         if let Some(layout) = self.material_desc_set_layout.take() {
             // SAFETY: layout was created by this device.
-            unsafe { d.destroy_descriptor_set_layout(layout, None); }
+            unsafe {
+                d.destroy_descriptor_set_layout(layout, None);
+            }
         }
 
         self.destroy_light_ssbo();

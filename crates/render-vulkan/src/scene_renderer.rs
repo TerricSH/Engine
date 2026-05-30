@@ -8,8 +8,8 @@
 //! * Meshes that are not yet cached fall back to a hard-coded coloured quad.
 //! * The framebuffer attachment is a placeholder (null image-view) so the
 //!   render pass begin is structurally present but may not produce visible
-//!   output on all drivers.  The frame lifecycle (acquire 鈫?record 鈫?submit
-//!   鈫?present) is otherwise complete.
+//!   output on all drivers.  The frame lifecycle (acquire �?record �?submit
+//!   �?present) is otherwise complete.
 //! * Material handling currently covers pipeline variants plus basic raster and
 //!   blend state, but textures and uniform bindings are not yet consumed.
 //! * No texture loading, skeletal animation, or multi-pass optimisation.
@@ -54,7 +54,7 @@ pub struct GpuMesh {
 }
 
 // ============================================================================
-// Fallback mesh data  鈥? a coloured quad
+// Fallback mesh data  �? a coloured quad
 // ============================================================================
 
 /// Single vertex for the fallback mesh.
@@ -188,12 +188,10 @@ fn scene_skinned_pipeline_context(
             // Material UBO at set=2, binding=0
             BindGroupLayoutDescriptor {
                 set_index: 2,
-                bindings: vec![
-                    BindGroupLayoutBinding {
-                        binding: 0,
-                        resource_kind: "uniform_buffer".into(),
-                    },
-                ],
+                bindings: vec![BindGroupLayoutBinding {
+                    binding: 0,
+                    resource_kind: "uniform_buffer".into(),
+                }],
             },
         ],
         pipeline_layout: pll,
@@ -221,12 +219,10 @@ fn scene_forward_pipeline_context(
             // Material UBO at set=2
             BindGroupLayoutDescriptor {
                 set_index: 2,
-                bindings: vec![
-                    BindGroupLayoutBinding {
-                        binding: 0,
-                        resource_kind: "uniform_buffer".into(),
-                    },
-                ],
+                bindings: vec![BindGroupLayoutBinding {
+                    binding: 0,
+                    resource_kind: "uniform_buffer".into(),
+                }],
             },
         ],
         pipeline_layout: pll,
@@ -340,10 +336,10 @@ fn get_or_create_scene_skinned_pipeline(
 /// Pack a single [`LightItem`] into the 64-byte GPU Light struct format.
 ///
 /// GPU layout (std430):
-///   position[4]    — xyz = world position, w = type flag (0=dir, 1=point, 2=spot)
-///   direction[4]   — xyz = normalized direction, w = unused
-///   color[4]       — rgb = color, a = intensity
-///   attenuation[4] — x = range, y = linear, z = quadratic, w = spot_cutoff_cos
+///   position[4]    �?xyz = world position, w = type flag (0=dir, 1=point, 2=spot)
+///   direction[4]   �?xyz = normalized direction, w = unused
+///   color[4]       �?rgb = color, a = intensity
+///   attenuation[4] �?x = range, y = linear, z = quadratic, w = spot_cutoff_cos
 ///
 /// Total: 64 bytes per light.
 fn pack_light_gpu_bytes(light: &LightItem, dir: [f32; 3], kind_w: f32) -> Vec<u8> {
@@ -432,7 +428,7 @@ pub(crate) const MAX_INDIRECT_DRAWS: u32 = 1024;
 /// intersects the given view-frustum planes.
 ///
 /// Each frustum plane is `(nx, ny, nz, d)` where the half-space
-/// `nx·x + ny·y + nz·z + d ≥ 0` is considered "inside".
+/// `nx·x + ny·y + nz·z + d �?0` is considered "inside".
 ///
 /// Returns `true` if the AABB is at least partially visible.
 pub(crate) fn is_aabb_visible(
@@ -574,7 +570,7 @@ impl SceneRenderer {
     }
 
     // ------------------------------------------------------------------
-    // Pipeline initialisation  (lazy 鈥?called on the first frame)
+    // Pipeline initialisation  (lazy �?called on the first frame)
     // ------------------------------------------------------------------
 
     /// Create the render pass and pipeline layout used by scene-forward draws.
@@ -597,14 +593,16 @@ impl SceneRenderer {
 
         // Ensure material descriptor infrastructure (set=2) exists before
         // creating the pipeline layout so the fallback picks it up.
-        self.device.create_material_descriptor_infra().map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0213",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("create_material_descriptor_infra: {e:?}"),
-            )]
-        })?;
+        self.device
+            .create_material_descriptor_infra()
+            .map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0213",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_material_descriptor_infra: {e:?}"),
+                )]
+            })?;
 
         // --- Render pass  (colour + depth) ---
         // NOTE: the scene-forward render pass renders directly to the
@@ -632,7 +630,7 @@ impl SceneRenderer {
                 // VK_SHADER_STAGE_VERTEX_BIT = 0x01
                 stage_flags: 0x01,
                 offset: 0,
-                size: 128, // 4脳4 f32 matrix (64 B) + spare uniform data
+                size: 128, // 4�? f32 matrix (64 B) + spare uniform data
             }],
             debug_label: Some("scene-pll".into()),
         };
@@ -659,54 +657,48 @@ impl SceneRenderer {
 
         // ── Shadow-mapping resources ──────────────────────────────────
         // Ensure the device has created shadow resources (idempotent).
+        self.device.ensure_shadow().map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0211",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("ensure_shadow: {e:?}"),
+            )]
+        })?;
+
+        // ── Environment cubemap (IBL, set=1 binding=1) ────────────────
+        self.device.create_env_cubemap().map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0212",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("create_env_cubemap: {e:?}"),
+            )]
+        })?;
+
+        // ── Light SSBO (set=1 binding=2) ───────────────────────────
+        self.device.create_light_ssbo().map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0222",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("create_light_ssbo: {e:?}"),
+            )]
+        })?;
+
+        // ── Indirect draw buffers (Phase 5.1) ─────────────────────
         self.device
-            .ensure_shadow()
+            .create_indirect_buffers(MAX_INDIRECT_DRAWS)
             .map_err(|e| {
                 vec![Diagnostic::new(
-                    "RV0211",
+                    "RV0223",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    format!("ensure_shadow: {e:?}"),
+                    format!("create_indirect_buffers: {e:?}"),
                 )]
             })?;
 
-                // ── Environment cubemap (IBL, set=1 binding=1) ────────────────
-                self.device
-                    .create_env_cubemap()
-                    .map_err(|e| {
-                        vec![Diagnostic::new(
-                            "RV0212",
-                            DiagnosticSeverity::Error,
-                            "scene_renderer",
-                            format!("create_env_cubemap: {e:?}"),
-                        )]
-                    })?;
-
-                // ── Light SSBO (set=1 binding=2) ───────────────────────────
-                self.device
-                    .create_light_ssbo()
-                    .map_err(|e| {
-                        vec![Diagnostic::new(
-                            "RV0222",
-                            DiagnosticSeverity::Error,
-                            "scene_renderer",
-                            format!("create_light_ssbo: {e:?}"),
-                        )]
-                    })?;
-
-                // ── Indirect draw buffers (Phase 5.1) ─────────────────────
-                self.device
-                    .create_indirect_buffers(MAX_INDIRECT_DRAWS)
-                    .map_err(|e| {
-                        vec![Diagnostic::new(
-                            "RV0223",
-                            DiagnosticSeverity::Error,
-                            "scene_renderer",
-                            format!("create_indirect_buffers: {e:?}"),
-                        )]
-                    })?;
-
-                self.rp = Some(rp);
+        self.rp = Some(rp);
         self.pll = Some(pll);
 
         // ── Framebuffers (per swapchain image, color + depth) ─────────
@@ -846,7 +838,7 @@ impl SceneRenderer {
         }
         ubo_data.resize(4096, 0u8);
 
-        // Check bone buffer cache — if found, update data and return.
+        // Check bone buffer cache �?if found, update data and return.
         if let Some(cached) = self.bone_palette_buffers.get(skeleton_id) {
             // Promote in LRU order
             if let Some(pos) = self
@@ -855,7 +847,8 @@ impl SceneRenderer {
                 .position(|k| k == skeleton_id)
             {
                 self.bone_palette_buffers_order.remove(pos);
-                self.bone_palette_buffers_order.push(skeleton_id.to_string());
+                self.bone_palette_buffers_order
+                    .push(skeleton_id.to_string());
             }
             // Update the buffer contents with the latest bone data.
             let _ = self.device.write_buffer(cached.handle, &ubo_data, 0);
@@ -992,10 +985,10 @@ impl SceneRenderer {
     /// Parse `ParamBlock` bytes into a [`MaterialUBO`].
     ///
     /// Expected byte layout (matching the shader's MaterialUBO):
-    ///   [0..16)  base_color  — vec4 f32
-    ///   [16..20) metallic    — f32
-    ///   [20..24) roughness   — f32
-    ///   [24..28) ao          — f32
+    ///   [0..16)  base_color  �?vec4 f32
+    ///   [16..20) metallic    �?f32
+    ///   [20..24) roughness   �?f32
+    ///   [24..28) ao          �?f32
     ///
     /// If `bytes` is empty or too short, sane defaults are used.
     fn parse_material_ubo(bytes: &[u8]) -> MaterialUBO {
@@ -1037,7 +1030,11 @@ impl SceneRenderer {
         // Check cache first (and move to front for LRU)
         if let Some(entry) = self.material_cache.get(material_id) {
             // Promote in LRU order (simple move-to-front)
-            if let Some(pos) = self.material_cache_order.iter().position(|k| k == material_id) {
+            if let Some(pos) = self
+                .material_cache_order
+                .iter()
+                .position(|k| k == material_id)
+            {
                 self.material_cache_order.remove(pos);
                 self.material_cache_order.push(material_id.to_string());
             }
@@ -1106,8 +1103,7 @@ impl SceneRenderer {
             desc_set,
             buffer: vk_buf,
         };
-        self.material_cache
-            .insert(material_id.to_string(), entry);
+        self.material_cache.insert(material_id.to_string(), entry);
         self.material_cache_order.push(material_id.to_string());
 
         Ok((desc_set, vk_buf))
@@ -1134,7 +1130,7 @@ impl SceneRenderer {
             return Ok(m.clone());
         }
 
-        // First encounter 鈥?upload a fallback coloured quad.
+        // First encounter �?upload a fallback coloured quad.
         let vertex_bytes = fallback_vertex_bytes();
         let index_bytes = fallback_index_bytes();
 
@@ -1216,7 +1212,7 @@ impl SceneRenderer {
         msaa_samples: vk::SampleCountFlags,
     ) -> Result<(SwapchainHandle, u32, Box<dyn CommandEncoder>), Vec<Diagnostic>> {
         // Apply the requested MSAA sample count to the device before any
-        // resource creation takes place (ensure_sc → ensure_hdr_resources).
+        // resource creation takes place (ensure_sc �?ensure_hdr_resources).
         self.device.hdr_msaa_samples = msaa_samples;
         self.init_once()?;
 
@@ -1265,17 +1261,12 @@ impl BackendRenderer for SceneRenderer {
     // ------------------------------------------------------------------
 
     fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        let msaa =
-            self.device
-                .msaa_samples(input.render_options.msaa_samples);
+        let msaa = self.device.msaa_samples(input.render_options.msaa_samples);
         let (sc_h, ii, mut encoder) = self.begin_frame_impl(msaa)?;
 
         // Begin a render pass covering the full viewport.
         if let Some(rp) = self.rp {
-            // TODO(Gate 3): wire up a real framebuffer backed by the
-            // swapchain image-views.  The current handle is a dummy that
-            // will cause `cmd_begin_render_pass` to be skipped by the
-            // encoder (null image-view guard in `VkCmdEncoder`).
+            // Real framebuffer from per-swapchain-image handles.
             let fb = self
                 .framebuffers
                 .get(self.cur_fb_index as usize)
@@ -1331,8 +1322,8 @@ impl BackendRenderer for SceneRenderer {
                     std::mem::size_of::<MaterialUBO>(),
                 )
             };
-            let (mat_desc_set, _mat_buf) = self
-                .get_or_create_material_desc_set(material_id, ubo_bytes)?;
+            let (mat_desc_set, _mat_buf) =
+                self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
             if let Some(pll) = self.pll {
                 let pll_vk = self
                     .device
@@ -1420,8 +1411,8 @@ impl BackendRenderer for SceneRenderer {
                     std::mem::size_of::<MaterialUBO>(),
                 )
             };
-            let (mat_desc_set, mat_buf) = self
-                .get_or_create_material_desc_set(material_id, ubo_bytes)?;
+            let (mat_desc_set, mat_buf) =
+                self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
 
             // --- Bone palette UBO (set=2, binding=2) ---
             let skeleton_id = &skinned.skeleton.id;
@@ -1513,9 +1504,7 @@ impl BackendRenderer for SceneRenderer {
     // ------------------------------------------------------------------
 
     fn begin_frame(&mut self, input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
-        let msaa =
-            self.device
-                .msaa_samples(input.render_options.msaa_samples);
+        let msaa = self.device.msaa_samples(input.render_options.msaa_samples);
         let (sc_h, ii, enc) = self.begin_frame_impl(msaa)?;
         self.cur_sc = Some(sc_h);
         self.cur_ii = Some(ii);
@@ -1535,7 +1524,7 @@ impl BackendRenderer for SceneRenderer {
 
         match pass.kind {
             render_graph::PassKind::OpaquePbrForward => {
-                // HDR offscreen forward pass — renders into RGBA16F color
+                // HDR offscreen forward pass �?renders into RGBA16F color
                 // attachment via the device-side HDR forward pipeline.
                 // NOTE: We borrow self.cur_enc locally for viewport/scissor
                 // and end_render_pass; draw-call commands go through raw
@@ -1543,9 +1532,18 @@ impl BackendRenderer for SceneRenderer {
                 // cache methods.
 
                 let hdr_rp = self.device.hdr_forward_rp.unwrap_or(vk::RenderPass::null());
-                let hdr_fb = self.device.hdr_forward_fb.unwrap_or(vk::Framebuffer::null());
-                let hdr_pl = self.device.hdr_forward_pipeline.unwrap_or(vk::Pipeline::null());
-                let hdr_pll = self.device.hdr_forward_pipeline_layout.unwrap_or(vk::PipelineLayout::null());
+                let hdr_fb = self
+                    .device
+                    .hdr_forward_fb
+                    .unwrap_or(vk::Framebuffer::null());
+                let hdr_pl = self
+                    .device
+                    .hdr_forward_pipeline
+                    .unwrap_or(vk::Pipeline::null());
+                let hdr_pll = self
+                    .device
+                    .hdr_forward_pipeline_layout
+                    .unwrap_or(vk::PipelineLayout::null());
                 if hdr_rp == vk::RenderPass::null() || hdr_pl == vk::Pipeline::null() {
                     return Ok(());
                 }
@@ -1556,7 +1554,7 @@ impl BackendRenderer for SceneRenderer {
                 let fi = self.device.current_frame;
                 let cmd = self.device.frame_sync[fi].command_buffer;
 
-                // ── Light setup: first directional → UBO, rest → SSBO ──────
+                // ── Light setup: first directional �?UBO, rest �?SSBO ──────
                 let mut light_ssbo_data: Vec<u8> = Vec::new();
                 let mut first_directional = true;
 
@@ -1568,24 +1566,21 @@ impl BackendRenderer for SceneRenderer {
                                 // Write to UBO at offsets 128 (light_dir) and 144 (light_color)
                                 let mut dir_bytes = [0u8; 16];
                                 for (j, &v) in dir.iter().enumerate() {
-                                    dir_bytes[j * 4..(j + 1) * 4]
-                                        .copy_from_slice(&v.to_ne_bytes());
+                                    dir_bytes[j * 4..(j + 1) * 4].copy_from_slice(&v.to_ne_bytes());
                                 }
                                 dir_bytes[12..16].copy_from_slice(&0.0f32.to_ne_bytes()); // w = 0
                                 self.device.write_ubo(fi, &dir_bytes, 128);
 
                                 let mut col_bytes = [0u8; 16];
                                 for (j, &v) in light.color.iter().enumerate() {
-                                    col_bytes[j * 4..(j + 1) * 4]
-                                        .copy_from_slice(&v.to_ne_bytes());
+                                    col_bytes[j * 4..(j + 1) * 4].copy_from_slice(&v.to_ne_bytes());
                                 }
-                                col_bytes[12..16]
-                                    .copy_from_slice(&light.intensity.to_ne_bytes());
+                                col_bytes[12..16].copy_from_slice(&light.intensity.to_ne_bytes());
                                 self.device.write_ubo(fi, &col_bytes, 144);
 
                                 first_directional = false;
                             } else {
-                                // Extra directional → SSBO
+                                // Extra directional �?SSBO
                                 light_ssbo_data
                                     .extend_from_slice(&pack_light_gpu_bytes(light, dir, 0.0));
                             }
@@ -1657,7 +1652,9 @@ impl BackendRenderer for SceneRenderer {
                     })
                     .clear_values(&clear_values);
                 // SAFETY: command buffer is in recording state; RP, FB valid.
-                unsafe { d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE); }
+                unsafe {
+                    d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
+                }
 
                 // Viewport + scissor
                 let vp = vk::Viewport {
@@ -1681,7 +1678,9 @@ impl BackendRenderer for SceneRenderer {
                 }
 
                 // Bind HDR forward pipeline via raw Vulkan
-                unsafe { d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, hdr_pl); }
+                unsafe {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, hdr_pl);
+                }
 
                 // Bind UBO descriptor set (set=0)
                 if let Some(desc_set) = self.device.frame_descriptor_set(fi) {
@@ -1847,7 +1846,9 @@ impl BackendRenderer for SceneRenderer {
 
                     // --- Bone palette UBO (set=2, binding=2) ---
                     let skeleton_id = &skinned.skeleton.id;
-                    let bone_buf = match self.get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette) {
+                    let bone_buf = match self
+                        .get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette)
+                    {
                         Ok(b) => b,
                         Err(diags) => {
                             for d in &diags {
@@ -1942,10 +1943,8 @@ impl BackendRenderer for SceneRenderer {
                     stats.triangles += mesh.index_count as u64 / 3;
                 }
 
-                // ═════════════════════════════════════════════════════════
-                // Phase 5.1: CPU frustum cull + indirect draw (parallel path)
-                // ═════════════════════════════════════════════════════════
-                //
+                // ════════════════════════════════════════════════════════�?                // Phase 5.1: CPU frustum cull + indirect draw (parallel path)
+                // ════════════════════════════════════════════════════════�?                //
                 // After the per-drawable loop above (kept as fallback), this
                 // section performs CPU-side frustum culling against the first
                 // view's frustum planes, writes the visible drawables' draw
@@ -1967,11 +1966,7 @@ impl BackendRenderer for SceneRenderer {
                         if !self.meshes.contains_key(&drawable.mesh.id) {
                             continue;
                         }
-                        if is_aabb_visible(
-                            &drawable.bounds,
-                            &drawable.world_transform,
-                            &fp,
-                        ) {
+                        if is_aabb_visible(&drawable.bounds, &drawable.world_transform, &fp) {
                             visible_indices.push(i);
                         }
                     }
@@ -1999,26 +1994,22 @@ impl BackendRenderer for SceneRenderer {
                         // Write commands into the GPU indirect buffer.
                         self.device.write_indirect_draw_buffer(&indirect_bytes, 0);
 
-                        let indirect_buf =
-                            self.device.indirect_draw_buffer.unwrap_or(vk::Buffer::null());
+                        let indirect_buf = self
+                            .device
+                            .indirect_draw_buffer
+                            .unwrap_or(vk::Buffer::null());
 
                         if indirect_buf != vk::Buffer::null() {
                             // Bind the HDR forward pipeline once (same
                             // pipeline for all drawables in this pass).
                             unsafe {
-                                d.cmd_bind_pipeline(
-                                    cmd,
-                                    vk::PipelineBindPoint::GRAPHICS,
-                                    hdr_pl,
-                                );
+                                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, hdr_pl);
                             }
 
                             // For each visible drawable, set up
                             // descriptors, push constants, vertex/index
                             // buffers, then issue indirect indexed draw.
-                            for (cmd_idx, &visible_idx) in
-                                visible_indices.iter().enumerate()
-                            {
+                            for (cmd_idx, &visible_idx) in visible_indices.iter().enumerate() {
                                 let drawable = &input.drawables[visible_idx];
 
                                 // Clone mesh to avoid holding a borrow on
@@ -2029,11 +2020,8 @@ impl BackendRenderer for SceneRenderer {
                                 };
 
                                 // ── Material UBO (set=2) ──
-                                let material = self
-                                    .material_binding_for_drawable(
-                                        input,
-                                        &drawable.material,
-                                    );
+                                let material =
+                                    self.material_binding_for_drawable(input, &drawable.material);
                                 let material_ubo =
                                     Self::parse_material_ubo(&material.uniforms.bytes);
                                 let ubo_bytes: &[u8] = unsafe {
@@ -2063,10 +2051,9 @@ impl BackendRenderer for SceneRenderer {
                                     for tex_slot in &material.textures {
                                         let tex_id = &tex_slot.texture.id;
                                         if self.device.textures.contains_key(tex_id) {
-                                            let _ = self.device.bind_material_texture(
-                                                tex_id,
-                                                mat_desc_set,
-                                            );
+                                            let _ = self
+                                                .device
+                                                .bind_material_texture(tex_id, mat_desc_set);
                                             break;
                                         }
                                     }
@@ -2105,19 +2092,13 @@ impl BackendRenderer for SceneRenderer {
                                 let vk_vb = self
                                     .device
                                     .buffers
-                                    .get(
-                                        mesh.vertex_buffer.index,
-                                        mesh.vertex_buffer.generation,
-                                    )
+                                    .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
                                     .map(|e| e.buffer)
                                     .unwrap_or(vk::Buffer::null());
                                 let vk_ib = self
                                     .device
                                     .buffers
-                                    .get(
-                                        mesh.index_buffer.index,
-                                        mesh.index_buffer.generation,
-                                    )
+                                    .get(mesh.index_buffer.index, mesh.index_buffer.generation)
                                     .map(|e| e.buffer)
                                     .unwrap_or(vk::Buffer::null());
 
@@ -2156,7 +2137,9 @@ impl BackendRenderer for SceneRenderer {
                 }
 
                 // End HDR render pass
-                unsafe { d.cmd_end_render_pass(cmd); }
+                unsafe {
+                    d.cmd_end_render_pass(cmd);
+                }
 
                 // Pipeline barrier: transition HDR color image from
                 // COLOR_ATTACHMENT_OPTIMAL to SHADER_READ_ONLY_OPTIMAL so the
@@ -2193,10 +2176,13 @@ impl BackendRenderer for SceneRenderer {
             }
 
             render_graph::PassKind::DirectionalShadow => {
-                // CSM depth pass — renders shadow-casting drawables into 3
+                // CSM depth pass �?renders shadow-casting drawables into 3
                 // cascade layers of the 2D array shadow map.
                 let rp = self.device.shadow_rp.unwrap_or(vk::RenderPass::null());
-                let pll = self.device.shadow_pipeline_layout.unwrap_or(vk::PipelineLayout::null());
+                let pll = self
+                    .device
+                    .shadow_pipeline_layout
+                    .unwrap_or(vk::PipelineLayout::null());
                 let pl = self.device.shadow_pipeline.unwrap_or(vk::Pipeline::null());
                 if rp == vk::RenderPass::null() || pl == vk::Pipeline::null() {
                     return Ok(());
@@ -2208,8 +2194,10 @@ impl BackendRenderer for SceneRenderer {
                 // ── Compute cascade splits & light VPs from camera ────────
                 // Use the first view's camera, or fall back to identity.
                 let (view_mat, proj_mat) = if let Some(view) = input.views.first() {
-                    (Mat4::from_cols_array(&view.view_matrix),
-                     Mat4::from_cols_array(&view.projection_matrix))
+                    (
+                        Mat4::from_cols_array(&view.view_matrix),
+                        Mat4::from_cols_array(&view.projection_matrix),
+                    )
                 } else {
                     (Mat4::IDENTITY, Mat4::IDENTITY)
                 };
@@ -2220,23 +2208,17 @@ impl BackendRenderer for SceneRenderer {
                 // ── Write cascade data to the per-frame UBO ───────────────
                 // Cascade splits at offset 176 (vec4)
                 let splits_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        &cascade_splits as *const _ as *const u8,
-                        16,
-                    )
+                    std::slice::from_raw_parts(&cascade_splits as *const _ as *const u8, 16)
                 };
                 self.device.write_ubo_current(splits_bytes, 176);
 
                 // Light VP matrices at offset 192, 256, 320 (each mat4 = 64 B)
                 for (i, lvp) in light_vps.iter().enumerate() {
                     let arr: [[f32; 4]; 4] = lvp.to_cols_array_2d();
-                    let vp_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            &arr as *const _ as *const u8,
-                            64,
-                        )
-                    };
-                    self.device.write_ubo_current(vp_bytes, 192 + (i as u64 * 64));
+                    let vp_bytes: &[u8] =
+                        unsafe { std::slice::from_raw_parts(&arr as *const _ as *const u8, 64) };
+                    self.device
+                        .write_ubo_current(vp_bytes, 192 + (i as u64 * 64));
                 }
 
                 let d = &self.device.logical_device.device;
@@ -2244,7 +2226,10 @@ impl BackendRenderer for SceneRenderer {
                 let cmd = self.device.frame_sync[fi].command_buffer;
 
                 let clear_value = vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
                 };
                 let clear_values = [clear_value];
 
@@ -2260,24 +2245,39 @@ impl BackendRenderer for SceneRenderer {
                         .framebuffer(fb)
                         .render_area(vk::Rect2D {
                             offset: vk::Offset2D { x: 0, y: 0 },
-                            extent: vk::Extent2D { width: SHADOW_SIZE, height: SHADOW_SIZE },
+                            extent: vk::Extent2D {
+                                width: SHADOW_SIZE,
+                                height: SHADOW_SIZE,
+                            },
                         })
                         .clear_values(&clear_values);
                     // SAFETY: command buffer is in recording state; RP, FB valid.
-                    unsafe { d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE); }
+                    unsafe {
+                        d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
+                    }
 
                     // Viewport + scissor
                     let vp = vk::Viewport {
-                        x: 0.0, y: 0.0,
-                        width: SHADOW_SIZE as f32, height: SHADOW_SIZE as f32,
-                        min_depth: 0.0, max_depth: 1.0,
+                        x: 0.0,
+                        y: 0.0,
+                        width: SHADOW_SIZE as f32,
+                        height: SHADOW_SIZE as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
                     };
                     unsafe {
                         d.cmd_set_viewport(cmd, 0, &[vp]);
-                        d.cmd_set_scissor(cmd, 0, &[vk::Rect2D {
-                            offset: vk::Offset2D { x: 0, y: 0 },
-                            extent: vk::Extent2D { width: SHADOW_SIZE, height: SHADOW_SIZE },
-                        }]);
+                        d.cmd_set_scissor(
+                            cmd,
+                            0,
+                            &[vk::Rect2D {
+                                offset: vk::Offset2D { x: 0, y: 0 },
+                                extent: vk::Extent2D {
+                                    width: SHADOW_SIZE,
+                                    height: SHADOW_SIZE,
+                                },
+                            }],
+                        );
                         d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pl);
                     }
 
@@ -2301,12 +2301,18 @@ impl BackendRenderer for SceneRenderer {
                             }
                         };
 
-                        let vk_vb = self.device.buffers
+                        let vk_vb = self
+                            .device
+                            .buffers
                             .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
-                            .map(|e| e.buffer).unwrap_or(vk::Buffer::null());
-                        let vk_ib = self.device.buffers
+                            .map(|e| e.buffer)
+                            .unwrap_or(vk::Buffer::null());
+                        let vk_ib = self
+                            .device
+                            .buffers
                             .get(mesh.index_buffer.index, mesh.index_buffer.generation)
-                            .map(|e| e.buffer).unwrap_or(vk::Buffer::null());
+                            .map(|e| e.buffer)
+                            .unwrap_or(vk::Buffer::null());
                         if vk_vb == vk::Buffer::null() || vk_ib == vk::Buffer::null() {
                             continue;
                         }
@@ -2325,7 +2331,11 @@ impl BackendRenderer for SceneRenderer {
                         // matches the shadow pipeline layout declaration.
                         unsafe {
                             d.cmd_push_constants(
-                                cmd, pll, vk::ShaderStageFlags::VERTEX, 0, mvp_bytes,
+                                cmd,
+                                pll,
+                                vk::ShaderStageFlags::VERTEX,
+                                0,
+                                mvp_bytes,
                             );
                             let vbs = [vk_vb];
                             let offsets = [0u64];
@@ -2339,10 +2349,12 @@ impl BackendRenderer for SceneRenderer {
                     }
 
                     // SAFETY: end render pass for this cascade.
-                    unsafe { d.cmd_end_render_pass(cmd); }
+                    unsafe {
+                        d.cmd_end_render_pass(cmd);
+                    }
                 }
 
-                // ── Global barrier: all 3 cascade layers → shader readable ──
+                // ── Global barrier: all 3 cascade layers �?shader readable ──
                 if let Some(sm) = self.device.shadow_map {
                     let barrier = vk::ImageMemoryBarrier::default()
                         .image(sm)
@@ -2379,7 +2391,9 @@ impl BackendRenderer for SceneRenderer {
             render_graph::PassKind::ToneMap => {
                 // Tone-mapping pass: reads the HDR color attachment and writes
                 // LDR to the swapchain via a fullscreen triangle.
-                let Some(ref mut enc) = self.cur_enc else { return Ok(()) };
+                let Some(ref mut enc) = self.cur_enc else {
+                    return Ok(());
+                };
 
                 let d = &self.device.logical_device.device;
                 let fi = self.device.current_frame;
@@ -2387,8 +2401,14 @@ impl BackendRenderer for SceneRenderer {
 
                 let tone_rp = self.device.tone_rp.unwrap_or(vk::RenderPass::null());
                 let tone_pl = self.device.tone_pipeline.unwrap_or(vk::Pipeline::null());
-                let tone_pll = self.device.tone_pipeline_layout.unwrap_or(vk::PipelineLayout::null());
-                let tone_ds = self.device.tone_desc_set.unwrap_or(vk::DescriptorSet::null());
+                let tone_pll = self
+                    .device
+                    .tone_pipeline_layout
+                    .unwrap_or(vk::PipelineLayout::null());
+                let tone_ds = self
+                    .device
+                    .tone_desc_set
+                    .unwrap_or(vk::DescriptorSet::null());
                 if tone_rp == vk::RenderPass::null() || tone_pl == vk::Pipeline::null() {
                     return Ok(());
                 }
@@ -2416,14 +2436,18 @@ impl BackendRenderer for SceneRenderer {
                             height: self.height,
                         },
                     });
-                unsafe { d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE); }
+                unsafe {
+                    d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
+                }
 
                 // Viewport + scissor via encoder
                 enc.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
                 enc.set_scissor(0, 0, self.width, self.height);
 
                 // Bind tonemap pipeline
-                unsafe { d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, tone_pl); }
+                unsafe {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, tone_pl);
+                }
 
                 // Bind HDR sampler descriptor set at set=0
                 if tone_ds != vk::DescriptorSet::null() {

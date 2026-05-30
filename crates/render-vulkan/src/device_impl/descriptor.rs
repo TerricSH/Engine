@@ -390,10 +390,8 @@ impl VulkanDevice {
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         // SAFETY: `buf` was created by this device; `allocation` is compatible.
-        unsafe {
-            d.bind_buffer_memory(buf, allocation.memory(), allocation.offset())
-        }
-        .map_err(|r| VulkanError::vk("bind_light_ssbo", r))?;
+        unsafe { d.bind_buffer_memory(buf, allocation.memory(), allocation.offset()) }
+            .map_err(|r| VulkanError::vk("bind_light_ssbo", r))?;
 
         // Update set=1 descriptor at binding=2 to point to the SSBO
         if let Some(ds) = self.shadow_desc_set {
@@ -438,7 +436,9 @@ impl VulkanDevice {
         let d = &self.logical_device.device;
         if let Some(buf) = self.light_ssbo.take() {
             // SAFETY: `buf` was created by this device and is no longer referenced.
-            unsafe { d.destroy_buffer(buf, None); }
+            unsafe {
+                d.destroy_buffer(buf, None);
+            }
         }
         if let Some(mut a) = self.light_ssbo_allocation.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {

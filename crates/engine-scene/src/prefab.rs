@@ -94,8 +94,8 @@ impl Prefab {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::ComponentRecord;
-use crate::EntityRecord;
+    use crate::ComponentRecord;
+    use crate::EntityRecord;
 
     fn sample_entity(name: &str) -> EntityRecord {
         let mut components = BTreeMap::new();

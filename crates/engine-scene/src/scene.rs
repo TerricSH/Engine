@@ -5,8 +5,8 @@ use engine_serialize::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use thiserror::Error;
 use std::path::Path;
+use thiserror::Error;
 
 pub const ECS_SCENE_CONTRACT: &str = "ECSScene-v0.1.0";
 
@@ -112,8 +112,7 @@ impl Scene {
     /// Returns an error if the file cannot be read or parsed.
     pub fn load_from_file(path: &Path) -> Result<Self, SceneError> {
         let ron_string = std::fs::read_to_string(path)?;
-        let scene: Scene = ron::de::from_str(&ron_string)
-            .map_err(|e| SceneError::Ron(e.code))?;
+        let scene: Scene = ron::de::from_str(&ron_string).map_err(|e| SceneError::Ron(e.code))?;
         Ok(scene)
     }
 

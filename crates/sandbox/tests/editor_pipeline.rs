@@ -76,11 +76,17 @@ fn make_renderable(visible: bool) -> ComponentRecord {
 /// Create a camera component record.
 fn make_camera() -> ComponentRecord {
     let mut fields = BTreeMap::new();
-    fields.insert("projection".to_string(), Value::Str("perspective".to_string()));
+    fields.insert(
+        "projection".to_string(),
+        Value::Str("perspective".to_string()),
+    );
     fields.insert("near".to_string(), Value::Float32(0.1));
     fields.insert("far".to_string(), Value::Float32(100.0));
     fields.insert("fov_y".to_string(), Value::Float32(1.0472)); // 60°
-    fields.insert("clear_color".to_string(), Value::Color([0.0, 0.0, 0.0, 1.0]));
+    fields.insert(
+        "clear_color".to_string(),
+        Value::Color([0.0, 0.0, 0.0, 1.0]),
+    );
     ComponentRecord {
         schema_version: SchemaVersion::new(0, 1, 0),
         enabled: true,
@@ -109,7 +115,10 @@ fn editor_scene_new_is_clean() {
 #[test]
 fn editor_scene_command_marks_dirty() {
     let mut es = EditorScene::new(sample_scene());
-    let cmd = Box::new(SetEntityName::new("camera-main".to_string(), Some("Cam".to_string())));
+    let cmd = Box::new(SetEntityName::new(
+        "camera-main".to_string(),
+        Some("Cam".to_string()),
+    ));
     es.execute(cmd).unwrap();
     assert!(es.is_dirty(), "after command, EditorScene should be dirty");
 }
@@ -176,7 +185,11 @@ fn set_component_field_execute_undo_redo() {
     assert_eq!(comp.fields.get("visible"), Some(&Value::Bool(false)));
 }
 
-fn find_component<'a>(es: &'a EditorScene, entity_id: &str, comp_type: &str) -> &'a ComponentRecord {
+fn find_component<'a>(
+    es: &'a EditorScene,
+    entity_id: &str,
+    comp_type: &str,
+) -> &'a ComponentRecord {
     let entity = find_entity(es, entity_id);
     entity
         .components
@@ -205,7 +218,10 @@ fn add_entity_execute_undo_redo() {
         "entity count should increase by 1"
     );
     assert!(
-        es.scene.entities.iter().any(|e| e.persistent_id == entity_id),
+        es.scene
+            .entities
+            .iter()
+            .any(|e| e.persistent_id == entity_id),
         "new entity should exist"
     );
     assert!(es.is_dirty());
@@ -217,14 +233,20 @@ fn add_entity_execute_undo_redo() {
         "after undo, entity count should be back to original"
     );
     assert!(
-        !es.scene.entities.iter().any(|e| e.persistent_id == entity_id),
+        !es.scene
+            .entities
+            .iter()
+            .any(|e| e.persistent_id == entity_id),
         "new entity should be removed after undo"
     );
 
     es.redo().unwrap();
     assert_eq!(es.scene.entities.len(), count_before + 1);
     assert!(
-        es.scene.entities.iter().any(|e| e.persistent_id == entity_id),
+        es.scene
+            .entities
+            .iter()
+            .any(|e| e.persistent_id == entity_id),
         "new entity should reappear after redo"
     );
 }
@@ -243,7 +265,10 @@ fn remove_entity_execute_undo_redo() {
         "entity count should decrease by 1"
     );
     assert!(
-        !es.scene.entities.iter().any(|e| e.persistent_id == "cube-01"),
+        !es.scene
+            .entities
+            .iter()
+            .any(|e| e.persistent_id == "cube-01"),
         "removed entity should not exist"
     );
 
@@ -254,7 +279,10 @@ fn remove_entity_execute_undo_redo() {
         "after undo, entity count should be restored"
     );
     assert!(
-        es.scene.entities.iter().any(|e| e.persistent_id == "cube-01"),
+        es.scene
+            .entities
+            .iter()
+            .any(|e| e.persistent_id == "cube-01"),
         "removed entity should be restored after undo"
     );
 
@@ -285,28 +313,28 @@ fn add_component_execute_undo_redo() {
     ));
     es.execute(cmd).unwrap();
 
-    assert!(find_component(&es, "camera-main", "test.custom").fields.contains_key("value"));
+    assert!(find_component(&es, "camera-main", "test.custom")
+        .fields
+        .contains_key("value"));
 
     es.undo().unwrap();
-    assert!(
-        !find_entity(&es, "camera-main")
-            .components
-            .contains_key("test.custom")
-    );
+    assert!(!find_entity(&es, "camera-main")
+        .components
+        .contains_key("test.custom"));
 
     es.redo().unwrap();
-    assert!(find_component(&es, "camera-main", "test.custom").fields.contains_key("value"));
+    assert!(find_component(&es, "camera-main", "test.custom")
+        .fields
+        .contains_key("value"));
 }
 
 #[test]
 fn remove_component_execute_undo_redo() {
     let mut es = EditorScene::new(sample_scene());
 
-    assert!(
-        find_entity(&es, "cube-01")
-            .components
-            .contains_key("engine.renderable")
-    );
+    assert!(find_entity(&es, "cube-01")
+        .components
+        .contains_key("engine.renderable"));
 
     let cmd = Box::new(RemoveComponent::new(
         "cube-01".to_string(),
@@ -314,25 +342,19 @@ fn remove_component_execute_undo_redo() {
     ));
     es.execute(cmd).unwrap();
 
-    assert!(
-        !find_entity(&es, "cube-01")
-            .components
-            .contains_key("engine.renderable")
-    );
+    assert!(!find_entity(&es, "cube-01")
+        .components
+        .contains_key("engine.renderable"));
 
     es.undo().unwrap();
-    assert!(
-        find_entity(&es, "cube-01")
-            .components
-            .contains_key("engine.renderable")
-    );
+    assert!(find_entity(&es, "cube-01")
+        .components
+        .contains_key("engine.renderable"));
 
     es.redo().unwrap();
-    assert!(
-        !find_entity(&es, "cube-01")
-            .components
-            .contains_key("engine.renderable")
-    );
+    assert!(!find_entity(&es, "cube-01")
+        .components
+        .contains_key("engine.renderable"));
 }
 
 // ============================================================================
@@ -441,10 +463,7 @@ fn extraction_reflects_visibility_change() {
         .iter()
         .filter(|d| d.material.id != "shadow-only")
         .count();
-    assert_eq!(
-        visible, 0,
-        "no visible drawables when cube is hidden"
-    );
+    assert_eq!(visible, 0, "no visible drawables when cube is hidden");
 }
 
 #[test]
@@ -461,13 +480,21 @@ fn extraction_after_undo_restores_original() {
     es.execute(cmd).unwrap();
 
     let input = extract(&es.scene).expect("extraction should succeed");
-    let visible = input.drawables.iter().filter(|d| d.material.id != "shadow-only").count();
+    let visible = input
+        .drawables
+        .iter()
+        .filter(|d| d.material.id != "shadow-only")
+        .count();
     assert_eq!(visible, 0);
 
     // Undo — should become visible again
     es.undo().unwrap();
     let input = extract(&es.scene).expect("extraction after undo should succeed");
-    let visible = input.drawables.iter().filter(|d| d.material.id != "shadow-only").count();
+    let visible = input
+        .drawables
+        .iter()
+        .filter(|d| d.material.id != "shadow-only")
+        .count();
     assert_eq!(visible, 1, "cube should be visible again after undo");
 }
 
@@ -583,10 +610,7 @@ fn full_editor_pipeline() {
     es.undo().unwrap();
     let input_after_undo = extract(&es.scene).expect("extraction after undo should succeed");
     let cams_after = input_after_undo.views.len();
-    assert_eq!(
-        cams_after, 1,
-        "after undo, should have 1 camera (original)"
-    );
+    assert_eq!(cams_after, 1, "after undo, should have 1 camera (original)");
 }
 
 // ============================================================================

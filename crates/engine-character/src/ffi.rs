@@ -117,7 +117,11 @@ pub extern "C" fn character_is_grounded(controller: *const CharacterController) 
     // SAFETY: Null-checked above; caller guarantees a valid `CharacterController`.
     let ctrl = unsafe { &*controller };
 
-    if ctrl.is_grounded() { 1 } else { 0 }
+    if ctrl.is_grounded() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns the character's current movement state as an integer.
@@ -156,7 +160,9 @@ pub extern "C" fn character_get_move_state(controller: *const CharacterControlle
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
 #[no_mangle]
 pub extern "C" fn character_get_velocity_x(controller: *const CharacterController) -> f32 {
-    if controller.is_null() { 0.0 } else {
+    if controller.is_null() {
+        0.0
+    } else {
         // SAFETY: Null-checked above.
         unsafe { (*controller).velocity().x }
     }
@@ -169,7 +175,9 @@ pub extern "C" fn character_get_velocity_x(controller: *const CharacterControlle
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
 #[no_mangle]
 pub extern "C" fn character_get_velocity_y(controller: *const CharacterController) -> f32 {
-    if controller.is_null() { 0.0 } else {
+    if controller.is_null() {
+        0.0
+    } else {
         // SAFETY: Null-checked above.
         unsafe { (*controller).velocity().y }
     }
@@ -182,7 +190,9 @@ pub extern "C" fn character_get_velocity_y(controller: *const CharacterControlle
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
 #[no_mangle]
 pub extern "C" fn character_get_velocity_z(controller: *const CharacterController) -> f32 {
-    if controller.is_null() { 0.0 } else {
+    if controller.is_null() {
+        0.0
+    } else {
         // SAFETY: Null-checked above.
         unsafe { (*controller).velocity().z }
     }
@@ -201,7 +211,14 @@ mod tests {
 
     #[test]
     fn move_null_controller() {
-        assert!(!character_move(std::ptr::null_mut(), 1.0, 0.0, 5.0, 1.0 / 60.0, std::ptr::null_mut()));
+        assert!(!character_move(
+            std::ptr::null_mut(),
+            1.0,
+            0.0,
+            5.0,
+            1.0 / 60.0,
+            std::ptr::null_mut()
+        ));
     }
 
     #[test]
@@ -234,9 +251,10 @@ mod tests {
         // Call update() through FFI — this is the real path
         let result = character_move(
             &mut ctrl as *mut CharacterController,
-            1.0, 0.0,   // dir_x, dir_z
-            5.0,         // speed
-            1.0 / 60.0,  // dt
+            1.0,
+            0.0,                  // dir_x, dir_z
+            5.0,                  // speed
+            1.0 / 60.0,           // dt
             std::ptr::null_mut(), // no physics
         );
         assert!(result, "should have moved");
@@ -255,7 +273,10 @@ mod tests {
         let jumped = character_jump(&mut ctrl as *mut CharacterController);
         assert!(jumped, "grounded character should be able to jump");
         assert_eq!(ctrl.state(), CharacterState::Jumping);
-        assert!((ctrl.velocity().y - ctrl.jump_velocity).abs() < 1e-6, "jump velocity should be applied");
+        assert!(
+            (ctrl.velocity().y - ctrl.jump_velocity).abs() < 1e-6,
+            "jump velocity should be applied"
+        );
     }
 
     #[test]
@@ -270,13 +291,19 @@ mod tests {
     fn character_is_grounded_true() {
         let mut ctrl = CharacterController::new();
         let _ = ctrl.transition_state(CharacterState::Grounded);
-        assert_eq!(character_is_grounded(&ctrl as *const CharacterController), 1);
+        assert_eq!(
+            character_is_grounded(&ctrl as *const CharacterController),
+            1
+        );
     }
 
     #[test]
     fn character_is_grounded_false() {
         let ctrl = CharacterController::new(); // starts as Falling
-        assert_eq!(character_is_grounded(&ctrl as *const CharacterController), 0);
+        assert_eq!(
+            character_is_grounded(&ctrl as *const CharacterController),
+            0
+        );
     }
 
     #[test]
@@ -284,17 +311,29 @@ mod tests {
         let mut ctrl = CharacterController::new();
 
         let _ = ctrl.transition_state(CharacterState::Grounded);
-        assert_eq!(character_get_move_state(&ctrl as *const CharacterController), STATE_GROUNDED);
+        assert_eq!(
+            character_get_move_state(&ctrl as *const CharacterController),
+            STATE_GROUNDED
+        );
 
         let _ = ctrl.transition_state(CharacterState::Jumping);
-        assert_eq!(character_get_move_state(&ctrl as *const CharacterController), STATE_JUMPING);
+        assert_eq!(
+            character_get_move_state(&ctrl as *const CharacterController),
+            STATE_JUMPING
+        );
 
         // Jumping → Falling is valid
         let _ = ctrl.transition_state(CharacterState::Falling);
-        assert_eq!(character_get_move_state(&ctrl as *const CharacterController), STATE_FALLING);
+        assert_eq!(
+            character_get_move_state(&ctrl as *const CharacterController),
+            STATE_FALLING
+        );
 
         let _ = ctrl.transition_state(CharacterState::Free);
-        assert_eq!(character_get_move_state(&ctrl as *const CharacterController), STATE_FREE);
+        assert_eq!(
+            character_get_move_state(&ctrl as *const CharacterController),
+            STATE_FREE
+        );
     }
 
     #[test]

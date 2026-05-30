@@ -303,9 +303,8 @@ impl RapierBackend {
         // any joints attached to this body from impulse_joints, so we clean
         // up our own tracking maps to prevent stale handle entries.
         self.joint_entity_map.remove(&entity_index);
-        self.joint_handle_lookup.retain(|_, rapier_handle| {
-            self.impulse_joints.get(*rapier_handle).is_some()
-        });
+        self.joint_handle_lookup
+            .retain(|_, rapier_handle| self.impulse_joints.get(*rapier_handle).is_some());
     }
 
     // ── Joint management ────────────────────────────────────────────────
@@ -389,9 +388,27 @@ impl RapierBackend {
                 if let Some(m) = &desc.motor {
                     use rapier3d::dynamics::JointAxis;
                     b = b
-                        .motor(JointAxis::AngX, m.target_pos, m.target_vel, m.stiffness, m.damping)
-                        .motor(JointAxis::AngY, m.target_pos, m.target_vel, m.stiffness, m.damping)
-                        .motor(JointAxis::AngZ, m.target_pos, m.target_vel, m.stiffness, m.damping);
+                        .motor(
+                            JointAxis::AngX,
+                            m.target_pos,
+                            m.target_vel,
+                            m.stiffness,
+                            m.damping,
+                        )
+                        .motor(
+                            JointAxis::AngY,
+                            m.target_pos,
+                            m.target_vel,
+                            m.stiffness,
+                            m.damping,
+                        )
+                        .motor(
+                            JointAxis::AngZ,
+                            m.target_pos,
+                            m.target_vel,
+                            m.stiffness,
+                            m.damping,
+                        );
                 }
                 self.impulse_joints
                     .insert(body_a_handle, body_b_handle, b, true)
@@ -638,11 +655,7 @@ impl RapierBackend {
                 na::Translation3::new(q.from.x, q.from.y, q.from.z),
                 na::UnitQuaternion::identity(),
             );
-            let delta = na::Vector3::new(
-                q.to.x - q.from.x,
-                q.to.y - q.from.y,
-                q.to.z - q.from.z,
-            );
+            let delta = na::Vector3::new(q.to.x - q.from.x, q.to.y - q.from.y, q.to.z - q.from.z);
             let max_dist = delta.magnitude();
             let dir = if max_dist > f32::EPSILON {
                 delta / max_dist
@@ -675,16 +688,11 @@ impl RapierBackend {
             ) {
                 if let Some(&entity_idx) = col_handle_to_entity.get(&handle) {
                     let entity = Entity::new(entity_idx, 0);
-                    let point = q.from
-                        + glam::Vec3::new(dir.x, dir.y, dir.z) * hit.time_of_impact;
+                    let point = q.from + glam::Vec3::new(dir.x, dir.y, dir.z) * hit.time_of_impact;
                     hits.push(SweepHitResult {
                         entity,
                         point,
-                        normal: glam::Vec3::new(
-                            hit.normal1.x,
-                            hit.normal1.y,
-                            hit.normal1.z,
-                        ),
+                        normal: glam::Vec3::new(hit.normal1.x, hit.normal1.y, hit.normal1.z),
                         distance: hit.time_of_impact,
                     });
                     all_hits.push(entity);

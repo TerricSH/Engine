@@ -1,4 +1,4 @@
-﻿use crate::ik::chain::IkChain;
+use crate::ik::chain::IkChain;
 use crate::ik::constraint::IkConstraintSet;
 use crate::ik::effector::IkEffector;
 use crate::layers::AnimLayer;
@@ -27,15 +27,25 @@ impl Component for AnimationPlayer {
 impl AnimationPlayer {
     pub fn new() -> Self {
         Self {
-            clip_asset: None, playing: false, looping: true, speed: 1.0,
-            current_time: 0.0, layer: 0, state_machine: None,
+            clip_asset: None,
+            playing: false,
+            looping: true,
+            speed: 1.0,
+            current_time: 0.0,
+            layer: 0,
+            state_machine: None,
             layers: vec![AnimLayer::new("base")],
         }
     }
     pub fn with_clip(clip_asset: impl Into<String>) -> Self {
         Self {
-            clip_asset: Some(clip_asset.into()), playing: true, looping: true,
-            speed: 1.0, current_time: 0.0, layer: 0, state_machine: None,
+            clip_asset: Some(clip_asset.into()),
+            playing: true,
+            looping: true,
+            speed: 1.0,
+            current_time: 0.0,
+            layer: 0,
+            state_machine: None,
             layers: vec![AnimLayer::new("base")],
         }
     }
@@ -43,12 +53,20 @@ impl AnimationPlayer {
         self.state_machine = Some(sm);
     }
     pub fn set_anim_param(&mut self, name: &str, value: AnimParamValue) {
-        if let Some(ref mut sm) = self.state_machine { sm.set_param(name, value); }
+        if let Some(ref mut sm) = self.state_machine {
+            sm.set_param(name, value);
+        }
     }
-    pub fn add_layer(&mut self, layer: AnimLayer) { self.layers.push(layer); }
+    pub fn add_layer(&mut self, layer: AnimLayer) {
+        self.layers.push(layer);
+    }
 }
 
-impl Default for AnimationPlayer { fn default() -> Self { Self::new() } }
+impl Default for AnimationPlayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkeletonComponent {
@@ -62,7 +80,10 @@ impl Component for SkeletonComponent {
 
 impl SkeletonComponent {
     pub fn new(skeleton_asset: impl Into<String>) -> Self {
-        Self { skeleton_asset: Some(skeleton_asset.into()), bind_shape: [0.5, 0.5, 0.5] }
+        Self {
+            skeleton_asset: Some(skeleton_asset.into()),
+            bind_shape: [0.5, 0.5, 0.5],
+        }
     }
 }
 
@@ -77,7 +98,9 @@ pub struct IkTargetComponent {
     pub blend_weight: f32,
 }
 
-fn default_ik_weight() -> f32 { 1.0 }
+fn default_ik_weight() -> f32 {
+    1.0
+}
 
 impl Component for IkTargetComponent {
     const TYPE_ID: &'static str = "engine.ik_target";
@@ -86,12 +109,19 @@ impl Component for IkTargetComponent {
 impl IkTargetComponent {
     pub fn new() -> Self {
         Self {
-            effectors: Vec::new(), chains: Vec::new(),
-            constraints: IkConstraintSet::new(), enabled: true, blend_weight: 1.0,
+            effectors: Vec::new(),
+            chains: Vec::new(),
+            constraints: IkConstraintSet::new(),
+            enabled: true,
+            blend_weight: 1.0,
         }
     }
-    pub fn add_effector(&mut self, effector: IkEffector) { self.effectors.push(effector); }
-    pub fn add_chain(&mut self, chain: IkChain) { self.chains.push(chain); }
+    pub fn add_effector(&mut self, effector: IkEffector) {
+        self.effectors.push(effector);
+    }
+    pub fn add_chain(&mut self, chain: IkChain) {
+        self.chains.push(chain);
+    }
     pub fn effector(&self, name: &str) -> Option<&IkEffector> {
         self.effectors.iter().find(|e| e.name == name)
     }
@@ -99,8 +129,14 @@ impl IkTargetComponent {
         self.effectors.iter_mut().find(|e| e.name == name)
     }
     pub fn set_target(&mut self, name: &str, position: glam::Vec3) {
-        if let Some(e) = self.effector_mut(name) { e.position = position; }
+        if let Some(e) = self.effector_mut(name) {
+            e.position = position;
+        }
     }
 }
 
-impl Default for IkTargetComponent { fn default() -> Self { Self::new() } }
+impl Default for IkTargetComponent {
+    fn default() -> Self {
+        Self::new()
+    }
+}

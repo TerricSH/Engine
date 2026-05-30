@@ -35,8 +35,7 @@ impl std::fmt::Debug for RawWorldPtr {
 }
 
 /// Erased pointer to the engine's `World` instance.
-static WORLD_PTR: std::sync::OnceLock<Mutex<RawWorldPtr>> =
-    std::sync::OnceLock::new();
+static WORLD_PTR: std::sync::OnceLock<Mutex<RawWorldPtr>> = std::sync::OnceLock::new();
 
 /// Set the engine world pointer (called from the engine runtime).
 ///
@@ -89,13 +88,18 @@ where
 // ---------------------------------------------------------------------------
 
 use crate::registry;
-use crate::types::{FfiAsyncHandle, FfiAsyncCallback, FfiComponentTypeId, FfiCoroutineHandle, FfiYieldInstruction};
+use crate::types::{
+    FfiAsyncCallback, FfiAsyncHandle, FfiComponentTypeId, FfiCoroutineHandle, FfiYieldInstruction,
+};
 use engine_scene::Entity;
 
 pub extern "C" fn entity_spawn() -> FfiEntityId {
     with_world_mut(|w| {
         let e = w.create_entity();
-        FfiEntityId { index: e.index(), generation: e.generation() }
+        FfiEntityId {
+            index: e.index(),
+            generation: e.generation(),
+        }
     })
     .unwrap_or(FfiEntityId::INVALID)
 }
@@ -140,30 +144,50 @@ pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
         FfiCoroutineHandle::INVALID
     }
     extern "C" fn coroutine_cancel(_h: FfiCoroutineHandle) {}
-    extern "C" fn coroutine_move_next(_p: *mut std::ffi::c_void, _o: &mut FfiYieldInstruction) -> bool { false }
-    extern "C" fn async_is_complete(_h: FfiAsyncHandle) -> bool { false }
-    extern "C" fn condition_check(_id: u64) -> bool { false }
-    extern "C" fn dispatch_callbacks() { crate::r#async::dispatch_main_thread_callbacks(); }
+    extern "C" fn coroutine_move_next(
+        _p: *mut std::ffi::c_void,
+        _o: &mut FfiYieldInstruction,
+    ) -> bool {
+        false
+    }
+    extern "C" fn async_is_complete(_h: FfiAsyncHandle) -> bool {
+        false
+    }
+    extern "C" fn condition_check(_id: u64) -> bool {
+        false
+    }
+    extern "C" fn dispatch_callbacks() {
+        crate::r#async::dispatch_main_thread_callbacks();
+    }
 
     extern "C" fn component_get_ptr(
-        _entity: FfiEntityId, _type_id: FfiComponentTypeId, out_len: &mut u32,
+        _entity: FfiEntityId,
+        _type_id: FfiComponentTypeId,
+        out_len: &mut u32,
     ) -> *mut u8 {
         *out_len = 0;
         std::ptr::null_mut()
     }
     extern "C" fn component_set_ptr(
-        _entity: FfiEntityId, _type_id: FfiComponentTypeId, _data: *const u8, _len: u32,
+        _entity: FfiEntityId,
+        _type_id: FfiComponentTypeId,
+        _data: *const u8,
+        _len: u32,
     ) -> bool {
         false
     }
 
     extern "C" fn async_load_image(
-        _url: *const std::ffi::c_char, _cb: FfiAsyncCallback, _ud: u64,
+        _url: *const std::ffi::c_char,
+        _cb: FfiAsyncCallback,
+        _ud: u64,
     ) -> FfiAsyncHandle {
         FfiAsyncHandle(0)
     }
     extern "C" fn async_http_get(
-        _url: *const std::ffi::c_char, _cb: FfiAsyncCallback, _ud: u64,
+        _url: *const std::ffi::c_char,
+        _cb: FfiAsyncCallback,
+        _ud: u64,
     ) -> FfiAsyncHandle {
         FfiAsyncHandle(0)
     }

@@ -287,9 +287,7 @@ impl VulkanDevice {
                 .binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
-                .stage_flags(
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                ),
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -579,11 +577,8 @@ impl VulkanDevice {
             let half_h = ((ls_max.y - ls_min.y) * 0.5).abs().max(1.0) * pad;
             let depth = ((ls_max.z - ls_min.z).abs()).max(1.0) * pad;
 
-            let ortho = glam::Mat4::orthographic_rh(
-                -half_w, half_w,
-                -half_h, half_h,
-                0.0, depth * 2.0,
-            );
+            let ortho =
+                glam::Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.0, depth * 2.0);
 
             light_vps[cascade] = ortho * light_view;
             prev_split_z = split_z;

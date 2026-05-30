@@ -77,12 +77,18 @@ mod tests {
 
     #[test]
     fn destroy_before_init_returns_false() {
-        assert!(!ffi_entity_destroy(FfiEntityId { index: 1, generation: 0 }));
+        assert!(!ffi_entity_destroy(FfiEntityId {
+            index: 1,
+            generation: 0
+        }));
     }
 
     #[test]
     fn alive_before_init_uses_fallback() {
-        let valid = FfiEntityId { index: 1, generation: 0 };
+        let valid = FfiEntityId {
+            index: 1,
+            generation: 0,
+        };
         assert!(ffi_entity_is_alive(valid));
         assert!(!ffi_entity_is_alive(FfiEntityId::INVALID));
     }

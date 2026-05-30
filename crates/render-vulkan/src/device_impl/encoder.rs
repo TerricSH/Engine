@@ -205,7 +205,13 @@ impl CmdEncoderTrait for VkCmdEncoder {
             self.device.cmd_draw_indexed(self.cmd, ic, ins, fi, vo, fii);
         }
     }
-    fn draw_indexed_indirect(&mut self, buffer: BufferHandle, offset: u64, draw_count: u32, stride: u32) {
+    fn draw_indexed_indirect(
+        &mut self,
+        buffer: BufferHandle,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    ) {
         if let Some(&buf) = self.buffer_cache.get(buffer.index as usize).and_then(|s| {
             s.as_ref()
                 .filter(|(g, _)| *g == buffer.generation)
@@ -215,13 +221,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
             // VkBuffer with INDIRECT_BUFFER usage; draw_count, offset and stride
             // are within the buffer's bounds.
             unsafe {
-                self.device.cmd_draw_indexed_indirect(
-                    self.cmd,
-                    buf,
-                    offset,
-                    draw_count,
-                    stride,
-                );
+                self.device
+                    .cmd_draw_indexed_indirect(self.cmd, buf, offset, draw_count, stride);
             }
         }
     }

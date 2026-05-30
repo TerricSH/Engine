@@ -54,8 +54,7 @@ impl RootMotionDelta {
     }
 
     pub fn is_identity(&self) -> bool {
-        self.translation == [0.0, 0.0, 0.0]
-            && self.rotation == [0.0, 0.0, 0.0, 1.0]
+        self.translation == [0.0, 0.0, 0.0] && self.rotation == [0.0, 0.0, 0.0, 1.0]
     }
 }
 
@@ -81,8 +80,18 @@ pub fn extract_root_motion(
 
     // Compute proper quaternion delta: q_prev.inverse() * q_current
     // This gives the rotation from prev to current in prev's local space.
-    let q_prev = Quat::from_xyzw(prev.rotation[0], prev.rotation[1], prev.rotation[2], prev.rotation[3]);
-    let q_current = Quat::from_xyzw(current.rotation[0], current.rotation[1], current.rotation[2], current.rotation[3]);
+    let q_prev = Quat::from_xyzw(
+        prev.rotation[0],
+        prev.rotation[1],
+        prev.rotation[2],
+        prev.rotation[3],
+    );
+    let q_current = Quat::from_xyzw(
+        current.rotation[0],
+        current.rotation[1],
+        current.rotation[2],
+        current.rotation[3],
+    );
     let q_delta = q_prev.inverse() * q_current;
 
     let mut delta = RootMotionDelta {

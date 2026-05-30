@@ -1,4 +1,4 @@
-﻿#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod clip;
 pub(crate) mod pose;
@@ -7,12 +7,12 @@ mod skeleton;
 pub mod assets;
 pub mod components;
 pub mod debug;
+pub mod events;
 pub mod extract;
 pub mod ik;
+pub mod layers;
 pub mod loader;
 pub mod player;
-pub mod events;
-pub mod layers;
 pub mod root_motion;
 pub mod state_machine;
 
@@ -23,17 +23,15 @@ pub use skeleton::{AnimationError, BoneIndex, BoneTransform};
 pub use assets::{AnimationChannel, AnimationClip, Joint, JointTransform, Keyframe, Skeleton};
 pub use components::{AnimationPlayer, IkTargetComponent, SkeletonComponent};
 pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
-pub use events::{AnimEvent, AnimEventCollector, AnimEventDef, check_event_trigger};
+pub use events::{check_event_trigger, AnimEvent, AnimEventCollector, AnimEventDef};
 pub use extract::{PendingSkinnedItem, SkinnedExtractProducer};
 pub use ik::{
-    IkChain, IkConstraint, IkConstraintSet, IkDebugDraw, IkDebugInfo, IkEffector, IkEffectorSpace,
-    IkSolverType, solve_pose, solve_pose_multi,
+    solve_pose, solve_pose_multi, IkChain, IkConstraint, IkConstraintSet, IkDebugDraw, IkDebugInfo,
+    IkEffector, IkEffectorSpace, IkSolverType,
 };
 pub use loader::{load_animation_clip, load_skeleton, register_asset_types};
 pub use player::{update_animation, AnimationEvaluator};
-pub use root_motion::{
-    extract_root_motion, RootMotionApplyTo, RootMotionConfig, RootMotionDelta,
-};
+pub use root_motion::{extract_root_motion, RootMotionApplyTo, RootMotionConfig, RootMotionDelta};
 
 pub use layers::{AnimLayer, LayerBlendMode};
 pub use player::update_animation_sm;
@@ -66,27 +64,36 @@ pub fn register_animation_extensions(
             type_id: AnimationPlayer::TYPE_ID,
             display_name: "Animation Player",
             schema_version: (0, 1, 0),
-            has_editor: false, has_script_binding: false,
+            has_editor: false,
+            has_script_binding: false,
         },
-        storage_factory: anim_player_storage, serialize: None, deserialize: None,
+        storage_factory: anim_player_storage,
+        serialize: None,
+        deserialize: None,
     });
     let _ = component_reg.register(ComponentExtension {
         meta: ComponentMeta {
             type_id: SkeletonComponent::TYPE_ID,
             display_name: "Skeleton",
             schema_version: (0, 1, 0),
-            has_editor: false, has_script_binding: false,
+            has_editor: false,
+            has_script_binding: false,
         },
-        storage_factory: skeleton_comp_storage, serialize: None, deserialize: None,
+        storage_factory: skeleton_comp_storage,
+        serialize: None,
+        deserialize: None,
     });
     let _ = component_reg.register(ComponentExtension {
         meta: ComponentMeta {
             type_id: IkTargetComponent::TYPE_ID,
             display_name: "IK Target",
             schema_version: (0, 1, 0),
-            has_editor: true, has_script_binding: false,
+            has_editor: true,
+            has_script_binding: false,
         },
-        storage_factory: ik_target_storage, serialize: None, deserialize: None,
+        storage_factory: ik_target_storage,
+        serialize: None,
+        deserialize: None,
     });
 
     loader::register_asset_types(asset_type_reg);
@@ -96,8 +103,7 @@ pub fn register_animation_extensions(
     let skeleton_draw: Box<dyn engine_renderer::DebugDrawProvider> =
         Box::new(SkeletonDebugDraw::new());
     debug_draw_reg.register(skeleton_draw);
-    let ik_draw: Box<dyn engine_renderer::DebugDrawProvider> =
-        Box::new(IkDebugDraw::new());
+    let ik_draw: Box<dyn engine_renderer::DebugDrawProvider> = Box::new(IkDebugDraw::new());
     debug_draw_reg.register(ik_draw);
 }
 

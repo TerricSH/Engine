@@ -504,7 +504,10 @@ impl RenderGraph {
 
             // ── Inputs (read-only) ──
             for input in &pass.inputs {
-                let old = resource_states.get(&input.name).copied().unwrap_or(ResourceState::Undefined);
+                let old = resource_states
+                    .get(&input.name)
+                    .copied()
+                    .unwrap_or(ResourceState::Undefined);
                 let new = ResourceState::ShaderReadOnlyOptimal;
                 if old != new {
                     barriers_per_pass[sorted_idx].push(CompiledBarrier {
@@ -520,7 +523,10 @@ impl RenderGraph {
 
             // ── Depth-stencil attachment ──
             if let Some(ref ds) = pass.depth_stencil {
-                let old = resource_states.get(&ds.name).copied().unwrap_or(ResourceState::Undefined);
+                let old = resource_states
+                    .get(&ds.name)
+                    .copied()
+                    .unwrap_or(ResourceState::Undefined);
                 let new = ResourceState::DepthStencilAttachmentOptimal;
                 if old != new {
                     barriers_per_pass[sorted_idx].push(CompiledBarrier {
@@ -536,7 +542,10 @@ impl RenderGraph {
 
             // ── Outputs (written by the pass) ──
             for output in &pass.outputs {
-                let old = resource_states.get(&output.name).copied().unwrap_or(ResourceState::Undefined);
+                let old = resource_states
+                    .get(&output.name)
+                    .copied()
+                    .unwrap_or(ResourceState::Undefined);
                 let new = output_resource_state(&output.name);
                 if old != new {
                     barriers_per_pass[sorted_idx].push(CompiledBarrier {
@@ -637,7 +646,9 @@ fn previous_stage(state: &ResourceState) -> PipeStage {
         ResourceState::DepthStencilAttachmentOptimal => PipeStage::LateFragmentTests,
         ResourceState::DepthStencilReadOnlyOptimal => PipeStage::EarlyFragmentTests,
         ResourceState::ShaderReadOnlyOptimal => PipeStage::FragmentShader,
-        ResourceState::TransferSrcOptimal | ResourceState::TransferDstOptimal => PipeStage::Transfer,
+        ResourceState::TransferSrcOptimal | ResourceState::TransferDstOptimal => {
+            PipeStage::Transfer
+        }
         ResourceState::PresentSrc => PipeStage::BottomOfPipe,
         ResourceState::Undefined | ResourceState::General => PipeStage::TopOfPipe,
     }
