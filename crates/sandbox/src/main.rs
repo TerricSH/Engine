@@ -849,20 +849,22 @@ fn run_character_demo() {
                 PlatformEvent::KeyReleased { key, .. } => { self.held_keys.remove(&key); EventFlow::Continue }
                 PlatformEvent::Resized { .. } => EventFlow::Continue,
                 PlatformEvent::Redraw => {
-                    let elapsed = self.last_frame_time.elapsed();
+                    let now = Instant::now();
+                    let elapsed = now - self.last_frame_time;
+                    self.last_frame_time = now;
                     let target = std::time::Duration::from_secs_f64(1.0 / 60.0);
                     if elapsed < target { std::thread::sleep(target - elapsed); }
-                    self.last_frame_time = Instant::now();
                     let dt = elapsed.as_secs_f32().min(0.05);
 
                     let mut dir = Vec3::ZERO;
-                    if self.held_keys.contains(&87) { dir.z -= 1.0; }
-                    if self.held_keys.contains(&83) { dir.z += 1.0; }
-                    if self.held_keys.contains(&65) { dir.x -= 1.0; }
-                    if self.held_keys.contains(&68) { dir.x += 1.0; }
+                    // winit KeyCode discriminant values: W=41, A=19, S=37, D=22, Space=62
+                    if self.held_keys.contains(&41) { dir.z -= 1.0; }
+                    if self.held_keys.contains(&37) { dir.z += 1.0; }
+                    if self.held_keys.contains(&19) { dir.x -= 1.0; }
+                    if self.held_keys.contains(&22) { dir.x += 1.0; }
                     let input = CharacterMovement {
                         direction: if dir.length_squared() > 0.0 { dir.normalize() } else { dir },
-                        wish_jump: self.held_keys.contains(&32),
+                        wish_jump: self.held_keys.contains(&62),
                         delta_time: dt,
                     };
                     self.controller.update(&input, self.physics.as_ref());

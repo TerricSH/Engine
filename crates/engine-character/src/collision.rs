@@ -83,8 +83,8 @@ pub fn resolve_collision(
     velocity: Vec3,
     controller: &CharacterController,
     physics: &PhysicsWorld,
+    dt: f32,
 ) -> (Vec3, Vec3) {
-    let dt = 1.0 / 60.0;
     let displacement = velocity * dt;
     let target = position + displacement;
 

@@ -177,7 +177,7 @@ pub fn process_movement(
 
     // ── 5. Move & resolve collisions ────────────────────────────────────
     if let Some(pw) = physics {
-        let (resolved_pos, resolved_vel) = resolve_collision(position, velocity, controller, pw);
+        let (resolved_pos, resolved_vel) = resolve_collision(position, velocity, controller, pw, input.delta_time);
         position = resolved_pos;
         velocity = resolved_vel;
     } else {
