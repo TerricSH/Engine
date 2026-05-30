@@ -131,6 +131,19 @@ impl Drop for VulkanDevice {
             }
         }
 
+        // Destroy material descriptor infra (set=2 pool + layout).
+        if let Some(pool) = self.material_desc_pool.take() {
+            // SAFETY: pool frees its descriptor sets automatically.
+            unsafe { d.destroy_descriptor_pool(pool, None); }
+        }
+        if let Some(layout) = self.material_desc_set_layout.take() {
+            // SAFETY: layout was created by this device.
+            unsafe { d.destroy_descriptor_set_layout(layout, None); }
+        }
+
+        self.destroy_material_textures();
+        self.destroy_hdr_resources();
+        self.destroy_env_resources();
         self.destroy_shadow_resources();
         self.destroy_descriptor_infra();
         self.destroy_depth_texture();

@@ -61,6 +61,9 @@ pub trait CommandEncoder: Send {
     /// Insert a pipeline barrier for the shadow map (default no-op).
     fn shadow_barrier(&mut self) {}
 
+    /// Insert a pipeline barrier for the HDR color image (default no-op).
+    fn hdr_barrier(&mut self) {}
+
     // ── Secondary command buffer support ──
 
     /// Execute a chain of pre-recorded secondary command buffers.

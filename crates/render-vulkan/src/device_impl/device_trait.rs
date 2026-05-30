@@ -51,7 +51,8 @@ impl render_core::Device for VulkanDevice {
         let size = desc.size_bytes.max(1);
         let usage = vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::VERTEX_BUFFER
-            | vk::BufferUsageFlags::INDEX_BUFFER;
+            | vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::UNIFORM_BUFFER;
         let bi = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
@@ -353,12 +354,19 @@ impl render_core::Device for VulkanDevice {
         let mut owned_set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
 
         if desc.bind_group_layouts.is_empty() {
-            // Fallback: use existing per-frame + shadow layouts
+            // Fallback: use existing per-frame + shadow + material layouts
             if let Some(dsl) = self.desc_set_layout_0 {
                 set_layouts.push(dsl);
             }
             if let Some(sdl) = self.shadow_desc_layout {
                 set_layouts.push(sdl);
+            }
+            // Material descriptor set layout at set=2
+            if let Some(mdl) = self.material_desc_set_layout {
+                while set_layouts.len() <= 2 {
+                    set_layouts.push(vk::DescriptorSetLayout::null());
+                }
+                set_layouts[2] = mdl;
             }
         } else {
             for bg in &desc.bind_group_layouts {
@@ -689,6 +697,7 @@ impl render_core::Device for VulkanDevice {
             device: self.logical_device.device.clone(),
             cmd: f.command_buffer,
             shadow_map: self.shadow_map.unwrap_or(vk::Image::null()),
+            hdr_image: self.hdr_color_image.unwrap_or(vk::Image::null()),
             // Snapshot slab entries into owned Vec caches — no raw pointers.
             pipeline_cache: self
                 .pipelines

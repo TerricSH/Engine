@@ -17,6 +17,8 @@ pub(crate) struct VkCmdEncoder {
     pub(crate) cmd: vk::CommandBuffer,
     /// Shadow map image for pipeline barrier (null = no shadow map).
     pub(crate) shadow_map: vk::Image,
+    /// HDR color image for pipeline barrier (null = no HDR).
+    pub(crate) hdr_image: vk::Image,
     /// Snapshot of slab entries taken at encoder creation.
     /// Each slot: `Some((generation, pipeline))` if occupied.
     pub(crate) pipeline_cache: Vec<Option<(u32, vk::Pipeline)>>,
@@ -227,6 +229,40 @@ impl CmdEncoderTrait for VkCmdEncoder {
     fn end_render_pass(&mut self) {
         unsafe {
             self.device.cmd_end_render_pass(self.cmd);
+        }
+    }
+
+    fn hdr_barrier(&mut self) {
+        if self.hdr_image == vk::Image::null() {
+            return;
+        }
+        // Transition HDR color image from COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
+        // so the tone-mapping pass can sample it as a texture.
+        let barrier = vk::ImageMemoryBarrier::default()
+            .image(self.hdr_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        // SAFETY: command buffer is in recording state; barrier references
+        // a valid HDR color image handle that outlives this encoder.
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
         }
     }
 

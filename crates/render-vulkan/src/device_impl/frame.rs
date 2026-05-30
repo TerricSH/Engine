@@ -42,8 +42,12 @@ impl VulkanDevice {
                     self.create_depth_texture()?;
                     // Create descriptor set infrastructure
                     self.create_descriptor_infra()?;
+                    // Create material descriptor infrastructure (set=2)
+                    self.create_material_descriptor_infra()?;
                     // Create shadow mapping resources
                     self.ensure_shadow()?;
+                    // Create HDR offscreen + tone-mapping resources
+                    self.ensure_hdr_resources()?;
                 }
                 Err(VulkanError::SurfaceMinimized) => {
                     self.minimized = true;

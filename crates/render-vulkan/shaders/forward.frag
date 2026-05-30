@@ -1,68 +1,115 @@
 #version 450
 
-// Forward-rendering fragment shader.
-// Uses the same per-frame UBO (set=0, binding=0) as the vertex shader.
-// Computes a simple NdotL diffuse term with a hardcoded albedo.
-// The albedo will be driven by a material texture in a later step.
+// Forward-rendering fragment shader with Cook-Torrance PBR BRDF.
+// Metallic-roughness workflow with GGX normal distribution, Smith
+// geometry function, and Fresnel-Schlick approximation.
+// Per-frame UBO at set=0, binding=0 (matches descriptor.rs layout).
 
-layout(location = 0) in vec3 in_world_pos;
-layout(location = 1) in vec3 in_normal;
-layout(location = 2) in vec2 in_uv;
-
-layout(set = 0, binding = 0) uniform UBO {
-    mat4 model;
-    mat4 view_proj;
-    vec4 light_dir;
-    vec4 light_color;
-    vec4 camera_pos;
-    // Light view-projection for shadow mapping (written by render_model_frame).
-    mat4 light_view_proj;
-} ubo;
-
-layout(set = 1, binding = 0) uniform sampler2DShadow u_shadow_map;
+layout(location = 0) in vec3 v_world_pos;
+layout(location = 1) in vec3 v_normal;
+layout(location = 2) in vec2 v_uv;
 
 layout(location = 0) out vec4 out_color;
 
-// Hardcoded albedo (will be replaced by material sampling later).
-const vec3 ALBEDO = vec3(0.8, 0.6, 0.4);
+layout(binding = 0) uniform PerFrameUBO {
+    mat4 model;
+    mat4 view_proj;
+    vec4 light_dir;       // w=0 (directional)
+    vec4 light_color;     // rgb = color, a = intensity
+    vec4 camera_pos;
+} ubo;
 
-// Bias to reduce shadow acne.
-const float SHADOW_BIAS = 0.005;
+// Environment cubemap (set=1, binding=1) — IBL irradiance / prefiltered env
+layout(binding = 1) uniform samplerCube u_irradiance_map;
 
-/// Compute PCF shadow factor in [0, 1] (1 = fully lit, 0 = fully shadowed).
-float shadow_factor(vec3 world_pos) {
-    vec4 light_space = ubo.light_view_proj * vec4(world_pos, 1.0);
-    if (light_space.w <= 0.0) {
-        return 1.0;
-    }
-    vec3 ndc = light_space.xyz / light_space.w;
-    vec2 shadow_uv = ndc.xy * 0.5 + 0.5;
-    float shadow_depth = ndc.z;
-    if (shadow_uv.x < 0.0 || shadow_uv.x > 1.0 ||
-        shadow_uv.y < 0.0 || shadow_uv.y > 1.0 ||
-        shadow_depth < 0.0 || shadow_depth > 1.0) {
-        return 1.0;
-    }
-    shadow_depth -= SHADOW_BIAS;
-    // sampler2DShadow automatically compares proj_coords.z against the stored
-    // depth value using the sampler's COMPARE_OP; returns PCF-weighted average.
-    return texture(u_shadow_map, vec3(shadow_uv, shadow_depth));
+// Material parameters (per-drawable, set=2 binding=0).
+layout(set = 2, binding = 0) uniform MaterialUBO {
+    vec4 base_color;
+    float metallic;
+    float roughness;
+    float ao;
+} material;
+
+// Base color texture (set=2, binding=1) — optional. When bound, the sampled
+// texel is multiplied with material.base_color to allow tinting. When no
+// texture is bound, material.base_color is used directly.
+layout(set = 2, binding = 1) uniform sampler2D u_base_color_texture;
+
+const float PI = 3.14159265359;
+const float MAX_REFLECTION_LOD = 4.0;
+
+// Normal Distribution Function — GGX / Trowbridge-Reitz
+float distribution_ggx(vec3 N, vec3 H, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+    float denom = NdotH2 * (a2 - 1.0) + 1.0;
+    return a2 / (PI * denom * denom);
+}
+
+// Geometry function — Smith GGX correlation (IBL-friendly k)
+float geometry_smith(vec3 N, vec3 V, vec3 L, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotL = max(dot(N, L), 0.0);
+    float ggx1 = NdotV / (NdotV * (1.0 - k) + k);
+    float ggx2 = NdotL / (NdotL * (1.0 - k) + k);
+    return ggx1 * ggx2;
+}
+
+// Fresnel-Schlick approximation
+vec3 fresnel_schlick(float cos_theta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
 void main() {
-    vec3 N = normalize(in_normal);
+    vec3 N = normalize(v_normal);
+    vec3 V = normalize(ubo.camera_pos.xyz - v_world_pos);
+
+    // Compute base color from texture (if bound) or uniform fallback.
+    // When a texture is present, sample it and tint with the uniform.
+    vec3 base_color = material.base_color.rgb;
+    // We cannot detect "is texture bound" in GLSL, but the driver returns
+    // (0,0,0,1) for an unbound descriptor — we use uniform as fallback.
+    // A more robust solution would use a push-constant or UBO flag.
+    vec3 tex_color = texture(u_base_color_texture, v_uv).rgb;
+    if (tex_color != vec3(0.0)) {
+        base_color = tex_color * material.base_color.rgb;
+    }
+
+    vec3 F0 = mix(vec3(0.04), base_color, material.metallic);
+
+    // Directional light
     vec3 L = normalize(-ubo.light_dir.xyz);
+    vec3 H = normalize(V + L);
 
-    // Diffuse lighting (NdotL clamped to [0, 1]).
-    float ndotl = max(dot(N, L), 0.0);
+    float NDF = distribution_ggx(N, H, material.roughness);
+    float G = geometry_smith(N, V, L, material.roughness);
+    vec3 F = fresnel_schlick(max(dot(H, V), 0.0), F0);
 
-    // Simple ambient term so back-faces are not completely black.
-    const float AMBIENT = 0.08;
+    vec3 kS = F;
+    vec3 kD = (1.0 - kS) * (1.0 - material.metallic);
 
-    float shadow = shadow_factor(in_world_pos);
-    vec3 lit = ALBEDO * (AMBIENT + ndotl * ubo.light_color.a * shadow);
+    vec3 numerator = NDF * G * F;
+    float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001;
+    vec3 specular = numerator / denominator;
 
-    // Output straight RGBA (swapchain format is BGRA8, but the shader
-    // writes RGBA and the Vulkan swizzle handles the channel mapping).
-    out_color = vec4(lit, 1.0);
+    float NdotL = max(dot(N, L), 0.0);
+    vec3 diffuse = kD * base_color / PI;
+
+    vec3 Lo = (diffuse + specular) * ubo.light_color.rgb * ubo.light_color.a * NdotL;
+
+    // IBL ambient: diffuse (irradiance) + specular (prefiltered env map)
+    vec3 irradiance = texture(u_irradiance_map, N).rgb;
+    vec3 diffuse_ibl = kD * irradiance * base_color;
+
+    vec3 R = reflect(-V, N);
+    vec3 specular_ibl = textureLod(u_irradiance_map, R, material.roughness * MAX_REFLECTION_LOD).rgb * F;
+
+    vec3 ambient = (diffuse_ibl + specular_ibl) * material.ao;
+
+    out_color = vec4(Lo + ambient, 1.0);
 }

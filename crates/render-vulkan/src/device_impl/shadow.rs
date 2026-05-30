@@ -249,15 +249,26 @@ impl VulkanDevice {
         }
         .map_err(|r| VulkanError::vk("cfb_shadow", r))?;
 
-        // ---- 8. Descriptor set layout (set=1, binding 0 = combined image sampler) ----
-        let ds_bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        // ---- 8. Descriptor set layout (set=1) ----
+        // binding=0: COMBINED_IMAGE_SAMPLER, VERTEX+FRAGMENT (shadow map)
+        // binding=1: COMBINED_IMAGE_SAMPLER, FRAGMENT (env cubemap)
+        let ds_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                ),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
         let ds_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&ds_bindings);
         // SAFETY: `d` is a valid AshDevice; `ds_layout_info` describes a valid
-        // layout with one combined image sampler binding; `None` means no custom
+        // layout with two combined image sampler bindings; `None` means no custom
         // allocator.
         let ds_layout = unsafe { d.create_descriptor_set_layout(&ds_layout_info, None) }
             .map_err(|r| VulkanError::vk("create_shadow_ds_layout", r))?;
@@ -265,7 +276,7 @@ impl VulkanDevice {
         // ---- 9. Descriptor pool + set ----
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: 1,
+            descriptor_count: 2, // binding 0 (shadow) + binding 1 (env cubemap)
         }];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
@@ -285,8 +296,8 @@ impl VulkanDevice {
             .map_err(|r| VulkanError::vk("alloc_shadow_ds", r))?;
         let desc_set = desc_sets[0];
 
-        // Write descriptor: combine shadow map view + sampler
-        let image_info = [vk::DescriptorImageInfo::default()
+        // Write descriptor binding=0: shadow map (depth image + sampler)
+        let shadow_image_info = [vk::DescriptorImageInfo::default()
             .sampler(sampler)
             .image_view(image_view)
             .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
@@ -294,7 +305,7 @@ impl VulkanDevice {
             .dst_set(desc_set)
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_info)];
+            .image_info(&shadow_image_info)];
         // SAFETY: `d` is a valid AshDevice; write descriptor references valid
         // descriptor set, sampler, and image view; no zero handles.
         unsafe {

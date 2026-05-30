@@ -63,6 +63,9 @@ impl VulkanDevice {
                 d.destroy_render_pass(rp, None);
             }
         }
+        // Destroy HDR + tone-mapping resources on resize so they get
+        // re-created at the new swapchain extent.
+        self.destroy_hdr_resources();
         self.swapchain = None;
     }
 
@@ -222,13 +225,16 @@ impl VulkanDevice {
         // SAFETY: `d` is a valid AshDevice; `frag` contains valid SPIR-V code.
         let fm = unsafe { mk_sm(d, frag)? };
 
-        // --- Pipeline layout: set=0 (UBO) + set=1 (shadow map) + no push constants ---
+        // --- Pipeline layout: set=0 (UBO) + set=1 (shadow) + set=2 (material) ---
         let mut set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
         if let Some(dsl) = self.desc_set_layout_0 {
             set_layouts.push(dsl);
         }
         if let Some(sdl) = self.shadow_desc_layout {
             set_layouts.push(sdl);
+        }
+        if let Some(mdl) = self.material_desc_set_layout {
+            set_layouts.push(mdl);
         }
         let pli = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
         // SAFETY: `d` is a valid AshDevice; `pli` describes a valid pipeline
