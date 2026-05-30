@@ -2,6 +2,7 @@ use glam::{Mat4, Quat, Vec3};
 
 use crate::assets::{AnimationClip, JointTransform, Keyframe, Skeleton};
 use crate::components::AnimationPlayer;
+use crate::state_machine::AnimStateMachineInstance;
 
 // ---------------------------------------------------------------------------
 // AnimationEvaluator
@@ -147,6 +148,99 @@ impl Lerp for [f32; 4] {
         let qb = Quat::from_array(b).normalize();
         qa.slerp(qb, t).to_array()
     }
+}
+
+// ---------------------------------------------------------------------------
+// update_animation_sm — state-machine-driven evaluation
+// ---------------------------------------------------------------------------
+
+/// Advance an [`AnimStateMachineInstance`] by `dt` seconds and produce a bone
+/// palette (global joint matrices) for GPU skinning.
+///
+/// `clips` is a slice of `(asset_id, AnimationClip)` pairs used to resolve the
+/// clip references inside each state of the state machine.
+///
+/// Returns the bone palette — one 4×4 matrix per skeleton joint.
+/// The palette is empty if the player is not playing or the clip cannot be
+/// resolved.
+pub fn update_animation_sm(
+    player: &AnimationPlayer,
+    sm: &mut AnimStateMachineInstance,
+    clips: &[(&str, AnimationClip)],
+    skel: &Skeleton,
+    dt: f32,
+) -> Vec<[[f32; 4]; 4]> {
+    if !player.playing || sm.state_machine.states.is_empty() {
+        return Vec::new();
+    }
+
+    // Advance the state machine and get the active state + blend weight.
+    let (_state_name, blend_weight) = sm.update(dt);
+
+    // Resolve the current state's animation clip.
+    let state = match sm.state_machine.find_state(&sm.current_state) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let clip = match clips.iter().find(|(id, _)| *id == state.clip_asset) {
+        Some((_, c)) => c,
+        None => return Vec::new(),
+    };
+
+    // Compute the effective clip time (handle looping).
+    let clip_time = if state.looping && clip.duration() > 0.0 {
+        sm.current_time % clip.duration()
+    } else {
+        sm.current_time.min(clip.duration())
+    };
+
+    // Evaluate the current clip.
+    let current_pose = AnimationEvaluator::evaluate(clip, clip_time, skel);
+
+    let final_pose = if sm.transitioning && blend_weight < 1.0 {
+        // Resolve the from-state clip for crossfade blending.
+        let from_state = match sm.state_machine.find_state(&sm.transition_from) {
+            Some(s) => s,
+            None => return AnimationEvaluator::solve_hierarchy(&current_pose, skel),
+        };
+        let from_clip = match clips.iter().find(|(id, _)| *id == from_state.clip_asset) {
+            Some((_, c)) => c,
+            None => return AnimationEvaluator::solve_hierarchy(&current_pose, skel),
+        };
+        let from_pose = AnimationEvaluator::evaluate(from_clip, sm.current_time, skel);
+
+        // Per-bone crossfade blend.
+        let count = current_pose.len().min(from_pose.len());
+        let mut blended: Vec<JointTransform> = Vec::with_capacity(count);
+        for i in 0..count {
+            blended.push(JointTransform {
+                translation: AnimationEvaluator::lerp_translation(
+                    &from_pose[i].translation,
+                    &current_pose[i].translation,
+                    blend_weight,
+                ),
+                rotation: AnimationEvaluator::lerp_rotation(
+                    &from_pose[i].rotation,
+                    &current_pose[i].rotation,
+                    blend_weight,
+                ),
+                scale: AnimationEvaluator::lerp_scale(
+                    &from_pose[i].scale,
+                    &current_pose[i].scale,
+                    blend_weight,
+                ),
+            });
+        }
+        // Append any extra bones from the current pose (defensive).
+        for i in count..current_pose.len() {
+            blended.push(current_pose[i].clone());
+        }
+        blended
+    } else {
+        current_pose
+    };
+
+    AnimationEvaluator::solve_hierarchy(&final_pose, skel)
 }
 
 // ---------------------------------------------------------------------------

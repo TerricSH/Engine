@@ -485,6 +485,8 @@ fn animation_player_roundtrip() {
         speed: 1.5,
         current_time: 2.0,
         layer: 1,
+        state_machine: None,
+        layers: vec![AnimLayer::new("base")],
     };
     let bytes = bincode::serialize(&p).unwrap();
     let restored: AnimationPlayer = bincode::deserialize(&bytes).unwrap();
