@@ -1,0 +1,25 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src_image;
+layout(set = 0, binding = 1, rgba16f) uniform image2D dst_image;
+
+layout(push_constant) uniform PushConstants {
+    vec4 params;
+} pc;
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dst_size = imageSize(dst_image);
+    if (dst.x >= dst_size.x || dst.y >= dst_size.y) {
+        return;
+    }
+
+    float intensity = pc.params.z;
+    vec2 uv = (vec2(dst) + vec2(0.5)) / vec2(dst_size);
+    vec3 bloom = texture(src_image, uv).rgb * intensity;
+    vec4 base = imageLoad(dst_image, dst);
+
+    imageStore(dst_image, dst, vec4(base.rgb + bloom, base.a));
+}
