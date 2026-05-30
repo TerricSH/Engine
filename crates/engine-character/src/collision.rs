@@ -49,12 +49,16 @@ pub fn ground_check(
 
 // ── Collision resolution ─────────────────────────────────────────────────────
 
-/// Resolve collisions using per-axis ray-casts.
+/// Resolve collisions using capsule-shaped sweep queries.
 ///
-/// Moves the character along each axis independently, casting a ray in the
-/// movement direction. If a collision is detected before the full distance,
-/// the character stops at the collision point and the velocity component
-/// for that axis is zeroed.
+/// Casts multiple rays at the capsule's surface levels — base, step‑height
+/// and centre — along each movement axis to approximate a capsule sweep.
+/// The minimum clear distance across all rays determines how far the
+/// character can travel before hitting an obstacle.
+///
+/// When horizontal movement is blocked at the capsule base but clear at the
+/// configured [`step_height`](CharacterController::step_height), the character
+/// is lifted onto the obstacle (step‑up behaviour).
 ///
 /// Horizontal axes (X, Z) are resolved first so the character slides along
 /// walls. The vertical axis (Y) is resolved last so ceiling/floor hits
@@ -69,8 +73,10 @@ pub fn resolve_collision(
     let mut final_vel = velocity;
 
     // Offset used to push the ray origin ahead of the capsule surface to
-    // avoid self-intersection.
-    let offset = controller.radius * 0.5;
+    // avoid self-intersection.  Full radius because we cast from the
+    // capsule rim.
+    let offset = controller.radius;
+    let bottom_y = position.y - controller.height * 0.5;
 
     // Resolve horizontal first (X, Z) then vertical (Y).
     for &axis in &[0usize, 2, 1] {
@@ -82,21 +88,82 @@ pub fn resolve_collision(
         let sign = displacement.signum();
         let dist = displacement.abs();
 
-        let mut ray_dir = Vec3::ZERO;
-        ray_dir[axis] = sign;
+        if axis == 1 {
+            // ── Vertical: single ray at centre ───────────────────────────
+            let mut ray_dir = Vec3::ZERO;
+            ray_dir[1] = sign;
+            let ray_origin = final_pos + ray_dir * offset;
+            if let Some(hit) = physics.cast_ray(ray_origin, ray_dir, dist + offset) {
+                let available = (hit.distance - offset).max(0.0);
+                final_pos.y += sign * available;
+                if available < dist {
+                    final_vel.y = 0.0;
+                }
+            } else {
+                final_pos.y += displacement;
+            }
+            continue;
+        }
 
-        let ray_origin = final_pos + ray_dir * offset;
+        // ── Horizontal: multi‑ray capsule approximation ──────────────────
+        // Cast rays at three vertical levels of the capsule volume in the
+        // movement direction and take the minimum clear distance.
+        let base_y = bottom_y + offset * 0.5 + EPSILON;
+        let step_y = bottom_y + controller.step_height;
+        let mid_y = final_pos.y;
 
-        if let Some(hit) = physics.cast_ray(ray_origin, ray_dir, dist + offset) {
-            let available = (hit.distance - offset).max(0.0);
-            final_pos[axis] += sign * available;
+        // Small helper: cast a ray in the horizontal axis direction.
+        let cast_at_level = |pos: Vec3, y: f32| -> Option<f32> {
+            let mut origin = pos;
+            origin.y = y;
+            origin[axis] += offset * sign;
+            let mut dir = Vec3::ZERO;
+            dir[axis] = sign;
+            physics
+                .cast_ray(origin, dir, dist + offset)
+                .map(|hit| (hit.distance - offset).max(0.0))
+        };
 
-            // Zero velocity in this axis when fully blocked.
-            if available < dist {
+        let base_avail = cast_at_level(final_pos, base_y).unwrap_or(dist);
+        let step_avail = cast_at_level(final_pos, step_y).unwrap_or(dist);
+        let mid_avail = cast_at_level(final_pos, mid_y).unwrap_or(dist);
+
+        let available = base_avail.min(step_avail).min(mid_avail);
+
+        // ── Step‑up logic ────────────────────────────────────────────────
+        // When the base is blocked but the path is clear when lifted to
+        // step_height, perform a step‑up.
+        let stepped_up = if available < dist
+            && controller.step_height > 0.0
+            && base_avail < dist * 0.5
+        {
+            // Re‑evaluate from the lifted position.
+            let lifted_y = final_pos.y + controller.step_height;
+            let lifted_base_avail =
+                cast_at_level(final_pos, bottom_y + controller.step_height).unwrap_or(dist);
+            let lifted_mid_avail = cast_at_level(final_pos, lifted_y).unwrap_or(dist);
+
+            if lifted_base_avail >= dist && lifted_mid_avail >= dist {
+                // Clear path when lifted — execute step‑up.
+                final_pos.y += controller.step_height;
+                final_pos[axis] += displacement;
+                final_vel.y = 0.0;
                 final_vel[axis] = 0.0;
+                true
+            } else {
+                false
             }
         } else {
-            final_pos[axis] += displacement;
+            false
+        };
+
+        // ── Apply movement ───────────────────────────────────────────────
+        if !stepped_up {
+            let travel = available.min(dist);
+            final_pos[axis] += sign * travel;
+            if travel < dist {
+                final_vel[axis] = 0.0;
+            }
         }
     }
 

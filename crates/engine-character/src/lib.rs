@@ -1,4 +1,7 @@
-#![forbid(unsafe_code)]
+// SAFETY: FFI bindings in the `ffi` module are excepted from this lint
+// because they inherently require unsafe pointer dereferencing.
+// All other modules must remain unsafe-free.
+#![deny(unsafe_code)]
 
 //! Kinematic character controller for the game engine.
 //!
@@ -29,13 +32,47 @@
 //! | `movement`    | [`process_movement`], [`CharacterMovement`], [`CharacterOutput`] |
 //! | `collision`   | [`ground_check`], [`resolve_collision`]             |
 
+mod animation_params;
 mod collision;
 mod controller;
+mod ffi;
 mod movement;
 
+pub use animation_params::{anim_params, AnimMoveState, AnimParams};
 pub use collision::{ground_check, resolve_collision};
 pub use controller::{CharacterController, CharacterError, CharacterState};
 pub use movement::{process_movement, CharacterMovement, CharacterOutput};
+
+// ── Gate 9 extension registration ──────────────────────────────────────────
+
+/// Register character controller extensions with Gate 9 extension surfaces.
+///
+/// This function should be called once during engine initialisation to
+/// register the `CharacterController` ECS component type.
+pub fn register_character_extensions(
+    component_registry: &mut engine_scene::registry::ComponentRegistry,
+    _debug_draw_registry: Option<&mut engine_renderer::DebugDrawRegistry>,
+    _editor_registry: Option<&mut ()>,
+    _script_registry: Option<&mut ()>,
+) {
+    use engine_scene::registry::{ComponentExtension, ComponentMeta};
+    use engine_scene::{Component, ComponentStorageDyn, SparseSet};
+
+    let _ = component_registry.register(ComponentExtension {
+        meta: ComponentMeta {
+            type_id: CharacterController::TYPE_ID,
+            display_name: "Character Controller",
+            schema_version: (0, 1, 0),
+            has_editor: true,
+            has_script_binding: true,
+        },
+        storage_factory: || -> Box<dyn ComponentStorageDyn> {
+            Box::new(SparseSet::<CharacterController>::new())
+        },
+        serialize: None,
+        deserialize: None,
+    });
+}
 
 #[cfg(test)]
 mod tests {
