@@ -97,11 +97,11 @@ impl ReloadCoordinator {
     /// # Parameters
     ///
     /// * `watch_dir`  – directory to watch for file changes (typically
-    ///                  `assets/source`).
+    ///   `assets/source`).
     /// * `source_dir` – directory containing source manifests and assets
-    ///                  (same as `watch_dir` in typical setups).
+    ///   (same as `watch_dir` in typical setups).
     /// * `cooked_dir` – directory where cooked artifacts are written
-    ///                  (typically `assets/cooked`).
+    ///   (typically `assets/cooked`).
     ///
     /// # Errors
     ///
@@ -225,10 +225,7 @@ impl ReloadCoordinator {
 
         // 6/7. Process results.
         for result in &results {
-            let matching_id = all_ids
-                .iter()
-                .find(|id| id.id == result.asset_id)
-                .cloned();
+            let matching_id = all_ids.iter().find(|id| id.id == result.asset_id).cloned();
 
             let Some(asset_id) = matching_id else {
                 continue;
@@ -353,23 +350,17 @@ impl ReloadCoordinator {
         };
 
         let cook_result = match asset_type {
-            crate::cook::AssetType::Mesh => {
-                crate::cook::cook_mesh(&source_path, &output_path)
-            }
+            crate::cook::AssetType::Mesh => crate::cook::cook_mesh(&source_path, &output_path),
             crate::cook::AssetType::Texture => {
                 crate::cook::cook_texture(&source_path, &output_path)
             }
-            crate::cook::AssetType::Shader => {
-                crate::cook::cook_shader(
-                    &source_path,
-                    &output_path,
-                    0,
-                    &recook::determine_shader_stage(&source_path),
-                )
-            }
-            crate::cook::AssetType::Scene => {
-                crate::cook::cook_scene(&source_path, &output_path, 0)
-            }
+            crate::cook::AssetType::Shader => crate::cook::cook_shader(
+                &source_path,
+                &output_path,
+                0,
+                &recook::determine_shader_stage(&source_path),
+            ),
+            crate::cook::AssetType::Scene => crate::cook::cook_scene(&source_path, &output_path, 0),
             _ => {
                 // Fallback: generic cook
                 let payload = match std::fs::read(&source_path) {
@@ -385,7 +376,6 @@ impl ReloadCoordinator {
                     &payload,
                     Default::default(),
                 )
-                .map_err(|e| e)
             }
         };
 

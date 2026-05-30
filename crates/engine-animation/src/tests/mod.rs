@@ -5,6 +5,7 @@
 use engine_renderer::{DebugDrawProvider, RenderExtensionProducer};
 use engine_scene::Component;
 use glam::{Mat4, Quat, Vec3};
+use std::f32::consts::FRAC_1_SQRT_2;
 
 use super::*;
 
@@ -225,13 +226,23 @@ fn lerp_rotation_ninety_degrees() {
     // Rotate 90° around X: q = (sin(45°), 0, 0, cos(45°)) for 90° total
     // Halfway should be 45° around X
     let a = [0.0, 0.0, 0.0, 1.0]; // identity
-    let b = [0.7071068, 0.0, 0.0, 0.7071068]; // 90° around X
+    let b = [FRAC_1_SQRT_2, 0.0, 0.0, FRAC_1_SQRT_2]; // 90° around X
     let mid = AnimationEvaluator::lerp_rotation(&a, &b, 0.5);
     // At 45° around X: (sin(22.5°), 0, 0, cos(22.5°))
     let expected_w = (22.5f32).to_radians().cos();
     let expected_x = (22.5f32).to_radians().sin();
-    assert!((mid[0] - expected_x).abs() < 1e-5, "x={} expected={}", mid[0], expected_x);
-    assert!((mid[3] - expected_w).abs() < 1e-5, "w={} expected={}", mid[3], expected_w);
+    assert!(
+        (mid[0] - expected_x).abs() < 1e-5,
+        "x={} expected={}",
+        mid[0],
+        expected_x
+    );
+    assert!(
+        (mid[3] - expected_w).abs() < 1e-5,
+        "w={} expected={}",
+        mid[3],
+        expected_w
+    );
 }
 
 #[test]

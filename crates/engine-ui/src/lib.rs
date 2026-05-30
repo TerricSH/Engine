@@ -9,20 +9,20 @@
 // Module declarations
 // ---------------------------------------------------------------------------
 
-mod types;
-mod canvas;
 mod batch;
+mod canvas;
 mod color;
 mod layout;
+mod types;
 
 // ---------------------------------------------------------------------------
 // Re-exports
 // ---------------------------------------------------------------------------
 
-pub use types::{ElementId, UiElement, UiElementKind, UiError, UiRect};
 pub use canvas::Canvas;
 pub use color::Color;
 pub use layout::*;
+pub use types::{ElementId, UiElement, UiElementKind, UiError, UiRect};
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -102,10 +102,7 @@ impl AnimationEvaluator {
     /// walking the skeleton hierarchy.
     ///
     /// Returns one 4×4 matrix per joint in skeleton order.
-    pub fn solve_hierarchy(
-        local: &[JointTransform],
-        skeleton: &Skeleton,
-    ) -> Vec<[[f32; 4]; 4]> {
+    pub fn solve_hierarchy(local: &[JointTransform], skeleton: &Skeleton) -> Vec<[[f32; 4]; 4]> {
         let count = skeleton.joint_count();
         let joints = skeleton.joints();
         // Use glam Mat4 for correct multiplication, then convert back.

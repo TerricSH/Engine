@@ -132,12 +132,7 @@ pub trait DebugDrawProvider: Send {
     ///
     /// `view_matrix` and `projection_matrix` are provided so that providers
     /// can cull or adjust debug visuals based on the camera state.
-    fn populate(
-        &self,
-        buffer: &mut DebugDrawBuffer,
-        view_matrix: &Mat4,
-        projection_matrix: &Mat4,
-    );
+    fn populate(&self, buffer: &mut DebugDrawBuffer, view_matrix: &Mat4, projection_matrix: &Mat4);
 }
 
 /// Registry for debug draw providers.
@@ -210,7 +205,11 @@ mod tests {
     #[test]
     fn line_convenience() {
         let mut buf = DebugDrawBuffer::new();
-        buf.line(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0), [1.0, 0.0, 0.0, 1.0]);
+        buf.line(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            [1.0, 0.0, 0.0, 1.0],
+        );
         assert_eq!(buf.lines.len(), 1);
         assert_eq!(buf.lines[0].start, Vec3::new(0.0, 0.0, 0.0));
         assert_eq!(buf.lines[0].end, Vec3::new(1.0, 1.0, 1.0));

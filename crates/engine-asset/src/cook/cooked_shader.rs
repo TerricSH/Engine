@@ -107,10 +107,7 @@ pub fn cook_shader_from_glsl(
     };
     let spirv_words = naga::back::spv::write_vec(&module, &module_info, &spv_options, None)
         .map_err(|e| CookError::Compile(format!("SPIR-V codegen failed: {e}")))?;
-    let spirv_bytes: Vec<u8> = spirv_words
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
+    let spirv_bytes: Vec<u8> = spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
     // 5. Extract reflection.
     let reflection = extract_reflection(&module, stage_str)?;
@@ -154,11 +151,13 @@ fn extract_reflection(
             let type_name = describe_type(&ty.inner, &module.types);
 
             // Determine descriptor count from array size.
-            let count = if let TypeInner::Array { base: _, size, .. } = &ty.inner {
-                match size {
-                    naga::ArraySize::Constant(len) => len.get(),
-                    _ => 1,
-                }
+            let count = if let TypeInner::Array {
+                base: _,
+                size: naga::ArraySize::Constant(len),
+                ..
+            } = &ty.inner
+            {
+                len.get()
             } else {
                 1
             };
@@ -176,8 +175,7 @@ fn extract_reflection(
             let ty = &module.types[var.ty];
             if let TypeInner::Struct { ref members, .. } = ty.inner {
                 for member in members {
-                    let member_end =
-                        member.offset as u32 + member_size(&member.ty, &module.types);
+                    let member_end = member.offset + member_size(&member.ty, &module.types);
                     if member_end > push_constant_size {
                         push_constant_size = member_end;
                     }
@@ -316,9 +314,7 @@ fn member_size(handle: &naga::Handle<naga::Type>, types: &naga::UniqueArena<naga
             };
             *width as u32 * cols
         }
-        TypeInner::Matrix {
-            columns, rows, ..
-        } => {
+        TypeInner::Matrix { columns, rows, .. } => {
             let width: u32 = 4; // f32 width
             width * *columns as u32 * *rows as u32
         }
@@ -328,7 +324,7 @@ fn member_size(handle: &naga::Handle<naga::Type>, types: &naga::UniqueArena<naga
                 naga::ArraySize::Constant(len) => len.get(),
                 _ => 1,
             };
-            let stride = *stride as u32;
+            let stride = *stride;
             if stride > elem_size {
                 stride * count
             } else {
@@ -338,7 +334,7 @@ fn member_size(handle: &naga::Handle<naga::Type>, types: &naga::UniqueArena<naga
         TypeInner::Struct { members, .. } => {
             let mut max_end = 0u32;
             for m in members {
-                let end = m.offset as u32 + member_size(&m.ty, types);
+                let end = m.offset + member_size(&m.ty, types);
                 if end > max_end {
                     max_end = end;
                 }
@@ -356,8 +352,7 @@ pub fn cook_shader(
     variant_key: u64,
     stage: &str,
 ) -> Result<CookResult, CookError> {
-    let source_code = std::fs::read_to_string(source)
-        .map_err(|e| CookError::Io(e))?;
+    let source_code = std::fs::read_to_string(source).map_err(CookError::Io)?;
 
     let cooked = cook_shader_from_glsl(source, &source_code, variant_key, stage, &[])?;
 

@@ -150,21 +150,19 @@ impl DependencyGraph {
         for (id, node) in &self.nodes {
             for dep in &node.deps {
                 if !self.nodes.contains_key(dep) {
-                    diags.push(
-                        {
-                            let mut d = Diagnostic::new(
-                                "COOK_MISSING_DEP",
-                                DiagnosticSeverity::Error,
-                                "cook",
-                                format!(
-                                    "asset {:?} depends on {:?} which is not registered",
-                                    id.id, dep.id
-                                ),
-                            );
-                            d.asset = Some(id.clone());
-                            d
-                        }
-                    );
+                    diags.push({
+                        let mut d = Diagnostic::new(
+                            "COOK_MISSING_DEP",
+                            DiagnosticSeverity::Error,
+                            "cook",
+                            format!(
+                                "asset {:?} depends on {:?} which is not registered",
+                                id.id, dep.id
+                            ),
+                        );
+                        d.asset = Some(id.clone());
+                        d
+                    });
                 }
             }
         }
@@ -173,18 +171,16 @@ impl DependencyGraph {
         let cycles = self.find_cycles();
         for cycle in cycles {
             let cycle_str: Vec<String> = cycle.iter().map(|a| a.id.clone()).collect();
-            diags.push(
-                {
-                    let mut d = Diagnostic::new(
-                        "COOK_CYCLE",
-                        DiagnosticSeverity::Error,
-                        "cook",
-                        format!("circular dependency detected: {}", cycle_str.join(" → ")),
-                    );
-                    d.asset = Some(cycle[0].clone());
-                    d
-                }
-            );
+            diags.push({
+                let mut d = Diagnostic::new(
+                    "COOK_CYCLE",
+                    DiagnosticSeverity::Error,
+                    "cook",
+                    format!("circular dependency detected: {}", cycle_str.join(" → ")),
+                );
+                d.asset = Some(cycle[0].clone());
+                d
+            });
         }
 
         // Check that all deps are cooked
@@ -193,38 +189,34 @@ impl DependencyGraph {
                 if let Some(dep_node) = self.nodes.get(dep) {
                     match &dep_node.state {
                         CookState::Uncooked | CookState::Cooking => {
-                            diags.push(
-                        {
-                            let mut d = Diagnostic::new(
-                                "COOK_DEP_NOT_READY",
-                                DiagnosticSeverity::Error,
-                                "cook",
-                                format!(
-                                    "dependency {:?} for {:?} is not yet cooked",
-                                    dep.id, id.id
-                                ),
-                            );
-                            d.asset = Some(id.clone());
-                            d
-                        }
-                            );
+                            diags.push({
+                                let mut d = Diagnostic::new(
+                                    "COOK_DEP_NOT_READY",
+                                    DiagnosticSeverity::Error,
+                                    "cook",
+                                    format!(
+                                        "dependency {:?} for {:?} is not yet cooked",
+                                        dep.id, id.id
+                                    ),
+                                );
+                                d.asset = Some(id.clone());
+                                d
+                            });
                         }
                         CookState::Failed(msg) => {
-                            diags.push(
-                        {
-                            let mut d = Diagnostic::new(
-                                "COOK_DEP_FAILED",
-                                DiagnosticSeverity::Error,
-                                "cook",
-                                format!(
-                                    "dependency {:?} for {:?} failed: {msg}",
-                                    dep.id, id.id
-                                ),
-                            );
-                            d.asset = Some(id.clone());
-                            d
-                        }
-                            );
+                            diags.push({
+                                let mut d = Diagnostic::new(
+                                    "COOK_DEP_FAILED",
+                                    DiagnosticSeverity::Error,
+                                    "cook",
+                                    format!(
+                                        "dependency {:?} for {:?} failed: {msg}",
+                                        dep.id, id.id
+                                    ),
+                                );
+                                d.asset = Some(id.clone());
+                                d
+                            });
                         }
                         CookState::Cooked(_) => {} // OK
                     }
@@ -344,7 +336,10 @@ mod tests {
         let mut g = DependencyGraph::new();
         g.register(id("mesh-cube"));
         g.mark_cooked(&id("mesh-cube"), hash(42));
-        assert_eq!(g.get_state(&id("mesh-cube")), Some(CookState::Cooked(hash(42))));
+        assert_eq!(
+            g.get_state(&id("mesh-cube")),
+            Some(CookState::Cooked(hash(42)))
+        );
     }
 
     #[test]

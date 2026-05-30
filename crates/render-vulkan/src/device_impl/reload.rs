@@ -240,7 +240,6 @@ impl VulkanDevice {
             d.destroy_command_pool(cp, None);
         }
         // Free staging allocation.
-        let mut staging_alloc = staging_alloc;
         allocator
             .lock()
             .map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?

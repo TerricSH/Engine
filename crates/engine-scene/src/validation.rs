@@ -2,7 +2,7 @@ use engine_renderer::LightKind;
 use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, Value};
 use std::collections::BTreeSet;
 
-use crate::scene::{ECS_SCENE_CONTRACT, EntityRecord, ComponentRecord, Scene};
+use crate::scene::{ComponentRecord, EntityRecord, Scene, ECS_SCENE_CONTRACT};
 
 pub fn validate_scene(scene: &Scene) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();

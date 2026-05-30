@@ -39,10 +39,7 @@ impl Installer {
 
         // Remove any existing staged directory.
         if staged_dest.exists() {
-            debug!(
-                "removing existing staged directory: {:?}",
-                staged_dest
-            );
+            debug!("removing existing staged directory: {:?}", staged_dest);
             std::fs::remove_dir_all(&staged_dest)?;
         }
 
@@ -87,10 +84,7 @@ impl Installer {
     ///
     /// On failure the system is left in a safe state (previous active
     /// is still in `previous/`).
-    pub fn activate(
-        package: &mut Package,
-        cache: &PackageCache,
-    ) -> Result<(), UpdateError> {
+    pub fn activate(package: &mut Package, cache: &PackageCache) -> Result<(), UpdateError> {
         let pkg_id = package.package_id().to_string();
         let staged_dir = package.staging_dir();
         let active_dir = package.active_dir();
@@ -251,7 +245,7 @@ mod tests {
         let manifest = sample_manifest();
         let staging_dir = tmp.path().join("download_temp");
         std::fs::create_dir_all(&staging_dir).unwrap();
-        std::fs::write(&staging_dir.join("data.bin"), b"test payload").unwrap();
+        std::fs::write(staging_dir.join("data.bin"), b"test payload").unwrap();
 
         let pkg = Installer::stage(&manifest, &staging_dir, &cache).unwrap();
         assert_eq!(pkg.state, PackageState::Staged);
@@ -267,7 +261,7 @@ mod tests {
         let manifest = sample_manifest();
         let staging_dir = tmp.path().join("download_temp2");
         std::fs::create_dir_all(&staging_dir).unwrap();
-        std::fs::write(&staging_dir.join("data.bin"), b"test").unwrap();
+        std::fs::write(staging_dir.join("data.bin"), b"test").unwrap();
 
         let pkg = Installer::stage(&manifest, &staging_dir, &cache).unwrap();
 
@@ -285,7 +279,7 @@ mod tests {
         let manifest = sample_manifest();
         let staging_dir = tmp.path().join("download_act");
         std::fs::create_dir_all(&staging_dir).unwrap();
-        std::fs::write(&staging_dir.join("data.bin"), b"activate me").unwrap();
+        std::fs::write(staging_dir.join("data.bin"), b"activate me").unwrap();
 
         let mut pkg = Installer::stage(&manifest, &staging_dir, &cache).unwrap();
         Installer::activate(&mut pkg, &cache).unwrap();
@@ -307,7 +301,7 @@ mod tests {
         let manifest = sample_manifest();
         let staging_dir = tmp.path().join("download_boot");
         std::fs::create_dir_all(&staging_dir).unwrap();
-        std::fs::write(&staging_dir.join("data.bin"), b"boot").unwrap();
+        std::fs::write(staging_dir.join("data.bin"), b"boot").unwrap();
 
         let mut pkg = Installer::stage(&manifest, &staging_dir, &cache).unwrap();
         Installer::activate(&mut pkg, &cache).unwrap();
@@ -339,7 +333,7 @@ mod tests {
         let m1 = sample_manifest();
         let s1 = tmp.path().join("dl_first");
         std::fs::create_dir_all(&s1).unwrap();
-        std::fs::write(&s1.join("data.bin"), b"first").unwrap();
+        std::fs::write(s1.join("data.bin"), b"first").unwrap();
         let mut pkg1 = Installer::stage(&m1, &s1, &cache).unwrap();
         Installer::activate(&mut pkg1, &cache).unwrap();
 
@@ -348,7 +342,7 @@ mod tests {
         m2.created_at = "2026-06-01T00:00:00Z".into();
         let s2 = tmp.path().join("dl_second");
         std::fs::create_dir_all(&s2).unwrap();
-        std::fs::write(&s2.join("data.bin"), b"second").unwrap();
+        std::fs::write(s2.join("data.bin"), b"second").unwrap();
         let mut pkg2 = Installer::stage(&m2, &s2, &cache).unwrap();
         Installer::activate(&mut pkg2, &cache).unwrap();
 
@@ -386,7 +380,7 @@ mod tests {
         let m1 = sample_manifest();
         let s1 = tmp.path().join("dl_rep1");
         std::fs::create_dir_all(&s1).unwrap();
-        std::fs::write(&s1.join("data.bin"), b"v1").unwrap();
+        std::fs::write(s1.join("data.bin"), b"v1").unwrap();
         let mut p1 = Installer::stage(&m1, &s1, &cache).unwrap();
         Installer::activate(&mut p1, &cache).unwrap();
         let id1 = p1.package_id().to_string();
@@ -396,7 +390,7 @@ mod tests {
         m2.created_at = "2026-07-01T00:00:00Z".into();
         let s2 = tmp.path().join("dl_rep2");
         std::fs::create_dir_all(&s2).unwrap();
-        std::fs::write(&s2.join("data.bin"), b"v2").unwrap();
+        std::fs::write(s2.join("data.bin"), b"v2").unwrap();
         let mut p2 = Installer::stage(&m2, &s2, &cache).unwrap();
         Installer::activate(&mut p2, &cache).unwrap();
 

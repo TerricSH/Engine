@@ -24,8 +24,12 @@ pub fn default_scene_path(scene: &Scene) -> String {
 pub fn save_scene(scene: &Scene, path: &Path) -> Result<(), EditorError> {
     // Ensure the parent directory exists.
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| EditorError::IoFailed(format!("failed to create directory {}: {e}", parent.display())))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            EditorError::IoFailed(format!(
+                "failed to create directory {}: {e}",
+                parent.display()
+            ))
+        })?;
     }
 
     let pretty = ron::ser::PrettyConfig::default();
@@ -41,14 +45,13 @@ pub fn save_scene(scene: &Scene, path: &Path) -> Result<(), EditorError> {
 
 /// Load a [`Scene`] from a RON file at `path`.
 pub fn load_scene(path: &Path) -> Result<Scene, EditorError> {
-    let data = fs::read_to_string(path)
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                EditorError::SceneNotFound
-            } else {
-                EditorError::IoFailed(format!("failed to read {}: {e}", path.display()))
-            }
-        })?;
+    let data = fs::read_to_string(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            EditorError::SceneNotFound
+        } else {
+            EditorError::IoFailed(format!("failed to read {}: {e}", path.display()))
+        }
+    })?;
 
     let scene: Scene = ron::from_str(&data)
         .map_err(|e| EditorError::IoFailed(format!("deserialization error: {e}")))?;

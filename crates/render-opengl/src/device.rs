@@ -15,9 +15,11 @@ fn convert_texture_format(format: TextureFormat) -> (i32, u32, u32) {
         TextureFormat::Rgba8Unorm => (glow::RGBA8 as i32, glow::RGBA, glow::UNSIGNED_BYTE),
         TextureFormat::Bgra8Unorm => (glow::RGBA8 as i32, glow::BGRA, glow::UNSIGNED_BYTE),
         TextureFormat::Rgba16Float => (glow::RGBA16F as i32, glow::RGBA, glow::HALF_FLOAT),
-        TextureFormat::Depth32Float => {
-            (glow::DEPTH_COMPONENT32F as i32, glow::DEPTH_COMPONENT, glow::FLOAT)
-        }
+        TextureFormat::Depth32Float => (
+            glow::DEPTH_COMPONENT32F as i32,
+            glow::DEPTH_COMPONENT,
+            glow::FLOAT,
+        ),
         _ => (glow::RGBA8 as i32, glow::RGBA, glow::UNSIGNED_BYTE),
     }
 }
@@ -399,9 +401,9 @@ impl Device for OpenGlDevice {
         &mut self,
         descriptor: &RenderPassDescriptor,
     ) -> Result<RenderPassHandle, RhiError> {
-        let (idx, gen) = self
-            .render_passes
-            .alloc(RenderPassSlot { _descriptor: descriptor.clone() });
+        let (idx, gen) = self.render_passes.alloc(RenderPassSlot {
+            _descriptor: descriptor.clone(),
+        });
         Ok(ResourceHandle::new(idx, gen))
     }
 
@@ -488,9 +490,9 @@ impl Device for OpenGlDevice {
         &mut self,
         descriptor: &PipelineLayoutDescriptor,
     ) -> Result<PipelineLayoutHandle, RhiError> {
-        let (idx, gen) = self
-            .pipeline_layouts
-            .alloc(PipelineLayoutSlot { _descriptor: descriptor.clone() });
+        let (idx, gen) = self.pipeline_layouts.alloc(PipelineLayoutSlot {
+            _descriptor: descriptor.clone(),
+        });
         Ok(ResourceHandle::new(idx, gen))
     }
 

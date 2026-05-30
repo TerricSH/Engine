@@ -279,7 +279,6 @@ impl LogicAsset {
             LogicCondition::Always | LogicCondition::Never => {}
         }
     }
-
 }
 
 // ── Cook entry point ─────────────────────────────────────────────────────
@@ -364,10 +363,7 @@ mod tests {
                     }],
                     properties: {
                         let mut m = BTreeMap::new();
-                        m.insert(
-                            "speed".into(),
-                            LogicValue::Float(2.5),
-                        );
+                        m.insert("speed".into(), LogicValue::Float(2.5));
                         m
                     },
                     children: vec![],
@@ -614,7 +610,10 @@ mod tests {
         // State machines are expected to support revisiting earlier states.
         asset.nodes[1].transitions[0].target_node = "closed".into();
         let errors = asset.validate();
-        assert!(errors.is_empty(), "expected FSM cycles to be allowed, got: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "expected FSM cycles to be allowed, got: {errors:?}"
+        );
     }
 
     #[test]
@@ -623,7 +622,10 @@ mod tests {
         let asset = sample_behavior_tree();
         // Both move_to_point and wait already link back to root — that's fine.
         let errors = asset.validate();
-        assert!(errors.is_empty(), "expected no errors for BT with back-edges, got: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "expected no errors for BT with back-edges, got: {errors:?}"
+        );
     }
 
     // ── Cook tests ─────────────────────────────────────────────────────
@@ -652,8 +654,7 @@ mod tests {
         let mut file_bytes = Vec::new();
         file.read_to_end(&mut file_bytes).unwrap();
 
-        let header: crate::cook::CookedAssetHeader =
-            bincode::deserialize(&file_bytes[..]).unwrap();
+        let header: crate::cook::CookedAssetHeader = bincode::deserialize(&file_bytes[..]).unwrap();
         assert!(header.is_valid());
         assert_eq!(header.asset_kind, AssetType::Logic.kind_code());
 
@@ -719,7 +720,7 @@ mod tests {
         let values = vec![
             LogicValue::Bool(true),
             LogicValue::Int(-42),
-            LogicValue::Float(3.14),
+            LogicValue::Float(std::f64::consts::PI),
             LogicValue::String("hello".into()),
             LogicValue::AssetRef(AssetId::new("some_asset")),
             LogicValue::EntityRef("player".into()),

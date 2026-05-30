@@ -1,7 +1,7 @@
 use crate::{
     BodyType, Collider, ColliderDebugInfo, ColliderShape, CollisionEvent, CollisionEventKind,
-    Component, Entity, PhysicsCommand, PhysicsEvents, PhysicsMaterial, PhysicsWorld,
-    RapierBackend, RigidBody, Transform,
+    Component, Entity, PhysicsCommand, PhysicsEvents, PhysicsMaterial, PhysicsWorld, RapierBackend,
+    RigidBody, Transform,
 };
 use engine_renderer::DebugDrawProvider;
 use engine_scene::World;
@@ -189,12 +189,9 @@ fn physics_world_gravity_moves_dynamic_body() {
     let rb = RigidBody::default(); // Dynamic
     world.backend.create_body(0, &rb, &transform);
     // Add a collider so the body has mass.
-    world.backend.create_collider(
-        0,
-        &Collider::default(),
-        0,
-        None,
-    );
+    world
+        .backend
+        .create_collider(0, &Collider::default(), 0, None);
     world.backend.sync_query_pipeline();
 
     let pos_before = world.backend.sync_body_transform(0).unwrap();
@@ -314,12 +311,9 @@ fn raycast_miss_beyond_max_distance() {
         ..RigidBody::default()
     };
     world.backend.create_body(0, &rb, &transform);
-    world.backend.create_collider(
-        0,
-        &Collider::default(),
-        0,
-        None,
-    );
+    world
+        .backend
+        .create_collider(0, &Collider::default(), 0, None);
     world.backend.sync_query_pipeline();
 
     // Ray starts far away but max_distance is very short.
@@ -345,12 +339,9 @@ fn query_proximity_finds_overlapping_entities() {
         ..RigidBody::default()
     };
     world.backend.create_body(0, &rb, &transform);
-    world.backend.create_collider(
-        0,
-        &Collider::default(),
-        0,
-        None,
-    );
+    world
+        .backend
+        .create_collider(0, &Collider::default(), 0, None);
     world.backend.sync_query_pipeline();
 
     // Query with a shape that overlaps the entity at origin.
@@ -379,20 +370,17 @@ fn query_proximity_no_overlap() {
         ..RigidBody::default()
     };
     world.backend.create_body(0, &rb, &transform);
-    world.backend.create_collider(
-        0,
-        &Collider::default(),
-        0,
-        None,
-    );
+    world
+        .backend
+        .create_collider(0, &Collider::default(), 0, None);
     world.backend.sync_query_pipeline();
 
-    let hits = world.query_proximity(
-        &ColliderShape::Ball { radius: 1.0 },
-        glam::Vec3::ZERO,
-    );
+    let hits = world.query_proximity(&ColliderShape::Ball { radius: 1.0 }, glam::Vec3::ZERO);
 
-    assert!(hits.is_empty(), "should not find overlapping entity at origin");
+    assert!(
+        hits.is_empty(),
+        "should not find overlapping entity at origin"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -431,7 +419,10 @@ fn collision_detected_by_proximity() {
         &ColliderShape::Ball { radius: 0.1 },
         glam::Vec3::new(0.0, 0.0, 0.0),
     );
-    assert!(!hits.is_empty(), "proximity query should find the floor collider");
+    assert!(
+        !hits.is_empty(),
+        "proximity query should find the floor collider"
+    );
 }
 
 #[test]
@@ -445,12 +436,9 @@ fn collision_events_triggered() {
     };
     let box_body = RigidBody::default();
     world.backend.create_body(0, &box_body, &box_transform);
-    world.backend.create_collider(
-        0,
-        &Collider::default(),
-        0,
-        None,
-    );
+    world
+        .backend
+        .create_collider(0, &Collider::default(), 0, None);
 
     // Create a static body also at origin (overlapping).
     let static_transform = Transform {
@@ -461,13 +449,12 @@ fn collision_events_triggered() {
         body_type: BodyType::Static,
         ..RigidBody::default()
     };
-    world.backend.create_body(1, &static_body, &static_transform);
-    world.backend.create_collider(
-        1,
-        &Collider::default(),
-        1,
-        None,
-    );
+    world
+        .backend
+        .create_body(1, &static_body, &static_transform);
+    world
+        .backend
+        .create_collider(1, &Collider::default(), 1, None);
     world.backend.sync_query_pipeline();
 
     // Step to detect collision.
@@ -528,12 +515,9 @@ fn apply_force_moves_body() {
     let transform = Transform::default();
     let rb = RigidBody::default(); // Dynamic
     world.backend.create_body(0, &rb, &transform);
-    world.backend.create_collider(
-        0,
-        &Collider::default(),
-        0,
-        None,
-    );
+    world
+        .backend
+        .create_collider(0, &Collider::default(), 0, None);
     world.backend.sync_query_pipeline();
 
     let pos_before = world.backend.sync_body_transform(0).unwrap();
@@ -567,18 +551,17 @@ fn apply_impulse_changes_velocity() {
     let transform = Transform::default();
     let rb = RigidBody::default(); // Dynamic
     world.backend.create_body(0, &rb, &transform);
-    world.backend.create_collider(
-        0,
-        &Collider::default(),
-        0,
-        None,
-    );
+    world
+        .backend
+        .create_collider(0, &Collider::default(), 0, None);
     world.backend.sync_query_pipeline();
 
     let pos_before = world.backend.sync_body_transform(0).unwrap();
 
     // Apply a horizontal impulse directly to the backend.
-    world.backend.apply_impulse(0, glam::Vec3::new(100.0, 0.0, 0.0));
+    world
+        .backend
+        .apply_impulse(0, glam::Vec3::new(100.0, 0.0, 0.0));
 
     // Step multiple times to integrate the impulse.
     for _ in 0..5 {
@@ -611,24 +594,14 @@ fn set_body_position_command() {
 
     // The command will be executed during the next step.
     // Instead of stepping, let's directly test via the backend.
-    world.backend.set_body_transform(0, glam::Vec3::new(10.0, 20.0, 30.0), glam::Quat::IDENTITY);
+    world
+        .backend
+        .set_body_transform(0, glam::Vec3::new(10.0, 20.0, 30.0), glam::Quat::IDENTITY);
 
     let pos = world.backend.sync_body_transform(0).unwrap();
-    assert!(
-        (pos.0.x - 10.0).abs() < 1e-6,
-        "x should be 10: {}",
-        pos.0.x
-    );
-    assert!(
-        (pos.0.y - 20.0).abs() < 1e-6,
-        "y should be 20: {}",
-        pos.0.y
-    );
-    assert!(
-        (pos.0.z - 30.0).abs() < 1e-6,
-        "z should be 30: {}",
-        pos.0.z
-    );
+    assert!((pos.0.x - 10.0).abs() < 1e-6, "x should be 10: {}", pos.0.x);
+    assert!((pos.0.y - 20.0).abs() < 1e-6, "y should be 20: {}", pos.0.y);
+    assert!((pos.0.z - 30.0).abs() < 1e-6, "z should be 30: {}", pos.0.z);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -969,9 +942,9 @@ fn register_physics_extensions_adds_all_components() {
 
     crate::register_physics_extensions(
         &mut component_registry,
-        None,  // debug_draw_registry
-        None,  // editor_registry
-        None,  // script_registry
+        None, // debug_draw_registry
+        None, // editor_registry
+        None, // script_registry
     );
 
     assert!(component_registry.is_registered(RigidBody::TYPE_ID));

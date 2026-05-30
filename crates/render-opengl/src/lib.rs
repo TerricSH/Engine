@@ -1,5 +1,9 @@
 //! OpenGL backend for the render layer, built on [glow].
 //!
+//! This crate is excepted from `#![forbid(unsafe_code)]` because OpenGL FFI
+//! inherently requires unsafe glow API calls (analogous to
+//! `render-vulkan`'s exception for Vulkan FFI).
+//!
 //! # Architecture
 //!
 //! - [OpenGlBackend] wraps an [Arc<glow::Context>] as the entry point.
@@ -83,9 +87,6 @@ mod tests {
     fn opengl_backend_kind() {
         // Without a glow context, we can't create an OpenGlBackend directly.
         // Just verify the kind constant is correct.
-        assert_eq!(
-            format!("{:?}", BackendKind::OpenGl),
-            "OpenGl"
-        );
+        assert_eq!(format!("{:?}", BackendKind::OpenGl), "OpenGl");
     }
 }

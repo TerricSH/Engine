@@ -75,10 +75,7 @@ impl BuildResult {
                 "CSBUILD_FAILED",
                 DiagnosticSeverity::Error,
                 "build",
-                format!(
-                    "C# build failed with {} error(s)",
-                    self.errors.len()
-                ),
+                format!("C# build failed with {} error(s)", self.errors.len()),
             );
             if let Some(ref path) = self.assembly_path {
                 summary = summary.path(path.to_string_lossy());
@@ -231,9 +228,9 @@ fn which(name: &str) -> Result<String, ()> {
 
 /// Find the first `.csproj` file in the given directory.
 fn find_csproj(dir: &Path) -> Result<PathBuf, BuildError> {
-    for entry in std::fs::read_dir(dir).map_err(|e| {
-        BuildError::IoError(format!("cannot read directory {}: {e}", dir.display()))
-    })? {
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| BuildError::IoError(format!("cannot read directory {}: {e}", dir.display())))?
+    {
         let entry = entry.map_err(|e| {
             BuildError::IoError(format!("cannot read entry in {}: {e}", dir.display()))
         })?;
@@ -381,9 +378,7 @@ mod tests {
         let result = BuildResult {
             success: false,
             output: "Build FAILED.".to_string(),
-            errors: vec![
-                "src/Program.cs(10,5): error CS1001: Identifier expected".to_string(),
-            ],
+            errors: vec!["src/Program.cs(10,5): error CS1001: Identifier expected".to_string()],
             assembly_path: None,
         };
         let diags = result.to_diagnostics();

@@ -232,6 +232,12 @@ impl MockScriptInstance {
     }
 }
 
+impl Default for MockScriptInstance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScriptInstance for MockScriptInstance {
     fn call(&mut self, function: &str, _args: &[ScriptValue]) -> Result<ScriptValue, ScriptError> {
         self.called.borrow_mut().push(function.to_string());
@@ -270,6 +276,12 @@ impl MockHost {
         Self {
             assemblies: HashMap::new(),
         }
+    }
+}
+
+impl Default for MockHost {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -314,7 +326,10 @@ mod tests {
     #[test]
     fn script_error_load_failed_display() {
         let err = ScriptError::LoadFailed("assembly not found".to_string());
-        assert_eq!(err.to_string(), "Failed to load assembly: assembly not found");
+        assert_eq!(
+            err.to_string(),
+            "Failed to load assembly: assembly not found"
+        );
     }
 
     #[test]
@@ -332,7 +347,10 @@ mod tests {
     #[test]
     fn script_error_host_error_display() {
         let err = ScriptError::HostError("runtime unavailable".to_string());
-        assert_eq!(err.to_string(), "Host infrastructure error: runtime unavailable");
+        assert_eq!(
+            err.to_string(),
+            "Host infrastructure error: runtime unavailable"
+        );
     }
 
     #[test]
@@ -476,12 +494,8 @@ mod tests {
     #[test]
     fn mock_instance_set_and_get_field() {
         let mut inst = MockScriptInstance::new();
-        inst.set_field("speed", ScriptValue::Float(42.0))
-            .unwrap();
-        assert_eq!(
-            inst.get_field("speed"),
-            Some(ScriptValue::Float(42.0))
-        );
+        inst.set_field("speed", ScriptValue::Float(42.0)).unwrap();
+        assert_eq!(inst.get_field("speed"), Some(ScriptValue::Float(42.0)));
     }
 
     #[test]

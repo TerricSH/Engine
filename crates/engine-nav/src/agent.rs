@@ -150,8 +150,7 @@ impl NavAgent {
 
     /// Whether the agent has finished its path (or never had one).
     pub fn is_path_finished(&self) -> bool {
-        self.path.is_none()
-            || self.path.as_ref().map(|p| p.is_empty()).unwrap_or(true)
+        self.path.is_none() || self.path.as_ref().map(|p| p.is_empty()).unwrap_or(true)
     }
 
     /// Total remaining distance along the path from the current position to

@@ -47,10 +47,15 @@ use crate::verify::Verifier;
 /// ```
 pub struct PackageManager {
     cache: PackageCache,
+    #[expect(dead_code)]
     verifier: Verifier,
+    #[expect(dead_code)]
     downloader: Downloader,
+    #[expect(dead_code)]
     installer: Installer,
+    #[expect(dead_code)]
     rollback_manager: RollbackManager,
+    #[expect(dead_code)]
     applier: UpdateApplier,
     current_engine_version: String,
     current_script_api_version: (u16, u16),
@@ -159,18 +164,14 @@ impl PackageManager {
         let _ = self.cache.write_state(&pkg);
 
         // ── 5. Verify hashes ────────────────────────────────────────────
-        if let Err(mut hash_errors) =
-            Verifier::verify_payload_hashes(&manifest, &download_dir)
-        {
+        if let Err(mut hash_errors) = Verifier::verify_payload_hashes(&manifest, &download_dir) {
             errors.append(&mut hash_errors);
             let _ = std::fs::remove_dir_all(&download_dir);
             return Err(errors);
         }
 
         // ── 6. Verify cooked headers ───────────────────────────────────
-        if let Err(mut header_errors) =
-            Verifier::verify_cooked_headers(&manifest, &download_dir)
-        {
+        if let Err(mut header_errors) = Verifier::verify_cooked_headers(&manifest, &download_dir) {
             errors.append(&mut header_errors);
             let _ = std::fs::remove_dir_all(&download_dir);
             return Err(errors);
@@ -212,10 +213,7 @@ impl PackageManager {
     /// The manifest file is parsed, then the flow follows the same
     /// pipeline as [`install_package`](Self::install_package) but uses
     /// `download_local` to copy payloads from the manifest's directory.
-    pub fn install_local(
-        &mut self,
-        manifest_path: &Path,
-    ) -> Result<Package, Vec<UpdateError>> {
+    pub fn install_local(&mut self, manifest_path: &Path) -> Result<Package, Vec<UpdateError>> {
         let mut errors: Vec<UpdateError> = Vec::new();
 
         // ── Read and parse manifest ────────────────────────────────────
@@ -277,18 +275,14 @@ impl PackageManager {
         }
 
         // ── 5. Verify hashes ────────────────────────────────────────────
-        if let Err(mut hash_errors) =
-            Verifier::verify_payload_hashes(&manifest, &download_dir)
-        {
+        if let Err(mut hash_errors) = Verifier::verify_payload_hashes(&manifest, &download_dir) {
             errors.append(&mut hash_errors);
             let _ = std::fs::remove_dir_all(&download_dir);
             return Err(errors);
         }
 
         // ── 6. Verify cooked headers ───────────────────────────────────
-        if let Err(mut header_errors) =
-            Verifier::verify_cooked_headers(&manifest, &download_dir)
-        {
+        if let Err(mut header_errors) = Verifier::verify_cooked_headers(&manifest, &download_dir) {
             errors.append(&mut header_errors);
             let _ = std::fs::remove_dir_all(&download_dir);
             return Err(errors);
@@ -455,12 +449,7 @@ mod tests {
 
     fn setup_manager() -> (PackageManager, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let manager = PackageManager::new(
-            tmp.path(),
-            PlatformKind::Desktop,
-            "1.5.0",
-            (1, 5),
-        );
+        let manager = PackageManager::new(tmp.path(), PlatformKind::Desktop, "1.5.0", (1, 5));
         (manager, tmp)
     }
 
@@ -476,8 +465,8 @@ mod tests {
 
         let pkg_dir = tmp.path().join("my_pkg");
         std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(&pkg_dir.join("manifest.json"), &manifest_json).unwrap();
-        std::fs::write(&pkg_dir.join("data.bin"), b"test payload").unwrap();
+        std::fs::write(pkg_dir.join("manifest.json"), &manifest_json).unwrap();
+        std::fs::write(pkg_dir.join("data.bin"), b"test payload").unwrap();
 
         let result = manager.install_local(&pkg_dir.join("manifest.json"));
         assert!(result.is_ok(), "install_local failed: {result:?}");
@@ -496,7 +485,7 @@ mod tests {
 
         let pkg_dir = tmp.path().join("incompat");
         std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(&pkg_dir.join("manifest.json"), &manifest_json).unwrap();
+        std::fs::write(pkg_dir.join("manifest.json"), &manifest_json).unwrap();
 
         let result = manager.install_local(&pkg_dir.join("manifest.json"));
         assert!(result.is_err());
@@ -511,7 +500,7 @@ mod tests {
 
         let pkg_dir = tmp.path().join("missing_payload");
         std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(&pkg_dir.join("manifest.json"), &manifest_json).unwrap();
+        std::fs::write(pkg_dir.join("manifest.json"), &manifest_json).unwrap();
         // data.bin NOT created — payload missing
 
         let result = manager.install_local(&pkg_dir.join("manifest.json"));
@@ -524,7 +513,7 @@ mod tests {
 
         let pkg_dir = tmp.path().join("bad_json");
         std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(&pkg_dir.join("manifest.json"), "not valid json").unwrap();
+        std::fs::write(pkg_dir.join("manifest.json"), "not valid json").unwrap();
 
         let result = manager.install_local(&pkg_dir.join("manifest.json"));
         assert!(result.is_err());
@@ -545,8 +534,8 @@ mod tests {
         let j1 = serde_json::to_string_pretty(&m1).unwrap();
         let d1 = tmp.path().join("pkg1");
         std::fs::create_dir_all(&d1).unwrap();
-        std::fs::write(&d1.join("manifest.json"), &j1).unwrap();
-        std::fs::write(&d1.join("data.bin"), b"test payload").unwrap();
+        std::fs::write(d1.join("manifest.json"), &j1).unwrap();
+        std::fs::write(d1.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d1.join("manifest.json")).unwrap();
         let id1 = manager.active_package().unwrap().package_id().to_string();
 
@@ -556,8 +545,8 @@ mod tests {
         let j2 = serde_json::to_string_pretty(&m2).unwrap();
         let d2 = tmp.path().join("pkg2");
         std::fs::create_dir_all(&d2).unwrap();
-        std::fs::write(&d2.join("manifest.json"), &j2).unwrap();
-        std::fs::write(&d2.join("data.bin"), b"test payload").unwrap();
+        std::fs::write(d2.join("manifest.json"), &j2).unwrap();
+        std::fs::write(d2.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d2.join("manifest.json")).unwrap();
 
         // Rollback.
@@ -593,8 +582,8 @@ mod tests {
         let j1 = serde_json::to_string_pretty(&m1).unwrap();
         let d1 = tmp.path().join("first");
         std::fs::create_dir_all(&d1).unwrap();
-        std::fs::write(&d1.join("manifest.json"), &j1).unwrap();
-        std::fs::write(&d1.join("data.bin"), b"test payload").unwrap();
+        std::fs::write(d1.join("manifest.json"), &j1).unwrap();
+        std::fs::write(d1.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d1.join("manifest.json")).unwrap();
 
         // Simulate boot marker presence (it's already there from activation).
@@ -614,8 +603,8 @@ mod tests {
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         let d = tmp.path().join("list_test");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(&d.join("manifest.json"), &json).unwrap();
-        std::fs::write(&d.join("data.bin"), b"test payload").unwrap();
+        std::fs::write(d.join("manifest.json"), &json).unwrap();
+        std::fs::write(d.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d.join("manifest.json")).unwrap();
 
         let packages = manager.list_packages();
@@ -630,8 +619,8 @@ mod tests {
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         let d = tmp.path().join("active_test");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(&d.join("manifest.json"), &json).unwrap();
-        std::fs::write(&d.join("data.bin"), b"test payload").unwrap();
+        std::fs::write(d.join("manifest.json"), &json).unwrap();
+        std::fs::write(d.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d.join("manifest.json")).unwrap();
 
         assert!(manager.active_package().is_some());
@@ -661,8 +650,8 @@ mod tests {
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         let d = tmp.path().join("apply_test");
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(&d.join("manifest.json"), &json).unwrap();
-        std::fs::write(&d.join("data.bin"), b"test payload").unwrap();
+        std::fs::write(d.join("manifest.json"), &json).unwrap();
+        std::fs::write(d.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d.join("manifest.json")).unwrap();
 
         let mut registry = AssetRegistry::new();
@@ -677,12 +666,7 @@ mod tests {
     #[test]
     fn manager_new_initializes_cache() {
         let tmp = tempfile::tempdir().unwrap();
-        let _manager = PackageManager::new(
-            tmp.path(),
-            PlatformKind::Desktop,
-            "1.5.0",
-            (1, 5),
-        );
+        let _manager = PackageManager::new(tmp.path(), PlatformKind::Desktop, "1.5.0", (1, 5));
 
         // Cache directories should exist.
         assert!(tmp.path().join("packages").exists());
@@ -700,8 +684,8 @@ mod tests {
             let json = serde_json::to_string_pretty(&m).unwrap();
             let d = tmp.path().join(format!("multi_{i}"));
             std::fs::create_dir_all(&d).unwrap();
-            std::fs::write(&d.join("manifest.json"), &json).unwrap();
-            std::fs::write(&d.join("data.bin"), b"test payload").unwrap();
+            std::fs::write(d.join("manifest.json"), &json).unwrap();
+            std::fs::write(d.join("data.bin"), b"test payload").unwrap();
             let result = manager.install_local(&d.join("manifest.json"));
             assert!(result.is_ok(), "install {i} failed: {result:?}");
         }

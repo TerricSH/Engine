@@ -102,16 +102,20 @@ pub fn mobile_subset_v0() -> ScriptApiSubset {
                     at runtime is not supported under NativeAOT because all \
                     managed code must be linked ahead of time.",
                 example: Some("Assembly.LoadFrom(\"Mod.dll\")"),
-                mobile_alternative: Some("Reference assemblies via the project file; \
-                    use the engine's plugin registry for dynamic loads."),
+                mobile_alternative: Some(
+                    "Reference assemblies via the project file; \
+                    use the engine's plugin registry for dynamic loads.",
+                ),
             },
             UnsupportedPattern {
                 name: "Reflection.Emit.ILGenerator",
                 description: "Runtime IL emission requires JIT compilation, \
                     which is unavailable on iOS and restricted on Android.",
                 example: Some("new DynamicMethod(\"Foo\", ...).GetILGenerator()"),
-                mobile_alternative: Some("Use expression trees with AOT-friendly \
-                    compilation, or pre-generate IL at build time."),
+                mobile_alternative: Some(
+                    "Use expression trees with AOT-friendly \
+                    compilation, or pre-generate IL at build time.",
+                ),
             },
             UnsupportedPattern {
                 name: "Type.MakeGenericType (open generics)",
@@ -119,8 +123,10 @@ pub fn mobile_subset_v0() -> ScriptApiSubset {
                     parameters at runtime may fail under AOT because the \
                     runtime cannot specialise the generic at compile time.",
                 example: Some("typeof(Dict<,>).MakeGenericType(typeof(int), typeof(string))"),
-                mobile_alternative: Some("Use closed generic types directly. \
-                    For dynamic dispatch, consider an interface-based factory."),
+                mobile_alternative: Some(
+                    "Use closed generic types directly. \
+                    For dynamic dispatch, consider an interface-based factory.",
+                ),
             },
             UnsupportedPattern {
                 name: "Activator.CreateInstance (non-AOT)",
@@ -128,24 +134,30 @@ pub fn mobile_subset_v0() -> ScriptApiSubset {
                     via string names (`Activator.CreateInstance(string, string)`) \
                     relies on reflection over unlinked assemblies.",
                 example: Some("Activator.CreateInstance(\"ExternalAssembly\", \"MyType\")"),
-                mobile_alternative: Some("Register known types via a static factory \
-                    or dependency injection container."),
+                mobile_alternative: Some(
+                    "Register known types via a static factory \
+                    or dependency injection container.",
+                ),
             },
             UnsupportedPattern {
                 name: "Marshal.GetFunctionPointerForDelegate",
                 description: "Converting a delegate to a native function pointer \
                     requires runtime code stubs that NativeAOT cannot generate.",
                 example: Some("Marshal.GetFunctionPointerForDelegate(myDelegate)"),
-                mobile_alternative: Some("Use [UnmanagedCallersOnly] for static \
-                    callbacks or DllImport for native entry points."),
+                mobile_alternative: Some(
+                    "Use [UnmanagedCallersOnly] for static \
+                    callbacks or DllImport for native entry points.",
+                ),
             },
             UnsupportedPattern {
                 name: "DynamicMethod",
                 description: "DynamicMethod creates lightweight methods at \
                     runtime, which depends on JIT compilation.",
                 example: Some("var dm = new DynamicMethod(\"Handler\", ...);"),
-                mobile_alternative: Some("Define methods statically in source code; \
-                    use delegates for dynamic dispatch."),
+                mobile_alternative: Some(
+                    "Define methods statically in source code; \
+                    use delegates for dynamic dispatch.",
+                ),
             },
             UnsupportedPattern {
                 name: "AssemblyBuilder / ModuleBuilder",
@@ -153,24 +165,30 @@ pub fn mobile_subset_v0() -> ScriptApiSubset {
                     both JIT and Reflection.Emit infrastructure not present \
                     in AOT runtimes.",
                 example: Some("AssemblyBuilder.DefineDynamicAssembly(...)"),
-                mobile_alternative: Some("Pre-compile all assemblies; load them \
-                    via static project references."),
+                mobile_alternative: Some(
+                    "Pre-compile all assemblies; load them \
+                    via static project references.",
+                ),
             },
             UnsupportedPattern {
                 name: "CSharpCodeProvider",
                 description: "Compiling C# source code at runtime requires \
                     the full Roslyn compiler and JIT, unavailable on mobile.",
                 example: Some("new CSharpCodeProvider().CompileAssemblyFromSource(...)"),
-                mobile_alternative: Some("Pre-compile scripts as part of the \
-                    application build pipeline."),
+                mobile_alternative: Some(
+                    "Pre-compile scripts as part of the \
+                    application build pipeline.",
+                ),
             },
             UnsupportedPattern {
                 name: "Expression<T>.Compile (LINQ Expressions)",
                 description: "Compiling expression trees to IL at runtime \
                     requires JIT, which is absent on iOS.",
                 example: Some("Expression<Func<int, int>> expr = x => x + 1;\nexpr.Compile()"),
-                mobile_alternative: Some("Use interpreted Expression.Invoke or \
-                    pre-compile expressions at build time with AOT-compatible tools."),
+                mobile_alternative: Some(
+                    "Use interpreted Expression.Invoke or \
+                    pre-compile expressions at build time with AOT-compatible tools.",
+                ),
             },
             UnsupportedPattern {
                 name: "P/Invoke undeclared native libraries",
@@ -178,8 +196,10 @@ pub fn mobile_subset_v0() -> ScriptApiSubset {
                     declared at compile time. Dynamically loading native \
                     libraries via DllImport with runtime-resolved paths fails.",
                 example: Some("[DllImport(\"user-provided.dll\")]"),
-                mobile_alternative: Some("Declare all native dependencies in the \
-                    project file; use the engine's native-plugin API for dynamic loads."),
+                mobile_alternative: Some(
+                    "Declare all native dependencies in the \
+                    project file; use the engine's native-plugin API for dynamic loads.",
+                ),
             },
         ],
     }
@@ -205,11 +225,7 @@ mod tests {
     #[test]
     fn mobile_subset_v0_contains_expected_patterns() {
         let subset = mobile_subset_v0();
-        let names: Vec<&str> = subset
-            .unsupported_patterns
-            .iter()
-            .map(|p| p.name)
-            .collect();
+        let names: Vec<&str> = subset.unsupported_patterns.iter().map(|p| p.name).collect();
 
         assert!(names.contains(&"Assembly.LoadFrom"));
         assert!(names.contains(&"Reflection.Emit.ILGenerator"));

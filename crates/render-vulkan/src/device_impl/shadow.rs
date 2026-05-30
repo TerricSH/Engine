@@ -393,7 +393,7 @@ impl VulkanDevice {
         }
         if let Some(mut a) = self.shadow_allocation.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
-                let _ = guard.free(&mut a);
+                guard.free(&mut a);
             }
         }
     }

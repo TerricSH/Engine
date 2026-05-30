@@ -79,7 +79,12 @@ fn schema_version_default_is_zero() {
 
 #[test]
 fn diagnostic_new_creates_basic_diagnostic() {
-    let d = Diagnostic::new("C001", DiagnosticSeverity::Error, "core", "something failed");
+    let d = Diagnostic::new(
+        "C001",
+        DiagnosticSeverity::Error,
+        "core",
+        "something failed",
+    );
     assert_eq!(d.code, "C001");
     assert_eq!(d.severity, DiagnosticSeverity::Error);
     assert_eq!(d.system, "core");
@@ -99,8 +104,7 @@ fn diagnostic_contract_sets_contract_and_version() {
 
 #[test]
 fn diagnostic_path_sets_path() {
-    let d = Diagnostic::new("C002", DiagnosticSeverity::Info, "sys", "msg")
-        .path("some/path.txt");
+    let d = Diagnostic::new("C002", DiagnosticSeverity::Info, "sys", "msg").path("some/path.txt");
     assert_eq!(d.path, Some("some/path.txt".to_string()));
 }
 
@@ -144,7 +148,10 @@ fn value_uint_variant() {
 fn value_float_variants() {
     let f32_val = Value::Float32(std::f32::consts::PI);
     let f64_val = Value::Float64(2.71);
-    assert_eq!(format!("{:?}", f32_val), format!("Float32({:?})", std::f32::consts::PI));
+    assert_eq!(
+        format!("{:?}", f32_val),
+        format!("Float32({:?})", std::f32::consts::PI)
+    );
     assert_eq!(format!("{:?}", f64_val), "Float64(2.71)");
 }
 
@@ -194,7 +201,10 @@ fn value_enum_variant() {
 #[test]
 fn value_list_variant() {
     let list = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
-    assert_eq!(list, Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
+    assert_eq!(
+        list,
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
     assert_ne!(list, Value::List(vec![]));
 }
 

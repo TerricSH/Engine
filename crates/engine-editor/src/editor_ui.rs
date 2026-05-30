@@ -57,13 +57,7 @@ impl EditorUi {
     ///
     /// Returns `Some(new_value)` while the slider is being dragged, or
     /// `None` when released / unchanged.
-    pub fn slider_f32(
-        &mut self,
-        label: &str,
-        value: f32,
-        min: f32,
-        max: f32,
-    ) -> Option<f32> {
+    pub fn slider_f32(&mut self, label: &str, value: f32, min: f32, max: f32) -> Option<f32> {
         let _ = (label, value, min, max, self.alloc_id());
         None
     }

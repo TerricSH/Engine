@@ -83,7 +83,7 @@ impl VulkanDevice {
             }
         }
         if let Some(mut a) = self.depth_allocation.take() {
-            let _ = self.logical_device.allocator().lock().unwrap().free(&mut a);
+            self.logical_device.allocator().lock().unwrap().free(&mut a);
         }
     }
 

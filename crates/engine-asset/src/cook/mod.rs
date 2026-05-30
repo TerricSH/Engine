@@ -169,8 +169,12 @@ pub fn write_cooked_artifact(
     hasher.update(payload);
     let content_hash: HashDigest = hasher.finalize().into();
 
-    let header =
-        CookedAssetHeader::new(asset_kind, schema_version, content_hash, payload.len() as u64);
+    let header = CookedAssetHeader::new(
+        asset_kind,
+        schema_version,
+        content_hash,
+        payload.len() as u64,
+    );
 
     // Ensure parent directory exists.
     if let Some(parent) = output.parent() {
@@ -207,10 +211,10 @@ pub fn write_cooked_artifact(
 /// # Parameters
 ///
 /// * `source_dir` – directory containing source manifests (`.manifest` files)
-///                  and referenced source assets.
+///   and referenced source assets.
 /// * `cooked_dir` – directory where cooked `.cooked` artifacts are written.
 /// * `graph`      – mutable [`DependencyGraph`] that is populated during
-///                  cooking.
+///   cooking.
 ///
 /// # Returns
 ///
@@ -277,7 +281,8 @@ pub fn cook_orchestrate(
             // Process cook rules for dependency tracking.
             for variant_key in &asset_entry.cook_rules.variant_keys {
                 // Variants are tracked by registering a synthetic dependency.
-                let variant_id = AssetId::new(format!("{}-variant-{variant_key}", asset_entry.id.id));
+                let variant_id =
+                    AssetId::new(format!("{}-variant-{variant_key}", asset_entry.id.id));
                 graph.register(variant_id);
             }
 
@@ -330,7 +335,8 @@ pub fn cook_orchestrate(
                         continue;
                     }
                 },
-                AssetType::Logic => match logic_asset::cook_logic_asset(&source_path, &output_path) {
+                AssetType::Logic => match logic_asset::cook_logic_asset(&source_path, &output_path)
+                {
                     Ok(r) => {
                         graph.mark_cooked(&asset_entry.id, compute_file_hash(&source_path));
                         r
@@ -434,8 +440,8 @@ mod tests {
         let output = dir.join("test_mesh.cooked");
         let payload = vec![0x01, 0x02, 0x03, 0x04];
 
-        let result = write_cooked_artifact(&output, 1, &payload, SchemaVersion::new(0, 1, 0))
-            .unwrap();
+        let result =
+            write_cooked_artifact(&output, 1, &payload, SchemaVersion::new(0, 1, 0)).unwrap();
         assert!(result.success);
         assert_eq!(result.asset_id, "test_mesh");
 
@@ -445,8 +451,7 @@ mod tests {
         file.read_to_end(&mut file_bytes).unwrap();
 
         // Header size: bincode serialized size of CookedAssetHeader.
-        let header: CookedAssetHeader =
-            bincode::deserialize(&file_bytes[..]).unwrap();
+        let header: CookedAssetHeader = bincode::deserialize(&file_bytes[..]).unwrap();
         assert!(header.is_valid());
         assert_eq!(header.asset_kind, 1);
 
@@ -460,18 +465,9 @@ mod tests {
 
     #[test]
     fn determine_shader_stage_by_extension() {
-        assert_eq!(
-            determine_shader_stage(Path::new("shader.vert")),
-            "vertex"
-        );
-        assert_eq!(
-            determine_shader_stage(Path::new("shader.frag")),
-            "fragment"
-        );
-        assert_eq!(
-            determine_shader_stage(Path::new("shader.comp")),
-            "compute"
-        );
+        assert_eq!(determine_shader_stage(Path::new("shader.vert")), "vertex");
+        assert_eq!(determine_shader_stage(Path::new("shader.frag")), "fragment");
+        assert_eq!(determine_shader_stage(Path::new("shader.comp")), "compute");
         assert_eq!(
             determine_shader_stage(Path::new("shader.unknown")),
             "vertex"

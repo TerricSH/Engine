@@ -30,8 +30,7 @@ public class AsyncHandle
         {
             if (!_isComplete)
             {
-                // TODO: check through FFI if async is done
-                // _isComplete = EngineAPI.ffi_async_is_complete(_id);
+                _isComplete = EngineAPI.ffi_async_is_complete(_id);
             }
             return _isComplete;
         }

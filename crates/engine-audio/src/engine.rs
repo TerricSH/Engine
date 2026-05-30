@@ -88,20 +88,17 @@ impl AudioEngine {
         cmd_rx: crossbeam_channel::Receiver<AudioCommand>,
     ) -> Result<cpal::Stream, AudioError> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or(AudioError::NoDevice)?;
+        let device = host.default_output_device().ok_or(AudioError::NoDevice)?;
 
-        let device_name = device
-            .name()
-            .unwrap_or_else(|_| "<unknown>".to_string());
+        let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
         tracing::info!("audio output device: {}", device_name);
 
-        let config = device
-            .default_output_config()
-            .map_err(|e: cpal::DefaultStreamConfigError| {
-                AudioError::DeviceUnavailable(e.to_string())
-            })?;
+        let config =
+            device
+                .default_output_config()
+                .map_err(|e: cpal::DefaultStreamConfigError| {
+                    AudioError::DeviceUnavailable(e.to_string())
+                })?;
 
         let sample_rate = config.config().sample_rate.0;
         let channels = config.config().channels;
@@ -119,19 +116,17 @@ impl AudioEngine {
         // Build the stream with a callback that never allocates in steady state
         // (the separate `temp` buffers for non-f32 formats grow at most once).
         let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => {
-                device.build_output_stream::<f32, _, _>(
-                    &config.config(),
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        mixer.process_commands(&cmd_rx);
-                        mixer.mix_f32(data, output_channels);
-                    },
-                    |err| {
-                        tracing::error!("audio stream error: {}", err);
-                    },
-                    None,
-                )
-            }
+            cpal::SampleFormat::F32 => device.build_output_stream::<f32, _, _>(
+                &config.config(),
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    mixer.process_commands(&cmd_rx);
+                    mixer.mix_f32(data, output_channels);
+                },
+                |err| {
+                    tracing::error!("audio stream error: {}", err);
+                },
+                None,
+            ),
             cpal::SampleFormat::I16 => {
                 // Separate scratch buffer to avoid borrow conflicts with mixer.
                 // Grown at most once (cpal buffer sizes are stable after stream creation).
@@ -189,9 +184,7 @@ impl AudioEngine {
             }
         };
 
-        stream.map_err(|e: cpal::BuildStreamError| {
-            AudioError::DeviceUnavailable(e.to_string())
-        })
+        stream.map_err(|e: cpal::BuildStreamError| AudioError::DeviceUnavailable(e.to_string()))
     }
 
     // ------------------------------------------------------------------
@@ -248,9 +241,7 @@ impl AudioEngine {
     /// Set the global listener.
     pub fn set_listener(&mut self, listener: AudioListener) {
         self.listener = listener.clone();
-        let _ = self
-            .cmd_tx
-            .send(AudioCommand::SetListener(listener));
+        let _ = self.cmd_tx.send(AudioCommand::SetListener(listener));
     }
 
     /// Per-frame update. Processes any pending state synchronisation.

@@ -35,8 +35,7 @@ pub enum MeshError {
 /// Returns the first mesh found in the file.  If the file contains multiple
 /// meshes, use [`load_meshes`] instead.
 pub fn load_mesh_from_gltf(path: &std::path::Path) -> Result<MeshData, MeshError> {
-    let (doc, buffers, _) = gltf::import(path)
-        .map_err(|e| MeshError::GltfLoad(e.to_string()))?;
+    let (doc, buffers, _) = gltf::import(path).map_err(|e| MeshError::GltfLoad(e.to_string()))?;
 
     // Pick the first mesh's first primitive.
     for mesh in doc.meshes() {
@@ -87,11 +86,8 @@ pub fn load_mesh_from_gltf(path: &std::path::Path) -> Result<MeshData, MeshError
 }
 
 /// Load all meshes from a glTF file, returning (name, MeshData) pairs.
-pub fn load_meshes_from_gltf(
-    path: &std::path::Path,
-) -> Result<Vec<(String, MeshData)>, MeshError> {
-    let (doc, buffers, _) = gltf::import(path)
-        .map_err(|e| MeshError::GltfLoad(e.to_string()))?;
+pub fn load_meshes_from_gltf(path: &std::path::Path) -> Result<Vec<(String, MeshData)>, MeshError> {
+    let (doc, buffers, _) = gltf::import(path).map_err(|e| MeshError::GltfLoad(e.to_string()))?;
 
     let mut out = Vec::new();
     for mesh in doc.meshes() {
@@ -147,40 +143,66 @@ pub fn create_test_cube() -> MeshData {
     // 24 vertices (4 per face, 6 faces) with unique normals.
     let positions = vec![
         // +X face
-        Vec3::new(0.5, -0.5, -0.5), Vec3::new(0.5, -0.5, 0.5),
-        Vec3::new(0.5, 0.5, 0.5), Vec3::new(0.5, 0.5, -0.5),
+        Vec3::new(0.5, -0.5, -0.5),
+        Vec3::new(0.5, -0.5, 0.5),
+        Vec3::new(0.5, 0.5, 0.5),
+        Vec3::new(0.5, 0.5, -0.5),
         // -X face
-        Vec3::new(-0.5, -0.5, 0.5), Vec3::new(-0.5, -0.5, -0.5),
-        Vec3::new(-0.5, 0.5, -0.5), Vec3::new(-0.5, 0.5, 0.5),
+        Vec3::new(-0.5, -0.5, 0.5),
+        Vec3::new(-0.5, -0.5, -0.5),
+        Vec3::new(-0.5, 0.5, -0.5),
+        Vec3::new(-0.5, 0.5, 0.5),
         // +Y face
-        Vec3::new(-0.5, 0.5, -0.5), Vec3::new(-0.5, 0.5, 0.5),
-        Vec3::new(0.5, 0.5, 0.5), Vec3::new(0.5, 0.5, -0.5),
+        Vec3::new(-0.5, 0.5, -0.5),
+        Vec3::new(-0.5, 0.5, 0.5),
+        Vec3::new(0.5, 0.5, 0.5),
+        Vec3::new(0.5, 0.5, -0.5),
         // -Y face
-        Vec3::new(-0.5, -0.5, 0.5), Vec3::new(-0.5, -0.5, -0.5),
-        Vec3::new(0.5, -0.5, -0.5), Vec3::new(0.5, -0.5, 0.5),
+        Vec3::new(-0.5, -0.5, 0.5),
+        Vec3::new(-0.5, -0.5, -0.5),
+        Vec3::new(0.5, -0.5, -0.5),
+        Vec3::new(0.5, -0.5, 0.5),
         // +Z face
-        Vec3::new(-0.5, -0.5, 0.5), Vec3::new(0.5, -0.5, 0.5),
-        Vec3::new(0.5, 0.5, 0.5), Vec3::new(-0.5, 0.5, 0.5),
+        Vec3::new(-0.5, -0.5, 0.5),
+        Vec3::new(0.5, -0.5, 0.5),
+        Vec3::new(0.5, 0.5, 0.5),
+        Vec3::new(-0.5, 0.5, 0.5),
         // -Z face
-        Vec3::new(0.5, -0.5, -0.5), Vec3::new(-0.5, -0.5, -0.5),
-        Vec3::new(-0.5, 0.5, -0.5), Vec3::new(0.5, 0.5, -0.5),
+        Vec3::new(0.5, -0.5, -0.5),
+        Vec3::new(-0.5, -0.5, -0.5),
+        Vec3::new(-0.5, 0.5, -0.5),
+        Vec3::new(0.5, 0.5, -0.5),
     ];
     let normals = vec![
-        Vec3::X, Vec3::X, Vec3::X, Vec3::X,
-        Vec3::NEG_X, Vec3::NEG_X, Vec3::NEG_X, Vec3::NEG_X,
-        Vec3::Y, Vec3::Y, Vec3::Y, Vec3::Y,
-        Vec3::NEG_Y, Vec3::NEG_Y, Vec3::NEG_Y, Vec3::NEG_Y,
-        Vec3::Z, Vec3::Z, Vec3::Z, Vec3::Z,
-        Vec3::NEG_Z, Vec3::NEG_Z, Vec3::NEG_Z, Vec3::NEG_Z,
+        Vec3::X,
+        Vec3::X,
+        Vec3::X,
+        Vec3::X,
+        Vec3::NEG_X,
+        Vec3::NEG_X,
+        Vec3::NEG_X,
+        Vec3::NEG_X,
+        Vec3::Y,
+        Vec3::Y,
+        Vec3::Y,
+        Vec3::Y,
+        Vec3::NEG_Y,
+        Vec3::NEG_Y,
+        Vec3::NEG_Y,
+        Vec3::NEG_Y,
+        Vec3::Z,
+        Vec3::Z,
+        Vec3::Z,
+        Vec3::Z,
+        Vec3::NEG_Z,
+        Vec3::NEG_Z,
+        Vec3::NEG_Z,
+        Vec3::NEG_Z,
     ];
     // Each face as 2 triangles (6 indices per face), CCW winding.
     let indices = vec![
-        0,1,2, 0,2,3,
-        4,5,6, 4,6,7,
-        8,9,10, 8,10,11,
-        12,13,14, 12,14,15,
-        16,17,18, 16,18,19,
-        20,21,22, 20,22,23,
+        0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11, 12, 13, 14, 12, 14, 15, 16, 17,
+        18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
     ];
     MeshData {
         positions,

@@ -63,9 +63,7 @@ impl AudioSource {
             // Resume.
             self.paused = false;
             self.playing = true;
-            let _ = self
-                .cmd_tx
-                .send(AudioCommand::Resume { id: self.id });
+            let _ = self.cmd_tx.send(AudioCommand::Resume { id: self.id });
         } else {
             // Fresh start.
             self.playing = true;
@@ -101,17 +99,19 @@ impl AudioSource {
     /// Set volume (0.0–1.0).
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
-        let _ = self
-            .cmd_tx
-            .send(AudioCommand::SetVolume { id: self.id, volume: self.volume });
+        let _ = self.cmd_tx.send(AudioCommand::SetVolume {
+            id: self.id,
+            volume: self.volume,
+        });
     }
 
     /// Enable or disable looping.
     pub fn set_loop(&mut self, loop_enabled: bool) {
         self.loop_enabled = loop_enabled;
-        let _ = self
-            .cmd_tx
-            .send(AudioCommand::SetLoop { id: self.id, enabled: loop_enabled });
+        let _ = self.cmd_tx.send(AudioCommand::SetLoop {
+            id: self.id,
+            enabled: loop_enabled,
+        });
     }
 
     /// Whether the source is currently playing (optimistic — may briefly diverge
@@ -132,13 +132,9 @@ impl AudioSource {
         let sample_rate = self.clip.sample_rate();
         let channels = self.clip.channels() as usize;
         let pos_frame = (clamped * sample_rate as f32) as usize;
-        let _ = self
-            .cmd_tx
-            .send(AudioCommand::SetPosition {
-                id: self.id,
-                pos_frame: pos_frame.min(
-                    self.clip.samples().len() / channels,
-                ),
-            });
+        let _ = self.cmd_tx.send(AudioCommand::SetPosition {
+            id: self.id,
+            pos_frame: pos_frame.min(self.clip.samples().len() / channels),
+        });
     }
 }

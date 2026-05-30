@@ -265,7 +265,7 @@ impl SceneRenderer {
                 "RV0200",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("create_render_pass: {e:?}"),
+                format!("create_render_pass: {e:?}"),
             )]
         })?;
 
@@ -285,7 +285,7 @@ impl SceneRenderer {
                 "RV0201",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("create_pipeline_layout: {e:?}"),
+                format!("create_pipeline_layout: {e:?}"),
             )]
         })?;
 
@@ -344,7 +344,7 @@ impl SceneRenderer {
                 "RV0204",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("resolve pipeline: {e:?}"),
+                format!("resolve pipeline: {e:?}"),
             )]
         })
     }
@@ -376,7 +376,7 @@ impl SceneRenderer {
                 "RV0203",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("create_buffer(vertices): {e:?}"),
+                format!("create_buffer(vertices): {e:?}"),
             )]
         })?;
         self.device
@@ -386,7 +386,7 @@ impl SceneRenderer {
                     "RV0204",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    &format!("write_buffer(vertices): {e:?}"),
+                    format!("write_buffer(vertices): {e:?}"),
                 )]
             })?;
 
@@ -402,7 +402,7 @@ impl SceneRenderer {
                 "RV0205",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("create_buffer(indices): {e:?}"),
+                format!("create_buffer(indices): {e:?}"),
             )]
         })?;
         self.device.write_buffer(ib, &index_bytes, 0).map_err(|e| {
@@ -410,7 +410,7 @@ impl SceneRenderer {
                 "RV0206",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("write_buffer(indices): {e:?}"),
+                format!("write_buffer(indices): {e:?}"),
             )]
         })?;
 
@@ -454,7 +454,7 @@ impl SceneRenderer {
                 "RV0207",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("create_swapchain: {e:?}"),
+                format!("create_swapchain: {e:?}"),
             )]
         })?;
 
@@ -463,7 +463,7 @@ impl SceneRenderer {
                 "RV0208",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("begin_frame: {e:?}"),
+                format!("begin_frame: {e:?}"),
             )]
         })?;
 
@@ -555,7 +555,7 @@ impl BackendRenderer for SceneRenderer {
                 "RV0209",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                &format!("end_frame: {e:?}"),
+                format!("end_frame: {e:?}"),
             )]
         })?;
 
@@ -598,13 +598,16 @@ impl BackendRenderer for SceneRenderer {
                 if let Some(rp) = self.rp {
                     // Dummy framebuffer 鈥?see TODO in render_frame.
                     let fb = render_core::FramebufferHandle::new(0, 0);
-                    self.cur_enc.as_mut().expect("encoder checked above").begin_render_pass(
-                        rp,
-                        fb,
-                        (0, 0, self.width, self.height),
-                        [0.02, 0.02, 0.06, 1.0],
-                        None,
-                    );
+                    self.cur_enc
+                        .as_mut()
+                        .expect("encoder checked above")
+                        .begin_render_pass(
+                            rp,
+                            fb,
+                            (0, 0, self.width, self.height),
+                            [0.02, 0.02, 0.06, 1.0],
+                            None,
+                        );
                 }
 
                 self.cur_enc
@@ -705,7 +708,7 @@ impl BackendRenderer for SceneRenderer {
                     "RV0209",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    &format!("end_frame: {e:?}"),
+                    format!("end_frame: {e:?}"),
                 )]
             })?;
             stats.draw_calls = s.draw_calls;
@@ -774,7 +777,10 @@ mod tests {
         );
 
         assert_eq!(key.shader_asset_id, SCENE_FORWARD_PIPELINE_ID);
-        assert_eq!(key.vertex_layout_hash, hash_vertex_layout(&desc.vertex_layout));
+        assert_eq!(
+            key.vertex_layout_hash,
+            hash_vertex_layout(&desc.vertex_layout)
+        );
         assert_eq!(key.variant_key, PipelineVariantKey::NONE);
         assert_eq!(desc.pipeline_layout, Some(pll));
         assert_eq!(desc.render_pass, Some(rp));

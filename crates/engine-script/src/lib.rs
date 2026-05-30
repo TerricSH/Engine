@@ -42,19 +42,19 @@ mod protocol;
 mod value;
 
 // Re-export lifecycle constants at the crate root for convenience.
-pub use lifecycle::lifecycle::{ON_CREATE, ON_START, ON_UPDATE, ON_DESTROY};
+pub use lifecycle::{ON_CREATE, ON_DESTROY, ON_START, ON_UPDATE};
 
 // Core types.
-pub use value::ScriptValue;
-pub use host::{
-    MockHost, MockScriptInstance, NullScriptHost, ScriptError, ScriptHandle, ScriptInstance,
-    ScriptHost,
-};
-pub use engine::ScriptEngine;
 pub use component::{ScriptComponent, ScriptInstanceState, ScriptManager};
-pub use protocol::ScriptMessage;
+pub use engine::ScriptEngine;
+pub use host::{
+    MockHost, MockScriptInstance, NullScriptHost, ScriptError, ScriptHandle, ScriptHost,
+    ScriptInstance,
+};
 pub use ilruntime_host::{ILRuntimeHost, ILRuntimeInstance};
 pub use process_host::{ProcessHost, ProcessScriptInstance};
+pub use protocol::ScriptMessage;
+pub use value::ScriptValue;
 
 // Script API extension surface.
 pub use extension::{
@@ -66,7 +66,7 @@ pub use extension::{
 pub use mobile_subset::{mobile_subset_v0, ScriptApiSubset, UnsupportedPattern};
 
 // Platform profile and API compatibility.
-pub use api_compat::{ApiCompatRange, MOBILE_SAFE_FEATURES, DESKTOP_ONLY_FEATURES};
+pub use api_compat::{ApiCompatRange, DESKTOP_ONLY_FEATURES, MOBILE_SAFE_FEATURES};
 pub use profile::{is_feature_available, PlatformConstraints, PlatformProfile};
 
 #[cfg(test)]
@@ -78,7 +78,10 @@ mod tests {
     #[test]
     fn script_error_load_failed_display() {
         let err = ScriptError::LoadFailed("assembly not found".to_string());
-        assert_eq!(err.to_string(), "Failed to load assembly: assembly not found");
+        assert_eq!(
+            err.to_string(),
+            "Failed to load assembly: assembly not found"
+        );
     }
 
     #[test]
@@ -96,7 +99,10 @@ mod tests {
     #[test]
     fn script_error_host_error_display() {
         let err = ScriptError::HostError("runtime unavailable".to_string());
-        assert_eq!(err.to_string(), "Host infrastructure error: runtime unavailable");
+        assert_eq!(
+            err.to_string(),
+            "Host infrastructure error: runtime unavailable"
+        );
     }
 
     #[test]
@@ -199,7 +205,7 @@ mod tests {
             ScriptValue::Null,
             ScriptValue::Bool(true),
             ScriptValue::Int(42),
-            ScriptValue::Float(3.14),
+            ScriptValue::Float(std::f64::consts::PI),
             ScriptValue::String("hello".into()),
             ScriptValue::Vec3([1.0, 2.0, 3.0]),
             ScriptValue::Vec4([1.0, 2.0, 3.0, 4.0]),

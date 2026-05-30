@@ -205,7 +205,12 @@ mod tests {
         let mut collector = DiagnosticsCollector::new();
 
         let diag1 = Diagnostic::new("SCR001", DiagnosticSeverity::Error, "script", "parse error");
-        let diag2 = Diagnostic::new("SCR002", DiagnosticSeverity::Warning, "script", "unused var");
+        let diag2 = Diagnostic::new(
+            "SCR002",
+            DiagnosticSeverity::Warning,
+            "script",
+            "unused var",
+        );
         collector.push_script_diags(vec![diag1, diag2]);
 
         let all = collector.all();

@@ -63,7 +63,7 @@ impl PassKind {
     }
 
     /// Parse from the string representation returned by [`as_str`](Self::as_str).
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s {
             "DirectionalShadow" => Some(Self::DirectionalShadow),
             "OpaquePbrForward" => Some(Self::OpaquePbrForward),
@@ -345,7 +345,7 @@ impl RenderGraph {
                 }
 
                 // Resolve the pass kind from the config string.
-                let kind = match PassKind::from_str(&entry.kind) {
+                let kind = match PassKind::parse_str(&entry.kind) {
                     Some(k) => k,
                     None => continue,
                 };
@@ -442,9 +442,7 @@ impl RenderGraph {
         }
 
         // Kahn's algorithm.
-        let mut queue: Vec<usize> = (0..n)
-            .filter(|&i| in_degree[i] == 0)
-            .collect();
+        let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
         let mut sorted = Vec::with_capacity(n);
 
         while let Some(v) = queue.pop() {
@@ -479,11 +477,8 @@ impl RenderGraph {
     ///
     /// Passes with `Custom` kind are silently skipped (no legacy equivalent).
     pub fn to_legacy(&self) -> render_graph::RenderGraph {
-        let legacy_passes: Vec<render_graph::PassNode> = self
-            .passes
-            .iter()
-            .filter_map(|p| p.to_legacy())
-            .collect();
+        let legacy_passes: Vec<render_graph::PassNode> =
+            self.passes.iter().filter_map(|p| p.to_legacy()).collect();
 
         render_graph::RenderGraph {
             passes: legacy_passes,

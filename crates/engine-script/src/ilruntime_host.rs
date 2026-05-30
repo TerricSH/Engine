@@ -32,11 +32,42 @@ use crate::value::ScriptValue;
 // FFI function signatures (provided by the managed side)
 // ---------------------------------------------------------------------------
 
-type FfiLoadAssembly = extern "C" fn(id: *const u8, id_len: u32, data: *const u8, data_len: u32) -> i32;
-type FfiInstantiate = extern "C" fn(assembly_id: *const u8, id_len: u32, class_name: *const u8, name_len: u32, instance_id: *const u8, inst_len: u32) -> i32;
-type FfiCallMethod = extern "C" fn(instance_id: *const u8, id_len: u32, method: *const u8, method_len: u32, args_json: *const u8, args_len: u32, result_out: *mut u8, result_cap: u32) -> i32;
-type FfiSetField = extern "C" fn(instance_id: *const u8, id_len: u32, name: *const u8, name_len: u32, value_json: *const u8, value_len: u32) -> i32;
-type FfiGetField = extern "C" fn(instance_id: *const u8, id_len: u32, name: *const u8, name_len: u32, result_out: *mut u8, result_cap: u32) -> i32;
+type FfiLoadAssembly =
+    extern "C" fn(id: *const u8, id_len: u32, data: *const u8, data_len: u32) -> i32;
+type FfiInstantiate = extern "C" fn(
+    assembly_id: *const u8,
+    id_len: u32,
+    class_name: *const u8,
+    name_len: u32,
+    instance_id: *const u8,
+    inst_len: u32,
+) -> i32;
+type FfiCallMethod = extern "C" fn(
+    instance_id: *const u8,
+    id_len: u32,
+    method: *const u8,
+    method_len: u32,
+    args_json: *const u8,
+    args_len: u32,
+    result_out: *mut u8,
+    result_cap: u32,
+) -> i32;
+type FfiSetField = extern "C" fn(
+    instance_id: *const u8,
+    id_len: u32,
+    name: *const u8,
+    name_len: u32,
+    value_json: *const u8,
+    value_len: u32,
+) -> i32;
+type FfiGetField = extern "C" fn(
+    instance_id: *const u8,
+    id_len: u32,
+    name: *const u8,
+    name_len: u32,
+    result_out: *mut u8,
+    result_cap: u32,
+) -> i32;
 type FfiDestroyInstance = extern "C" fn(instance_id: *const u8, id_len: u32) -> i32;
 type FfiShutdown = extern "C" fn() -> i32;
 
@@ -46,6 +77,7 @@ type FfiShutdown = extern "C" fn() -> i32;
 
 /// Opaque handle to the managed ILRuntime runtime.
 struct ManagedRuntime {
+    #[expect(dead_code)]
     lib_handle: *mut c_void,
     load_assembly: FfiLoadAssembly,
     instantiate: FfiInstantiate,
@@ -114,9 +146,8 @@ impl ScriptInstance for ILRuntimeInstance {
         let rt = unsafe { &*self.runtime };
 
         // Serialize args to JSON for the FFI call
-        let args_json = serde_json::to_string(args).map_err(|e| {
-            ScriptError::ExecutionError(format!("Failed to serialize args: {e}"))
-        })?;
+        let args_json = serde_json::to_string(args)
+            .map_err(|e| ScriptError::ExecutionError(format!("Failed to serialize args: {e}")))?;
 
         let mut result_buf = [0u8; 4096];
         let result_code = (rt.call_method)(
@@ -143,18 +174,19 @@ impl ScriptInstance for ILRuntimeInstance {
         }
 
         // Parse result JSON back to ScriptValue
-        let len = result_buf.iter().position(|&b| b == 0).unwrap_or(result_buf.len());
-        let result_str = std::str::from_utf8(&result_buf[..len]).map_err(|_| {
-            ScriptError::ExecutionError("Invalid UTF-8 in FFI result".into())
-        })?;
+        let len = result_buf
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(result_buf.len());
+        let result_str = std::str::from_utf8(&result_buf[..len])
+            .map_err(|_| ScriptError::ExecutionError("Invalid UTF-8 in FFI result".into()))?;
 
         if result_str.is_empty() {
             return Ok(ScriptValue::Null);
         }
 
-        serde_json::from_str(result_str).map_err(|e| {
-            ScriptError::ExecutionError(format!("Failed to parse FFI result: {e}"))
-        })
+        serde_json::from_str(result_str)
+            .map_err(|e| ScriptError::ExecutionError(format!("Failed to parse FFI result: {e}")))
     }
 
     fn set_field(&mut self, name: &str, value: ScriptValue) -> Result<(), ScriptError> {
@@ -163,9 +195,8 @@ impl ScriptInstance for ILRuntimeInstance {
         }
         let rt = unsafe { &*self.runtime };
 
-        let value_json = serde_json::to_string(&value).map_err(|e| {
-            ScriptError::ExecutionError(format!("Failed to serialize value: {e}"))
-        })?;
+        let value_json = serde_json::to_string(&value)
+            .map_err(|e| ScriptError::ExecutionError(format!("Failed to serialize value: {e}")))?;
 
         let result_code = (rt.set_field)(
             self.instance_id.as_ptr(),
@@ -204,7 +235,10 @@ impl ScriptInstance for ILRuntimeInstance {
             return None;
         }
 
-        let len = result_buf.iter().position(|&b| b == 0).unwrap_or(result_buf.len());
+        let len = result_buf
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(result_buf.len());
         let result_str = std::str::from_utf8(&result_buf[..len]).ok()?;
 
         if result_str.is_empty() {
@@ -342,8 +376,11 @@ impl ScriptHost for ILRuntimeHost {
         }
 
         // Store a raw pointer to the runtime so instances can call back
-        let runtime_ptr: *mut ManagedRuntime =
-            self.runtime.as_mut().map(|r| r as *mut ManagedRuntime).unwrap();
+        let runtime_ptr: *mut ManagedRuntime = self
+            .runtime
+            .as_mut()
+            .map(|r| r as *mut ManagedRuntime)
+            .unwrap();
 
         Ok(Box::new(ILRuntimeInstance {
             instance_id,
@@ -391,10 +428,7 @@ mod tests {
         let mut host = ILRuntimeHost::new("test");
         let result = host.load_assembly("asm", b"data");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not loaded"));
+        assert!(result.unwrap_err().to_string().contains("not loaded"));
     }
 
     #[test]

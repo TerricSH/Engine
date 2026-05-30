@@ -5,7 +5,7 @@ use tracing::debug;
 
 use crate::batch;
 use crate::types::{UiElement, UiElementKind};
-use crate::{DEFAULT_UI_MATERIAL, ElementId};
+use crate::{ElementId, DEFAULT_UI_MATERIAL};
 
 // ---------------------------------------------------------------------------
 // Canvas
@@ -171,22 +171,44 @@ impl Canvas {
 
             match &element.kind {
                 UiElementKind::Quad { color, .. } => {
-                    batch::add_quad(batch, &element.rect, &[0.0, 0.0], &[1.0, 1.0], &batch::color_to_array(*color));
+                    batch::add_quad(
+                        batch,
+                        &element.rect,
+                        &[0.0, 0.0],
+                        &[1.0, 1.0],
+                        &batch::color_to_array(*color),
+                    );
                 }
                 UiElementKind::Border { color, thickness } => {
-                    batch::add_border(batch, &element.rect, *thickness, batch::color_to_array(*color));
+                    batch::add_border(
+                        batch,
+                        &element.rect,
+                        *thickness,
+                        batch::color_to_array(*color),
+                    );
                 }
                 UiElementKind::Text { color, .. } => {
                     // Placeholder: render as a semi-transparent quad
                     let mut c = batch::color_to_array(*color);
-                    c[3] = c[3] / 2;
+                    c[3] /= 2;
                     batch::add_quad(batch, &element.rect, &[0.0, 0.0], &[1.0, 1.0], &c);
                 }
                 UiElementKind::Image { tint, .. } => {
-                    batch::add_quad(batch, &element.rect, &[0.0, 0.0], &[1.0, 1.0], &batch::color_to_array(*tint));
+                    batch::add_quad(
+                        batch,
+                        &element.rect,
+                        &[0.0, 0.0],
+                        &[1.0, 1.0],
+                        &batch::color_to_array(*tint),
+                    );
                 }
                 UiElementKind::NineSlice { border, tint, .. } => {
-                    batch::add_nine_slice(batch, &element.rect, border, batch::color_to_array(*tint));
+                    batch::add_nine_slice(
+                        batch,
+                        &element.rect,
+                        border,
+                        batch::color_to_array(*tint),
+                    );
                 }
             }
         }

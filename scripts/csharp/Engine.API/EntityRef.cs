@@ -43,7 +43,7 @@ public readonly ref struct EntityRef
         var typeId = ComponentRegistry.GetId<T>();
         unsafe
         {
-            var ptr = ffi_component_get(_worldPtr, _id, typeId);
+            var ptr = EngineAPI.ffi_component_get(_worldPtr, _id, typeId);
             if (ptr == IntPtr.Zero)
                 throw new InvalidOperationException(
                     $"Entity {_id} does not have component {typeof(T).Name}");
@@ -64,23 +64,7 @@ public readonly ref struct EntityRef
             {
                 *(T*)p = value;
             }
-            ffi_component_set(_worldPtr, _id, typeId, bytes, bytes.Length);
+            EngineAPI.ffi_component_set(_worldPtr, _id, typeId, bytes, bytes.Length);
         }
-    }
-
-    // ── FFI wrappers (temporary until proper P/Invoke into engine-ffi) ─
-
-    private static IntPtr ffi_component_get(
-        IntPtr world, EntityId entity, int typeId)
-    {
-        // TODO: replace with actual P/Invoke to engine-ffi
-        return IntPtr.Zero;
-    }
-
-    private static void ffi_component_set(
-        IntPtr world, EntityId entity, int typeId,
-        byte[] data, int length)
-    {
-        // TODO: replace with actual P/Invoke to engine-ffi
     }
 }

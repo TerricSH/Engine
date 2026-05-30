@@ -6,12 +6,7 @@ use crate::UiRect;
 
 /// Align `rect` to the left edge of `container` with `padding`.
 pub fn align_left(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
-    UiRect::new(
-        container.x + padding,
-        rect.y,
-        rect.width,
-        rect.height,
-    )
+    UiRect::new(container.x + padding, rect.y, rect.width, rect.height)
 }
 
 /// Align `rect` to the right edge of `container` with `padding`.
@@ -26,12 +21,7 @@ pub fn align_right(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
 
 /// Align `rect` to the top edge of `container` with `padding`.
 pub fn align_top(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
-    UiRect::new(
-        rect.x,
-        container.y + padding,
-        rect.width,
-        rect.height,
-    )
+    UiRect::new(rect.x, container.y + padding, rect.width, rect.height)
 }
 
 /// Align `rect` to the bottom edge of `container` with `padding`.

@@ -18,7 +18,7 @@ pub(crate) struct BufEntry {
 impl Drop for BufEntry {
     fn drop(&mut self) {
         if let Some(mut a) = self.allocation.take() {
-            let _ = self.allocator.lock().unwrap().free(&mut a);
+            self.allocator.lock().unwrap().free(&mut a);
         }
     }
 }

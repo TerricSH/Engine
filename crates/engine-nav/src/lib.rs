@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod agent;
 mod navmesh;
 mod pathfinding;
-mod agent;
 
-pub use navmesh::{NavMesh, VertexIndex, PolygonIndex, NavError};
-pub use pathfinding::{Pathfinder, Path, PathPoint};
-pub use agent::{NavAgent, AgentUpdate};
+pub use agent::{AgentUpdate, NavAgent};
+pub use navmesh::{NavError, NavMesh, PolygonIndex, VertexIndex};
+pub use pathfinding::{Path, PathPoint, Pathfinder};
 
 #[cfg(test)]
 mod tests {
@@ -63,7 +63,10 @@ mod tests {
     #[test]
     fn nav_error_no_path_found_display() {
         let err = NavError::NoPathFound;
-        assert_eq!(err.to_string(), "No path found between the specified points");
+        assert_eq!(
+            err.to_string(),
+            "No path found between the specified points"
+        );
     }
 
     #[test]
@@ -109,12 +112,10 @@ mod tests {
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
 
-        let path = Path::new(vec![
-            PathPoint {
-                position: Vec3::ZERO,
-                polygon: PolygonIndex(0),
-            },
-        ]);
+        let path = Path::new(vec![PathPoint {
+            position: Vec3::ZERO,
+            polygon: PolygonIndex(0),
+        }]);
         assert!(!path.is_empty());
         assert_eq!(path.len(), 1);
     }
@@ -265,7 +266,11 @@ mod tests {
         // After 1 second at 1 m/s, should be at x=1
         let update = agent.update(1.0);
         match update {
-            AgentUpdate::Moving { position, target, speed } => {
+            AgentUpdate::Moving {
+                position,
+                target,
+                speed,
+            } => {
                 assert!((position.x - 1.0).abs() < 0.001);
                 assert_eq!(target, Vec3::new(10.0, 0.0, 0.0));
                 assert_eq!(speed, 1.0);

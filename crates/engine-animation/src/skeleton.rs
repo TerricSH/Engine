@@ -158,9 +158,7 @@ impl Skeleton {
 
     /// The parent of `index`, or `None` if it is a root bone.
     pub fn parent_of(&self, index: BoneIndex) -> Option<BoneIndex> {
-        self.bones
-            .get(index.0 as usize)
-            .and_then(|b| b.parent)
+        self.bones.get(index.0 as usize).and_then(|b| b.parent)
     }
 
     /// Slice of immediate children of `index`. Returns an empty slice if the

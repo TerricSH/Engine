@@ -125,7 +125,10 @@ fn sample_keyframes(keyframes: &[Keyframe], time: f32) -> BoneTransform {
     };
 
     BoneTransform {
-        translation: prev.transform.translation.lerp(next.transform.translation, t),
+        translation: prev
+            .transform
+            .translation
+            .lerp(next.transform.translation, t),
         rotation: prev.transform.rotation.slerp(next.transform.rotation, t),
         scale: prev.transform.scale.lerp(next.transform.scale, t),
     }

@@ -54,7 +54,7 @@ impl VulkanDevice {
             let buf = unsafe { d.create_buffer(&bi, None) }
                 .map_err(|r| VulkanError::vk("create_ubo", r))?;
             let req = unsafe { d.get_buffer_memory_requirements(buf) };
-            self.ubo_alignment = req.alignment as u64;
+            self.ubo_alignment = req.alignment;
             let allocation = allocator
                 .lock()
                 .unwrap()
@@ -167,7 +167,7 @@ impl VulkanDevice {
     pub(crate) fn destroy_descriptor_infra(&mut self) {
         let d = &self.logical_device.device;
         for mut a in self.ubo_allocations.drain(..) {
-            let _ = self.logical_device.allocator().lock().unwrap().free(&mut a);
+            self.logical_device.allocator().lock().unwrap().free(&mut a);
         }
         for buf in self.frame_ubos.drain(..) {
             unsafe {

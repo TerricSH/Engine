@@ -58,10 +58,9 @@ impl AudioClip {
     /// Supported formats depend on the symphonia features enabled at the workspace level
     /// (default: WAV, MP3, FLAC, OGG Vorbis).
     pub fn decode(path: &Path) -> Result<Self, AudioError> {
-        let data = std::fs::read(path)
-            .map_err(|e| AudioError::DecodeError {
-                detail: format!("failed to read '{}': {}", path.display(), e),
-            })?;
+        let data = std::fs::read(path).map_err(|e| AudioError::DecodeError {
+            detail: format!("failed to read '{}': {}", path.display(), e),
+        })?;
         tracing::info!("reading audio file: {}", path.display());
         Self::decode_inner(data)
     }
@@ -119,12 +118,13 @@ impl AudioClip {
                 detail: "unknown sample rate".to_string(),
             })?;
 
-        let num_channels: u16 = codec_params
-            .channels
-            .map(|c| c.count() as u16)
-            .ok_or_else(|| AudioError::DecodeError {
-                detail: "unknown channel count".to_string(),
-            })?;
+        let num_channels: u16 =
+            codec_params
+                .channels
+                .map(|c| c.count() as u16)
+                .ok_or_else(|| AudioError::DecodeError {
+                    detail: "unknown channel count".to_string(),
+                })?;
 
         // Build the decoder for the track's codec.
         let codec_registry = symphonia::default::get_codecs();

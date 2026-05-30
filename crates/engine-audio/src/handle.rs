@@ -32,7 +32,11 @@ impl AudioHandle {
         cmd_tx: crossbeam_channel::Sender<AudioCommand>,
         finished: Arc<AtomicBool>,
     ) -> Self {
-        Self { id, cmd_tx, finished }
+        Self {
+            id,
+            cmd_tx,
+            finished,
+        }
     }
 
     /// Stop playback. Returns `InvalidHandle` if the command channel is closed.

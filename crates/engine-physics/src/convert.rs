@@ -17,7 +17,10 @@ pub fn from_rapier_vec(v: na::Vector3<f32>) -> glam::Vec3 {
 // ── Private conversion helpers ──────────────────────────────────────────────
 
 #[inline]
-pub(crate) fn to_rapier_isometry(translation: glam::Vec3, rotation: glam::Quat) -> na::Isometry3<f32> {
+pub(crate) fn to_rapier_isometry(
+    translation: glam::Vec3,
+    rotation: glam::Quat,
+) -> na::Isometry3<f32> {
     na::Isometry3::from_parts(
         na::Translation3::new(translation.x, translation.y, translation.z),
         na::UnitQuaternion::from_quaternion(na::Quaternion::new(

@@ -222,7 +222,9 @@ impl Command for SetComponentField {
             .components
             .get_mut(&self.component_type)
             .ok_or_else(|| EditorError::ComponentNotFound(self.component_type.clone()))?;
-        self.old_value = comp.fields.insert(self.field_name.clone(), self.new_value.clone());
+        self.old_value = comp
+            .fields
+            .insert(self.field_name.clone(), self.new_value.clone());
         Ok(())
     }
 
@@ -269,7 +271,9 @@ impl Command for AddEntity {
     }
 
     fn undo(&mut self, scene: &mut Scene) -> Result<(), EditorError> {
-        scene.entities.retain(|e| e.persistent_id != self.entity.persistent_id);
+        scene
+            .entities
+            .retain(|e| e.persistent_id != self.entity.persistent_id);
         Ok(())
     }
 }
@@ -289,7 +293,11 @@ impl RemoveEntity {
         let mut removed = Vec::new();
 
         // Capture the target entity.
-        if let Some(entity) = scene.entities.iter().find(|e| e.persistent_id == *entity_id) {
+        if let Some(entity) = scene
+            .entities
+            .iter()
+            .find(|e| e.persistent_id == *entity_id)
+        {
             removed.push(entity.clone());
         }
 

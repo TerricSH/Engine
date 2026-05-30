@@ -30,19 +30,19 @@ use glam::Vec3;
 // ---------------------------------------------------------------------------
 
 pub mod clip;
-pub mod source;
+pub mod engine;
 pub mod handle;
 pub(crate) mod mixer;
-pub mod engine;
+pub mod source;
 
 // ---------------------------------------------------------------------------
 // Re-exports (all public types)
 // ---------------------------------------------------------------------------
 
 pub use clip::AudioClip;
-pub use source::AudioSource;
-pub use handle::AudioHandle;
 pub use engine::AudioEngine;
+pub use handle::AudioHandle;
+pub use source::AudioSource;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -236,7 +236,10 @@ pub(crate) fn _compute_stereo_pan(
 ) -> (f32, f32) {
     let to_emitter = (emitter - listener_pos).normalize_or_zero();
     if to_emitter == Vec3::ZERO {
-        return (std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+        return (
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        );
     }
 
     let forward = listener_forward.normalize_or_zero();

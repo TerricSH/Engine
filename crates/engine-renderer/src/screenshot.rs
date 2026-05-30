@@ -34,10 +34,11 @@ pub fn save_framebuffer(
     height: u32,
 ) -> Result<(), ScreenshotError> {
     let pixels = device.read_pixels(x, y, width, height)?;
-    let img = image::RgbaImage::from_raw(width, height, pixels).ok_or(
-        ScreenshotError::Encode("image dimensions do not match pixel data".to_string()),
-    )?;
-    img.save(path).map_err(|e| ScreenshotError::Io(e.to_string()))?;
+    let img = image::RgbaImage::from_raw(width, height, pixels).ok_or(ScreenshotError::Encode(
+        "image dimensions do not match pixel data".to_string(),
+    ))?;
+    img.save(path)
+        .map_err(|e| ScreenshotError::Io(e.to_string()))?;
     tracing::info!(?path, "screenshot saved");
     Ok(())
 }

@@ -51,10 +51,7 @@ fn run_gate04_scene() {
 
             // Log aggregated diagnostics
             let all = sandbox_diags.all_diagnostics();
-            tracing::info!(
-                count = all.len(),
-                "sandbox diagnostics collected"
-            );
+            tracing::info!(count = all.len(), "sandbox diagnostics collected");
             for diagnostic in &all {
                 tracing::debug!(
                     code = diagnostic.code,
@@ -156,6 +153,7 @@ fn run_contract_triangle() {
                 size.width.max(1),
                 size.height.max(1),
                 enable_validation,
+                Some(std::path::Path::new("./pso_cache")),
             ) {
                 Ok(d) => d,
                 Err(err) => {
@@ -622,8 +620,14 @@ fn run_static_lit_scene() {
             };
             let val = std::env::var("ENGINE_VK_VALIDATION").is_ok();
 
-            let mut device =
-                match VulkanDevice::new(dh, wh, size.width.max(1), size.height.max(1), val) {
+            let mut device = match VulkanDevice::new(
+                dh,
+                wh,
+                size.width.max(1),
+                size.height.max(1),
+                val,
+                Some(std::path::Path::new("./pso_cache")),
+            ) {
                     Ok(d) => d,
                     Err(e) => {
                         tracing::error!("VulkanDevice: {e}");
@@ -725,13 +729,11 @@ fn run_model_viewer() {
     use engine_renderer::{
         BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, RenderFrameInput, Renderer,
     };
-    use glam::{Mat4, Vec3, Vec2};
+    use glam::{Mat4, Vec2, Vec3};
     use platform::winit::window::Window;
     use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-    use render_core::{
-        BufferDescriptor, BufferHandle, Device, MemoryHint,
-    };
+    use render_core::{BufferDescriptor, BufferHandle, Device, MemoryHint};
     use render_vulkan::device_impl::VulkanDevice;
     use std::sync::Arc;
 
@@ -739,15 +741,13 @@ fn run_model_viewer() {
     // Parse model path (skip --frames / --frames=N flags).
     let model_path = std::env::args().skip(2).find(|a| !a.starts_with("--"));
     let mesh = match model_path.as_deref() {
-        Some(path) if !path.is_empty() => {
-            match load_mesh_from_gltf(std::path::Path::new(path)) {
-                Ok(m) => m,
-                Err(err) => {
-                    tracing::warn!(path, error = %err, "glTF load failed, using test cube");
-                    engine_asset::mesh::create_test_cube()
-                }
+        Some(path) if !path.is_empty() => match load_mesh_from_gltf(std::path::Path::new(path)) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!(path, error = %err, "glTF load failed, using test cube");
+                engine_asset::mesh::create_test_cube()
             }
-        }
+        },
         _ => {
             tracing::info!("no model path provided, using test cube");
             engine_asset::mesh::create_test_cube()
@@ -868,7 +868,10 @@ fn run_model_viewer() {
                 if let Err(e) = engine_renderer::screenshot::save_framebuffer(
                     &mut self.device,
                     std::path::Path::new("screenshot.png"),
-                    0, 0, self.width as u32, self.height as u32,
+                    0,
+                    0,
+                    self.width as u32,
+                    self.height as u32,
                 ) {
                     tracing::warn!("screenshot failed: {e}");
                 }
@@ -916,6 +919,7 @@ fn run_model_viewer() {
                 size.width.max(1),
                 size.height.max(1),
                 enable_validation,
+                Some(std::path::Path::new("./pso_cache")),
             ) {
                 Ok(d) => d,
                 Err(err) => {
@@ -936,12 +940,12 @@ fn run_model_viewer() {
 
             // Ground plane: a 6×6 quad at y=−1.0, normal +Y
             let plane_verts: [(f32, f32, f32); 4] = [
-                (-3.0, -1.0, -3.0), (3.0, -1.0, -3.0),
-                (3.0, -1.0,  3.0), (-3.0, -1.0,  3.0),
+                (-3.0, -1.0, -3.0),
+                (3.0, -1.0, -3.0),
+                (3.0, -1.0, 3.0),
+                (-3.0, -1.0, 3.0),
             ];
-            let plane_uvs: [(f32, f32); 4] = [
-                (0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0),
-            ];
+            let plane_uvs: [(f32, f32); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
             let plane_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
 
             let cube_vert_count = mesh.positions.len();
@@ -970,7 +974,8 @@ fn run_model_viewer() {
                 vert_bytes.extend_from_slice(&px.to_ne_bytes());
                 vert_bytes.extend_from_slice(&py.to_ne_bytes());
                 vert_bytes.extend_from_slice(&pz.to_ne_bytes());
-                let one: f32 = 1.0; let zero: f32 = 0.0;
+                let one: f32 = 1.0;
+                let zero: f32 = 0.0;
                 vert_bytes.extend_from_slice(&zero.to_ne_bytes());
                 vert_bytes.extend_from_slice(&one.to_ne_bytes());
                 vert_bytes.extend_from_slice(&zero.to_ne_bytes());
@@ -1056,19 +1061,22 @@ fn run_model_viewer() {
                     if let Some(ref mut renderer) = self.renderer {
                         let mut input = RenderFrameInput::empty(self.frames);
                         input.views.push(engine_renderer::RenderView {
-                            view_id: 0, camera_entity: None,
+                            view_id: 0,
+                            camera_entity: None,
                             viewport: engine_renderer::Rect::FULL,
                             viewport_rect_normalized: engine_renderer::Rect::FULL,
                             view_matrix: engine_renderer::IDENTITY_MAT4,
                             projection_matrix: engine_renderer::IDENTITY_MAT4,
                             clear_flags: engine_renderer::ClearFlags::ColorAndDepth,
                             clear_color: [0.02, 0.02, 0.06, 1.0],
-                            render_layer_mask: u32::MAX, msaa_samples: 1,
+                            render_layer_mask: u32::MAX,
+                            msaa_samples: 1,
                             compose: engine_renderer::ViewCompose::Base {
                                 clear: engine_renderer::ClearFlags::ColorAndDepth,
                                 clear_color: [0.02, 0.02, 0.06, 1.0],
                             },
-                            stack_order: 0, frustum: None,
+                            stack_order: 0,
+                            frustum: None,
                         });
                         match renderer.draw_scene(&input) {
                             Ok(stats) => {

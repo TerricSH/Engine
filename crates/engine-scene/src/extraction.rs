@@ -4,13 +4,13 @@ use engine_renderer::{
 };
 use engine_serialize::{Diagnostic, DiagnosticSeverity, PersistentId};
 
-use crate::scene::{ECS_SCENE_CONTRACT, Scene};
+use crate::components;
+use crate::scene::{Scene, ECS_SCENE_CONTRACT};
 use crate::validation::{
-    active_camera_entity, asset_field, bool_field, enabled_component, f32_field,
-    light_kind_field, string_field, validate_scene, vec3_field,
+    active_camera_entity, asset_field, bool_field, enabled_component, f32_field, light_kind_field,
+    string_field, validate_scene, vec3_field,
 };
 use crate::World;
-use crate::components;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Legacy Scene extraction path
@@ -123,7 +123,13 @@ pub fn extract_renderer_input_from_world(
     // ── Camera pass: build RenderViews ──────────────────────────────────
 
     // Collect all cameras with their transforms, sorted by priority/stack_order.
-    type CameraEntry = (i32, Option<PersistentId>, components::Camera, components::Transform, crate::Entity);
+    type CameraEntry = (
+        i32,
+        Option<PersistentId>,
+        components::Camera,
+        components::Transform,
+        crate::Entity,
+    );
     let mut cameras: Vec<CameraEntry> = Vec::new();
 
     for (entity, camera_ref) in world.query::<components::Camera>() {
@@ -138,19 +144,35 @@ pub fn extract_renderer_input_from_world(
         // Validate camera near/far.
         if camera.near <= 0.0 {
             diagnostics.push(
-                Diagnostic::new("SC0022", DiagnosticSeverity::Error, "engine-scene",
-                    format!("Camera '{}' has non-positive near plane ({})", pid.as_deref().unwrap_or("?"), camera.near))
-                    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
-                    .entity(pid.clone()),
+                Diagnostic::new(
+                    "SC0022",
+                    DiagnosticSeverity::Error,
+                    "engine-scene",
+                    format!(
+                        "Camera '{}' has non-positive near plane ({})",
+                        pid.as_deref().unwrap_or("?"),
+                        camera.near
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .entity(pid.clone()),
             );
         }
         if camera.far <= camera.near {
             diagnostics.push(
-                Diagnostic::new("SC0023", DiagnosticSeverity::Error, "engine-scene",
-                    format!("Camera '{}' far plane ({}) must be greater than near plane ({})",
-                        pid.as_deref().unwrap_or("?"), camera.far, camera.near))
-                    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
-                    .entity(pid.clone()),
+                Diagnostic::new(
+                    "SC0023",
+                    DiagnosticSeverity::Error,
+                    "engine-scene",
+                    format!(
+                        "Camera '{}' far plane ({}) must be greater than near plane ({})",
+                        pid.as_deref().unwrap_or("?"),
+                        camera.far,
+                        camera.near
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .entity(pid.clone()),
             );
         }
 
@@ -171,12 +193,13 @@ pub fn extract_renderer_input_from_world(
     cameras.sort_by_key(|(priority, _, _, _, _)| *priority);
 
     // Compute the primary frustum from the first camera for culling.
-    let primary_frustum: Option<[glam::Vec4; 6]> = cameras.first().map(|(_, _, camera, transform, _)| {
-        let view = compute_view_matrix(transform);
-        let proj = compute_projection_matrix(camera);
-        let view_proj = proj * view;
-        extract_frustum_planes(&view_proj)
-    });
+    let primary_frustum: Option<[glam::Vec4; 6]> =
+        cameras.first().map(|(_, _, camera, transform, _)| {
+            let view = compute_view_matrix(transform);
+            let proj = compute_projection_matrix(camera);
+            let view_proj = proj * view;
+            extract_frustum_planes(&view_proj)
+        });
 
     for (view_idx, (priority, pid, camera, transform, _entity)) in cameras.iter().enumerate() {
         let view = compute_view_matrix(transform);
@@ -188,7 +211,10 @@ pub fn extract_renderer_input_from_world(
         let frustum = Some(extract_frustum_planes(&(proj * view)));
 
         let viewport = match camera.viewport_rect {
-            Some([x, y, w, h]) => Rect { min: [x, y], max: [x + w, y + h] },
+            Some([x, y, w, h]) => Rect {
+                min: [x, y],
+                max: [x + w, y + h],
+            },
             None => Rect::FULL,
         };
 
@@ -213,7 +239,12 @@ pub fn extract_renderer_input_from_world(
     }
 
     // Reject extraction if there are fatal diagnostics.
-    if diagnostics.iter().any(|d| matches!(d.severity, DiagnosticSeverity::Error | DiagnosticSeverity::Fatal)) {
+    if diagnostics.iter().any(|d| {
+        matches!(
+            d.severity,
+            DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+        )
+    }) {
         return Err(diagnostics);
     }
 
@@ -233,7 +264,10 @@ pub fn extract_renderer_input_from_world(
         }
 
         let pid = world.persistent_id(entity).map(|s| s.to_string());
-        let transform = world.get::<components::Transform>(entity).cloned().unwrap_or_default();
+        let transform = world
+            .get::<components::Transform>(entity)
+            .cloned()
+            .unwrap_or_default();
         let bounds = world.get::<components::Bounds>(entity);
 
         // Compute world transform matrix.
@@ -268,12 +302,16 @@ pub fn extract_renderer_input_from_world(
             world_transform: world_mat,
             bounds: match bounds {
                 Some(b) => AxisAlignedBox {
-                    min: [b.center[0] - b.half_extents[0],
-                          b.center[1] - b.half_extents[1],
-                          b.center[2] - b.half_extents[2]],
-                    max: [b.center[0] + b.half_extents[0],
-                          b.center[1] + b.half_extents[1],
-                          b.center[2] + b.half_extents[2]],
+                    min: [
+                        b.center[0] - b.half_extents[0],
+                        b.center[1] - b.half_extents[1],
+                        b.center[2] - b.half_extents[2],
+                    ],
+                    max: [
+                        b.center[0] + b.half_extents[0],
+                        b.center[1] + b.half_extents[1],
+                        b.center[2] + b.half_extents[2],
+                    ],
                 },
                 None => AxisAlignedBox::UNIT,
             },
@@ -294,18 +332,34 @@ pub fn extract_renderer_input_from_world(
         // Validate light values.
         if light.intensity < 0.0 {
             diagnostics.push(
-                Diagnostic::new("SC0024", DiagnosticSeverity::Warning, "engine-scene",
-                    format!("Light '{}' has negative intensity ({})", pid.as_deref().unwrap_or("?"), light.intensity))
-                    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
-                    .entity(pid.clone()),
+                Diagnostic::new(
+                    "SC0024",
+                    DiagnosticSeverity::Warning,
+                    "engine-scene",
+                    format!(
+                        "Light '{}' has negative intensity ({})",
+                        pid.as_deref().unwrap_or("?"),
+                        light.intensity
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .entity(pid.clone()),
             );
         }
         if light.range < 0.0 {
             diagnostics.push(
-                Diagnostic::new("SC0025", DiagnosticSeverity::Warning, "engine-scene",
-                    format!("Light '{}' has negative range ({})", pid.as_deref().unwrap_or("?"), light.range))
-                    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
-                    .entity(pid.clone()),
+                Diagnostic::new(
+                    "SC0025",
+                    DiagnosticSeverity::Warning,
+                    "engine-scene",
+                    format!(
+                        "Light '{}' has negative range ({})",
+                        pid.as_deref().unwrap_or("?"),
+                        light.range
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .entity(pid.clone()),
             );
         }
 
@@ -326,7 +380,9 @@ pub fn extract_renderer_input_from_world(
             [0.0, 0.0, 0.0]
         };
 
-        let spot_angles = light.spot_angles.map(|[inner, outer]| engine_renderer::SpotAngles { inner, outer });
+        let spot_angles = light
+            .spot_angles
+            .map(|[inner, outer]| engine_renderer::SpotAngles { inner, outer });
 
         input.lights.push(LightItem {
             entity: pid,
@@ -344,8 +400,10 @@ pub fn extract_renderer_input_from_world(
     // Attach culling stats to the input (stored in stats_scope).
     input.stats_scope = Some(format!(
         "World | drawables: {}/{} culled, lights: {}/{} culled",
-        culled_drawables, visible_drawables + culled_drawables,
-        culled_lights, visible_lights + culled_lights,
+        culled_drawables,
+        visible_drawables + culled_drawables,
+        culled_lights,
+        visible_lights + culled_lights,
     ));
 
     // Emit warnings as non-fatal diagnostics.
@@ -381,12 +439,12 @@ pub fn extract_frustum_planes(view_proj: &glam::Mat4) -> [glam::Vec4; 6] {
 
     // For OpenGL clip space (NDC [-1, 1]): plane = row3 ± row_i
     let mut planes = [
-        row3 + row0,  // left:   -x - w >= 0  →  -(row0·p) - (row3·p) >= 0  →  (row3 + row0)·p >= 0
-        row3 - row0,  // right:   x - w <= 0  →   (row0·p) - (row3·p) <= 0  →  (row3 - row0)·p >= 0
-        row3 + row1,  // bottom: -y - w >= 0
-        row3 - row1,  // top:     y - w <= 0
-        row3 + row2,  // near:   -z - w >= 0
-        row3 - row2,  // far:     z - w <= 0
+        row3 + row0, // left:   -x - w >= 0  →  -(row0·p) - (row3·p) >= 0  →  (row3 + row0)·p >= 0
+        row3 - row0, // right:   x - w <= 0  →   (row0·p) - (row3·p) <= 0  →  (row3 - row0)·p >= 0
+        row3 + row1, // bottom: -y - w >= 0
+        row3 - row1, // top:     y - w <= 0
+        row3 + row2, // near:   -z - w >= 0
+        row3 - row2, // far:     z - w <= 0
     ];
 
     // Normalise each plane (normal = xyz, constant = w).
@@ -455,9 +513,12 @@ fn compute_projection_matrix(camera: &components::Camera) -> glam::Mat4 {
             let half_w = camera.ortho_half_height * ASPECT;
             let half_h = camera.ortho_half_height;
             glam::Mat4::orthographic_rh_gl(
-                -half_w, half_w,
-                -half_h, half_h,
-                camera.near, camera.far,
+                -half_w,
+                half_w,
+                -half_h,
+                half_h,
+                camera.near,
+                camera.far,
             )
         }
     }
@@ -521,17 +582,20 @@ mod tests {
         // All planes should be normalised.
         for (i, plane) in planes.iter().enumerate() {
             let len = plane.truncate().length();
-            assert!((len - 1.0).abs() < 1e-6,
-                "plane {} not normalised (len={})", i, len);
+            assert!(
+                (len - 1.0).abs() < 1e-6,
+                "plane {} not normalised (len={})",
+                i,
+                len
+            );
         }
     }
 
     #[test]
     fn aabb_inside_default_frustum() {
         // A simple perspective frustum looking down -Z.
-        let proj = glam::Mat4::perspective_rh_gl(
-            std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0,
-        );
+        let proj =
+            glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
         let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
@@ -541,38 +605,47 @@ mod tests {
 
     #[test]
     fn aabb_outside_frustum_culled() {
-        let proj = glam::Mat4::perspective_rh_gl(
-            std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0,
-        );
+        let proj =
+            glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
         let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
         // Box far behind the camera.
-        assert!(!aabb_in_frustum([0.0, 0.0, 10.0], [0.5, 0.5, 0.5], &frustum));
+        assert!(!aabb_in_frustum(
+            [0.0, 0.0, 10.0],
+            [0.5, 0.5, 0.5],
+            &frustum
+        ));
     }
 
     #[test]
     fn aabb_far_beyond_far_plane() {
-        let proj = glam::Mat4::perspective_rh_gl(
-            std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0,
-        );
+        let proj =
+            glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
         let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
         // Box far beyond the far plane.
-        assert!(!aabb_in_frustum([0.0, 0.0, -200.0], [1.0, 1.0, 1.0], &frustum));
+        assert!(!aabb_in_frustum(
+            [0.0, 0.0, -200.0],
+            [1.0, 1.0, 1.0],
+            &frustum
+        ));
     }
 
     #[test]
     fn aabb_partially_inside_is_visible() {
-        let proj = glam::Mat4::perspective_rh_gl(
-            std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0,
-        );
+        let proj =
+            glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
         let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
         // Large box straddling the camera should be visible.
-        assert!(aabb_in_frustum([0.0, 0.0, -2.0], [10.0, 10.0, 10.0], &frustum));
+        assert!(aabb_in_frustum(
+            [0.0, 0.0, -2.0],
+            [10.0, 10.0, 10.0],
+            &frustum
+        ));
     }
 
     // ── World extraction tests ──────────────────────────────────────────
@@ -595,7 +668,10 @@ mod tests {
     fn extract_from_world_without_camera_fails() {
         let world = World::new();
         let result = extract_renderer_input_from_world(&world, 0);
-        assert!(result.is_err(), "expected extraction to fail without camera");
+        assert!(
+            result.is_err(),
+            "expected extraction to fail without camera"
+        );
     }
 
     #[test]
@@ -605,7 +681,8 @@ mod tests {
 
         // Convert scene to world and extract via the new path.
         let world = World::from_scene(&scene);
-        let world_input = extract_renderer_input_from_world(&world, 7).expect("world extraction OK");
+        let world_input =
+            extract_renderer_input_from_world(&world, 7).expect("world extraction OK");
 
         // Compare counts (the structural output should match).
         assert_eq!(
@@ -625,7 +702,11 @@ mod tests {
         );
 
         // Compare drawable mesh/material/render_layer.
-        for (wd, sd) in world_input.drawables.iter().zip(scene_input.drawables.iter()) {
+        for (wd, sd) in world_input
+            .drawables
+            .iter()
+            .zip(scene_input.drawables.iter())
+        {
             assert_eq!(wd.mesh, sd.mesh, "mesh mismatch");
             assert_eq!(wd.material, sd.material, "material mismatch");
             assert_eq!(wd.render_layer, sd.render_layer, "render_layer mismatch");
@@ -643,39 +724,57 @@ mod tests {
 
         // Renderable in front of camera (should be visible).
         let e_front = world.create_entity();
-        world.add_component(e_front, components::Renderable {
-            mesh_asset: "mesh-visible".into(),
-            material_asset: "mat-default".into(),
-            visible: true,
-            cast_shadows: true,
-            render_layer: "Default".into(),
-        });
-        world.add_component(e_front, components::Transform {
-            translation: glam::Vec3::new(0.0, 0.0, -5.0),
-            ..Default::default()
-        });
-        world.add_component(e_front, components::Bounds {
-            center: [0.0, 0.0, -5.0],
-            half_extents: [0.5, 0.5, 0.5],
-        });
+        world.add_component(
+            e_front,
+            components::Renderable {
+                mesh_asset: "mesh-visible".into(),
+                material_asset: "mat-default".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            e_front,
+            components::Transform {
+                translation: glam::Vec3::new(0.0, 0.0, -5.0),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            e_front,
+            components::Bounds {
+                center: [0.0, 0.0, -5.0],
+                half_extents: [0.5, 0.5, 0.5],
+            },
+        );
 
         // Renderable behind camera (should be culled).
         let e_back = world.create_entity();
-        world.add_component(e_back, components::Renderable {
-            mesh_asset: "mesh-culled".into(),
-            material_asset: "mat-default".into(),
-            visible: true,
-            cast_shadows: true,
-            render_layer: "Default".into(),
-        });
-        world.add_component(e_back, components::Transform {
-            translation: glam::Vec3::new(0.0, 0.0, 10.0),
-            ..Default::default()
-        });
-        world.add_component(e_back, components::Bounds {
-            center: [0.0, 0.0, 10.0],
-            half_extents: [0.5, 0.5, 0.5],
-        });
+        world.add_component(
+            e_back,
+            components::Renderable {
+                mesh_asset: "mesh-culled".into(),
+                material_asset: "mat-default".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            e_back,
+            components::Transform {
+                translation: glam::Vec3::new(0.0, 0.0, 10.0),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            e_back,
+            components::Bounds {
+                center: [0.0, 0.0, 10.0],
+                half_extents: [0.5, 0.5, 0.5],
+            },
+        );
 
         let result = extract_renderer_input_from_world(&world, 1);
         assert!(result.is_ok(), "extraction failed: {:?}", result.err());
@@ -694,15 +793,18 @@ mod tests {
         world.add_component(e_cam, components::Transform::default());
 
         let e_light = world.create_entity();
-        world.add_component(e_light, crate::components::Light {
-            kind: crate::components::LightKind::Point,
-            color: [1.0, 0.5, 0.2],
-            intensity: 100.0,
-            range: 20.0,
-            spot_angles: None,
-            shadow_mode: 0,
-            direction: [0.0, -1.0, 0.0],
-        });
+        world.add_component(
+            e_light,
+            crate::components::Light {
+                kind: crate::components::LightKind::Point,
+                color: [1.0, 0.5, 0.2],
+                intensity: 100.0,
+                range: 20.0,
+                spot_angles: None,
+                shadow_mode: 0,
+                direction: [0.0, -1.0, 0.0],
+            },
+        );
 
         let input = extract_renderer_input_from_world(&world, 2).expect("world extraction OK");
         assert_eq!(input.lights.len(), 1);

@@ -29,13 +29,13 @@
 //! | `movement`    | [`process_movement`], [`CharacterMovement`], [`CharacterOutput`] |
 //! | `collision`   | [`ground_check`], [`resolve_collision`]             |
 
+mod collision;
 mod controller;
 mod movement;
-mod collision;
 
+pub use collision::{ground_check, resolve_collision};
 pub use controller::{CharacterController, CharacterError, CharacterState};
 pub use movement::{process_movement, CharacterMovement, CharacterOutput};
-pub use collision::{ground_check, resolve_collision};
 
 #[cfg(test)]
 mod tests {

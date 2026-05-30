@@ -5,7 +5,7 @@ use std::sync::Arc;
 use engine_serialize::AssetId;
 use tracing::{debug, info};
 
-use crate::loader::{AssetLoader, AssetHandle, AssetError};
+use crate::loader::{AssetError, AssetHandle, AssetLoader};
 use crate::path::asset_path;
 
 // ---------------------------------------------------------------------------
@@ -157,7 +157,10 @@ impl AssetRegistry {
     /// exist; otherwise [`AssetError::UnsupportedFormat`] is returned.
     ///
     /// If the raw bytes are already cached the disk read is skipped.
-    pub fn load_typed<T: Send + Sync + 'static>(&mut self, id: &AssetId) -> Result<AssetHandle<T>, AssetError> {
+    pub fn load_typed<T: Send + Sync + 'static>(
+        &mut self,
+        id: &AssetId,
+    ) -> Result<AssetHandle<T>, AssetError> {
         // Fast path – typed data already cached and matches the requested type.
         if let Some(entry) = self.cache.get(id) {
             if let Some(ref typed) = entry.typed {
@@ -199,7 +202,9 @@ impl AssetRegistry {
         info!(asset_id = %id.id, extension = %ext, "loading typed asset");
 
         let boxed = loader.load(id, &raw_bytes)?;
-        let typed: Box<T> = boxed.downcast::<T>().map_err(|_| AssetError::TypeMismatch)?;
+        let typed: Box<T> = boxed
+            .downcast::<T>()
+            .map_err(|_| AssetError::TypeMismatch)?;
         let typed_arc = Arc::from(typed);
 
         self.cache.insert(

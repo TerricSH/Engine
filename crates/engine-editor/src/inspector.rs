@@ -57,17 +57,18 @@ impl InspectorPanel {
 
         ui.collapsing_header("Inspector", true);
 
-        let entity = match selected.and_then(|id| scene.entities.iter().find(|e| e.persistent_id == *id)) {
-            Some(e) => e,
-            None => {
-                // No entity selected – show placeholder.
-                ui.text_field("Entity", "(none selected)");
-                ui.separator();
-                ui.collapsing_header("Components", true);
-                ui.text_field("Hint", "Select an entity in the Hierarchy panel");
-                return commands;
-            }
-        };
+        let entity =
+            match selected.and_then(|id| scene.entities.iter().find(|e| e.persistent_id == *id)) {
+                Some(e) => e,
+                None => {
+                    // No entity selected – show placeholder.
+                    ui.text_field("Entity", "(none selected)");
+                    ui.separator();
+                    ui.collapsing_header("Components", true);
+                    ui.text_field("Hint", "Select an entity in the Hierarchy panel");
+                    return commands;
+                }
+            };
 
         // ── Entity header ────────────────────────────────────────
         ui.separator();
@@ -76,7 +77,11 @@ impl InspectorPanel {
         // Name
         let current_name = entity.name.clone().unwrap_or_default();
         if let Some(edited) = ui.text_field("Name", &current_name) {
-            let new_name = if edited.is_empty() { None } else { Some(edited) };
+            let new_name = if edited.is_empty() {
+                None
+            } else {
+                Some(edited)
+            };
             commands.push(Box::new(crate::commands::SetEntityName::new(
                 entity.persistent_id.clone(),
                 new_name,
@@ -92,12 +97,22 @@ impl InspectorPanel {
         let expanded = ui.collapsing_header("Components", true);
         if expanded {
             for (comp_type, comp_record) in &entity.components {
-                let comp_header = format!("{comp_type} [{}]", if comp_record.enabled { "x" } else { " " });
+                let comp_header = format!(
+                    "{comp_type} [{}]",
+                    if comp_record.enabled { "x" } else { " " }
+                );
                 let comp_open = ui.collapsing_header(&comp_header, false);
                 if comp_open {
                     for (field_name, value) in &comp_record.fields {
                         let label = format!("{comp_type}/{field_name}");
-                        if let Some(cmd) = edit_value(ui, &label, value, &entity.persistent_id, comp_type, field_name) {
+                        if let Some(cmd) = edit_value(
+                            ui,
+                            &label,
+                            value,
+                            &entity.persistent_id,
+                            comp_type,
+                            field_name,
+                        ) {
                             commands.push(cmd);
                         }
                     }
@@ -154,14 +169,9 @@ impl InspectorPanel {
                 let comp_type = format!("__script_component__.{idx}");
                 // Use the selected entity ID if available
                 let entity_id = selected.unwrap_or(&sc.class_name);
-                if let Some(cmd) = edit_script_value(
-                    ui,
-                    &label,
-                    sv,
-                    entity_id,
-                    &comp_type,
-                    field_name,
-                ) {
+                if let Some(cmd) =
+                    edit_script_value(ui, &label, sv, entity_id, &comp_type, field_name)
+                {
                     commands.push(cmd);
                 }
             }
@@ -479,7 +489,10 @@ fn edit_script_value(
         }
         engine_script::ScriptValue::Vec4(arr) => {
             // Display as read-only text since Value has no Vec4 variant
-            ui.text_field(label, &format!("[{}, {}, {}, {}]", arr[0], arr[1], arr[2], arr[3]));
+            ui.text_field(
+                label,
+                &format!("[{}, {}, {}, {}]", arr[0], arr[1], arr[2], arr[3]),
+            );
         }
         engine_script::ScriptValue::EntityId(eid) => {
             ui.text_field(label, eid);
@@ -492,7 +505,8 @@ fn edit_script_value(
             if open {
                 for (i, item) in items.iter().enumerate() {
                     let item_label = format!("{label}[{i}]");
-                    let _ = edit_script_value(ui, &item_label, item, entity_id, comp_type, field_name);
+                    let _ =
+                        edit_script_value(ui, &item_label, item, entity_id, comp_type, field_name);
                 }
             }
         }
@@ -501,7 +515,8 @@ fn edit_script_value(
             if open {
                 for (key, val) in map {
                     let entry_label = format!("{label}.{key}");
-                    let _ = edit_script_value(ui, &entry_label, val, entity_id, comp_type, field_name);
+                    let _ =
+                        edit_script_value(ui, &entry_label, val, entity_id, comp_type, field_name);
                 }
             }
         }

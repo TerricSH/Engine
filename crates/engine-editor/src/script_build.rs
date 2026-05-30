@@ -72,7 +72,11 @@ impl ScriptBuildManager {
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let merged = if stderr.is_empty() { stdout } else { format!("{stdout}\n{stderr}") };
+        let merged = if stderr.is_empty() {
+            stdout
+        } else {
+            format!("{stdout}\n{stderr}")
+        };
 
         // Parse error lines: "error CS..." or "error :..."
         let errors: Vec<String> = merged
@@ -95,7 +99,11 @@ impl ScriptBuildManager {
 
         tracing::info!(
             success = success,
-            error_count = self.last_build_result.as_ref().map(|r| r.errors.len()).unwrap_or(0),
+            error_count = self
+                .last_build_result
+                .as_ref()
+                .map(|r| r.errors.len())
+                .unwrap_or(0),
             elapsed_ms = start.elapsed().as_millis(),
             "ScriptBuildManager::build completed"
         );
@@ -142,9 +150,7 @@ mod tests {
     fn script_build_manager_build_no_dotnet() {
         // Without `dotnet` on PATH, this should return an IoFailed error.
         // We simulate by pointing to a non-existent directory.
-        let mut mgr = ScriptBuildManager::new(PathBuf::from(
-            "Z:\\nonexistent\\project",
-        ));
+        let mut mgr = ScriptBuildManager::new(PathBuf::from("Z:\\nonexistent\\project"));
         let result = mgr.build();
         // The result may be Ok (if dotnet happens to be installed) or Err.
         // If it's Ok, the build likely failed with a non-zero exit (which

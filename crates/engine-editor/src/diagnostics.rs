@@ -264,7 +264,11 @@ impl DiagnosticsPanel {
 
         // Expand / collapse detail
         let is_expanded = self.expanded == Some(orig_idx);
-        let btn_label = if is_expanded { "▲ Hide" } else { "▼ Detail" };
+        let btn_label = if is_expanded {
+            "▲ Hide"
+        } else {
+            "▼ Detail"
+        };
         if ui.button(btn_label) {
             self.expanded = if is_expanded { None } else { Some(orig_idx) };
         }
@@ -334,8 +338,13 @@ mod tests {
 
     fn sample_diagnostics() -> Vec<Diagnostic> {
         vec![
-            Diagnostic::new("CS1001", DiagnosticSeverity::Error, "build", "Identifier expected")
-                .path("src/Program.cs"),
+            Diagnostic::new(
+                "CS1001",
+                DiagnosticSeverity::Error,
+                "build",
+                "Identifier expected",
+            )
+            .path("src/Program.cs"),
             Diagnostic::new(
                 "RELOAD_OK",
                 DiagnosticSeverity::Info,
@@ -371,7 +380,12 @@ mod tests {
     #[test]
     fn diagnostics_panel_push() {
         let mut panel = DiagnosticsPanel::new("D");
-        panel.push(Diagnostic::new("E1", DiagnosticSeverity::Error, "test", "msg"));
+        panel.push(Diagnostic::new(
+            "E1",
+            DiagnosticSeverity::Error,
+            "test",
+            "msg",
+        ));
         assert_eq!(panel.all_entries().len(), 1);
     }
 

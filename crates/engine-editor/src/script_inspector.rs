@@ -182,7 +182,9 @@ impl ScriptInspector {
                 }
             }
             ScriptValue::Vec3(arr) => {
-                if let Some(new_x) = ui.slider_f32(&format!("{label}.x"), arr[0], -10_000.0, 10_000.0) {
+                if let Some(new_x) =
+                    ui.slider_f32(&format!("{label}.x"), arr[0], -10_000.0, 10_000.0)
+                {
                     let mut new_arr = *arr;
                     new_arr[0] = new_x;
                     commands.push(Box::new(SetComponentField::new(
@@ -192,7 +194,9 @@ impl ScriptInspector {
                         Value::Vec3(new_arr),
                     )));
                 }
-                if let Some(new_y) = ui.slider_f32(&format!("{label}.y"), arr[1], -10_000.0, 10_000.0) {
+                if let Some(new_y) =
+                    ui.slider_f32(&format!("{label}.y"), arr[1], -10_000.0, 10_000.0)
+                {
                     let mut new_arr = *arr;
                     new_arr[1] = new_y;
                     commands.push(Box::new(SetComponentField::new(
@@ -202,7 +206,9 @@ impl ScriptInspector {
                         Value::Vec3(new_arr),
                     )));
                 }
-                if let Some(new_z) = ui.slider_f32(&format!("{label}.z"), arr[2], -10_000.0, 10_000.0) {
+                if let Some(new_z) =
+                    ui.slider_f32(&format!("{label}.z"), arr[2], -10_000.0, 10_000.0)
+                {
                     let mut new_arr = *arr;
                     new_arr[2] = new_z;
                     commands.push(Box::new(SetComponentField::new(
@@ -215,7 +221,10 @@ impl ScriptInspector {
             }
             ScriptValue::Vec4(arr) => {
                 // Render as read-only since Value has no Vec4 variant
-                ui.text_field(label, &format!("[{}, {}, {}, {}]", arr[0], arr[1], arr[2], arr[3]));
+                ui.text_field(
+                    label,
+                    &format!("[{}, {}, {}, {}]", arr[0], arr[1], arr[2], arr[3]),
+                );
             }
             ScriptValue::EntityId(eid) => {
                 ui.text_field(label, eid);

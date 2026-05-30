@@ -167,10 +167,7 @@ impl HotUpdateManifest {
                 errors.push("payload_hash algorithm must not be empty".into());
             }
             if !seen_paths.insert(&hash_entry.path) {
-                errors.push(format!(
-                    "duplicate payload hash path: {}",
-                    hash_entry.path
-                ));
+                errors.push(format!("duplicate payload hash path: {}", hash_entry.path));
             }
         }
 
@@ -231,9 +228,7 @@ impl HotUpdateManifest {
         if platform == PlatformKind::Ios {
             for payload in &self.platform_payloads {
                 if payload.platform == PlatformKind::Ios && payload.optional_assembly.is_some() {
-                    reasons.push(
-                        "iOS platform payload must not contain optional_assembly".into(),
-                    );
+                    reasons.push("iOS platform payload must not contain optional_assembly".into());
                 }
             }
         }
@@ -410,7 +405,9 @@ mod tests {
         );
         if let CompatibilityResult::Incompatible { ref reasons } = result {
             assert!(
-                reasons.iter().any(|r| r.contains("iOS") && r.contains("assembly")),
+                reasons
+                    .iter()
+                    .any(|r| r.contains("iOS") && r.contains("assembly")),
                 "expected reason about iOS assembly rejection, got: {reasons:?}"
             );
         }
@@ -473,7 +470,9 @@ mod tests {
             "expected content_schema_version error, got: {errors:?}"
         );
         assert!(
-            errors.iter().any(|e| e.contains("logic_asset_schema_version")),
+            errors
+                .iter()
+                .any(|e| e.contains("logic_asset_schema_version")),
             "expected logic_asset_schema_version error, got: {errors:?}"
         );
         assert!(
@@ -530,10 +529,7 @@ mod tests {
         assert!(manifest.verify_payload_hash("data/desktop/patch.bundle", data));
 
         // Wrong data fails.
-        assert!(!manifest.verify_payload_hash(
-            "data/desktop/patch.bundle",
-            b"tampered data"
-        ));
+        assert!(!manifest.verify_payload_hash("data/desktop/patch.bundle", b"tampered data"));
 
         // Non-existent path fails.
         assert!(!manifest.verify_payload_hash("nonexistent/path", data));

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crossbeam_channel::Sender;
-use rapier3d::prelude::*;
 use rapier3d::na;
+use rapier3d::prelude::*;
 
 use crate::components::{BodyType, Collider, ColliderShape, RigidBody};
 use crate::convert::{from_rapier_isometry, from_rapier_vec, to_rapier_isometry, to_rapier_vec};
@@ -263,9 +263,9 @@ impl RapierBackend {
             .collision_groups(groups)
             .build();
 
-        let collider_handle = self
-            .colliders
-            .insert_with_parent(rapier_collider, body_handle, &mut self.bodies);
+        let collider_handle =
+            self.colliders
+                .insert_with_parent(rapier_collider, body_handle, &mut self.bodies);
 
         self.collider_map
             .insert(entity_index, (collider_handle, collider.shape.clone()));
@@ -289,12 +289,8 @@ impl RapierBackend {
     /// Remove a collider but keep the body.
     pub fn remove_collider(&mut self, entity_index: u32) {
         if let Some((handle, _)) = self.collider_map.remove(&entity_index) {
-            self.colliders.remove(
-                handle,
-                &mut self.islands,
-                &mut self.bodies,
-                true,
-            );
+            self.colliders
+                .remove(handle, &mut self.islands, &mut self.bodies, true);
         }
     }
 
@@ -308,12 +304,7 @@ impl RapierBackend {
     }
 
     /// Set the world-space transform of a body.
-    pub fn set_body_transform(
-        &mut self,
-        entity_index: u32,
-        pos: glam::Vec3,
-        rot: glam::Quat,
-    ) {
+    pub fn set_body_transform(&mut self, entity_index: u32, pos: glam::Vec3, rot: glam::Quat) {
         if let Some(&handle) = self.body_map.get(&entity_index) {
             if let Some(body) = self.bodies.get_mut(handle) {
                 body.set_position(to_rapier_isometry(pos, rot), true);
@@ -356,9 +347,14 @@ impl RapierBackend {
         );
         let filter = QueryFilter::default().exclude_sensors();
 
-        let (collider_handle, intersection) = self
-            .query_pipeline
-            .cast_ray_and_get_normal(&self.bodies, &self.colliders, &ray, max_dist, true, filter)?;
+        let (collider_handle, intersection) = self.query_pipeline.cast_ray_and_get_normal(
+            &self.bodies,
+            &self.colliders,
+            &ray,
+            max_dist,
+            true,
+            filter,
+        )?;
 
         let collider = self.colliders.get(collider_handle)?;
         let body_handle = collider.parent()?;

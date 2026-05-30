@@ -144,14 +144,8 @@ pub mod hot_update;
 
 // Re-export key hot_update types.
 pub use hot_update::{
-    AssemblyPayload,
-    CompatibilityResult,
-    HotUpdateManifest,
-    ManifestSignature,
-    PayloadHash,
-    PlatformKind,
-    PlatformPayload,
-    RollbackMetadata,
+    AssemblyPayload, CompatibilityResult, HotUpdateManifest, ManifestSignature, PayloadHash,
+    PlatformKind, PlatformPayload, RollbackMetadata,
 };
 
 #[cfg(test)]

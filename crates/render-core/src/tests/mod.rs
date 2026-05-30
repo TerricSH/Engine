@@ -1,8 +1,8 @@
+use crate::RhiError;
 use crate::{
     BackendKind, BufferHandle, BufferUsage, ResourceHandle, ShaderFormat, TextureFormat,
     TextureUsage,
 };
-use crate::RhiError;
 
 #[test]
 fn rhi_error_codes_match_registry() {

@@ -13,7 +13,7 @@ pub struct AssetTypeMeta {
 }
 
 // ---------------------------------------------------------------------------
-/// Type aliases for extension hooks
+// Type aliases for extension hooks
 // ---------------------------------------------------------------------------
 
 /// Asset cooker: produces cooked data from source bytes.

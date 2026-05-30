@@ -866,10 +866,12 @@ dependencies = [
 name = "engine-core"
 version = "0.1.0"
 dependencies = [
+ "engine-ffi",
  "engine-renderer",
  "engine-scene",
  "engine-script",
  "engine-serialize",
+ "tracing",
 ]
 
 [[package]]
@@ -894,6 +896,7 @@ dependencies = [
 name = "engine-ffi"
 version = "0.1.0"
 dependencies = [
+ "engine-scene",
  "engine-serialize",
  "tracing",
 ]

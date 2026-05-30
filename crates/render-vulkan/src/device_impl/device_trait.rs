@@ -81,7 +81,7 @@ impl render_core::Device for VulkanDevice {
                 allocation_scheme: AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| render_core::RhiError::Backend {
-                detail: format!("{e}"),
+                detail: e.to_string(),
             })?;
         // SAFETY: `buffer` was created by this device; `allocation` was created
         // for this buffer's memory requirements; the memory and offset are valid.
@@ -90,7 +90,7 @@ impl render_core::Device for VulkanDevice {
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
         } {
             if let Ok(mut alloc_guard) = alloc_handle.lock() {
-                let _ = alloc_guard.free(&mut allocation);
+                alloc_guard.free(&mut allocation);
             }
             // SAFETY: `buffer` was just created; not bound to memory; destroying
             // a freshly-created buffer is safe even on failed bind.
@@ -752,7 +752,7 @@ impl render_core::Device for VulkanDevice {
         if subopt {
             // SAFETY: `self.logical_device` is alive by type invariant
             // (ManuallyDrop ensures destruction order).
-            let _ = unsafe { self.logical_device.device.device_wait_idle() };
+            unsafe { let _ = self.logical_device.device.device_wait_idle(); };
             self.swapchain = None;
         }
         self.current_frame = (fi + 1) % 2;
@@ -771,7 +771,7 @@ impl render_core::Device for VulkanDevice {
     ) -> Result<(), render_core::RhiError> {
         // SAFETY: `self.logical_device` is alive by type invariant
         // (ManuallyDrop ensures destruction order).
-        let _ = unsafe { self.logical_device.device.device_wait_idle() };
+        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
         self.window_width = w.max(1);
         self.window_height = h.max(1);
         self.swapchain = None;
@@ -781,7 +781,7 @@ impl render_core::Device for VulkanDevice {
     fn wait_idle(&self) {
         // SAFETY: `self.logical_device` is alive by type invariant
         // (ManuallyDrop ensures destruction order).
-        let _ = unsafe { self.logical_device.device.device_wait_idle() };
+        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
     }
 
     fn read_pixels(
@@ -795,7 +795,7 @@ impl render_core::Device for VulkanDevice {
         // deterministic layout (PRESENT_SRC_KHR after the last render pass).
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures destruction order).
-        let _ = unsafe { self.logical_device.device.device_wait_idle() };
+        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
 
         let sc = self
             .swapchain
@@ -881,7 +881,7 @@ impl render_core::Device for VulkanDevice {
             // SAFETY: buffer/allocation were just created and are not in use
             // after the failed bind; cleanup is safe.
             if let Ok(mut guard) = alloc_handle.lock() {
-                let _ = guard.free(&mut staging_alloc);
+                guard.free(&mut staging_alloc);
             }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             return Err(render_core::RhiError::Backend {
@@ -904,7 +904,7 @@ impl render_core::Device for VulkanDevice {
         }
         .map_err(|r| {
             if let Ok(mut guard) = alloc_handle.lock() {
-                let _ = guard.free(&mut staging_alloc);
+                guard.free(&mut staging_alloc);
             }
             // SAFETY: cleanup only happen on error; all handles are valid.
             unsafe { device.destroy_buffer(staging_buffer, None) };
@@ -927,7 +927,7 @@ impl render_core::Device for VulkanDevice {
             // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
             if let Ok(mut guard) = alloc_handle.lock() {
-                let _ = guard.free(&mut staging_alloc);
+                guard.free(&mut staging_alloc);
             }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
@@ -951,7 +951,7 @@ impl render_core::Device for VulkanDevice {
             // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
             if let Ok(mut guard) = alloc_handle.lock() {
-                let _ = guard.free(&mut staging_alloc);
+                guard.free(&mut staging_alloc);
             }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
@@ -1063,7 +1063,7 @@ impl render_core::Device for VulkanDevice {
             // SAFETY: cleanup only on error; all handles created so far are valid.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
             if let Ok(mut guard) = alloc_handle.lock() {
-                let _ = guard.free(&mut staging_alloc);
+                guard.free(&mut staging_alloc);
             }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
@@ -1081,7 +1081,7 @@ impl render_core::Device for VulkanDevice {
                 // SAFETY: cleanup only on error; all handles are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
-                    let _ = guard.free(&mut staging_alloc);
+                    guard.free(&mut staging_alloc);
                 }
                 unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
@@ -1099,7 +1099,7 @@ impl render_core::Device for VulkanDevice {
             unsafe { device.destroy_fence(fence, None) };
             unsafe { device.destroy_command_pool(cmd_pool, None) };
             if let Ok(mut guard) = alloc_handle.lock() {
-                let _ = guard.free(&mut staging_alloc);
+                guard.free(&mut staging_alloc);
             }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
@@ -1114,7 +1114,7 @@ impl render_core::Device for VulkanDevice {
             unsafe { device.destroy_fence(fence, None) };
             unsafe { device.destroy_command_pool(cmd_pool, None) };
             if let Ok(mut guard) = alloc_handle.lock() {
-                let _ = guard.free(&mut staging_alloc);
+                guard.free(&mut staging_alloc);
             }
             unsafe { device.destroy_buffer(staging_buffer, None) };
             render_core::RhiError::Backend {
@@ -1135,7 +1135,7 @@ impl render_core::Device for VulkanDevice {
                 // SAFETY: cleanup only on error; all handles are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
-                    let _ = guard.free(&mut staging_alloc);
+                    guard.free(&mut staging_alloc);
                 }
                 unsafe { device.destroy_buffer(staging_buffer, None) };
                 return Err(render_core::RhiError::Backend {
@@ -1166,7 +1166,7 @@ impl render_core::Device for VulkanDevice {
         // in use after fence wait; reverse order of creation is respected.
         unsafe { device.destroy_command_pool(cmd_pool, None) };
         if let Ok(mut guard) = alloc_handle.lock() {
-            let _ = guard.free(&mut staging_alloc);
+            guard.free(&mut staging_alloc);
         }
         unsafe { device.destroy_buffer(staging_buffer, None) };
 

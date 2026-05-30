@@ -63,20 +63,11 @@ impl Component for RigidBody {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ColliderShape {
     /// Axis-aligned box defined by half-extents.
-    Cuboid {
-        hx: f32,
-        hy: f32,
-        hz: f32,
-    },
+    Cuboid { hx: f32, hy: f32, hz: f32 },
     /// Sphere with the given radius.
-    Ball {
-        radius: f32,
-    },
+    Ball { radius: f32 },
     /// Capsule (cylinder with hemispherical caps) aligned to local +Y.
-    Capsule {
-        half_height: f32,
-        radius: f32,
-    },
+    Capsule { half_height: f32, radius: f32 },
 }
 
 // ── Collider ────────────────────────────────────────────────────────────────

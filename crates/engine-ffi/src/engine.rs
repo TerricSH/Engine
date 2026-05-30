@@ -9,8 +9,13 @@ use std::ffi::CStr;
 // Logging
 // ---------------------------------------------------------------------------
 
+/// Log an info message from the scripting layer.
+///
+/// # Safety
+///
+/// `msg` must be a valid, null-terminated C string pointer or null.
 #[no_mangle]
-pub extern "C" fn ffi_log_info(msg: *const std::ffi::c_char) {
+pub unsafe extern "C" fn ffi_log_info(msg: *const std::ffi::c_char) {
     if msg.is_null() {
         return;
     }
@@ -20,8 +25,13 @@ pub extern "C" fn ffi_log_info(msg: *const std::ffi::c_char) {
     }
 }
 
+/// Log a warning from the scripting layer.
+///
+/// # Safety
+///
+/// `msg` must be a valid, null-terminated C string pointer or null.
 #[no_mangle]
-pub extern "C" fn ffi_log_warn(msg: *const std::ffi::c_char) {
+pub unsafe extern "C" fn ffi_log_warn(msg: *const std::ffi::c_char) {
     if msg.is_null() {
         return;
     }
@@ -31,8 +41,13 @@ pub extern "C" fn ffi_log_warn(msg: *const std::ffi::c_char) {
     }
 }
 
+/// Log an error from the scripting layer.
+///
+/// # Safety
+///
+/// `msg` must be a valid, null-terminated C string pointer or null.
 #[no_mangle]
-pub extern "C" fn ffi_log_error(msg: *const std::ffi::c_char) {
+pub unsafe extern "C" fn ffi_log_error(msg: *const std::ffi::c_char) {
     if msg.is_null() {
         return;
     }
@@ -67,16 +82,20 @@ mod tests {
 
     #[test]
     fn log_null_safe() {
-        ffi_log_info(std::ptr::null());
-        ffi_log_warn(std::ptr::null());
-        ffi_log_error(std::ptr::null());
+        unsafe {
+            ffi_log_info(std::ptr::null());
+            ffi_log_warn(std::ptr::null());
+            ffi_log_error(std::ptr::null());
+        }
         // Should not panic
     }
 
     #[test]
     fn log_message() {
         let msg = CString::new("test message").unwrap();
-        ffi_log_info(msg.as_ptr());
+        unsafe {
+            ffi_log_info(msg.as_ptr());
+        }
         // Smoke test — just verifies no crash
     }
 

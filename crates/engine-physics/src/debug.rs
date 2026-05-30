@@ -74,7 +74,8 @@ impl DebugDrawProvider for PhysicsDebugDraw {
                     half_height,
                     radius,
                 } => {
-                    let top = info.position + info.rotation * glam::Vec3::new(0.0, *half_height, 0.0);
+                    let top =
+                        info.position + info.rotation * glam::Vec3::new(0.0, *half_height, 0.0);
                     let bottom =
                         info.position + info.rotation * glam::Vec3::new(0.0, -*half_height, 0.0);
                     buffer.sphere_wireframe(top, *radius, color);
@@ -85,4 +86,3 @@ impl DebugDrawProvider for PhysicsDebugDraw {
         }
     }
 }
-

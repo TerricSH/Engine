@@ -1,4 +1,4 @@
-use crate::navmesh::{NavMesh, PolygonIndex, NavError};
+use crate::navmesh::{NavError, NavMesh, PolygonIndex};
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -88,7 +88,10 @@ impl PartialOrd for AStarNode {
 impl Ord for AStarNode {
     fn cmp(&self, other: &Self) -> Ordering {
         // BinaryHeap is a max-heap; reverse so smallest f_score is on top.
-        other.f_score.partial_cmp(&self.f_score).unwrap_or(Ordering::Equal)
+        other
+            .f_score
+            .partial_cmp(&self.f_score)
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -130,12 +133,7 @@ impl Pathfinder {
     /// The start and goal polygons are resolved automatically:
     ///  1. If the point is inside a polygon, that polygon is used.
     ///  2. Otherwise the nearest polygon (by centre distance) is used.
-    pub fn find_path(
-        &self,
-        navmesh: &NavMesh,
-        from: Vec3,
-        to: Vec3,
-    ) -> Result<Path, NavError> {
+    pub fn find_path(&self, navmesh: &NavMesh, from: Vec3, to: Vec3) -> Result<Path, NavError> {
         let from_poly = navmesh
             .find_polygon_containing(from)
             .or_else(|| {
@@ -175,9 +173,7 @@ impl Pathfinder {
         to_poly: PolygonIndex,
     ) -> Result<Path, NavError> {
         if navmesh.polygon_count() == 0 {
-            return Err(NavError::InvalidNavMesh(
-                "navmesh has no polygons".into(),
-            ));
+            return Err(NavError::InvalidNavMesh("navmesh has no polygons".into()));
         }
 
         // Trivial case: start == goal.
@@ -216,10 +212,11 @@ impl Pathfinder {
         while let Some(node) = open_heap.pop() {
             // Lazy removal: skip if this entry is stale.
             if let Some(&best_g) = g_score.get(&node.polygon) {
-                let f_expected = best_g + self.distance_xz(
-                    navmesh.polygon_center(node.polygon).unwrap_or(start_center),
-                    goal_center,
-                );
+                let f_expected = best_g
+                    + self.distance_xz(
+                        navmesh.polygon_center(node.polygon).unwrap_or(start_center),
+                        goal_center,
+                    );
                 // Allow small epsilon for floating-point drift.
                 if node.f_score > f_expected + 0.0001 {
                     continue;
@@ -306,9 +303,7 @@ impl Pathfinder {
 
         while cur != from_poly {
             polys.push(cur);
-            cur = *came_from
-                .get(&cur)
-                .ok_or(NavError::NoPathFound)?;
+            cur = *came_from.get(&cur).ok_or(NavError::NoPathFound)?;
         }
         polys.push(from_poly);
         polys.reverse();
@@ -316,9 +311,10 @@ impl Pathfinder {
         let waypoints: Vec<PathPoint> = polys
             .iter()
             .filter_map(|&p| {
-                navmesh
-                    .polygon_center(p)
-                    .map(|pos| PathPoint { position: pos, polygon: p })
+                navmesh.polygon_center(p).map(|pos| PathPoint {
+                    position: pos,
+                    polygon: p,
+                })
             })
             .collect();
 

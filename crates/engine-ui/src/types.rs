@@ -23,7 +23,9 @@ pub enum UiError {
 // ---------------------------------------------------------------------------
 
 /// Unique identifier for a [`UiElement`] within a [`Canvas`](crate::Canvas).
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct ElementId(pub u32);
 
 // ---------------------------------------------------------------------------
@@ -91,10 +93,7 @@ pub enum UiElementKind {
         color: Color,
     },
     /// Texture-backed image.
-    Image {
-        texture: AssetId,
-        tint: Color,
-    },
+    Image { texture: AssetId, tint: Color },
     /// 9-slice scaled texture.
     ///
     /// The `border` field is a [`UiRect`] whose values represent the border

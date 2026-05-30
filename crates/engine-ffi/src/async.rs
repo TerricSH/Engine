@@ -1,14 +1,25 @@
 //! FFI bridge for async I/O operations.
 //!
 //! C# scripts initiate async work (image loading, HTTP requests, asset I/O)
-//! through these FFI calls. The actual work runs on Rust's thread pool,
-//! and completion callbacks are dispatched on the main thread via
-//! [`MAIN_THREAD_QUEUE`].
+//! through these FFI calls.  The actual work runs on Rust's thread pool
+//! (or a background task system registered by the engine), and completion
+//! callbacks are dispatched on the main thread via [`MAIN_THREAD_QUEUE`].
+//!
+//! Two dispatch paths exist:
+//!
+//! 1. **Registry path** (preferred) — [`ffi_async_load_image`] and
+//!    [`ffi_async_http_get`] delegate to the runtime callback registry.
+//! 2. **Direct path** — thread-pool workers call
+//!    [`queue_main_thread_callback`] to enqueue results.
+//!
+//! The main-thread dispatch happens once per frame via
+//! [`dispatch_main_thread_callbacks`], which the engine's
+//! `EngineRuntime::tick()` invokes.
 
 use std::collections::VecDeque;
-use std::ffi::CStr;
 use std::sync::{LazyLock, Mutex};
 
+use crate::registry;
 use crate::types::{FfiAsyncCallback, FfiAsyncHandle};
 
 // ---------------------------------------------------------------------------
@@ -71,10 +82,16 @@ pub fn pending_callback_count() -> usize {
 /// C# calls this via EngineAPI when the script does
 /// `ImageLoader.LoadAsync(url, callback)`.
 ///
-/// The actual I/O + decode runs on a thread-pool worker.
+/// The actual I/O + decode runs on a thread-pool worker or is dispatched
+/// through the engine's callback registry.
 /// On completion, `callback` is queued to the main thread.
+///
+/// # Safety
+///
+/// `url` must be a valid, null-terminated C string pointer or null.
+/// `callback` must be a valid function pointer.
 #[no_mangle]
-pub extern "C" fn ffi_async_load_image(
+pub unsafe extern "C" fn ffi_async_load_image(
     url: *const std::ffi::c_char,
     callback: FfiAsyncCallback,
     user_data: u64,
@@ -82,7 +99,16 @@ pub extern "C" fn ffi_async_load_image(
     if url.is_null() {
         return FfiAsyncHandle(0);
     }
-    let c_str = unsafe { CStr::from_ptr(url) };
+
+    if registry::is_initialized() {
+        // Delegate to the engine's implementation (which may use reqwest,
+        // image crate, or a custom asset system).
+        return (registry::get().async_load_image)(url, callback, user_data);
+    }
+
+    // SAFETY: url is null-checked above; CStr::from_ptr requires a valid
+    // null-terminated string, which the C# caller guarantees.
+    let c_str = unsafe { std::ffi::CStr::from_ptr(url) };
     let url_str = match c_str.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return FfiAsyncHandle(0),
@@ -90,15 +116,12 @@ pub extern "C" fn ffi_async_load_image(
 
     let handle = FfiAsyncHandle(next_async_id());
 
-    // Spawn on global thread pool (basic std::thread for now)
     std::thread::spawn(move || {
-        tracing::debug!(url = %url_str, handle = handle.0, "Async image load started");
-
-        // TODO: actual download + decode logic
-        // For now, simulate with an empty result after a short delay
+        tracing::debug!(url = %url_str, handle = handle.0, "Async image load started (fallback)");
+        // Fallback: simulate work with a short delay
         std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let result = Vec::new(); // decoded image bytes
+        tracing::debug!(url = %url_str, handle = handle.0, "Async image load completed (fallback)");
+        let result = Vec::new();
         queue_main_thread_callback(handle, callback, result, user_data);
     });
 
@@ -106,8 +129,13 @@ pub extern "C" fn ffi_async_load_image(
 }
 
 /// Initiate an async HTTP GET request.
+///
+/// # Safety
+///
+/// `url` must be a valid, null-terminated C string pointer or null.
+/// `callback` must be a valid function pointer.
 #[no_mangle]
-pub extern "C" fn ffi_async_http_get(
+pub unsafe extern "C" fn ffi_async_http_get(
     url: *const std::ffi::c_char,
     callback: FfiAsyncCallback,
     user_data: u64,
@@ -115,7 +143,13 @@ pub extern "C" fn ffi_async_http_get(
     if url.is_null() {
         return FfiAsyncHandle(0);
     }
-    let c_str = unsafe { CStr::from_ptr(url) };
+
+    if registry::is_initialized() {
+        return (registry::get().async_http_get)(url, callback, user_data);
+    }
+
+    // Fallback: basic thread with simulated delay.
+    let c_str = unsafe { std::ffi::CStr::from_ptr(url) };
     let url_str = match c_str.to_str() {
         Ok(s) => s.to_string(),
         Err(_) => return FfiAsyncHandle(0),
@@ -124,12 +158,10 @@ pub extern "C" fn ffi_async_http_get(
     let handle = FfiAsyncHandle(next_async_id());
 
     std::thread::spawn(move || {
-        tracing::debug!(url = %url_str, handle = handle.0, "Async HTTP GET started");
-
-        // TODO: actual HTTP request via reqwest or similar
+        tracing::debug!(url = %url_str, handle = handle.0, "Async HTTP GET started (fallback)");
         std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let result = Vec::new(); // response bytes
+        tracing::debug!(url = %url_str, handle = handle.0, "Async HTTP GET completed (fallback)");
+        let result = Vec::new();
         queue_main_thread_callback(handle, callback, result, user_data);
     });
 
@@ -180,5 +212,19 @@ mod tests {
 
         dispatch_main_thread_callbacks();
         assert_eq!(pending_callback_count(), 0);
+    }
+
+    extern "C" fn noop_callback(_handle: FfiAsyncHandle, _data: *mut u8, _len: u32, _user: u64) {}
+
+    #[test]
+    fn load_image_null_url_returns_zero() {
+        let handle = unsafe { ffi_async_load_image(std::ptr::null(), noop_callback, 0) };
+        assert_eq!(handle, FfiAsyncHandle(0));
+    }
+
+    #[test]
+    fn http_get_null_url_returns_zero() {
+        let handle = unsafe { ffi_async_http_get(std::ptr::null(), noop_callback, 0) };
+        assert_eq!(handle, FfiAsyncHandle(0));
     }
 }
