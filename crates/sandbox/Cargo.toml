@@ -10,7 +10,7 @@ default = []
 backend-vulkan = ["render-vulkan/backend-vulkan"]
 backend-opengl = ["render-opengl/backend-opengl"]
 backend-dx12 = ["render-dx12/backend-dx12"]
-tooling-editor = []
+tooling-editor = ["engine-editor/tooling-editor", "dep:engine-editor"]
 tooling-hot-reload = []
 target-desktop = []
 target-mobile = []
@@ -19,6 +19,7 @@ subsystem-scripting-csharp = []
 [dependencies]
 engine-asset = { path = "../engine-asset" }
 engine-core = { path = "../engine-core" }
+engine-editor = { path = "../engine-editor", optional = true }
 engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
 engine-serialize = { path = "../engine-serialize" }
