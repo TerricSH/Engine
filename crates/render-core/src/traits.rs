@@ -50,14 +50,16 @@ pub trait CommandEncoder: Send {
         vertex_offset: i32,
         first_instance: u32,
     );
+    fn end_render_pass(&mut self);
     fn push_constants(
         &mut self,
-        layout: PipelineLayoutHandle,
+        pipeline_layout: PipelineLayoutHandle,
         stage_flags: u32,
         offset: u32,
         data: &[u8],
     );
-    fn end_render_pass(&mut self);
+    /// Insert a pipeline barrier for the shadow map (default no-op).
+    fn shadow_barrier(&mut self) {}
 
     // ── Secondary command buffer support ──
 

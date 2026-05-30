@@ -19,7 +19,9 @@ use std::mem::ManuallyDrop;
 use ash::vk;
 use ash::Device as AshDevice;
 
-use render_core::{self, AdapterInfo, BackendKind, ResourceLimits, ShaderFormat, TextureFormat};
+use render_core::{
+    self, AdapterInfo, BackendKind, FramebufferHandle, ResourceLimits, ShaderFormat, TextureFormat,
+};
 
 use crate::device::Device as VkLogicalDevice;
 use crate::error::{VkResult, VulkanError};
@@ -92,6 +94,10 @@ pub struct VulkanDevice {
 
     // Render pass metadata
     pub(crate) rp_has_depth: HashMap<u32, bool>,
+    /// Render-pass index → depth-only (no color attachments).
+    /// TODO(Gate 3): populate when registering shadow RP in the encoder slab.
+    #[allow(dead_code)]
+    pub(crate) rp_is_depth_only: HashMap<u32, bool>,
 
     // Per-frame descriptor infrastructure (set=0 per FD-041)
     pub(crate) desc_set_layout_0: Option<vk::DescriptorSetLayout>,
@@ -221,6 +227,7 @@ impl VulkanDevice {
             pipeline_cache: vk::PipelineCache::null(),
             pso_cache_path: None,
             rp_has_depth: HashMap::new(),
+            rp_is_depth_only: HashMap::new(),
             desc_set_layout_0: None,
             desc_pool: None,
             frame_desc_sets: Vec::new(),
@@ -343,6 +350,51 @@ impl VulkanDevice {
     /// [`write_ubo`](Self::write_ubo).
     pub fn current_frame_index(&self) -> usize {
         self.current_frame
+    }
+
+    /// Create one framebuffer per swapchain image view, each with colour +
+    /// depth attachments.  Inserts into the framebuffer slab and returns
+    /// handles that the `VkCmdEncoder` can resolve.
+    pub fn create_scene_framebuffers(
+        &mut self,
+        render_pass: vk::RenderPass,
+    ) -> VkResult<Vec<FramebufferHandle>> {
+        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("no swapchain".into()))?;
+        let dv = self.depth_image_view.unwrap_or(vk::ImageView::null());
+        let ext = self.swapchain_extent;
+        let mut handles = Vec::with_capacity(sc.image_views.len());
+        for &iv in &sc.image_views {
+            let att = [iv, dv];
+            // SAFETY: device is valid; framebuffer info references valid image
+            // views that outlive this device; render pass is alive.
+            let fb = unsafe {
+                self.logical_device.device.create_framebuffer(
+                    &vk::FramebufferCreateInfo::default()
+                        .render_pass(render_pass)
+                        .attachments(&att)
+                        .width(ext.width)
+                        .height(ext.height)
+                        .layers(1),
+                    None,
+                )
+            }
+            .map_err(|e| VulkanError::vk("create_scene_fb", e))?;
+            let (idx, gen) = self.framebuffers.insert(fb);
+            handles.push(FramebufferHandle::new(idx, gen));
+        }
+        Ok(handles)
+    }
+
+    /// Remove scene framebuffers from the slab and destroy their Vulkan handles.
+    pub fn destroy_scene_framebuffers(&mut self, handles: &[FramebufferHandle]) {
+        let d = &self.logical_device.device;
+        for h in handles {
+            if let Some(fb) = self.framebuffers.remove(h.index, h.generation) {
+                // SAFETY: `fb` was created by this device and is no longer
+                // referenced by any in-flight frame.
+                unsafe { d.destroy_framebuffer(fb, None); }
+            }
+        }
     }
 
     /// Convenience wrapper: write UBO data for the current in-flight frame.

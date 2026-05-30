@@ -688,6 +688,7 @@ impl render_core::Device for VulkanDevice {
         let encoder = Box::new(VkCmdEncoder {
             device: self.logical_device.device.clone(),
             cmd: f.command_buffer,
+            shadow_map: self.shadow_map.unwrap_or(vk::Image::null()),
             // Snapshot slab entries into owned Vec caches — no raw pointers.
             pipeline_cache: self
                 .pipelines
