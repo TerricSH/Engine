@@ -342,6 +342,10 @@ pub struct RenderOptions {
     pub exposure_ev100: Option<f32>,
     /// Number of MSAA samples (1 = disabled, 2/4/8 = MSAA).
     pub msaa_samples: u8,
+    /// Pass graph configuration — loadable from scene settings.
+    /// Controls which passes are enabled and their ordering.
+    #[serde(default)]
+    pub pass_graph_config: crate::render_graph2::PassGraphConfig,
 }
 
 impl Default for RenderOptions {
@@ -350,6 +354,7 @@ impl Default for RenderOptions {
             tone_mapping: ToneMapping::Aces,
             exposure_ev100: None,
             msaa_samples: 1,
+            pass_graph_config: crate::render_graph2::PassGraphConfig::default(),
         }
     }
 }

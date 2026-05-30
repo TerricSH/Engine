@@ -79,6 +79,16 @@ impl PassKind {
     }
 }
 
+// ── Resource access mode ─────────────────────────────────────────────────────
+
+/// How a pass accesses an attachment resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
 // ── Resource attachments ────────────────────────────────────────────────────
 
 /// Describes how a single resource attachment (colour or depth) is bound
@@ -90,6 +100,7 @@ pub struct PassAttachment {
     pub clear: bool,
     pub load_op: String, // "clear", "load", "dont_care"
     pub size_source: SizeSource,
+    pub access: ResourceAccess,
 }
 
 /// Determines how the attachment dimensions are resolved.
@@ -206,6 +217,7 @@ impl RenderGraph {
                         clear: true,
                         load_op: "clear".into(),
                         size_source: SizeSource::Swapchain,
+                        access: ResourceAccess::Read,
                     }],
                     outputs: vec![PassAttachment {
                         name: "shadow_map".into(),
@@ -213,6 +225,7 @@ impl RenderGraph {
                         clear: false,
                         load_op: "load".into(),
                         size_source: SizeSource::Custom(1024, 1024),
+                        access: ResourceAccess::Write,
                     }],
                     depth_stencil: Some(PassAttachment {
                         name: "shadow_depth".into(),
@@ -220,6 +233,7 @@ impl RenderGraph {
                         clear: true,
                         load_op: "clear".into(),
                         size_source: SizeSource::Custom(1024, 1024),
+                        access: ResourceAccess::ReadWrite,
                     }),
                 });
             }
@@ -235,6 +249,7 @@ impl RenderGraph {
                     clear: true,
                     load_op: "load".into(),
                     size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Read,
                 }],
                 outputs: vec![PassAttachment {
                     name: "hdr_color".into(),
@@ -242,6 +257,7 @@ impl RenderGraph {
                     clear: true,
                     load_op: "clear".into(),
                     size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Write,
                 }],
                 depth_stencil: Some(PassAttachment {
                     name: "depth_stencil".into(),
@@ -249,6 +265,7 @@ impl RenderGraph {
                     clear: true,
                     load_op: "clear".into(),
                     size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::ReadWrite,
                 }),
             });
 
@@ -263,6 +280,7 @@ impl RenderGraph {
                     clear: false,
                     load_op: "load".into(),
                     size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Read,
                 }],
                 outputs: vec![PassAttachment {
                     name: "ldr_color".into(),
@@ -270,6 +288,7 @@ impl RenderGraph {
                     clear: true,
                     load_op: "clear".into(),
                     size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Write,
                 }],
                 depth_stencil: None,
             });
@@ -285,6 +304,7 @@ impl RenderGraph {
                     clear: false,
                     load_op: "load".into(),
                     size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Read,
                 }],
                 outputs: vec![PassAttachment {
                     name: "swapchain".into(),
@@ -292,6 +312,7 @@ impl RenderGraph {
                     clear: false,
                     load_op: "dont_care".into(),
                     size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Write,
                 }],
                 depth_stencil: None,
             });
@@ -566,6 +587,197 @@ impl RenderGraph {
         })
     }
 
+    /// Phase B: Enhanced compilation with pass culling and access-aware
+    /// barrier inference.
+    ///
+    /// 1. Topologically sorts the passes (Kahn's algorithm).
+    /// 2. **Culls** passes whose outputs are never consumed (backward
+    ///    reachability from the Present pass and other terminal passes).
+    /// 3. Tracks resource state transitions across the live passes and
+    ///    inserts [`CompiledBarrier`] whenever a resource transitions
+    ///    between read/write roles.
+    ///
+    /// The `access` field on each [`PassAttachment`] is respected so that
+    /// depth-stencil attachments used read-only get
+    /// `DepthStencilReadOnlyOptimal` instead of
+    /// `DepthStencilAttachmentOptimal`.
+    pub fn compile_v2(&self) -> Result<CompiledRenderGraph, String> {
+        let all_sorted = self.topological_sort()?;
+        let n = all_sorted.len();
+        if n == 0 {
+            return Ok(CompiledRenderGraph {
+                pass_order: vec![],
+                barriers_per_pass: vec![],
+            });
+        }
+
+        // ── Phase 1: Cull dead passes via backward reachability ──────────
+
+        // Collect which passes produce / consume each resource.
+        let mut resource_writers: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut resource_readers: HashMap<String, Vec<usize>> = HashMap::new();
+
+        for &pass_idx in &all_sorted {
+            let pass = &self.passes[pass_idx];
+            for o in &pass.outputs {
+                resource_writers.entry(o.name.clone()).or_default().push(pass_idx);
+            }
+            for i in &pass.inputs {
+                resource_readers.entry(i.name.clone()).or_default().push(pass_idx);
+            }
+            if let Some(ref ds) = pass.depth_stencil {
+                resource_readers.entry(ds.name.clone()).or_default().push(pass_idx);
+                resource_writers.entry(ds.name.clone()).or_default().push(pass_idx);
+            }
+        }
+
+        // Build forward edges: producer → consumer via resource flow.
+        let mut forward_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &pass_idx in &all_sorted {
+            let pass = &self.passes[pass_idx];
+            let written: Vec<&str> = pass
+                .outputs
+                .iter()
+                .map(|o| o.name.as_str())
+                .chain(pass.depth_stencil.as_ref().map(|ds| ds.name.as_str()))
+                .collect();
+            for w in written {
+                if let Some(consumers) = resource_readers.get(w) {
+                    for &c in consumers {
+                        if c != pass_idx && !forward_edges[pass_idx].contains(&c) {
+                            forward_edges[pass_idx].push(c);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reverse the forward edges: needed_by[c] = {p | p → c}.
+        let mut needed_by: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (p, consumers) in forward_edges.iter().enumerate() {
+            for &c in consumers {
+                needed_by[c].push(p);
+            }
+        }
+
+        // Also respect explicit GraphEdges.
+        for edge in &self.edges {
+            if edge.from_pass < n && edge.to_pass < n {
+                if !needed_by[edge.to_pass].contains(&edge.from_pass) {
+                    needed_by[edge.to_pass].push(edge.from_pass);
+                }
+            }
+        }
+
+        // BFS backward from terminal passes.
+        let mut live: Vec<bool> = vec![false; n];
+        let mut queue: Vec<usize> = Vec::new();
+
+        for &pass_idx in &all_sorted {
+            let pass = &self.passes[pass_idx];
+            // A pass is terminal (always live) if it is the Present pass or
+            // if it produces no outputs (operator / side-effect passes).
+            let is_terminal = matches!(pass.kind, PassKind::Present)
+                || pass.outputs.is_empty();
+            if is_terminal && !live[pass_idx] {
+                live[pass_idx] = true;
+                queue.push(pass_idx);
+            }
+        }
+
+        while let Some(v) = queue.pop() {
+            for &pred in &needed_by[v] {
+                if !live[pred] {
+                    live[pred] = true;
+                    queue.push(pred);
+                }
+            }
+        }
+
+        let live_order: Vec<usize> = all_sorted.into_iter().filter(|&i| live[i]).collect();
+        let m = live_order.len();
+
+        // ── Phase 2: Barrier inference ──────────────────────────────────
+
+        let mut resource_states: HashMap<String, ResourceState> = HashMap::new();
+        let mut barriers_per_pass: Vec<Vec<CompiledBarrier>> = vec![Vec::new(); m];
+
+        for (sorted_idx, &pass_idx) in live_order.iter().enumerate() {
+            let pass = &self.passes[pass_idx];
+
+            // ── Inputs (read or read-write) ──
+            for input in &pass.inputs {
+                let old = resource_states
+                    .get(&input.name)
+                    .copied()
+                    .unwrap_or(ResourceState::Undefined);
+                let new = match input.access {
+                    ResourceAccess::Read => ResourceState::ShaderReadOnlyOptimal,
+                    ResourceAccess::ReadWrite => ResourceState::General,
+                    ResourceAccess::Write => ResourceState::ShaderReadOnlyOptimal,
+                };
+                if old != new {
+                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
+                        resource_name: input.name.clone(),
+                        src_stage: previous_stage(&old),
+                        dst_stage: PipeStage::FragmentShader,
+                        old_state: old,
+                        new_state: new,
+                    });
+                }
+                resource_states.insert(input.name.clone(), new);
+            }
+
+            // ── Depth-stencil attachment ──
+            if let Some(ref ds) = pass.depth_stencil {
+                let old = resource_states
+                    .get(&ds.name)
+                    .copied()
+                    .unwrap_or(ResourceState::Undefined);
+                let new = match ds.access {
+                    ResourceAccess::Read => ResourceState::DepthStencilReadOnlyOptimal,
+                    ResourceAccess::Write | ResourceAccess::ReadWrite => {
+                        ResourceState::DepthStencilAttachmentOptimal
+                    }
+                };
+                if old != new {
+                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
+                        resource_name: ds.name.clone(),
+                        src_stage: previous_stage(&old),
+                        dst_stage: PipeStage::EarlyFragmentTests,
+                        old_state: old,
+                        new_state: new,
+                    });
+                }
+                resource_states.insert(ds.name.clone(), new);
+            }
+
+            // ── Outputs (written by the pass) ──
+            for output in &pass.outputs {
+                let old = resource_states
+                    .get(&output.name)
+                    .copied()
+                    .unwrap_or(ResourceState::Undefined);
+                let new = output_resource_state(&output.name);
+                if old != new {
+                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
+                        resource_name: output.name.clone(),
+                        src_stage: previous_stage(&old),
+                        dst_stage: output_stage(&output.name),
+                        old_state: old,
+                        new_state: new,
+                    });
+                }
+                resource_states.insert(output.name.clone(), new);
+            }
+        }
+
+        Ok(CompiledRenderGraph {
+            pass_order: live_order,
+            barriers_per_pass,
+        })
+    }
+
     /// Convert this new-style `RenderGraph` into the legacy
     /// `render_graph::RenderGraph` so it can be consumed by the existing
     /// `BackendRenderer::execute_pass` trait.
@@ -674,5 +886,496 @@ fn output_stage(name: &str) -> PipeStage {
         "shadow_map" | "shadow_depth" => PipeStage::LateFragmentTests,
         "hdr_color" | "ldr_color" => PipeStage::ColorAttachmentOutput,
         _ => PipeStage::ColorAttachmentOutput,
+    }
+}
+
+// ============================================================================
+// Transient resource aliasing  (Phase B)
+// ============================================================================
+
+/// A single slot in the aliasing plan — one or more resources that share
+/// the same physical memory because their lifetimes do not overlap.
+#[derive(Clone, Debug)]
+pub struct AliasSlot {
+    /// Resources aliased into this slot.
+    pub resources: Vec<String>,
+    /// Index of this slot in the pool.
+    pub slot_index: usize,
+}
+
+/// Plan produced by [`TransientResourcePool::build`] describing how to
+/// alias transient resources onto a fixed number of memory slots.
+#[derive(Clone, Debug, Default)]
+pub struct AliasingPlan {
+    /// Ordered list of alias slots.
+    pub slots: Vec<AliasSlot>,
+    /// Mapping from resource name to its assigned slot index.
+    pub resource_to_slot: HashMap<String, usize>,
+}
+
+/// A pool that analyses resource lifetimes across the sorted pass order
+/// and assigns non-overlapping resources to the same memory slot.
+///
+/// # Algorithm
+///
+/// 1. For each resource, compute the interval `[first_pass, last_pass]`
+///    over the sorted pass order.
+/// 2. Sort resources by their first-use pass.
+/// 3. Greedy interval packing: assign each resource to the first slot
+///    whose current occupant's interval does not overlap.
+///
+/// Resources whose names appear in `exempt` (e.g. `"swapchain"`) are
+/// excluded from aliasing because their memory is owned by the swapchain.
+#[derive(Clone, Debug)]
+pub struct TransientResourcePool {
+    /// Resource names that must not be aliased.
+    exempt: Vec<String>,
+}
+
+impl TransientResourcePool {
+    /// Create a new pool with the given exempt resources.
+    pub fn new(exempt: Vec<String>) -> Self {
+        Self { exempt }
+    }
+
+    /// Build an aliasing plan from the render graph's pass declarations.
+    ///
+    /// `pass_order` is the sorted execution order (e.g. from
+    /// [`compile_v2`](RenderGraph::compile_v2)).
+    pub fn build(&self, graph: &RenderGraph, pass_order: &[usize]) -> AliasingPlan {
+        // ── Step 1: collect lifetime intervals ──────────────────────────
+        let mut first_use: HashMap<String, usize> = HashMap::new();
+        let mut last_use: HashMap<String, usize> = HashMap::new();
+
+        for (sorted_idx, &pass_idx) in pass_order.iter().enumerate() {
+            let pass = &graph.passes[pass_idx];
+            for i in &pass.inputs {
+                first_use.entry(i.name.clone()).or_insert(sorted_idx);
+                last_use.insert(i.name.clone(), sorted_idx);
+            }
+            for o in &pass.outputs {
+                first_use.entry(o.name.clone()).or_insert(sorted_idx);
+                last_use.insert(o.name.clone(), sorted_idx);
+            }
+            if let Some(ref ds) = pass.depth_stencil {
+                first_use.entry(ds.name.clone()).or_insert(sorted_idx);
+                last_use.insert(ds.name.clone(), sorted_idx);
+            }
+        }
+
+        // ── Step 2: build intervals, excluding exempt resources ─────────
+        struct Interval {
+            name: String,
+            first: usize,
+            last: usize,
+        }
+
+        let mut intervals: Vec<Interval> = Vec::new();
+        for (name, &first) in &first_use {
+            if self.exempt.iter().any(|e| e == name) {
+                continue;
+            }
+            let last = *last_use.get(name).unwrap_or(&first);
+            intervals.push(Interval {
+                name: name.clone(),
+                first,
+                last,
+            });
+        }
+
+        // Sort by first-use pass.
+        intervals.sort_by_key(|iv| iv.first);
+
+        // ── Step 3: greedy interval packing ─────────────────────────────
+        let mut slot_ends: Vec<usize> = Vec::new();
+        let mut slots: Vec<AliasSlot> = Vec::new();
+        let mut resource_to_slot: HashMap<String, usize> = HashMap::new();
+
+        for iv in &intervals {
+            let mut placed = false;
+            for (slot_idx, &end) in slot_ends.iter().enumerate() {
+                if iv.first > end {
+                    // Non-overlapping → alias into this slot.
+                    slots[slot_idx].resources.push(iv.name.clone());
+                    slot_ends[slot_idx] = slot_ends[slot_idx].max(iv.last);
+                    resource_to_slot.insert(iv.name.clone(), slot_idx);
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                // Need a new slot.
+                let slot_idx = slots.len();
+                slot_ends.push(iv.last);
+                slots.push(AliasSlot {
+                    resources: vec![iv.name.clone()],
+                    slot_index: slot_idx,
+                });
+                resource_to_slot.insert(iv.name.clone(), slot_idx);
+            }
+        }
+
+        AliasingPlan {
+            slots,
+            resource_to_slot,
+        }
+    }
+}
+
+impl Default for TransientResourcePool {
+    fn default() -> Self {
+        Self {
+            exempt: vec!["swapchain".into()],
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    fn make_graph() -> RenderGraph {
+        // Build a simple 4-pass graph:
+        //   A (writes "color") → B (reads "color", writes "temp", writes
+        //   "unused") → C (side-effect, reads "temp") → D (reads "temp",
+        //   outputs "swapchain")
+        let mut graph = RenderGraph::new();
+
+        // Pass 0: A → writes "color"
+        graph.add_pass(PassNode {
+            kind: PassKind::Custom("A"),
+            name: "pass_a",
+            view_id: 0,
+            inputs: vec![],
+            outputs: vec![PassAttachment {
+                name: "color".into(),
+                format: Some("RGBA16F".into()),
+                clear: true,
+                load_op: "clear".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Write,
+            }],
+            depth_stencil: None,
+        });
+
+        // Pass 1: B → reads "color", writes "temp", also writes "unused"
+        graph.add_pass(PassNode {
+            kind: PassKind::Custom("B"),
+            name: "pass_b",
+            view_id: 0,
+            inputs: vec![PassAttachment {
+                name: "color".into(),
+                format: Some("RGBA16F".into()),
+                clear: false,
+                load_op: "load".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Read,
+            }],
+            outputs: vec![
+                PassAttachment {
+                    name: "temp".into(),
+                    format: Some("R8".into()),
+                    clear: true,
+                    load_op: "clear".into(),
+                    size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Write,
+                },
+                PassAttachment {
+                    name: "unused".into(),
+                    format: Some("R8".into()),
+                    clear: true,
+                    load_op: "clear".into(),
+                    size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Write,
+                },
+            ],
+            depth_stencil: None,
+        });
+
+        // Pass 2: C → side-effect pass (reads "temp", no outputs)
+        graph.add_pass(PassNode {
+            kind: PassKind::Custom("C"),
+            name: "pass_c",
+            view_id: 0,
+            inputs: vec![PassAttachment {
+                name: "temp".into(),
+                format: Some("R8".into()),
+                clear: false,
+                load_op: "load".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Read,
+            }],
+            outputs: vec![],
+            depth_stencil: None,
+        });
+
+        // Pass 3: D → Present (reads "temp", writes "swapchain")
+        graph.add_pass(PassNode {
+            kind: PassKind::Present,
+            name: "present",
+            view_id: 0,
+            inputs: vec![PassAttachment {
+                name: "temp".into(),
+                format: Some("R8".into()),
+                clear: false,
+                load_op: "load".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Read,
+            }],
+            outputs: vec![PassAttachment {
+                name: "swapchain".into(),
+                format: None,
+                clear: false,
+                load_op: "dont_care".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Write,
+            }],
+            depth_stencil: None,
+        });
+
+        // Add sequential edges for deterministic ordering.
+        let count = graph.passes.len();
+        for i in 0..count.saturating_sub(1) {
+            graph.add_edge(i, i + 1, "auto");
+        }
+
+        graph
+    }
+
+    // ── compile_v2 tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn compile_v2_topological_sort() {
+        let graph = make_graph();
+        let compiled = graph.compile_v2().expect("compile_v2 should succeed");
+        assert_eq!(compiled.pass_order.len(), 4);
+        let positions: Vec<usize> = compiled.pass_order.iter().copied().collect();
+        for w in positions.windows(2) {
+            assert!(w[0] < w[1], "pass_order should be ascending");
+        }
+    }
+
+    #[test]
+    fn compile_v2_culls_unconsumed_output() {
+        // Pass B writes "unused" that nobody reads, but B also writes "temp"
+        // which IS consumed → B stays live because "temp" reaches Present.
+        let graph = make_graph();
+        let compiled = graph.compile_v2().expect("compile_v2 should succeed");
+        assert_eq!(compiled.pass_order.len(), 4);
+    }
+
+    #[test]
+    fn compile_v2_culls_dead_pass() {
+        let mut graph = make_graph();
+
+        // Pass 4: E (dead) — writes "dead_buffer", nothing reads it.
+        graph.add_pass(PassNode {
+            kind: PassKind::Custom("E"),
+            name: "dead_pass",
+            view_id: 0,
+            inputs: vec![],
+            outputs: vec![PassAttachment {
+                name: "dead_buffer".into(),
+                format: Some("R8".into()),
+                clear: true,
+                load_op: "clear".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Write,
+            }],
+            depth_stencil: None,
+        });
+
+        let compiled = graph.compile_v2().expect("compile_v2 should succeed");
+        assert_eq!(compiled.pass_order.len(), 4);
+        assert!(
+            !compiled.pass_order.contains(&4),
+            "dead pass should be culled"
+        );
+    }
+
+    #[test]
+    fn compile_v2_barriers_between_transitions() {
+        let graph = make_graph();
+        let compiled = graph.compile_v2().expect("compile_v2 should succeed");
+        let total_barriers: usize = compiled
+            .barriers_per_pass
+            .iter()
+            .map(|b| b.len())
+            .sum();
+        assert!(total_barriers >= 1, "expected at least 1 barrier");
+    }
+
+    #[test]
+    fn compile_v2_empty_graph() {
+        let graph = RenderGraph::new();
+        let compiled = graph.compile_v2().expect("empty graph should compile");
+        assert!(compiled.pass_order.is_empty());
+        assert!(compiled.barriers_per_pass.is_empty());
+    }
+
+    #[test]
+    fn compile_v2_matches_compile_when_no_dead_passes() {
+        let graph = make_graph();
+        let v2 = graph.compile_v2().expect("compile_v2");
+        let v1 = graph.compile().expect("compile");
+        // Since there are no dead passes, orders match.
+        assert_eq!(v2.pass_order, v1.pass_order);
+    }
+
+    // ── TransientResourcePool tests ──────────────────────────────────────
+
+    #[test]
+    fn transient_pool_empty_graph() {
+        let graph = RenderGraph::new();
+        let pool = TransientResourcePool::default();
+        let plan = pool.build(&graph, &[]);
+        assert!(plan.slots.is_empty());
+        assert!(plan.resource_to_slot.is_empty());
+    }
+
+    #[test]
+    fn transient_pool_aliases_non_overlapping_resources() {
+        let graph = make_graph();
+        let order: Vec<usize> = (0..graph.passes.len()).collect();
+        let pool = TransientResourcePool::default();
+        let plan = pool.build(&graph, &order);
+
+        assert!(
+            !plan.resource_to_slot.contains_key("swapchain"),
+            "swapchain should be exempt"
+        );
+
+        for name in &["color", "temp", "unused"] {
+            assert!(
+                plan.resource_to_slot.contains_key(*name),
+                "resource '{name}' should have a slot assignment"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_pool_overlapping_resources_get_different_slots() {
+        let mut graph = RenderGraph::new();
+
+        graph.add_pass(PassNode {
+            kind: PassKind::Custom("P"),
+            name: "p",
+            view_id: 0,
+            inputs: vec![],
+            outputs: vec![
+                PassAttachment {
+                    name: "a".into(),
+                    format: Some("R8".into()),
+                    clear: true,
+                    load_op: "clear".into(),
+                    size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Write,
+                },
+                PassAttachment {
+                    name: "b".into(),
+                    format: Some("R8".into()),
+                    clear: true,
+                    load_op: "clear".into(),
+                    size_source: SizeSource::Swapchain,
+                    access: ResourceAccess::Write,
+                },
+            ],
+            depth_stencil: None,
+        });
+
+        let order = vec![0usize];
+        let pool = TransientResourcePool::new(vec![]);
+        let plan = pool.build(&graph, &order);
+
+        let slot_a = plan.resource_to_slot.get("a").copied();
+        let slot_b = plan.resource_to_slot.get("b").copied();
+        assert!(slot_a.is_some());
+        assert!(slot_b.is_some());
+        assert_ne!(
+            slot_a, slot_b,
+            "overlapping resources must get different slots"
+        );
+    }
+
+    #[test]
+    fn transient_pool_sequential_resources_can_share_slot() {
+        let mut graph = RenderGraph::new();
+
+        // Pass 0: writes "early"
+        graph.add_pass(PassNode {
+            kind: PassKind::Custom("E"),
+            name: "early",
+            view_id: 0,
+            inputs: vec![],
+            outputs: vec![PassAttachment {
+                name: "early".into(),
+                format: Some("R8".into()),
+                clear: true,
+                load_op: "clear".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Write,
+            }],
+            depth_stencil: None,
+        });
+
+        // Pass 1: reads "early", writes "late" (no overlap — early not
+        // used after pass 1, late starts at pass 1).
+        graph.add_pass(PassNode {
+            kind: PassKind::Custom("L"),
+            name: "late",
+            view_id: 0,
+            inputs: vec![PassAttachment {
+                name: "early".into(),
+                format: Some("R8".into()),
+                clear: false,
+                load_op: "load".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Read,
+            }],
+            outputs: vec![PassAttachment {
+                name: "late".into(),
+                format: Some("R16F".into()),
+                clear: true,
+                load_op: "clear".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Write,
+            }],
+            depth_stencil: None,
+        });
+
+        // Pass 2: Present (consumes "late")
+        graph.add_pass(PassNode {
+            kind: PassKind::Present,
+            name: "present",
+            view_id: 0,
+            inputs: vec![PassAttachment {
+                name: "late".into(),
+                format: Some("R16F".into()),
+                clear: false,
+                load_op: "load".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Read,
+            }],
+            outputs: vec![],
+            depth_stencil: None,
+        });
+
+        let order: Vec<usize> = (0..graph.passes.len()).collect();
+        let pool = TransientResourcePool::new(vec![]);
+        let plan = pool.build(&graph, &order);
+
+        let slot_early = plan.resource_to_slot.get("early").copied();
+        let slot_late = plan.resource_to_slot.get("late").copied();
+        assert!(slot_early.is_some());
+        assert!(slot_late.is_some());
+        // Early's lifetime [0,1], late's [1,2]; they overlap at pass 1
+        // (both referenced), so must be in different slots.
+        assert_ne!(slot_early, slot_late);
     }
 }
