@@ -14,7 +14,7 @@
 //!   blend state, but textures and uniform bindings are not yet consumed.
 //! * No texture loading, skeletal animation, or multi-pass optimisation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ash::vk;
 use glam::Mat4;
@@ -25,10 +25,11 @@ use engine_renderer::{
     RenderableItem, Transparency,
 };
 use render_core::{
-    self, BufferDescriptor, BufferHandle, CommandEncoder, Device, FramebufferHandle, IndexFormat,
-    MemoryHint, PipelineHandle, PipelineLayoutDescriptor, PipelineLayoutHandle, PipelineVariantKey,
-    PushConstantRange, RenderPassDescriptor, RenderPassHandle, SwapchainDescriptor,
-    SwapchainHandle, TextureFormat, VertexAttribute, VertexLayout,
+    self, BindGroupLayoutBinding, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
+    CommandEncoder, Device, FramebufferHandle, IndexFormat, MemoryHint, PipelineHandle,
+    PipelineLayoutDescriptor, PipelineLayoutHandle, PipelineVariantKey, PushConstantRange,
+    RenderPassDescriptor, RenderPassHandle, SwapchainDescriptor, SwapchainHandle, TextureFormat,
+    VertexAttribute, VertexLayout,
 };
 
 #[cfg(test)]
@@ -147,7 +148,18 @@ fn scene_forward_pipeline_context(
     MaterialPipelineContext {
         shader_modules: vec![],
         vertex_layout: scene_forward_vertex_layout(),
-        bind_layouts: vec![],
+        bind_layouts: vec![
+            // Material UBO at set=2
+            BindGroupLayoutDescriptor {
+                set_index: 2,
+                bindings: vec![
+                    BindGroupLayoutBinding {
+                        binding: 0,
+                        resource_kind: "uniform_buffer".into(),
+                    },
+                ],
+            },
+        ],
         pipeline_layout: pll,
         render_pass: rp,
         render_targets: vec![TextureFormat::Bgra8Unorm],
@@ -176,6 +188,34 @@ fn fallback_material_binding(material_id: &AssetId) -> MaterialBinding {
         double_sided: false,
     }
 }
+
+/// CPU-side material UBO layout (32 bytes total).
+///
+/// Field layout (std140):
+/// | offset | field       | type      | bytes |
+/// |--------|-------------|-----------|-------|
+/// |      0 | base_color  | vec4     |    16 |
+/// |     16 | metallic    | float    |     4 |
+/// |     20 | roughness   | float    |     4 |
+/// |     24 | ao          | float    |     4 |
+/// |     28 | _padding    | float    |     4 |
+/// Total: 32 bytes.
+#[repr(C)]
+struct MaterialUBO {
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    ao: f32,
+    _padding: [f32; 1],
+}
+
+/// Cache entry for a material descriptor set + UBO buffer.
+struct MaterialCacheEntry {
+    desc_set: vk::DescriptorSet,
+    buffer: vk::Buffer,
+}
+
+const MAX_MATERIALS: usize = 256;
 
 fn get_or_create_scene_forward_pipeline(
     material_resolver: &mut MaterialResolver,
@@ -209,6 +249,12 @@ pub struct SceneRenderer {
     meshes: BTreeMap<String, GpuMesh>,
     material_resolver: MaterialResolver,
 
+    /// Cache of material descriptor sets + buffers, keyed by material_id.
+    /// Limited to [`MAX_MATERIALS`] entries; oldest entries evicted when full.
+    material_cache: HashMap<String, MaterialCacheEntry>,
+    /// Insertion order for LRU eviction of the material cache.
+    material_cache_order: Vec<String>,
+
     rp: Option<RenderPassHandle>,
     pll: Option<PipelineLayoutHandle>,
 
@@ -238,6 +284,8 @@ impl SceneRenderer {
             initialized: false,
             material_resolver: MaterialResolver::new(16),
             meshes: BTreeMap::new(),
+            material_cache: HashMap::new(),
+            material_cache_order: Vec::new(),
             rp: None,
             pll: None,
             framebuffers: Vec::new(),
@@ -282,6 +330,17 @@ impl SceneRenderer {
         self.device
             .set_mvp_shaders(FORWARD_VERT_SPV, FORWARD_FRAG_SPV);
 
+        // Ensure material descriptor infrastructure (set=2) exists before
+        // creating the pipeline layout so the fallback picks it up.
+        self.device.create_material_descriptor_infra().map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0213",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("create_material_descriptor_infra: {e:?}"),
+            )]
+        })?;
+
         // --- Render pass  (colour + depth) ---
         let rp_desc = RenderPassDescriptor {
             color_attachments: vec![TextureFormat::Bgra8Unorm],
@@ -318,16 +377,40 @@ impl SceneRenderer {
             )]
         })?;
 
+        // ── Material descriptor infrastructure (set=2: UBO + texture) ─
+        self.device
+            .create_material_descriptor_infra()
+            .map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0210",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_material_descriptor_infra: {e:?}"),
+                )]
+            })?;
+
         // ── Shadow-mapping resources ──────────────────────────────────
         // Ensure the device has created shadow resources (idempotent).
         self.device
             .ensure_shadow()
             .map_err(|e| {
                 vec![Diagnostic::new(
-                    "RV0210",
+                    "RV0211",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
                     format!("ensure_shadow: {e:?}"),
+                )]
+            })?;
+
+        // ── Environment cubemap (IBL, set=1 binding=1) ────────────────
+        self.device
+            .create_env_cubemap()
+            .map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0212",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_env_cubemap: {e:?}"),
                 )]
             })?;
 
@@ -343,7 +426,7 @@ impl SceneRenderer {
         if let Some(vk_rp) = vk_rp {
             let fbs = self.device.create_scene_framebuffers(vk_rp).map_err(|e| {
                 vec![Diagnostic::new(
-                    "RV0212",
+                    "RV0213",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
                     format!("create_scene_framebuffers: {e:?}"),
@@ -408,6 +491,144 @@ impl SceneRenderer {
                 format!("resolve pipeline: {e:?}"),
             )]
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Material UBO helpers
+    // ------------------------------------------------------------------
+
+    /// Parse `ParamBlock` bytes into a [`MaterialUBO`].
+    ///
+    /// Expected byte layout (matching the shader's MaterialUBO):
+    ///   [0..16)  base_color  — vec4 f32
+    ///   [16..20) metallic    — f32
+    ///   [20..24) roughness   — f32
+    ///   [24..28) ao          — f32
+    ///
+    /// If `bytes` is empty or too short, sane defaults are used.
+    fn parse_material_ubo(bytes: &[u8]) -> MaterialUBO {
+        let read_f32 = |offset: usize| -> f32 {
+            if offset + 4 <= bytes.len() {
+                f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            } else {
+                0.0
+            }
+        };
+        let read_vec4 = |offset: usize| -> [f32; 4] {
+            if offset + 16 <= bytes.len() {
+                [
+                    f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+                    f32::from_ne_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()),
+                    f32::from_ne_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()),
+                    f32::from_ne_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()),
+                ]
+            } else {
+                [0.8, 0.6, 0.4, 1.0]
+            }
+        };
+        MaterialUBO {
+            base_color: read_vec4(0),
+            metallic: read_f32(16),
+            roughness: read_f32(20),
+            ao: read_f32(24),
+            _padding: [0.0],
+        }
+    }
+
+    /// Look up or create a material descriptor set + buffer for the given
+    /// material.  Uses a LRU eviction policy capped at [`MAX_MATERIALS`].
+    fn get_or_create_material_desc_set(
+        &mut self,
+        material_id: &str,
+        ubo_data: &[u8],
+    ) -> Result<(vk::DescriptorSet, vk::Buffer), Vec<Diagnostic>> {
+        // Check cache first (and move to front for LRU)
+        if let Some(entry) = self.material_cache.get(material_id) {
+            // Promote in LRU order (simple move-to-front)
+            if let Some(pos) = self.material_cache_order.iter().position(|k| k == material_id) {
+                self.material_cache_order.remove(pos);
+                self.material_cache_order.push(material_id.to_string());
+            }
+            return Ok((entry.desc_set, entry.buffer));
+        }
+
+        // Evict oldest if at capacity
+        if self.material_cache.len() >= MAX_MATERIALS {
+            self.evict_oldest_material();
+        }
+
+        // Create a small UBO buffer (32 bytes for MaterialUBO)
+        let buf_desc = BufferDescriptor {
+            size_bytes: 32,
+            usage_flags: render_core::BufferUsage(0),
+            memory_hint: MemoryHint::CpuToGpu,
+            debug_label: Some(format!("mat-ubo-{material_id}")),
+        };
+        let buf = self.device.create_buffer(&buf_desc).map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0214",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("create_buffer(material UBO): {e:?}"),
+            )]
+        })?;
+        self.device.write_buffer(buf, ubo_data, 0).map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0215",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("write_buffer(material UBO): {e:?}"),
+            )]
+        })?;
+
+        // Resolve raw Vulkan buffer handle for the descriptor set
+        let vk_buf = self
+            .device
+            .buffers
+            .get(buf.index, buf.generation)
+            .map(|e| e.buffer)
+            .unwrap_or(vk::Buffer::null());
+        if vk_buf == vk::Buffer::null() {
+            return Err(vec![Diagnostic::new(
+                "RV0216",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "material UBO buffer handle invalid",
+            )]);
+        }
+
+        // Allocate and update descriptor set via the device
+        let desc_set = self
+            .device
+            .allocate_material_descriptor_set(vk_buf, 32)
+            .map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0217",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("allocate_material_descriptor_set: {e:?}"),
+                )]
+            })?;
+
+        let entry = MaterialCacheEntry {
+            desc_set,
+            buffer: vk_buf,
+        };
+        self.material_cache
+            .insert(material_id.to_string(), entry);
+        self.material_cache_order.push(material_id.to_string());
+
+        Ok((desc_set, vk_buf))
+    }
+
+    /// Evict the oldest entry from the material cache (LRU).
+    fn evict_oldest_material(&mut self) {
+        if let Some(oldest_key) = self.material_cache_order.first().cloned() {
+            self.material_cache_order.remove(0);
+            self.material_cache.remove(&oldest_key);
+            // NOTE: Vulkan buffers and descriptor sets are freed when the
+            // descriptor pool is destroyed (no per-allocation free needed).
+        }
     }
 
     // ------------------------------------------------------------------
@@ -596,6 +817,54 @@ impl BackendRenderer for SceneRenderer {
             let pipeline = self.pipeline_for_drawable(input, drawable)?;
             encoder.bind_pipeline(pipeline);
 
+            // --- Material UBO (set=2) ---
+            let material_id = &drawable.material.id;
+            let material = self.material_binding_for_drawable(input, &drawable.material);
+            let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+            let ubo_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    &material_ubo as *const _ as *const u8,
+                    std::mem::size_of::<MaterialUBO>(),
+                )
+            };
+            let (mat_desc_set, _mat_buf) = self
+                .get_or_create_material_desc_set(material_id, ubo_bytes)?;
+            if let Some(pll) = self.pll {
+                let pll_vk = self
+                    .device
+                    .pipeline_layouts
+                    .get(pll.index, pll.generation)
+                    .map(|e| e.layout)
+                    .unwrap_or(vk::PipelineLayout::null());
+                if pll_vk != vk::PipelineLayout::null() {
+                    let d = &self.device.logical_device.device;
+                    let fi = self.device.current_frame;
+                    let cmd = self.device.frame_sync[fi].command_buffer;
+                    let sets = [mat_desc_set];
+                    // SAFETY: command buffer is in recording state; descriptor
+                    // set and pipeline layout are valid.
+                    unsafe {
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pll_vk,
+                            2,
+                            &sets,
+                            &[],
+                        );
+                    }
+                }
+            }
+
+            // ── Bind base color texture (set=2, binding=1) if cached ─────
+            for tex_slot in &material.textures {
+                let tex_id = &tex_slot.texture.id;
+                if self.device.textures.contains_key(tex_id) {
+                    let _ = self.device.bind_material_texture(tex_id, mat_desc_set);
+                    break; // bind at most one texture per drawable for now
+                }
+            }
+
             // Push the world transform as push constants (placeholder MVP).
             if let Some(pll) = self.pll {
                 let world = &drawable.world_transform; // [f32; 16]
@@ -661,97 +930,237 @@ impl BackendRenderer for SceneRenderer {
 
         match pass.kind {
             render_graph::PassKind::OpaquePbrForward => {
-                // Begin render pass for this view.
-                if let Some(rp) = self.rp {
-                    let fb = self
-                        .framebuffers
-                        .get(self.cur_fb_index as usize)
-                        .copied()
-                        .unwrap_or(FramebufferHandle::new(0, 0));
-                    self.cur_enc
-                        .as_mut()
-                        .expect("encoder checked above")
-                        .begin_render_pass(
-                            rp,
-                            fb,
-                            (0, 0, self.width, self.height),
-                            [0.02, 0.02, 0.06, 1.0],
-                            None,
+                // HDR offscreen forward pass — renders into RGBA16F color
+                // attachment via the device-side HDR forward pipeline.
+                // NOTE: We borrow self.cur_enc locally for viewport/scissor
+                // and end_render_pass; draw-call commands go through raw
+                // Vulkan to avoid borrow-checker conflicts with material
+                // cache methods.
+
+                let hdr_rp = self.device.hdr_forward_rp.unwrap_or(vk::RenderPass::null());
+                let hdr_fb = self.device.hdr_forward_fb.unwrap_or(vk::Framebuffer::null());
+                let hdr_pl = self.device.hdr_forward_pipeline.unwrap_or(vk::Pipeline::null());
+                let hdr_pll = self.device.hdr_forward_pipeline_layout.unwrap_or(vk::PipelineLayout::null());
+                if hdr_rp == vk::RenderPass::null() || hdr_pl == vk::Pipeline::null() {
+                    return Ok(());
+                }
+
+                // Clone device + cmd handles to avoid borrow-checker conflicts
+                // with material cache methods that take &mut self.
+                let d = self.device.logical_device.device.clone();
+                let fi = self.device.current_frame;
+                let cmd = self.device.frame_sync[fi].command_buffer;
+
+                // Begin HDR render pass with clear color + depth
+                let clear_values = [
+                    vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: [0.02, 0.02, 0.06, 1.0],
+                        },
+                    },
+                    vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue {
+                            depth: 1.0,
+                            stencil: 0,
+                        },
+                    },
+                ];
+                let rpbi = vk::RenderPassBeginInfo::default()
+                    .render_pass(hdr_rp)
+                    .framebuffer(hdr_fb)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: self.width,
+                            height: self.height,
+                        },
+                    })
+                    .clear_values(&clear_values);
+                // SAFETY: command buffer is in recording state; RP, FB valid.
+                unsafe { d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE); }
+
+                // Viewport + scissor
+                let vp = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: self.width as f32,
+                    height: self.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                let sc = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: self.width,
+                        height: self.height,
+                    },
+                };
+                unsafe {
+                    d.cmd_set_viewport(cmd, 0, &[vp]);
+                    d.cmd_set_scissor(cmd, 0, &[sc]);
+                }
+
+                // Bind HDR forward pipeline via raw Vulkan
+                unsafe { d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, hdr_pl); }
+
+                // Bind UBO descriptor set (set=0)
+                if let Some(desc_set) = self.device.frame_descriptor_set(fi) {
+                    let sets = [desc_set];
+                    // SAFETY: descriptor set, layout, and CB are valid.
+                    unsafe {
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            hdr_pll,
+                            0,
+                            &sets,
+                            &[],
                         );
+                    }
                 }
 
-                self.cur_enc
-                    .as_mut()
-                    .expect("encoder checked above")
-                    .set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
-                self.cur_enc
-                    .as_mut()
-                    .expect("encoder checked above")
-                    .set_scissor(0, 0, self.width, self.height);
-
-                if let Some(pll) = self.pll {
-                    self.cur_enc
-                        .as_mut()
-                        .expect("encoder checked above")
-                        .bind_descriptor_sets(pll, 0, &[], &[]);
-                }
-
+                // Draw calls (vertex/index buffers via encoder, push constants
+                // via raw Vulkan since the HDR layout is not in the slab).
                 for drawable in &input.drawables {
                     let mesh_id = &drawable.mesh.id;
-                    // execute_pass assumes meshes were already cached by
-                    // render_frame or by an earlier warm-up call.
                     let mesh = match self.meshes.get(mesh_id).cloned() {
                         Some(m) => m,
                         None => {
                             tracing::trace!(
                                 target: "scene_renderer",
                                 mesh = mesh_id,
-                                "skipping un-cached mesh in execute_pass"
+                                "skipping un-cached mesh in HDR forward pass"
                             );
                             continue;
                         }
                     };
 
-                    if let Some(pll) = self.pll {
-                        let world = &drawable.world_transform;
-                        let mut pc_bytes = Vec::with_capacity(128);
-                        for v in world {
-                            pc_bytes.extend_from_slice(&v.to_ne_bytes());
+                    // --- Material UBO (set=2) ---
+                    let material_id = &drawable.material.id;
+                    let material = self.material_binding_for_drawable(input, &drawable.material);
+                    let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+                    let ubo_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            &material_ubo as *const _ as *const u8,
+                            std::mem::size_of::<MaterialUBO>(),
+                        )
+                    };
+                    let (mat_desc_set, _mat_buf) = self
+                        .get_or_create_material_desc_set(material_id, ubo_bytes)
+                        .unwrap_or_else(|diags| {
+                            for d in &diags {
+                                tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
+                            }
+                            (vk::DescriptorSet::null(), vk::Buffer::null())
+                        });
+                    if mat_desc_set != vk::DescriptorSet::null() {
+                        // ── Bind base color texture (set=2, binding=1) if cached ──
+                        for tex_slot in &material.textures {
+                            let tex_id = &tex_slot.texture.id;
+                            if self.device.textures.contains_key(tex_id) {
+                                let _ = self.device.bind_material_texture(tex_id, mat_desc_set);
+                                break;
+                            }
                         }
-                        pc_bytes.resize(128, 0u8);
-                        self.cur_enc
-                            .as_mut()
-                            .expect("encoder checked above")
-                            .push_constants(pll, 0x01, 0, &pc_bytes);
+
+                        let sets = [mat_desc_set];
+                        // SAFETY: CB in render pass; descriptor set and
+                        // pipeline layout are valid.
+                        unsafe {
+                            d.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                hdr_pll,
+                                2,
+                                &sets,
+                                &[],
+                            );
+                        }
                     }
 
-                    let pipeline = self.pipeline_for_drawable(input, drawable)?;
-                    self.cur_enc
-                        .as_mut()
-                        .expect("encoder checked above")
-                        .bind_pipeline(pipeline);
+                    // Push constants: world transform (128 B)
+                    let world = &drawable.world_transform;
+                    let mut pc_bytes = Vec::with_capacity(128);
+                    for v in world {
+                        pc_bytes.extend_from_slice(&v.to_ne_bytes());
+                    }
+                    pc_bytes.resize(128, 0u8);
+                    // SAFETY: CB in render pass; push constant matches HDR
+                    // pipeline layout (128 B at offset 0, VERTEX stage).
+                    unsafe {
+                        d.cmd_push_constants(
+                            cmd,
+                            hdr_pll,
+                            vk::ShaderStageFlags::VERTEX,
+                            0,
+                            &pc_bytes,
+                        );
+                    }
 
-                    self.cur_enc
-                        .as_mut()
-                        .expect("encoder checked above")
-                        .bind_vertex_buffers(&[mesh.vertex_buffer], &[0]);
-                    self.cur_enc
-                        .as_mut()
-                        .expect("encoder checked above")
-                        .bind_index_buffer(mesh.index_buffer, 0, mesh.index_format);
-                    self.cur_enc
-                        .as_mut()
-                        .expect("encoder checked above")
-                        .draw_indexed(mesh.index_count, 1, 0, 0, 0);
+                    // Bind vertex/index buffers via raw Vulkan
+                    let vk_vb = self
+                        .device
+                        .buffers
+                        .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
+                        .map(|e| e.buffer)
+                        .unwrap_or(vk::Buffer::null());
+                    let vk_ib = self
+                        .device
+                        .buffers
+                        .get(mesh.index_buffer.index, mesh.index_buffer.generation)
+                        .map(|e| e.buffer)
+                        .unwrap_or(vk::Buffer::null());
+                    if vk_vb != vk::Buffer::null() {
+                        let vbs = [vk_vb];
+                        let offsets = [0u64];
+                        let idx_ty = match mesh.index_format {
+                            IndexFormat::U16 => vk::IndexType::UINT16,
+                            IndexFormat::U32 => vk::IndexType::UINT32,
+                        };
+                        unsafe {
+                            d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
+                            d.cmd_bind_index_buffer(cmd, vk_ib, 0, idx_ty);
+                            d.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+                        }
+                    }
 
                     stats.draw_calls += 1;
                     stats.triangles += mesh.index_count as u64 / 3;
                 }
 
-                self.cur_enc
-                    .as_mut()
-                    .expect("encoder checked above")
-                    .end_render_pass();
+                // End HDR render pass
+                unsafe { d.cmd_end_render_pass(cmd); }
+
+                // Pipeline barrier: transition HDR color image from
+                // COLOR_ATTACHMENT_OPTIMAL to SHADER_READ_ONLY_OPTIMAL so the
+                // tone-mapping pass can sample it as a texture.
+                if let Some(hdr_img) = self.device.hdr_color_image {
+                    let barrier = vk::ImageMemoryBarrier::default()
+                        .image(hdr_img)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                    unsafe {
+                        d.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                            vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[barrier],
+                        );
+                    }
+                }
+
                 stats.visible_drawables = input.drawables.len() as u32;
                 stats.visible_lights = input.lights.len() as u32;
             }
@@ -978,7 +1387,86 @@ impl BackendRenderer for SceneRenderer {
                 stats.visible_lights = input.lights.len() as u32;
             }
 
-            render_graph::PassKind::ToneMap => {}
+            render_graph::PassKind::ToneMap => {
+                // Tone-mapping pass: reads the HDR color attachment and writes
+                // LDR to the swapchain via a fullscreen triangle.
+                let Some(ref mut enc) = self.cur_enc else { return Ok(()) };
+
+                let d = &self.device.logical_device.device;
+                let fi = self.device.current_frame;
+                let cmd = self.device.frame_sync[fi].command_buffer;
+
+                let tone_rp = self.device.tone_rp.unwrap_or(vk::RenderPass::null());
+                let tone_pl = self.device.tone_pipeline.unwrap_or(vk::Pipeline::null());
+                let tone_pll = self.device.tone_pipeline_layout.unwrap_or(vk::PipelineLayout::null());
+                let tone_ds = self.device.tone_desc_set.unwrap_or(vk::DescriptorSet::null());
+                if tone_rp == vk::RenderPass::null() || tone_pl == vk::Pipeline::null() {
+                    return Ok(());
+                }
+
+                // Pick the tonemap framebuffer for the current swapchain image.
+                let tone_fb = self
+                    .device
+                    .tone_framebuffers
+                    .get(self.cur_fb_index as usize)
+                    .copied()
+                    .unwrap_or(vk::Framebuffer::null());
+                if tone_fb == vk::Framebuffer::null() {
+                    return Ok(());
+                }
+
+                // Begin tonemap render pass (color-only, no depth, LOAD op)
+                // SAFETY: CB in recording state; RP, FB, CB are valid.
+                let rpbi = vk::RenderPassBeginInfo::default()
+                    .render_pass(tone_rp)
+                    .framebuffer(tone_fb)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: self.width,
+                            height: self.height,
+                        },
+                    });
+                unsafe { d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE); }
+
+                // Viewport + scissor via encoder
+                enc.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
+                enc.set_scissor(0, 0, self.width, self.height);
+
+                // Bind tonemap pipeline
+                unsafe { d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, tone_pl); }
+
+                // Bind HDR sampler descriptor set at set=0
+                if tone_ds != vk::DescriptorSet::null() {
+                    let sets = [tone_ds];
+                    // SAFETY: descriptor set, layout, and CB are valid.
+                    unsafe {
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            tone_pll,
+                            0,
+                            &sets,
+                            &[],
+                        );
+                    }
+                }
+
+                // Push identity MVP (128 B, not used by tonemap.vert but
+                // declared in the pipeline layout).
+                let identity: [u8; 128] = [0; 128];
+                // SAFETY: CB in render pass; push constant ranges match the
+                // tone pipeline layout (128 B at offset 0, VERTEX stage).
+                unsafe {
+                    d.cmd_push_constants(cmd, tone_pll, vk::ShaderStageFlags::VERTEX, 0, &identity);
+                }
+
+                // Fullscreen triangle: 3 vertices, 1 instance.
+                enc.draw(3, 1, 0, 0);
+
+                // End tonemap render pass via encoder
+                enc.end_render_pass();
+            }
 
             // Present is handled entirely by end_frame.
             render_graph::PassKind::Present => {}

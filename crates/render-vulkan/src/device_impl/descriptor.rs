@@ -164,6 +164,109 @@ impl VulkanDevice {
         }
     }
 
+    // ======================================================================
+    // Material descriptor infra (set=2, per-drawable material UBO)
+    // ======================================================================
+
+    /// Create descriptor set layout + pool for material resources (set=2).
+    ///
+    /// Layout (set=2):
+    ///   binding=0: UNIFORM_BUFFER  (MaterialUBO — base_color, metallic, etc.)
+    ///   binding=1: COMBINED_IMAGE_SAMPLER (base color texture)
+    ///
+    /// Pool: up to 256 descriptor sets, each with 1 UBO + 1 sampler descriptor.
+    ///
+    /// Idempotent: returns `Ok(())` if already created.
+    pub(crate) fn create_material_descriptor_infra(&mut self) -> VkResult<()> {
+        if self.material_desc_set_layout.is_some() {
+            return Ok(());
+        }
+        let d = &self.logical_device.device;
+
+        // Layout: UBO at binding=0, combined image sampler at binding=1
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let ds_layout = unsafe { d.create_descriptor_set_layout(&layout_info, None) }
+            .map_err(|r| VulkanError::vk("create_material_ds_layout", r))?;
+
+        // Pool: up to 256 material descriptor sets, each with UBO + sampler
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 256,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 256,
+            },
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(256)
+            .pool_sizes(&pool_sizes)
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
+        let pool = unsafe { d.create_descriptor_pool(&pool_info, None) }
+            .map_err(|r| VulkanError::vk("create_material_ds_pool", r))?;
+
+        self.material_desc_set_layout = Some(ds_layout);
+        self.material_desc_pool = Some(pool);
+        Ok(())
+    }
+
+    /// Allocate a new material descriptor set for the given buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `create_material_descriptor_infra` has not been called first.
+    pub(crate) fn allocate_material_descriptor_set(
+        &self,
+        buffer: vk::Buffer,
+        ubo_size: vk::DeviceSize,
+    ) -> VkResult<vk::DescriptorSet> {
+        let d = &self.logical_device.device;
+        let layout = self
+            .material_desc_set_layout
+            .expect("material_desc_set_layout not created");
+        let pool = self
+            .material_desc_pool
+            .expect("material_desc_pool not created");
+
+        let layouts = [layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&layouts);
+        let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
+            .map_err(|r| VulkanError::vk("alloc_material_ds", r))?;
+        let desc_set = desc_sets[0];
+
+        // Write the descriptor: binding 0 → uniform buffer
+        let buf_info = [vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(ubo_size)];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&buf_info)];
+        // SAFETY: `d` is a valid AshDevice; descriptor set, buffer are valid.
+        unsafe {
+            d.update_descriptor_sets(&writes, &[]);
+        }
+
+        Ok(desc_set)
+    }
+
     pub(crate) fn destroy_descriptor_infra(&mut self) {
         let d = &self.logical_device.device;
         for mut a in self.ubo_allocations.drain(..) {

@@ -5,12 +5,15 @@ pub(crate) mod descriptor;
 pub(crate) mod device_trait;
 pub(crate) mod drop;
 pub(crate) mod encoder;
+pub(crate) mod env;
 pub(crate) mod frame;
 pub(crate) mod pipeline;
 pub(crate) mod reload;
 pub(crate) mod rendering;
+pub(crate) mod hdr;
 pub(crate) mod shadow;
 pub(crate) mod slab;
+pub(crate) mod texture;
 
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -36,6 +39,18 @@ unsafe impl Send for VulkanDevice {}
 // SAFETY: all fields are Sync-safe: mutable access requires &mut self; Vulkan
 // handles are integers; allocator Mutex provides interior mutability safely.
 unsafe impl Sync for VulkanDevice {}
+
+// ============================================================================
+// GpuTexture — GPU-side resources for a sampled 2D texture
+// ============================================================================
+
+/// GPU resources for a single 2D texture (image, view, allocation, sampler).
+pub(crate) struct GpuTexture {
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    pub allocation: crate::allocator::Allocation,
+    pub sampler: vk::Sampler,
+}
 
 // ============================================================================
 // VulkanDevice
@@ -113,6 +128,16 @@ pub struct VulkanDevice {
     pub(crate) depth_image_view: Option<vk::ImageView>,
     pub(crate) depth_allocation: Option<crate::allocator::Allocation>,
 
+    // Environment cubemap (IBL, set=1 binding=1)
+    pub(crate) env_cubemap: Option<vk::Image>,
+    pub(crate) env_cubemap_view: Option<vk::ImageView>,
+    pub(crate) env_cubemap_allocation: Option<crate::allocator::Allocation>,
+    pub(crate) env_sampler: Option<vk::Sampler>,
+
+    // Material descriptor infrastructure (set=2, binding 0 = UBO, binding 1 = texture)
+    pub(crate) material_desc_set_layout: Option<vk::DescriptorSetLayout>,
+    pub(crate) material_desc_pool: Option<vk::DescriptorPool>,
+
     // Shadow mapping (directional light, 2048×2048)
     pub(crate) shadow_map: Option<vk::Image>,
     pub(crate) shadow_map_view: Option<vk::ImageView>,
@@ -128,6 +153,33 @@ pub struct VulkanDevice {
     /// Pipeline layout containing only set=1 (shadow map), used to bind the
     /// shadow descriptor set in `begin_frame` before the encoder takes over.
     pub(crate) shadow_bind_layout: Option<vk::PipelineLayout>,
+
+    // HDR offscreen rendering (Phase 2.1)
+    pub(crate) hdr_color_image: Option<vk::Image>,
+    pub(crate) hdr_color_view: Option<vk::ImageView>,
+    pub(crate) hdr_color_allocation: Option<crate::allocator::Allocation>,
+    pub(crate) hdr_color_sampler: Option<vk::Sampler>,
+    pub(crate) tone_rp: Option<vk::RenderPass>,
+    pub(crate) tone_pipeline: Option<vk::Pipeline>,
+    pub(crate) tone_pipeline_layout: Option<vk::PipelineLayout>,
+    pub(crate) tone_framebuffers: Vec<vk::Framebuffer>,
+    /// Descriptor set + infrastructure for HDR texture binding in tonemap.
+    pub(crate) tone_desc_set: Option<vk::DescriptorSet>,
+    pub(crate) tone_desc_pool: Option<vk::DescriptorPool>,
+    pub(crate) tone_desc_layout: Option<vk::DescriptorSetLayout>,
+    /// Forward HDR render pass (RGBA16F color + D32 depth).
+    pub(crate) hdr_forward_rp: Option<vk::RenderPass>,
+    /// Forward HDR pipeline (targets hdr_forward_rp).
+    pub(crate) hdr_forward_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_forward_pipeline_layout: Option<vk::PipelineLayout>,
+    /// Framebuffer for forward HDR pass (HDR color view + depth view).
+    pub(crate) hdr_forward_fb: Option<vk::Framebuffer>,
+
+    // Material texture cache (Phase 3.1)
+    /// Uploaded GPU textures indexed by asset ID string.
+    pub(crate) textures: HashMap<String, GpuTexture>,
+    /// Cached descriptor sets per material ID (allocated from material_desc_pool).
+    pub(crate) material_desc_sets: HashMap<String, vk::DescriptorSet>,
 }
 
 impl VulkanDevice {
@@ -239,6 +291,16 @@ impl VulkanDevice {
             depth_image_view: None,
             depth_allocation: None,
 
+            // Environment cubemap (IBL)
+            env_cubemap: None,
+            env_cubemap_view: None,
+            env_cubemap_allocation: None,
+            env_sampler: None,
+
+            // Material descriptor infrastructure (set=2)
+            material_desc_set_layout: None,
+            material_desc_pool: None,
+
             // Shadow mapping
             shadow_map: None,
             shadow_map_view: None,
@@ -252,6 +314,27 @@ impl VulkanDevice {
             shadow_desc_layout: None,
             shadow_desc_pool: None,
             shadow_bind_layout: None,
+
+            // HDR offscreen rendering
+            hdr_color_image: None,
+            hdr_color_view: None,
+            hdr_color_allocation: None,
+            hdr_color_sampler: None,
+            tone_rp: None,
+            tone_pipeline: None,
+            tone_pipeline_layout: None,
+            tone_framebuffers: Vec::new(),
+            tone_desc_set: None,
+            tone_desc_pool: None,
+            tone_desc_layout: None,
+            hdr_forward_rp: None,
+            hdr_forward_pipeline: None,
+            hdr_forward_pipeline_layout: None,
+            hdr_forward_fb: None,
+
+            // Material texture cache (Phase 3.1)
+            textures: HashMap::new(),
+            material_desc_sets: HashMap::new(),
         };
 
         // Phase 3.3: Initialize PSO cache (load from disk if cache_dir provided).
