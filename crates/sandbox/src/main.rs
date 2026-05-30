@@ -2,6 +2,7 @@
 
 use engine_asset::ReloadCoordinator;
 use engine_core::{EngineConfig, EngineRuntime};
+use render_core::Device;
 
 mod diagnostics;
 
@@ -13,6 +14,7 @@ fn main() {
     match command.as_str() {
         "workspace" => tracing::info!("engine workspace initialized"),
         "gate04-scene" => run_gate04_scene(),
+        "character-demo" => run_character_demo(),
         "contract-triangle" => run_contract_triangle(),
         "static-lit-scene" => run_static_lit_scene(),
         "triangle" => run_triangle(),
@@ -715,6 +717,215 @@ fn run_static_lit_scene() {
 #[cfg(not(feature = "backend-vulkan"))]
 fn run_static_lit_scene() {
     tracing::error!("static-lit-scene requires backend-vulkan");
+    std::process::exit(2);
+}
+
+// ============================================================================
+// Character demo: WASD-controlled capsule on ground plane
+// ============================================================================
+
+#[cfg(feature = "backend-vulkan")]
+fn run_character_demo() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use engine_character::{CharacterController, CharacterMovement};
+    use engine_physics::{BodyType, Collider, ColliderShape, PhysicsWorld, RigidBody};
+    use engine_scene::components::Transform;
+    use engine_scene::World;
+    use glam::{Mat4, Vec3};
+    use platform::winit::window::Window;
+    use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+    use render_core::{BufferDescriptor, BufferHandle, MemoryHint};
+    use render_vulkan::device_impl::VulkanDevice;
+    use render_vulkan::shaders_embedded;
+
+    struct CharacterApp {
+        renderer: Option<CharacterBackend>,
+        frames: u64,
+        max_frames: Option<u64>,
+        last_frame_time: Instant,
+        held_keys: HashSet<u32>,
+        controller: CharacterController,
+        physics: Option<PhysicsWorld>,
+        _ecs_world: World,
+    }
+
+    struct CharacterBackend {
+        device: VulkanDevice,
+        vertex_buf: BufferHandle,
+        index_buf: BufferHandle,
+        index_count: u32,
+        width: f32,
+        height: f32,
+    }
+
+    fn build_vertex_buffers(device: &mut VulkanDevice) -> (BufferHandle, BufferHandle, u32) {
+        let stride = 32u64;
+        // Cube: 24 verts × 8 floats = 192 floats → 768 bytes
+        let cube_verts: &[f32] = &[
+            -0.5, -0.5, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0,
+            0.5, -0.5, 0.5, 0.0, 0.0, 1.0, 1.0, 0.0,
+            0.5, 0.5, 0.5, 0.0, 0.0, 1.0, 1.0, 1.0,
+            -0.5, 0.5, 0.5, 0.0, 0.0, 1.0, 0.0, 1.0,
+            -0.5, -0.5, -0.5, 0.0, 0.0, -1.0, 0.0, 0.0,
+            0.5, -0.5, -0.5, 0.0, 0.0, -1.0, 1.0, 0.0,
+            0.5, 0.5, -0.5, 0.0, 0.0, -1.0, 1.0, 1.0,
+            -0.5, 0.5, -0.5, 0.0, 0.0, -1.0, 0.0, 1.0,
+            0.5, -0.5, -0.5, 1.0, 0.0, 0.0, 0.0, 0.0,
+            0.5, -0.5, 0.5, 1.0, 0.0, 0.0, 1.0, 0.0,
+            0.5, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0, 1.0,
+            0.5, 0.5, -0.5, 1.0, 0.0, 0.0, 0.0, 1.0,
+            -0.5, -0.5, -0.5, -1.0, 0.0, 0.0, 0.0, 0.0,
+            -0.5, -0.5, 0.5, -1.0, 0.0, 0.0, 1.0, 0.0,
+            -0.5, 0.5, 0.5, -1.0, 0.0, 0.0, 1.0, 1.0,
+            -0.5, 0.5, -0.5, -1.0, 0.0, 0.0, 0.0, 1.0,
+            -0.5, 0.5, -0.5, 0.0, 1.0, 0.0, 0.0, 0.0,
+            0.5, 0.5, -0.5, 0.0, 1.0, 0.0, 1.0, 0.0,
+            0.5, 0.5, 0.5, 0.0, 1.0, 0.0, 1.0, 1.0,
+            -0.5, 0.5, 0.5, 0.0, 1.0, 0.0, 0.0, 1.0,
+            -0.5, -0.5, -0.5, 0.0, -1.0, 0.0, 0.0, 0.0,
+            0.5, -0.5, -0.5, 0.0, -1.0, 0.0, 1.0, 0.0,
+            0.5, -0.5, 0.5, 0.0, -1.0, 0.0, 1.0, 1.0,
+            -0.5, -0.5, 0.5, 0.0, -1.0, 0.0, 0.0, 1.0,
+        ];
+        let plane_pos: [[f32; 3]; 4] = [[-10.0, -0.5, -10.0], [10.0, -0.5, -10.0], [10.0, -0.5, 10.0], [-10.0, -0.5, 10.0]];
+        let plane_n = [0.0f32, 1.0, 0.0];
+        let plane_uv: [[f32; 2]; 4] = [[0.0, 0.0], [5.0, 0.0], [5.0, 5.0], [0.0, 5.0]];
+        let cube_vc = 24u32;
+        let vert_count = cube_vc as usize + plane_pos.len();
+
+        let mut vert_bytes: Vec<u8> = Vec::with_capacity(vert_count * stride as usize);
+        for c in cube_verts.chunks(8) {
+            for v in c { vert_bytes.extend_from_slice(&v.to_ne_bytes()); }
+        }
+        for i in 0..4 {
+            for v in &[plane_pos[i][0], plane_pos[i][1], plane_pos[i][2], plane_n[0], plane_n[1], plane_n[2], plane_uv[i][0], plane_uv[i][1]] {
+                vert_bytes.extend_from_slice(&v.to_ne_bytes());
+            }
+        }
+
+        let mut idx: Vec<u32> = (0..6u32).flat_map(|f| { let b = f * 4; vec![b, b+1, b+2, b, b+2, b+3] }).collect();
+        idx.extend_from_slice(&[cube_vc, cube_vc+1, cube_vc+2, cube_vc, cube_vc+2, cube_vc+3]);
+        let idx_count = idx.len() as u32;
+
+        let mut idx_bytes: Vec<u8> = Vec::with_capacity(idx.len() * 4);
+        for i in &idx { idx_bytes.extend_from_slice(&i.to_ne_bytes()); }
+
+        let vb = device.create_buffer(&BufferDescriptor {
+            size_bytes: vert_bytes.len() as u64, usage_flags: render_core::BufferUsage(0),
+            memory_hint: MemoryHint::CpuToGpu, debug_label: Some("char-vert".into()),
+        }).unwrap();
+        device.write_buffer(vb, &vert_bytes, 0).unwrap();
+
+        let ib = device.create_buffer(&BufferDescriptor {
+            size_bytes: idx_bytes.len() as u64, usage_flags: render_core::BufferUsage(0),
+            memory_hint: MemoryHint::CpuToGpu, debug_label: Some("char-idx".into()),
+        }).unwrap();
+        device.write_buffer(ib, &idx_bytes, 0).unwrap();
+        (vb, ib, idx_count)
+    }
+
+    impl WindowApp for CharacterApp {
+        fn on_create(&mut self, window: Arc<Window>) {
+            let size = window.inner_size();
+            let dh = window.display_handle().unwrap().as_raw();
+            let wh = window.window_handle().unwrap().as_raw();
+            let val = std::env::var("ENGINE_VK_VALIDATION").is_ok();
+            let mut device = VulkanDevice::new(dh, wh, size.width.max(1), size.height.max(1), val,
+                Some(std::path::Path::new("./pso_cache"))).unwrap();
+            device.set_mvp_shaders(shaders_embedded::FORWARD_VERT_SPV, shaders_embedded::FORWARD_FRAG_SPV);
+            let (vb, ib, ic) = build_vertex_buffers(&mut device);
+            self.renderer = Some(CharacterBackend { device, vertex_buf: vb, index_buf: ib, index_count: ic,
+                width: size.width.max(1) as f32, height: size.height.max(1) as f32 });
+            tracing::info!("character-demo ready");
+        }
+
+        fn on_event(&mut self, _window: &Window, event: PlatformEvent) -> EventFlow {
+            match event {
+                PlatformEvent::KeyPressed { key, .. } => { self.held_keys.insert(key); EventFlow::Continue }
+                PlatformEvent::KeyReleased { key, .. } => { self.held_keys.remove(&key); EventFlow::Continue }
+                PlatformEvent::Resized { .. } => EventFlow::Continue,
+                PlatformEvent::Redraw => {
+                    let elapsed = self.last_frame_time.elapsed();
+                    let target = std::time::Duration::from_secs_f64(1.0 / 60.0);
+                    if elapsed < target { std::thread::sleep(target - elapsed); }
+                    self.last_frame_time = Instant::now();
+                    let dt = elapsed.as_secs_f32().min(0.05);
+
+                    let mut dir = Vec3::ZERO;
+                    if self.held_keys.contains(&87) { dir.z -= 1.0; }
+                    if self.held_keys.contains(&83) { dir.z += 1.0; }
+                    if self.held_keys.contains(&65) { dir.x -= 1.0; }
+                    if self.held_keys.contains(&68) { dir.x += 1.0; }
+                    let input = CharacterMovement {
+                        direction: if dir.length_squared() > 0.0 { dir.normalize() } else { dir },
+                        wish_jump: self.held_keys.contains(&32),
+                        delta_time: dt,
+                    };
+                    self.controller.update(&input, self.physics.as_ref());
+
+                    if let Some(ref mut rb) = self.renderer {
+                        let cp = self.controller.position();
+                        let angle = self.frames as f32 * 0.02;
+                        let r = 5.0f32;
+                        let eye = Vec3::new(r * angle.sin() + cp.x, r * 0.5 + cp.y, r * angle.cos() + cp.z);
+                        let view = Mat4::look_at_rh(eye, cp, Vec3::Y);
+                        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, rb.width/rb.height, 0.1, 100.0);
+                        let vc = Mat4::from_cols_array_2d(&[
+                            [1.0,0.0,0.0,0.0],[0.0,-1.0,0.0,0.0],[0.0,0.0,0.5,0.0],[0.0,0.0,0.5,1.0]]);
+                        let vp = vc * proj * view;
+                        let model = Mat4::from_translation(cp)
+                            * Mat4::from_scale(Vec3::new(self.controller.radius*2.0, self.controller.height, self.controller.radius*2.0));
+
+                        let mut ubo = Vec::with_capacity(176);
+                        for v in model.to_cols_array_2d().iter().flatten() { ubo.extend_from_slice(&v.to_ne_bytes()); }
+                        for v in vp.to_cols_array_2d().iter().flatten() { ubo.extend_from_slice(&v.to_ne_bytes()); }
+                        let ld = Vec3::new(0.5, -0.707, 0.5).normalize();
+                        for v in &[ld.x, ld.y, ld.z, 0.0f32] { ubo.extend_from_slice(&v.to_ne_bytes()); }
+                        for v in &[1.5f32; 4] { ubo.extend_from_slice(&v.to_ne_bytes()); }
+                        for v in &[eye.x, eye.y, eye.z, 1.0f32] { ubo.extend_from_slice(&v.to_ne_bytes()); }
+                        rb.device.write_ubo_current(&ubo, 0);
+
+                        if let Err(e) = rb.device.render_model_frame(rb.vertex_buf, rb.index_buf, rb.index_count) {
+                            tracing::error!("render: {e}"); return EventFlow::Exit;
+                        }
+                    }
+                    self.frames += 1;
+                    if self.max_frames.is_some_and(|l| self.frames >= l) { return EventFlow::Exit; }
+                    EventFlow::Continue
+                }
+                PlatformEvent::CloseRequested => EventFlow::Exit,
+                PlatformEvent::Resumed | PlatformEvent::Suspended => EventFlow::Continue,
+                _ => EventFlow::Continue,
+            }
+        }
+    }
+
+    let max_frames = parse_frame_limit();
+    let mut world = World::new();
+    let g = world.create_entity();
+    world.add_component(g, RigidBody { body_type: BodyType::Static, ..RigidBody::default() });
+    world.add_component(g, Collider { shape: ColliderShape::Cuboid { hx: 10.0, hy: 0.5, hz: 10.0 }, ..Collider::default() });
+    world.add_component(g, Transform { translation: Vec3::new(0.0, -0.5, 0.0), ..Transform::default() });
+    let mut physics = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0));
+    physics.sync_from_ecs(&world);
+    let mut controller = CharacterController::new();
+    controller.set_position(Vec3::new(0.0, 3.0, 0.0));
+    let app = CharacterApp {
+        renderer: None, frames: 0, max_frames, last_frame_time: Instant::now(),
+        held_keys: HashSet::new(), controller, physics: Some(physics), _ecs_world: world,
+    };
+    if let Err(e) = platform::run(WindowDescriptor { title: "Engine Character Demo".into(), width: 1280, height: 720 }, app) {
+        tracing::error!("{e}");
+    }
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn run_character_demo() {
+    tracing::error!("character-demo requires `backend-vulkan` feature");
     std::process::exit(2);
 }
 
