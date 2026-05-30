@@ -5,6 +5,7 @@ pub mod components;
 mod convert;
 mod debug;
 pub mod events;
+pub mod joints;
 pub mod queries;
 mod world;
 
@@ -13,7 +14,10 @@ pub use components::{BodyType, Collider, ColliderShape, PhysicsMaterial, RigidBo
 pub use convert::{from_rapier_vec, to_rapier_vec};
 pub use debug::{ColliderDebugInfo, PhysicsDebugDraw};
 pub use events::{CollisionEvent, CollisionEventKind, PhysicsEvents};
-pub use queries::{OverlapQuery, QueryResults, RaycastQuery, SweepQuery};
+pub use queries::{
+    OverlapHitResult, OverlapQuery, QueryBatcher, QueryResults, RaycastHitResult, RaycastQuery,
+    SweepHitResult, SweepQuery,
+};
 pub use world::{PhysicsCommand, PhysicsWorld};
 
 // Re-export key types from engine-scene for convenience

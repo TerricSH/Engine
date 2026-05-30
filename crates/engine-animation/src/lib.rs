@@ -13,6 +13,10 @@ pub mod debug;
 pub mod extract;
 pub mod loader;
 pub mod player;
+pub mod events;
+pub mod layers;
+pub mod root_motion;
+pub mod state_machine;
 
 // ── Re-exports: old public API (from skeleton, clip, pose) ────────────
 pub use clip::{AnimationClip as RuntimeAnimationClip, Keyframe as RuntimeKeyframe};
@@ -20,13 +24,25 @@ pub use pose::Pose;
 pub use skeleton::{AnimationError, BoneIndex, BoneTransform};
 // Old player types are no longer re-exported — use the Gate 10 player instead.
 
-// ── Re-exports: new Gate 10 public API ─────────────────────────────────
+// ── Re-exports: Gate 10 public API ────────────────────────────────────
 pub use assets::{AnimationChannel, AnimationClip, Joint, JointTransform, Keyframe, Skeleton};
 pub use components::{AnimationPlayer, SkeletonComponent};
 pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
+pub use events::{AnimEvent, AnimEventCollector, AnimEventDef, check_event_trigger};
 pub use extract::{PendingSkinnedItem, SkinnedExtractProducer};
 pub use loader::{load_animation_clip, load_skeleton, register_asset_types};
 pub use player::{update_animation, AnimationEvaluator};
+pub use root_motion::{
+    extract_root_motion, RootMotionApplyTo, RootMotionConfig, RootMotionDelta,
+};
+
+// ── Re-exports: Gate 11 public API ────────────────────────────────────
+pub use layers::{AnimLayer, LayerBlendMode};
+pub use player::update_animation_sm;
+pub use state_machine::{
+    AnimParamValue, AnimParameter, AnimStateMachine, AnimStateMachineInstance, AnimationState,
+    ConditionOp, StateTransition, TransitionCondition,
+};
 
 // ── Registration (Gate 9 extension surfaces) ──────────────────────────
 

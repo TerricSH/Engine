@@ -6,6 +6,10 @@ use crate::backend::{RapierBackend, RaycastHit};
 use crate::components::{ColliderShape, RigidBody};
 use crate::debug::{ColliderDebugInfo, PhysicsDebugDraw};
 use crate::events::{CollisionEvent, PhysicsEvents};
+use crate::joints::{JointDescriptor, JointHandle};
+use crate::queries::{
+    OverlapQuery, QueryBatcher, QueryResults, RaycastQuery, SweepQuery,
+};
 use crate::{Collider, Entity, PhysicsMaterial, Transform};
 
 // ── PhysicsCommand ──────────────────────────────────────────────────────────
@@ -51,6 +55,8 @@ pub struct PhysicsWorld {
     pending_commands: Vec<PhysicsCommand>,
     pending_events: Vec<CollisionEvent>,
     debug_colliders: Arc<Mutex<Vec<ColliderDebugInfo>>>,
+    /// Accumulated queries waiting for batched execution.
+    query_batcher: QueryBatcher,
 }
 
 impl PhysicsWorld {
@@ -64,6 +70,7 @@ impl PhysicsWorld {
             pending_commands: Vec::new(),
             pending_events: Vec::new(),
             debug_colliders: Arc::new(Mutex::new(Vec::new())),
+            query_batcher: QueryBatcher::new(),
         }
     }
 
@@ -343,6 +350,62 @@ impl PhysicsWorld {
     /// Find all entities whose colliders overlap with the given shape.
     pub fn query_proximity(&self, shape: &ColliderShape, position: glam::Vec3) -> Vec<Entity> {
         self.backend.query_proximity(shape, position)
+    }
+
+    // ── Batched queries ──────────────────────────────────────────────
+
+    /// Queue a raycast query for batched execution.
+    ///
+    /// The query will be executed when [`execute_queries`] is called.
+    pub fn queue_raycast(&mut self, query: RaycastQuery) {
+        self.query_batcher.push_raycast(query);
+    }
+
+    /// Queue an overlap (proximity) query for batched execution.
+    ///
+    /// The query will be executed when [`execute_queries`] is called.
+    pub fn queue_overlap(&mut self, query: OverlapQuery) {
+        self.query_batcher.push_overlap(query);
+    }
+
+    /// Queue a sweep (shape cast) query for batched execution.
+    ///
+    /// The query will be executed when [`execute_queries`] is called.
+    pub fn queue_sweep(&mut self, query: SweepQuery) {
+        self.query_batcher.push_sweep(query);
+    }
+
+    /// Execute all queued batched queries and return the results.
+    ///
+    /// After calling this method the internal batcher is cleared so that
+    /// new queries can be queued for the next frame.
+    pub fn execute_queries(&mut self) -> QueryResults {
+        let batcher = std::mem::take(&mut self.query_batcher);
+        if batcher.is_empty() {
+            return QueryResults::new();
+        }
+        self.backend.execute_batched_queries(&batcher)
+    }
+
+    // ── Joint API ───────────────────────────────────────────────────────
+
+    /// Create a joint between two entities.
+    ///
+    /// Returns `None` if either entity does not have a registered rigid body.
+    pub fn create_joint(&mut self, desc: JointDescriptor) -> Option<JointHandle> {
+        let body_a_handle = *self.backend.body_map.get(&desc.entity_a)?;
+        let body_b_handle = *self.backend.body_map.get(&desc.entity_b)?;
+        self.backend.create_joint(&desc, body_a_handle, body_b_handle)
+    }
+
+    /// Remove a joint by its handle.
+    pub fn remove_joint(&mut self, handle: JointHandle) {
+        self.backend.remove_joint(handle);
+    }
+
+    /// Number of active joints in the simulation.
+    pub fn joint_count(&self) -> usize {
+        self.backend.joint_count()
     }
 
     // ── Debug draw ──────────────────────────────────────────────────────

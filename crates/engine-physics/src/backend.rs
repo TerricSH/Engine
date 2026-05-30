@@ -7,6 +7,10 @@ use rapier3d::prelude::*;
 use crate::components::{BodyType, Collider, ColliderShape, RigidBody};
 use crate::convert::{from_rapier_isometry, from_rapier_vec, to_rapier_isometry, to_rapier_vec};
 use crate::events::{CollisionEvent, CollisionEventKind};
+use crate::joints::{JointDescriptor, JointHandle, JointType};
+use crate::queries::{
+    OverlapHitResult, QueryBatcher, QueryResults, RaycastHitResult, SweepHitResult,
+};
 use crate::Entity;
 use crate::Transform;
 
@@ -110,6 +114,13 @@ pub struct RapierBackend {
     pub(crate) body_map: HashMap<u32, RigidBodyHandle>,
     /// Maps entity index → (Rapier collider handle, original shape).
     pub(crate) collider_map: HashMap<u32, (ColliderHandle, ColliderShape)>,
+
+    /// Maps entity index → joint handle (tracking which entities have joints).
+    pub(crate) joint_entity_map: HashMap<u32, u32>,
+    /// Maps our JointHandle.0 → full Rapier ImpulseJointHandle (with generation).
+    pub(crate) joint_handle_lookup: HashMap<u32, ImpulseJointHandle>,
+    /// Auto-incrementing counter for JointHandle IDs.
+    next_joint_id: u32,
 }
 
 impl RapierBackend {
@@ -130,6 +141,9 @@ impl RapierBackend {
             query_pipeline: QueryPipeline::new(),
             body_map: HashMap::new(),
             collider_map: HashMap::new(),
+            joint_entity_map: HashMap::new(),
+            joint_handle_lookup: HashMap::new(),
+            next_joint_id: 0,
         }
     }
 
@@ -284,6 +298,123 @@ impl RapierBackend {
             );
         }
         self.collider_map.remove(&entity_index);
+        self.joint_entity_map.remove(&entity_index);
+    }
+
+    // ── Joint management ────────────────────────────────────────────────
+
+    /// Create a joint between two rigid bodies.
+    pub fn create_joint(
+        &mut self,
+        desc: &JointDescriptor,
+        body_a_handle: RigidBodyHandle,
+        body_b_handle: RigidBodyHandle,
+    ) -> Option<JointHandle> {
+        let frame_a = na::Isometry3::from_parts(
+            na::Translation3::new(desc.anchor_a[0], desc.anchor_a[1], desc.anchor_a[2]),
+            na::UnitQuaternion::identity(),
+        );
+        let frame_b = na::Isometry3::from_parts(
+            na::Translation3::new(desc.anchor_b[0], desc.anchor_b[1], desc.anchor_b[2]),
+            na::UnitQuaternion::identity(),
+        );
+        let anchor_a = na::Point3::new(desc.anchor_a[0], desc.anchor_a[1], desc.anchor_a[2]);
+        let anchor_b = na::Point3::new(desc.anchor_b[0], desc.anchor_b[1], desc.anchor_b[2]);
+
+        // Build the appropriate Rapier joint type and insert directly.
+        // NOTE: Rapier 0.22 builders implement Into<GenericJoint> so we pass
+        // them straight to impulse_joints.insert().
+        let rapier_handle = match desc.joint_type {
+            JointType::Fixed => {
+                let b = FixedJointBuilder::new()
+                    .local_frame1(frame_a)
+                    .local_frame2(frame_b);
+                self.impulse_joints
+                    .insert(body_a_handle, body_b_handle, b, true)
+            }
+            JointType::Revolute => {
+                let axis = na::Unit::new_normalize(na::Vector3::new(
+                    desc.axis[0],
+                    desc.axis[1],
+                    desc.axis[2],
+                ));
+                let mut b = RevoluteJointBuilder::new(axis)
+                    .local_anchor1(anchor_a)
+                    .local_anchor2(anchor_b);
+                if let Some(l) = &desc.limits {
+                    b = b.limits([l.min, l.max]);
+                }
+                if let Some(m) = &desc.motor {
+                    b = b.motor(m.target_pos, m.target_vel, m.stiffness, m.damping);
+                }
+                self.impulse_joints
+                    .insert(body_a_handle, body_b_handle, b, true)
+            }
+            JointType::Prismatic => {
+                let axis = na::Unit::new_normalize(na::Vector3::new(
+                    desc.axis[0],
+                    desc.axis[1],
+                    desc.axis[2],
+                ));
+                let mut b = PrismaticJointBuilder::new(axis)
+                    .local_anchor1(anchor_a)
+                    .local_anchor2(anchor_b);
+                if let Some(l) = &desc.limits {
+                    b = b.limits([l.min, l.max]);
+                }
+                if let Some(m) = &desc.motor {
+                    b = b.set_motor(m.target_pos, m.target_vel, m.stiffness, m.damping);
+                }
+                self.impulse_joints
+                    .insert(body_a_handle, body_b_handle, b, true)
+            }
+            JointType::Spherical => {
+                let mut b = SphericalJointBuilder::new()
+                    .local_frame1(frame_a)
+                    .local_frame2(frame_b);
+                if let Some(l) = &desc.limits {
+                    use rapier3d::dynamics::JointAxis;
+                    b = b
+                        .limits(JointAxis::AngX, [l.min, l.max])
+                        .limits(JointAxis::AngY, [l.min, l.max])
+                        .limits(JointAxis::AngZ, [l.min, l.max]);
+                }
+                if let Some(m) = &desc.motor {
+                    use rapier3d::dynamics::JointAxis;
+                    b = b
+                        .motor(JointAxis::AngX, m.target_pos, m.target_vel, m.stiffness, m.damping)
+                        .motor(JointAxis::AngY, m.target_pos, m.target_vel, m.stiffness, m.damping)
+                        .motor(JointAxis::AngZ, m.target_pos, m.target_vel, m.stiffness, m.damping);
+                }
+                self.impulse_joints
+                    .insert(body_a_handle, body_b_handle, b, true)
+            }
+        };
+
+        // Generate a unique handle ID and store the full Rapier handle.
+        let our_id = self.next_joint_id;
+        self.next_joint_id += 1;
+        self.joint_handle_lookup.insert(our_id, rapier_handle);
+
+        // Track entity → joint mapping.
+        self.joint_entity_map.insert(desc.entity_a, our_id);
+        self.joint_entity_map.insert(desc.entity_b, our_id);
+
+        Some(JointHandle(our_id))
+    }
+
+    /// Remove a joint by handle.
+    pub fn remove_joint(&mut self, handle: JointHandle) {
+        if let Some(rapier_handle) = self.joint_handle_lookup.remove(&handle.0) {
+            self.impulse_joints.remove(rapier_handle, true);
+        }
+        // Clean up entity tracking.
+        self.joint_entity_map.retain(|_, v| *v != handle.0);
+    }
+
+    /// Number of active impulse joints.
+    pub fn joint_count(&self) -> usize {
+        self.impulse_joints.len()
     }
 
     /// Remove a collider but keep the body.
@@ -407,6 +538,157 @@ impl RapierBackend {
         );
 
         entities
+    }
+
+    /// Execute a set of batched queries in a single call.
+    ///
+    /// Processes all queued raycasts, overlaps, and sweeps, collecting
+    /// per-query detailed results and a flat list of all entity hits.
+    pub fn execute_batched_queries(&self, batcher: &QueryBatcher) -> QueryResults {
+        use rapier3d::parry::query::details::ShapeCastOptions;
+
+        // Build reverse map: collider handle → entity index for O(1) lookup.
+        let mut col_handle_to_entity: HashMap<ColliderHandle, u32> = HashMap::new();
+        for (&entity_idx, &(ch, _)) in &self.collider_map {
+            col_handle_to_entity.insert(ch, entity_idx);
+        }
+
+        let mut all_hits: Vec<Entity> = Vec::new();
+        let mut raycast_details: Vec<Vec<RaycastHitResult>> = Vec::new();
+        let mut overlap_details: Vec<Vec<OverlapHitResult>> = Vec::new();
+        let mut sweep_details: Vec<Vec<SweepHitResult>> = Vec::new();
+
+        // ── 1. Raycasts ────────────────────────────────────────────────
+        for q in &batcher.raycasts {
+            let rapier_origin = na::Point3::new(q.origin.x, q.origin.y, q.origin.z);
+            let rapier_dir = na::Vector3::new(q.direction.x, q.direction.y, q.direction.z);
+            let ray = Ray::new(rapier_origin, rapier_dir);
+            let filter = QueryFilter::default().exclude_sensors();
+
+            let mut hits: Vec<RaycastHitResult> = Vec::new();
+            self.query_pipeline.intersections_with_ray(
+                &self.bodies,
+                &self.colliders,
+                &ray,
+                q.max_distance,
+                true, // solid
+                filter,
+                |handle, intersection| {
+                    if let Some(&entity_idx) = col_handle_to_entity.get(&handle) {
+                        let entity = Entity::new(entity_idx, 0);
+                        // `RayIntersection` has `time_of_impact`, `normal`, `feature`
+                        let toi = intersection.time_of_impact;
+                        hits.push(RaycastHitResult {
+                            entity,
+                            point: q.origin + q.direction * toi,
+                            normal: glam::Vec3::new(
+                                intersection.normal.x,
+                                intersection.normal.y,
+                                intersection.normal.z,
+                            ),
+                            distance: toi,
+                        });
+                        all_hits.push(entity);
+                    }
+                    true // continue collecting
+                },
+            );
+            raycast_details.push(hits);
+        }
+
+        // ── 2. Overlaps ────────────────────────────────────────────────
+        for q in &batcher.overlaps {
+            let shape = to_rapier_shared_shape(&q.shape);
+            let pos = Isometry::from_parts(
+                na::Translation3::new(q.position.x, q.position.y, q.position.z),
+                na::UnitQuaternion::identity(),
+            );
+            let filter = QueryFilter::default().exclude_sensors();
+
+            let mut hits: Vec<OverlapHitResult> = Vec::new();
+            self.query_pipeline.intersections_with_shape(
+                &self.bodies,
+                &self.colliders,
+                &pos,
+                &*shape,
+                filter,
+                |handle| {
+                    if let Some(&entity_idx) = col_handle_to_entity.get(&handle) {
+                        let entity = Entity::new(entity_idx, 0);
+                        hits.push(OverlapHitResult { entity });
+                        all_hits.push(entity);
+                    }
+                    true
+                },
+            );
+            overlap_details.push(hits);
+        }
+
+        // ── 3. Sweeps (shape casts) ────────────────────────────────────
+        for q in &batcher.sweeps {
+            let shape = to_rapier_shared_shape(&q.shape);
+            let from_pos = Isometry::from_parts(
+                na::Translation3::new(q.from.x, q.from.y, q.from.z),
+                na::UnitQuaternion::identity(),
+            );
+            let delta = na::Vector3::new(
+                q.to.x - q.from.x,
+                q.to.y - q.from.y,
+                q.to.z - q.from.z,
+            );
+            let max_dist = delta.magnitude();
+            let dir = if max_dist > f32::EPSILON {
+                delta / max_dist
+            } else {
+                delta
+            };
+
+            let filter = QueryFilter::default().exclude_sensors();
+            let options = ShapeCastOptions {
+                max_time_of_impact: max_dist,
+                target_distance: 0.0,
+                stop_at_penetration: true,
+                compute_impact_geometry_on_penetration: false,
+            };
+
+            let mut hits: Vec<SweepHitResult> = Vec::new();
+            // `cast_shape` returns the closest hit; Rapier does not have
+            // a multi-hit sweep API, so we accept the single closest.
+            if let Some((handle, hit)) = self.query_pipeline.cast_shape(
+                &self.bodies,
+                &self.colliders,
+                &from_pos,
+                &dir,
+                &*shape,
+                options,
+                filter,
+            ) {
+                if let Some(&entity_idx) = col_handle_to_entity.get(&handle) {
+                    let entity = Entity::new(entity_idx, 0);
+                    let point = q.from
+                        + glam::Vec3::new(dir.x, dir.y, dir.z) * hit.time_of_impact;
+                    hits.push(SweepHitResult {
+                        entity,
+                        point,
+                        normal: glam::Vec3::new(
+                            hit.normal1.x,
+                            hit.normal1.y,
+                            hit.normal1.z,
+                        ),
+                        distance: hit.time_of_impact,
+                    });
+                    all_hits.push(entity);
+                }
+            }
+            sweep_details.push(hits);
+        }
+
+        QueryResults {
+            hits: all_hits,
+            raycast_details,
+            overlap_details,
+            sweep_details,
+        }
     }
 
     /// Update the query pipeline after structural changes.
