@@ -82,6 +82,7 @@ impl MaterialResolver {
             polygon_mode: context.polygon_mode.clone(),
             sample_count: Some(context.sample_count),
             render_pass: Some(context.render_pass),
+            specialization: Vec::new(),
         };
 
         let key = PipelineCacheKey::from_descriptor(

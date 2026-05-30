@@ -46,6 +46,22 @@ fn old_test_skeleton() -> crate::skeleton::Skeleton {
     skel
 }
 
+/// 2-bone runtime skeleton matching the structure of `test_skeleton()`.
+fn test_runtime_skeleton() -> crate::skeleton::Skeleton {
+    let mut skel = crate::skeleton::Skeleton::new("test".to_string());
+    skel.add_bone(None, "root".into(), BoneTransform::IDENTITY);
+    skel.add_bone(
+        Some(BoneIndex(0)),
+        "child".into(),
+        BoneTransform {
+            translation: Vec3::new(0.0, 1.0, 0.0),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        },
+    );
+    skel
+}
+
 #[test]
 fn old_skeleton_bone_count() {
     let skel = old_test_skeleton();
@@ -320,50 +336,36 @@ fn evaluate_interpolates_between_keyframes() {
     assert_eq!(local[0].translation, [5.0, 0.0, 0.0]);
 }
 
-// ── solve_hierarchy tests ──────────────────────────────────────────────
+// ── Hierarchy solve tests (via Pose::global_transforms) ────────────────
 
 #[test]
-fn solve_hierarchy_identity_skeleton() {
-    let skeleton = test_skeleton();
-    let local = vec![JointTransform::IDENTITY; 2];
-    let global = AnimationEvaluator::solve_hierarchy(&local, &skeleton);
+fn hierarchy_solve_identity_via_pose() {
+    let skel = test_runtime_skeleton();
+    // Override pose with identity transforms for both bones.
+    let mut pose = Pose::new(&skel);
+    pose.local[0] = BoneTransform::IDENTITY;
+    pose.local[1] = BoneTransform::IDENTITY;
+
+    let global = pose.global_transforms(&skel);
     assert_eq!(global.len(), 2);
-    // All identity matrices
-    for m in &global {
-        assert_eq!(m, &IDENTITY_MAT4_4X4);
+    for bt in &global {
+        assert_eq!(bt.translation, Vec3::ZERO);
+        assert_eq!(bt.rotation, Quat::IDENTITY);
+        assert_eq!(bt.scale, Vec3::ONE);
     }
 }
 
 #[test]
-fn solve_hierarchy_composes_parent_child() {
-    let skeleton = test_skeleton();
-    let local = vec![
-        JointTransform {
-            translation: [1.0, 0.0, 0.0],
-            rotation: [0.0, 0.0, 0.0, 1.0],
-            scale: [1.0, 1.0, 1.0],
-        },
-        JointTransform {
-            translation: [0.0, 2.0, 0.0],
-            rotation: [0.0, 0.0, 0.0, 1.0],
-            scale: [1.0, 1.0, 1.0],
-        },
-    ];
-    let global = AnimationEvaluator::solve_hierarchy(&local, &skeleton);
-    // Child should be at root(1,0,0) + child(0,2,0) = (1,2,0)
-    // Column-major: translation is in column 3 (index 3)
-    let child_tx = global[1][3][0];
-    let child_ty = global[1][3][1];
-    assert!(
-        (child_tx - 1.0).abs() < 1e-5,
-        "expected child.x = 1.0, got {}",
-        child_tx
-    );
-    assert!(
-        (child_ty - 2.0).abs() < 1e-5,
-        "expected child.y = 2.0, got {}",
-        child_ty
-    );
+fn hierarchy_solve_composes_parent_child_via_pose() {
+    let skel = test_runtime_skeleton();
+    // Create a pose with root at [1,0,0] and child at [0,2,0].
+    let mut pose = Pose::new(&skel);
+    pose.local[0].translation = Vec3::new(1.0, 0.0, 0.0);
+    pose.local[1].translation = Vec3::new(0.0, 2.0, 0.0);
+
+    let global = pose.global_transforms(&skel);
+    assert_eq!(global[0].translation, Vec3::new(1.0, 0.0, 0.0));
+    assert_eq!(global[1].translation, Vec3::new(1.0, 2.0, 0.0));
 }
 
 // ── AnimationPlayer component time advancement ─────────────────────────
@@ -384,7 +386,7 @@ fn player_advances_time_with_speed() {
         speed: 2.0,
         ..Default::default()
     };
-    let skeleton = test_skeleton();
+    let skel = test_runtime_skeleton();
     let clip = AnimationClip {
         name: "test".into(),
         duration: 10.0,
@@ -392,7 +394,7 @@ fn player_advances_time_with_speed() {
         joint_indices: vec![],
     };
 
-    let _palette = update_animation(&mut player, Some(&clip), Some(&skeleton), 1.0);
+    let _palette = update_animation(&mut player, Some(&clip), Some(&skel), 1.0);
     assert!((player.current_time - 2.0).abs() < 1e-5);
 }
 
@@ -410,8 +412,8 @@ fn player_looping_wraps_time() {
         channels: vec![],
         joint_indices: vec![],
     };
-    let skeleton = test_skeleton();
-    let _palette = update_animation(&mut player, Some(&clip), Some(&skeleton), 2.0);
+    let skel = test_runtime_skeleton();
+    let _palette = update_animation(&mut player, Some(&clip), Some(&skel), 2.0);
     // 9 + 2 = 11, rem_euclid(10) = 1
     assert!((player.current_time - 1.0).abs() < 1e-5);
 }
@@ -430,8 +432,8 @@ fn player_non_looping_clamps_and_stops() {
         channels: vec![],
         joint_indices: vec![],
     };
-    let skeleton = test_skeleton();
-    let _palette = update_animation(&mut player, Some(&clip), Some(&skeleton), 5.0);
+    let skel = test_runtime_skeleton();
+    let _palette = update_animation(&mut player, Some(&clip), Some(&skel), 5.0);
     assert!((player.current_time - 10.0).abs() < 1e-5);
     assert!(!player.playing);
 }
@@ -443,20 +445,20 @@ fn player_paused_does_not_advance() {
         current_time: 3.0,
         ..Default::default()
     };
-    let skeleton = test_skeleton();
+    let skel = test_runtime_skeleton();
     let clip = AnimationClip {
         name: "test".into(),
         duration: 10.0,
         channels: vec![],
         joint_indices: vec![],
     };
-    let _palette = update_animation(&mut player, Some(&clip), Some(&skeleton), 5.0);
+    let _palette = update_animation(&mut player, Some(&clip), Some(&skel), 5.0);
     assert!((player.current_time - 3.0).abs() < 1e-5);
 }
 
 #[test]
 fn player_update_returns_bone_palette() {
-    let skeleton = test_skeleton();
+    let skel = test_runtime_skeleton();
     let clip = AnimationClip {
         name: "test".into(),
         duration: 1.0,
@@ -467,7 +469,7 @@ fn player_update_returns_bone_palette() {
         playing: true,
         ..Default::default()
     };
-    let palette = update_animation(&mut player, Some(&clip), Some(&skeleton), 0.0);
+    let palette = update_animation(&mut player, Some(&clip), Some(&skel), 0.0);
     // Should return 2 identity matrices (one per joint)
     assert_eq!(palette.len(), 2);
     assert_eq!(palette[0], IDENTITY_MAT4_4X4);
@@ -685,12 +687,12 @@ fn register_animation_extensions_registers_components() {
 
 #[test]
 fn update_animation_no_clip_returns_empty() {
-    let skeleton = test_skeleton();
+    let skel = test_runtime_skeleton();
     let mut player = AnimationPlayer {
         playing: true,
         ..Default::default()
     };
-    let palette = update_animation(&mut player, None, Some(&skeleton), 1.0);
+    let palette = update_animation(&mut player, None, Some(&skel), 1.0);
     assert!(palette.is_empty());
 }
 
@@ -745,4 +747,369 @@ fn evaluate_clip_with_interpolation() {
 
     let past_end = AnimationEvaluator::evaluate(&clip, 2.0, &skeleton);
     assert_eq!(past_end[1].translation, [10.0, 0.0, 0.0]);
+}
+
+// =========================================================================
+// Unified pipeline integration tests (New Gate 10+)
+// =========================================================================
+
+#[test]
+fn unified_skeleton_conversion() {
+    let skel = test_skeleton();
+    let (runtime, joint_map) = skeleton_asset_to_runtime(&skel);
+
+    assert_eq!(runtime.bone_count(), 2);
+    assert_eq!(runtime.bone_name(BoneIndex(0)), Some("root"));
+    assert_eq!(runtime.bone_name(BoneIndex(1)), Some("child"));
+    assert_eq!(runtime.parent_of(BoneIndex(1)), Some(BoneIndex(0)));
+
+    assert_eq!(joint_map.len(), 2);
+    assert_eq!(joint_map[0], BoneIndex(0));
+    assert_eq!(joint_map[1], BoneIndex(1));
+}
+
+#[test]
+fn unified_clip_conversion() {
+    let skel = test_skeleton();
+    let (runtime_skel, joint_map) = skeleton_asset_to_runtime(&skel);
+
+    // Asset clip: animate joint 1 translation [0,0,0] → [10,0,0] over 1 s.
+    let clip = AnimationClip {
+        name: "test".into(),
+        duration: 1.0,
+        channels: vec![AnimationChannel {
+            joint_index: 1,
+            translations: vec![
+                Keyframe {
+                    time: 0.0,
+                    value: [0.0, 0.0, 0.0],
+                },
+                Keyframe {
+                    time: 1.0,
+                    value: [10.0, 0.0, 0.0],
+                },
+            ],
+            rotations: vec![
+                Keyframe {
+                    time: 0.0,
+                    value: [0.0, 0.0, 0.0, 1.0],
+                },
+                Keyframe {
+                    time: 1.0,
+                    value: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            scales: vec![
+                Keyframe {
+                    time: 0.0,
+                    value: [1.0, 1.0, 1.0],
+                },
+                Keyframe {
+                    time: 1.0,
+                    value: [1.0, 1.0, 1.0],
+                },
+            ],
+        }],
+        joint_indices: vec![1],
+    };
+
+    let runtime_clip = clip_asset_to_runtime(&clip, &joint_map);
+
+    // Sample at t = 0.5 → interpolated translation should be [5, 0, 0].
+    let pose_half = runtime_clip.sample(0.5, &runtime_skel);
+    assert!(
+        (pose_half.local[1].translation.x - 5.0).abs() < 1e-5,
+        "mid translation.x expected ≈5.0 got {}",
+        pose_half.local[1].translation.x
+    );
+    assert!(
+        (pose_half.local[1].translation.y).abs() < 1e-5,
+        "mid translation.y expected ≈0.0 got {}",
+        pose_half.local[1].translation.y
+    );
+    assert!(
+        (pose_half.local[1].translation.z).abs() < 1e-5,
+        "mid translation.z expected ≈0.0 got {}",
+        pose_half.local[1].translation.z
+    );
+
+    // Sample at t = 0.0 → identity translation.
+    let pose_zero = runtime_clip.sample(0.0, &runtime_skel);
+    assert_eq!(
+        pose_zero.local[1].translation,
+        Vec3::ZERO,
+        "start translation should be zero"
+    );
+}
+
+#[test]
+fn pipeline_evaluate_to_skin_matrices() {
+    let skel = test_runtime_skeleton();
+    let clip = AnimationClip {
+        name: "test_clip".into(),
+        duration: 1.0,
+        channels: vec![],
+        joint_indices: vec![],
+    };
+    let player = AnimationPlayer {
+        clip_asset: Some("test_clip".into()),
+        playing: true,
+        ..Default::default()
+    };
+
+    let matrices = update_animation_pipeline(&player, &mut None, &[("test_clip", clip)], &skel, None, 0.0);
+
+    assert_eq!(matrices.len(), skel.bone_count());
+    // First matrix should be near identity (no animation, root at origin).
+    let m0 = &matrices[0];
+    assert!(
+        (m0[0][0] - 1.0).abs() < 1e-5
+            && (m0[1][1] - 1.0).abs() < 1e-5
+            && (m0[2][2] - 1.0).abs() < 1e-5
+            && (m0[3][3] - 1.0).abs() < 1e-5,
+        "first skin matrix should be near identity, got {m0:?}"
+    );
+}
+
+#[test]
+fn pipeline_ik_via_orchestrator() {
+    // 4-bone chain: root(0) → hip(1) → knee(2) → foot(3)
+    let skel = old_test_skeleton();
+
+    // IK chain: foot→knee→hip→root (tip→base).
+    let chain = IkChain::new(
+        "leg",
+        vec![BoneIndex(3), BoneIndex(2), BoneIndex(1), BoneIndex(0)],
+    )
+    .with_solver(IkSolverType::Fabrik)
+    .with_iterations(30)
+    .with_tolerance(0.01);
+
+    let target = Vec3::new(0.3, -0.3, 0.0);
+    let effector = IkEffector::new("foot_target", BoneIndex(3), target);
+
+    let ik = IkTargetComponent {
+        effectors: vec![effector],
+        chains: vec![chain],
+        constraints: IkConstraintSet::new(),
+        enabled: true,
+        blend_weight: 1.0,
+    };
+
+    let player = AnimationPlayer {
+        playing: false, // uses rest pose
+        ..Default::default()
+    };
+
+    let matrices = update_animation_pipeline(&player, &mut None, &[], &skel, Some(&ik), 0.0);
+
+    assert_eq!(matrices.len(), 4);
+
+    // At rest the foot (bone 3) global position is [0,0,0], so the
+    // skin-matrix translation column equals the foot's world position.
+    let foot_pos = Vec3::new(matrices[3][3][0], matrices[3][3][1], matrices[3][3][2]);
+    let rest_dist = Vec3::ZERO.distance(target);
+    let ik_dist = foot_pos.distance(target);
+
+    assert!(
+        ik_dist < rest_dist,
+        "IK foot ({foot_pos:?}) should be closer to target ({target:?}) \
+         than rest ({rest_dist:.4}); ik_dist={ik_dist:.4}"
+    );
+    assert!(
+        ik_dist < 0.1,
+        "IK foot too far from target: {ik_dist:.4} (expected < 0.1)"
+    );
+}
+
+#[test]
+fn pipeline_constraint_enforced() {
+    // 4-bone chain: root(0) → hip(1) → knee(2) → foot(3)
+    let skel = old_test_skeleton();
+
+    let chain = IkChain::new(
+        "leg",
+        vec![BoneIndex(3), BoneIndex(2), BoneIndex(1), BoneIndex(0)],
+    )
+    .with_solver(IkSolverType::Fabrik)
+    .with_iterations(30)
+    .with_tolerance(0.01);
+
+    // Extreme target that would cause hyper-extension without constraints.
+    let effector = IkEffector::new("foot_target", BoneIndex(3), Vec3::new(2.0, 0.0, 2.0));
+
+    // Very tight twist/swing limits on the knee (BoneIndex 2) — ±1°.
+    let mut constraints = IkConstraintSet::new();
+    constraints.add(
+        IkConstraint::new(BoneIndex(2))
+            .with_twist(-1.0, 1.0)
+            .with_swing(-1.0, 1.0),
+    );
+
+    let ik = IkTargetComponent {
+        effectors: vec![effector],
+        chains: vec![chain.clone()],
+        constraints,
+        enabled: true,
+        blend_weight: 1.0,
+    };
+
+    let player = AnimationPlayer {
+        playing: false,
+        ..Default::default()
+    };
+
+    // ── Smoke test: pipeline runs without panicking ──────────────────────
+    let matrices = update_animation_pipeline(&player, &mut None, &[], &skel, Some(&ik), 0.0);
+    assert_eq!(matrices.len(), 4);
+
+    // ── Direct constraint verification via solve_pose_multi ──────────────
+    // The pipeline internally calls solve_pose_multi which applies the
+    // constraint to the knee.  We re-solve here to inspect the knee's local
+    // rotation directly.
+    let effector_direct = IkEffector::new("foot_target", BoneIndex(3), Vec3::new(2.0, 0.0, 2.0));
+    let mut constraints_direct = IkConstraintSet::new();
+    // Same tight ±1° limit used by the pipeline.
+    constraints_direct.add(
+        IkConstraint::new(BoneIndex(2))
+            .with_twist(-1.0, 1.0)
+            .with_swing(-1.0, 1.0),
+    );
+
+    let mut pose = skel.rest_pose();
+    solve_pose_multi(
+        &mut pose,
+        &skel,
+        &[chain],
+        &[effector_direct],
+        &constraints_direct,
+    );
+
+    // Decompose the knee's local rotation into swing + twist around Z.
+    let knee_rot = pose.local[2].rotation;
+    let rest_rot = Quat::IDENTITY; // knee's rest rotation is identity.
+    let delta = rest_rot.inverse() * knee_rot;
+
+    // Swing-twist decomposition (see solver.rs for the canonical impl).
+    let v = Vec3::new(delta.x, delta.y, delta.z);
+    let proj = Vec3::Z * v.dot(Vec3::Z);
+    let twist = Quat::from_xyzw(proj.x, proj.y, proj.z, delta.w).normalize();
+    let (_twist_axis, twist_angle) = twist.to_axis_angle();
+
+    // Constraint limits twist to ±1°.
+    let max_allowed_rad = 1.1_f32.to_radians();
+    assert!(
+        twist_angle.abs() < max_allowed_rad,
+        "knee twist {:.4}° exceeds ±1° constraint (max {:.4}°)",
+        twist_angle.to_degrees(),
+        max_allowed_rad.to_degrees()
+    );
+
+}
+
+#[test]
+fn pipeline_empty_state_machine_no_crash() {
+    // State machine with no states.
+    let sm = AnimStateMachine::new("".into());
+    let sm_instance = AnimStateMachineInstance::new(sm);
+    let mut sm_opt = Some(sm_instance);
+
+    let player = AnimationPlayer {
+        playing: true,
+        ..Default::default()
+    };
+
+    // 0-bone skeleton so the resulting palette is also empty.
+    let skel = crate::skeleton::Skeleton::new("empty".into());
+
+    let matrices = update_animation_pipeline(&player, &mut sm_opt, &[], &skel, None, 0.0);
+
+    assert!(
+        matrices.is_empty(),
+        "expected empty matrices for empty state machine + empty skeleton, got {} matrices",
+        matrices.len()
+    );
+}
+
+#[test]
+fn pipeline_clip_advances_time() {
+    let skel = test_runtime_skeleton();
+
+    // Clip: animate bone 0 translation [0,0,0] → [10,0,0] over 1 second.
+    let clip = AnimationClip {
+        name: "test_clip".into(),
+        duration: 1.0,
+        channels: vec![AnimationChannel {
+            joint_index: 0,
+            translations: vec![
+                Keyframe {
+                    time: 0.0,
+                    value: [0.0, 0.0, 0.0],
+                },
+                Keyframe {
+                    time: 1.0,
+                    value: [10.0, 0.0, 0.0],
+                },
+            ],
+            rotations: vec![
+                Keyframe {
+                    time: 0.0,
+                    value: [0.0, 0.0, 0.0, 1.0],
+                },
+                Keyframe {
+                    time: 1.0,
+                    value: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+            scales: vec![
+                Keyframe {
+                    time: 0.0,
+                    value: [1.0, 1.0, 1.0],
+                },
+                Keyframe {
+                    time: 1.0,
+                    value: [1.0, 1.0, 1.0],
+                },
+            ],
+        }],
+        joint_indices: vec![0],
+    };
+
+    let player = AnimationPlayer {
+        clip_asset: Some("test_clip".into()),
+        playing: true,
+        speed: 1.0,
+        current_time: 0.0,
+        ..Default::default()
+    };
+
+    let matrices = update_animation_pipeline(
+        &player,
+        &mut None,
+        &[("test_clip", clip)],
+        &skel,
+        None,
+        0.5, // dt = 0.5s → effective time = 0.0 + 0.5 * 1.0 = 0.5
+    );
+
+    assert_eq!(matrices.len(), 2);
+
+    // At effective time 0.5, bone 0 local translation is [5, 0, 0].
+    // rest_global[0] = identity (root at origin), so
+    // skin_matrix[0] = current_global[0] = translate([5, 0, 0]).
+    assert!(
+        (matrices[0][3][0] - 5.0).abs() < 1e-4,
+        "expected tx ≈ 5.0 at t=0.5, got {}",
+        matrices[0][3][0]
+    );
+    assert!(
+        matrices[0][3][1].abs() < 1e-5,
+        "expected ty ≈ 0.0 at t=0.5, got {}",
+        matrices[0][3][1]
+    );
+    assert!(
+        matrices[0][3][2].abs() < 1e-5,
+        "expected tz ≈ 0.0 at t=0.5, got {}",
+        matrices[0][3][2]
+    );
 }

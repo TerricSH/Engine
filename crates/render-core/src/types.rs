@@ -223,7 +223,7 @@ pub struct PushConstantRange {
     pub size: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PipelineDescriptor {
     pub shader_modules: Vec<ShaderModuleHandle>,
     pub vertex_layout: VertexLayout,
@@ -239,6 +239,8 @@ pub struct PipelineDescriptor {
     pub polygon_mode: Option<String>,
     pub sample_count: Option<u8>,
     pub render_pass: Option<RenderPassHandle>,
+    /// Specialization constants for pipeline variants.
+    pub specialization: Vec<SpecConstant>,
 }
 
 impl Default for PipelineDescriptor {
@@ -257,6 +259,7 @@ impl Default for PipelineDescriptor {
             polygon_mode: Some("fill".into()),
             sample_count: Some(1),
             render_pass: None,
+            specialization: Vec::new(),
         }
     }
 }
@@ -384,3 +387,4 @@ pub struct SpecConstant {
     pub id: u32,
     pub value: SpecValue,
 }
+

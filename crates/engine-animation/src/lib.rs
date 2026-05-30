@@ -37,6 +37,7 @@ pub use player::{update_animation, AnimationEvaluator};
 pub use root_motion::{extract_root_motion, RootMotionApplyTo, RootMotionConfig, RootMotionDelta};
 
 pub use layers::{AnimLayer, LayerBlendMode};
+pub use player::update_animation_pipeline;
 pub use player::update_animation_sm;
 pub use state_machine::{
     AnimParamValue, AnimParameter, AnimStateMachine, AnimStateMachineInstance, AnimationState,

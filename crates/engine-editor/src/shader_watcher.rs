@@ -55,7 +55,7 @@ impl ShaderWatcher {
     ///
     /// The watcher is **not** watching any directories yet — call
     /// [`watch`](Self::watch) to start watching a path.
-    pub fn new() -> Result<(Self, crossbeam_channel::Receiver<ShaderChange>), String> {
+    pub fn new() -> Result<Self, String> {
         let (raw_tx, raw_rx) = crossbeam_channel::unbounded::<notify::Event>();
         let (debounce_tx, debounce_rx) = crossbeam_channel::unbounded::<ShaderChange>();
 
