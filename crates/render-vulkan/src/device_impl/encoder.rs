@@ -15,6 +15,8 @@ use render_core::{
 pub(crate) struct VkCmdEncoder {
     pub(crate) device: AshDevice,
     pub(crate) cmd: vk::CommandBuffer,
+    /// Shadow map image for pipeline barrier (null = no shadow map).
+    pub(crate) shadow_map: vk::Image,
     /// Snapshot of slab entries taken at encoder creation.
     /// Each slot: `Some((generation, pipeline))` if occupied.
     pub(crate) pipeline_cache: Vec<Option<(u32, vk::Pipeline)>>,
@@ -225,6 +227,38 @@ impl CmdEncoderTrait for VkCmdEncoder {
     fn end_render_pass(&mut self) {
         unsafe {
             self.device.cmd_end_render_pass(self.cmd);
+        }
+    }
+
+    fn shadow_barrier(&mut self) {
+        if self.shadow_map == vk::Image::null() {
+            return;
+        }
+        let barrier = vk::ImageMemoryBarrier::default()
+            .image(self.shadow_map)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+        // SAFETY: command buffer is in recording state; barrier references
+        // a valid shadow image handle that outlives this encoder.
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
         }
     }
 }

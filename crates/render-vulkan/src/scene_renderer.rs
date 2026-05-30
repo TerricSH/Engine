@@ -16,14 +16,17 @@
 
 use std::collections::BTreeMap;
 
+use ash::vk;
+use glam::Mat4;
+
 use engine_renderer::{
     render_graph, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats,
     MaterialBinding, MaterialPipelineContext, MaterialResolver, ParamBlock, RenderFrameInput,
     RenderableItem, Transparency,
 };
 use render_core::{
-    self, BufferDescriptor, BufferHandle, CommandEncoder, Device, IndexFormat, MemoryHint,
-    PipelineHandle, PipelineLayoutDescriptor, PipelineLayoutHandle, PipelineVariantKey,
+    self, BufferDescriptor, BufferHandle, CommandEncoder, Device, FramebufferHandle, IndexFormat,
+    MemoryHint, PipelineHandle, PipelineLayoutDescriptor, PipelineLayoutHandle, PipelineVariantKey,
     PushConstantRange, RenderPassDescriptor, RenderPassHandle, SwapchainDescriptor,
     SwapchainHandle, TextureFormat, VertexAttribute, VertexLayout,
 };
@@ -53,42 +56,58 @@ pub struct GpuMesh {
 // ============================================================================
 
 /// Single vertex for the fallback mesh.
+///
+/// Layout: position (float32x3) + color (float32x4) + padding (float32)
+/// Total stride = 32 bytes, matching the shadow pipeline's vertex-input
+/// stride so the same vertex buffer can be used for both forward and
+/// shadow rendering.
 #[repr(C)]
 struct FallbackVertex {
     position: [f32; 3],
     color: [f32; 4],
+    _pad: f32,
 }
 
 const FALLBACK_VERTICES: [FallbackVertex; 4] = [
     FallbackVertex {
         position: [-0.5, -0.5, 0.0],
         color: [1.0, 0.0, 0.0, 1.0],
+        _pad: 0.0,
     },
     FallbackVertex {
         position: [0.5, -0.5, 0.0],
         color: [0.0, 1.0, 0.0, 1.0],
+        _pad: 0.0,
     },
     FallbackVertex {
         position: [0.5, 0.5, 0.0],
         color: [0.0, 0.0, 1.0, 1.0],
+        _pad: 0.0,
     },
     FallbackVertex {
         position: [-0.5, 0.5, 0.0],
         color: [1.0, 1.0, 0.0, 1.0],
+        _pad: 0.0,
     },
 ];
 
-const FALLBACK_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
-
 fn fallback_vertex_bytes() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(FALLBACK_VERTICES.len() * 28);
+    let mut bytes = Vec::with_capacity(FALLBACK_VERTICES.len() * 32);
     for v in &FALLBACK_VERTICES {
-        for f in v.position.iter().copied().chain(v.color.iter().copied()) {
+        for f in v
+            .position
+            .iter()
+            .copied()
+            .chain(v.color.iter().copied())
+            .chain(std::iter::once(v._pad))
+        {
             bytes.extend_from_slice(&f.to_ne_bytes());
         }
     }
     bytes
 }
+
+const FALLBACK_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
 
 fn fallback_index_bytes() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(FALLBACK_INDICES.len() * 2);
@@ -102,7 +121,10 @@ const SCENE_FORWARD_PIPELINE_ID: &str = "scene-forward";
 
 fn scene_forward_vertex_layout() -> VertexLayout {
     VertexLayout {
-        stride_bytes: 28, // float32x3 + float32x4
+        // 32-byte stride: float32x3 + float32x4 + 4-byte padding.
+        // The padding ensures the stride matches the shadow pipeline's
+        // vertex-input stride so the same buffers can be used for both.
+        stride_bytes: 32,
         attributes: vec![
             VertexAttribute {
                 semantic: "position".into(),
@@ -190,6 +212,11 @@ pub struct SceneRenderer {
     rp: Option<RenderPassHandle>,
     pll: Option<PipelineLayoutHandle>,
 
+    /// Per-swapchain-image framebuffer handles (color + depth).
+    framebuffers: Vec<FramebufferHandle>,
+    /// Index into `framebuffers` for the current swapchain image.
+    cur_fb_index: u32,
+
     // Frame lifecycle state (stored between begin_frame / execute_pass / end_frame).
     cur_sc: Option<SwapchainHandle>,
     cur_ii: Option<u32>,
@@ -213,6 +240,8 @@ impl SceneRenderer {
             meshes: BTreeMap::new(),
             rp: None,
             pll: None,
+            framebuffers: Vec::new(),
+            cur_fb_index: 0,
             cur_sc: None,
             cur_ii: None,
             cur_enc: None,
@@ -289,8 +318,40 @@ impl SceneRenderer {
             )]
         })?;
 
+        // ── Shadow-mapping resources ──────────────────────────────────
+        // Ensure the device has created shadow resources (idempotent).
+        self.device
+            .ensure_shadow()
+            .map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0210",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("ensure_shadow: {e:?}"),
+                )]
+            })?;
+
         self.rp = Some(rp);
         self.pll = Some(pll);
+
+        // ── Framebuffers (per swapchain image, color + depth) ─────────
+        let vk_rp = self
+            .device
+            .render_passes
+            .get(rp.index, rp.generation)
+            .copied();
+        if let Some(vk_rp) = vk_rp {
+            let fbs = self.device.create_scene_framebuffers(vk_rp).map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0212",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_scene_framebuffers: {e:?}"),
+                )]
+            })?;
+            self.framebuffers = fbs;
+        }
+
         self.initialized = true;
         Ok(())
     }
@@ -467,6 +528,8 @@ impl SceneRenderer {
             )]
         })?;
 
+        self.cur_fb_index = ii;
+
         Ok((sc_h, ii, encoder))
     }
 }
@@ -489,13 +552,17 @@ impl BackendRenderer for SceneRenderer {
             // swapchain image-views.  The current handle is a dummy that
             // will cause `cmd_begin_render_pass` to be skipped by the
             // encoder (null image-view guard in `VkCmdEncoder`).
-            let fb = render_core::FramebufferHandle::new(0, 0);
+            let fb = self
+                .framebuffers
+                .get(self.cur_fb_index as usize)
+                .copied()
+                .unwrap_or(FramebufferHandle::new(0, 0));
             encoder.begin_render_pass(
                 rp,
                 fb,
                 (0, 0, self.width, self.height),
                 [0.02, 0.02, 0.06, 1.0],
-                None,
+                Some(1.0),
             );
         }
 
@@ -596,8 +663,11 @@ impl BackendRenderer for SceneRenderer {
             render_graph::PassKind::OpaquePbrForward => {
                 // Begin render pass for this view.
                 if let Some(rp) = self.rp {
-                    // Dummy framebuffer 鈥?see TODO in render_frame.
-                    let fb = render_core::FramebufferHandle::new(0, 0);
+                    let fb = self
+                        .framebuffers
+                        .get(self.cur_fb_index as usize)
+                        .copied()
+                        .unwrap_or(FramebufferHandle::new(0, 0));
                     self.cur_enc
                         .as_mut()
                         .expect("encoder checked above")
@@ -686,9 +756,229 @@ impl BackendRenderer for SceneRenderer {
                 stats.visible_lights = input.lights.len() as u32;
             }
 
-            // Shadow and tone-map passes are no-ops in this first-pass
-            // implementation.
-            render_graph::PassKind::DirectionalShadow | render_graph::PassKind::ToneMap => {}
+            render_graph::PassKind::DirectionalShadow => {
+                // Shadow-map depth pass.
+                // Shadow resources live on VulkanDevice as raw handles and are
+                // NOT registered in the encoder slab to avoid double-free with
+                // destroy_shadow_resources. Shadow commands go through the
+                // encoder trait for structural consistency.
+                let Some(ref mut enc) = self.cur_enc else { return Ok(()) };
+
+                let rp = self.device.shadow_rp.unwrap_or(vk::RenderPass::null());
+                let pll = self.device.shadow_pipeline_layout.unwrap_or(vk::PipelineLayout::null());
+                let pl = self.device.shadow_pipeline.unwrap_or(vk::Pipeline::null());
+                let fb = self.device.shadow_fb.unwrap_or(vk::Framebuffer::null());
+                if rp == vk::RenderPass::null() || pl == vk::Pipeline::null() {
+                    return Ok(());
+                }
+
+                const SHADOW_SIZE: u32 = 2048;
+
+                // Begin depth-only render pass via raw Vulkan (encoder doesn't
+                // support depth-only begin_render_pass yet).
+                let d = &self.device.logical_device.device;
+                let fi = self.device.current_frame;
+                let cmd = self.device.frame_sync[fi].command_buffer;
+
+                let clear_value = vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                };
+                let clear_values = [clear_value];
+                let rpbi = vk::RenderPassBeginInfo::default()
+                    .render_pass(rp)
+                    .framebuffer(fb)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D { width: SHADOW_SIZE, height: SHADOW_SIZE },
+                    })
+                    .clear_values(&clear_values);
+                // SAFETY: command buffer is in recording state; RP, FB valid.
+                unsafe { d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE); }
+
+                // Viewport + scissor (via encoder)
+                enc.set_viewport(0.0, 0.0, SHADOW_SIZE as f32, SHADOW_SIZE as f32, 0.0, 1.0);
+                enc.set_scissor(0, 0, SHADOW_SIZE, SHADOW_SIZE);
+                // Bind shadow pipeline via raw Vulkan (no slab entry)
+                unsafe { d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pl); }
+
+                // Compute light MVP
+                let light_vp = Mat4::from_cols_array_2d(&self.device.compute_light_mvp());
+
+                for drawable in &input.drawables {
+                    if !drawable.cast_shadows { continue; }
+                    let mesh = match self.meshes.get(&drawable.mesh.id).cloned() {
+                        Some(m) => m, None => continue,
+                    };
+                    let vk_vb = self.device.buffers
+                        .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
+                        .map(|e| e.buffer).unwrap_or(vk::Buffer::null());
+                    let vk_ib = self.device.buffers
+                        .get(mesh.index_buffer.index, mesh.index_buffer.generation)
+                        .map(|e| e.buffer).unwrap_or(vk::Buffer::null());
+                    if vk_vb == vk::Buffer::null() { continue; }
+
+                    let world = Mat4::from_cols_array(&drawable.world_transform);
+                    let mvp = light_vp * world;
+                    let mvp_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(&mvp as *const _ as *const u8, 64)
+                    };
+                    // SAFETY: CB in render pass; push constant matches layout.
+                    unsafe {
+                        d.cmd_push_constants(cmd, pll, vk::ShaderStageFlags::VERTEX, 0, mvp_bytes);
+                        d.cmd_bind_vertex_buffers(cmd, 0, &[vk_vb], &[0u64]);
+                        d.cmd_bind_index_buffer(cmd, vk_ib, 0, vk::IndexType::UINT32);
+                        d.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+                    }
+                    stats.draw_calls += 1;
+                    stats.triangles += mesh.index_count as u64 / 3;
+                }
+
+                // End render pass + barrier via encoder
+                enc.end_render_pass();
+                enc.shadow_barrier();
+
+                // Viewport + scissor.
+                let vp = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: SHADOW_SIZE as f32,
+                    height: SHADOW_SIZE as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                // SAFETY: command buffer is inside a render pass instance.
+                unsafe {
+                    d.cmd_set_viewport(cmd, 0, &[vp]);
+                    d.cmd_set_scissor(
+                        cmd,
+                        0,
+                        &[vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: vk::Extent2D {
+                                width: SHADOW_SIZE,
+                                height: SHADOW_SIZE,
+                            },
+                        }],
+                    );
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pl);
+                }
+
+                // Compute the light view-projection matrix.
+                let light_vp = Mat4::from_cols_array_2d(&self.device.compute_light_mvp());
+
+                for drawable in &input.drawables {
+                    if !drawable.cast_shadows {
+                        continue;
+                    }
+
+                    let mesh_id = &drawable.mesh.id;
+                    let mesh = match self.meshes.get(mesh_id).cloned() {
+                        Some(m) => m,
+                        None => {
+                            tracing::trace!(
+                                target: "scene_renderer",
+                                mesh = mesh_id,
+                                "skipping un-cached mesh in shadow pass"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Resolve buffer handles to raw Vulkan buffers.
+                    let vk_vb = self
+                        .device
+                        .buffers
+                        .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
+                        .map(|e| e.buffer)
+                        .unwrap_or(vk::Buffer::null());
+                    let vk_ib = self
+                        .device
+                        .buffers
+                        .get(mesh.index_buffer.index, mesh.index_buffer.generation)
+                        .map(|e| e.buffer)
+                        .unwrap_or(vk::Buffer::null());
+                    if vk_vb == vk::Buffer::null() || vk_ib == vk::Buffer::null() {
+                        continue;
+                    }
+
+                    // Push constant: MVP = light_vp * world_transform (64 bytes).
+                    // world_transform is [f32; 16] (column-major).
+                    let world = Mat4::from_cols_array(&drawable.world_transform);
+                    let mvp = light_vp * world;
+                    let mvp_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            &mvp as *const _ as *const u8,
+                            std::mem::size_of::<Mat4>(),
+                        )
+                    };
+                    // SAFETY: command buffer is inside a render pass; push
+                    // constant range (64 bytes at offset 0, VERTEX stage)
+                    // matches the shadow pipeline layout declaration.
+                    unsafe {
+                        d.cmd_push_constants(
+                            cmd,
+                            pll,
+                            vk::ShaderStageFlags::VERTEX,
+                            0,
+                            mvp_bytes,
+                        );
+                        let vbs = [vk_vb];
+                        let offsets = [0u64];
+                        d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
+                        d.cmd_bind_index_buffer(
+                            cmd,
+                            vk_ib,
+                            0,
+                            vk::IndexType::UINT32,
+                        );
+                        d.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+                    }
+
+                    stats.draw_calls += 1;
+                    stats.triangles += mesh.index_count as u64 / 3;
+                }
+
+                // SAFETY: command buffer is inside a render pass instance.
+                unsafe {
+                    d.cmd_end_render_pass(cmd);
+                }
+
+                // Pipeline barrier: make shadow depth writes visible to
+                // fragment shader reads in the subsequent forward pass.
+                if let Some(sm) = self.device.shadow_map {
+                    let barrier = vk::ImageMemoryBarrier::default()
+                        .image(sm)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::DEPTH,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .old_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                        .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+                    // SAFETY: command buffer is still in recording state;
+                    // barrier references a valid shadow image.
+                    unsafe {
+                        d.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                            vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &[barrier],
+                        );
+                    }
+                }
+
+                stats.visible_drawables = input.drawables.len() as u32;
+                stats.visible_lights = input.lights.len() as u32;
+            }
+
+            render_graph::PassKind::ToneMap => {}
 
             // Present is handled entirely by end_frame.
             render_graph::PassKind::Present => {}
