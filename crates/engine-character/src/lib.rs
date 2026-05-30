@@ -40,7 +40,7 @@ mod movement;
 
 pub use animation_params::{anim_params, AnimMoveState, AnimParams};
 pub use collision::{ground_check, resolve_collision};
-pub use controller::{CharacterController, CharacterError, CharacterState};
+pub use controller::{CharacterCommand, CharacterController, CharacterError, CharacterState};
 pub use movement::{process_movement, CharacterMovement, CharacterOutput};
 
 // ── Gate 9 extension registration ──────────────────────────────────────────

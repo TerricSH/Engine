@@ -8,6 +8,12 @@ license.workspace = true
 [features]
 default = []
 
+[dev-dependencies]
+platform = { path = "../platform" }
+raw-window-handle.workspace = true
+render-core = { path = "../render-core" }
+render-vulkan = { path = "../render-vulkan" }
+
 [dependencies]
 engine-animation = { path = "../engine-animation" }
 engine-physics = { path = "../engine-physics" }
