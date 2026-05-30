@@ -18,11 +18,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use ash::vk;
 use glam::Mat4;
+use glam::Vec4 as GlamVec4;
 
 use engine_renderer::{
-    render_graph, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats,
-    LightItem, LightKind, MaterialBinding, MaterialPipelineContext, MaterialResolver, ParamBlock,
-    RenderFrameInput, RenderableItem, SkinnedItem, Transparency,
+    render_graph, AssetId, AxisAlignedBox, BackendRenderer, Diagnostic, DiagnosticSeverity,
+    FrameStats, LightItem, LightKind, MaterialBinding, MaterialPipelineContext, MaterialResolver,
+    ParamBlock, RenderFrameInput, RenderableItem, SkinnedItem, Transparency,
 };
 use render_core::{
     self, BindGroupLayoutBinding, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
@@ -397,6 +398,85 @@ fn normalize_dir(d: &[f32; 3]) -> [f32; 3] {
 }
 
 // ============================================================================
+// CPU-side indirect-draw command (matches VkDrawIndexedIndirectCommand)
+// ============================================================================
+
+/// CPU-side representation of a single `vkCmdDrawIndexedIndirect` command.
+///
+/// Layout matches `VkDrawIndexedIndirectCommand` exactly (20 bytes total):
+/// | offset | field          | type | bytes |
+/// |--------|----------------|------|-------|
+/// |      0 | index_count    | u32  |     4 |
+/// |      4 | instance_count | u32  |     4 |
+/// |      8 | first_index    | u32  |     4 |
+/// |     12 | vertex_offset  | i32  |     4 |
+/// |     16 | first_instance | u32  |     4 |
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct IndirectDrawCommand {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub first_index: u32,
+    pub vertex_offset: i32,
+    pub first_instance: u32,
+}
+
+/// Maximum number of indirect draw commands we can issue per frame.
+pub(crate) const MAX_INDIRECT_DRAWS: u32 = 1024;
+
+// ============================================================================
+// Frustum-culling helpers
+// ============================================================================
+
+/// Test whether an [`AxisAlignedBox`] transformed by `world_transform`
+/// intersects the given view-frustum planes.
+///
+/// Each frustum plane is `(nx, ny, nz, d)` where the half-space
+/// `nx·x + ny·y + nz·z + d ≥ 0` is considered "inside".
+///
+/// Returns `true` if the AABB is at least partially visible.
+pub(crate) fn is_aabb_visible(
+    bounds: &AxisAlignedBox,
+    world_transform: &[f32; 16],
+    frustum_planes: &[[f32; 4]; 6],
+) -> bool {
+    // 8 corners of the AABB in local space.
+    let corners = [
+        [bounds.min[0], bounds.min[1], bounds.min[2], 1.0],
+        [bounds.max[0], bounds.min[1], bounds.min[2], 1.0],
+        [bounds.min[0], bounds.max[1], bounds.min[2], 1.0],
+        [bounds.max[0], bounds.max[1], bounds.min[2], 1.0],
+        [bounds.min[0], bounds.min[1], bounds.max[2], 1.0],
+        [bounds.max[0], bounds.min[1], bounds.max[2], 1.0],
+        [bounds.min[0], bounds.max[1], bounds.max[2], 1.0],
+        [bounds.max[0], bounds.max[1], bounds.max[2], 1.0],
+    ];
+
+    // Build transform matrix once.
+    let m = Mat4::from_cols_array(world_transform);
+
+    for plane in frustum_planes {
+        let (nx, ny, nz, d) = (plane[0], plane[1], plane[2], plane[3]);
+        let mut all_outside = true;
+
+        for corner in &corners {
+            let world_corner = m * GlamVec4::new(corner[0], corner[1], corner[2], corner[3]);
+            let dist = nx * world_corner.x + ny * world_corner.y + nz * world_corner.z + d;
+            if dist >= 0.0 {
+                all_outside = false;
+                break;
+            }
+        }
+
+        if all_outside {
+            return false; // Entire AABB is on the outside of this plane.
+        }
+    }
+
+    true
+}
+
+// ============================================================================
 // SceneRenderer
 // ============================================================================
 
@@ -611,6 +691,18 @@ impl SceneRenderer {
                             DiagnosticSeverity::Error,
                             "scene_renderer",
                             format!("create_light_ssbo: {e:?}"),
+                        )]
+                    })?;
+
+                // ── Indirect draw buffers (Phase 5.1) ─────────────────────
+                self.device
+                    .create_indirect_buffers(MAX_INDIRECT_DRAWS)
+                    .map_err(|e| {
+                        vec![Diagnostic::new(
+                            "RV0223",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!("create_indirect_buffers: {e:?}"),
                         )]
                     })?;
 
@@ -1848,6 +1940,219 @@ impl BackendRenderer for SceneRenderer {
 
                     stats.draw_calls += 1;
                     stats.triangles += mesh.index_count as u64 / 3;
+                }
+
+                // ═════════════════════════════════════════════════════════
+                // Phase 5.1: CPU frustum cull + indirect draw (parallel path)
+                // ═════════════════════════════════════════════════════════
+                //
+                // After the per-drawable loop above (kept as fallback), this
+                // section performs CPU-side frustum culling against the first
+                // view's frustum planes, writes the visible drawables' draw
+                // commands into the indirect buffer, and issues one
+                // `draw_indexed_indirect` call per material (pipeline) batch.
+                //
+                // The indirect buffer is already present on the GPU so this
+                // path is ready to be converted to GPU-driven culling later
+                // by replacing the CPU cull + write phase with a compute
+                // shader that writes the same `VkDrawIndexedIndirectCommand`
+                // structs.
+
+                if let Some(planes) = input.views.first().and_then(|v| v.frustum) {
+                    let fp: [[f32; 4]; 6] = planes;
+
+                    // ── Frustum-cull drawables ──────────────────────────
+                    let mut visible_indices: Vec<usize> = Vec::new();
+                    for (i, drawable) in input.drawables.iter().enumerate() {
+                        if !self.meshes.contains_key(&drawable.mesh.id) {
+                            continue;
+                        }
+                        if is_aabb_visible(
+                            &drawable.bounds,
+                            &drawable.world_transform,
+                            &fp,
+                        ) {
+                            visible_indices.push(i);
+                        }
+                    }
+
+                    if !visible_indices.is_empty() {
+                        // ── Build indirect command buffer ─────────────
+                        let mut indirect_bytes: Vec<u8> =
+                            Vec::with_capacity(visible_indices.len() * 20);
+
+                        for &idx in &visible_indices {
+                            let drawable = &input.drawables[idx];
+                            let mesh = self.meshes.get(&drawable.mesh.id).unwrap();
+                            // index_count
+                            indirect_bytes.extend_from_slice(&mesh.index_count.to_ne_bytes());
+                            // instance_count
+                            indirect_bytes.extend_from_slice(&1u32.to_ne_bytes());
+                            // first_index
+                            indirect_bytes.extend_from_slice(&0u32.to_ne_bytes());
+                            // vertex_offset
+                            indirect_bytes.extend_from_slice(&0i32.to_ne_bytes());
+                            // first_instance
+                            indirect_bytes.extend_from_slice(&0u32.to_ne_bytes());
+                        }
+
+                        // Write commands into the GPU indirect buffer.
+                        self.device.write_indirect_draw_buffer(&indirect_bytes, 0);
+
+                        let indirect_buf =
+                            self.device.indirect_draw_buffer.unwrap_or(vk::Buffer::null());
+
+                        if indirect_buf != vk::Buffer::null() {
+                            // Bind the HDR forward pipeline once (same
+                            // pipeline for all drawables in this pass).
+                            unsafe {
+                                d.cmd_bind_pipeline(
+                                    cmd,
+                                    vk::PipelineBindPoint::GRAPHICS,
+                                    hdr_pl,
+                                );
+                            }
+
+                            // For each visible drawable, set up
+                            // descriptors, push constants, vertex/index
+                            // buffers, then issue indirect indexed draw.
+                            for (cmd_idx, &visible_idx) in
+                                visible_indices.iter().enumerate()
+                            {
+                                let drawable = &input.drawables[visible_idx];
+
+                                // Clone mesh to avoid holding a borrow on
+                                // self.meshes while calling &mut self methods.
+                                let mesh = match self.meshes.get(&drawable.mesh.id).cloned() {
+                                    Some(m) => m,
+                                    None => continue,
+                                };
+
+                                // ── Material UBO (set=2) ──
+                                let material = self
+                                    .material_binding_for_drawable(
+                                        input,
+                                        &drawable.material,
+                                    );
+                                let material_ubo =
+                                    Self::parse_material_ubo(&material.uniforms.bytes);
+                                let ubo_bytes: &[u8] = unsafe {
+                                    std::slice::from_raw_parts(
+                                        &material_ubo as *const _ as *const u8,
+                                        std::mem::size_of::<MaterialUBO>(),
+                                    )
+                                };
+                                let (mat_desc_set, _mat_buf) = self
+                                    .get_or_create_material_desc_set(
+                                        &drawable.material.id,
+                                        ubo_bytes,
+                                    )
+                                    .unwrap_or_else(|diags| {
+                                        for d in &diags {
+                                            tracing::warn!(
+                                                target: "scene_renderer",
+                                                code = d.code,
+                                                message = d.message,
+                                            );
+                                        }
+                                        (vk::DescriptorSet::null(), vk::Buffer::null())
+                                    });
+
+                                if mat_desc_set != vk::DescriptorSet::null() {
+                                    // Bind base color texture if cached.
+                                    for tex_slot in &material.textures {
+                                        let tex_id = &tex_slot.texture.id;
+                                        if self.device.textures.contains_key(tex_id) {
+                                            let _ = self.device.bind_material_texture(
+                                                tex_id,
+                                                mat_desc_set,
+                                            );
+                                            break;
+                                        }
+                                    }
+
+                                    let sets = [mat_desc_set];
+                                    unsafe {
+                                        d.cmd_bind_descriptor_sets(
+                                            cmd,
+                                            vk::PipelineBindPoint::GRAPHICS,
+                                            hdr_pll,
+                                            2,
+                                            &sets,
+                                            &[],
+                                        );
+                                    }
+                                }
+
+                                // ── Push constants ──
+                                let world = &drawable.world_transform;
+                                let mut pc_bytes = Vec::with_capacity(128);
+                                for v in world {
+                                    pc_bytes.extend_from_slice(&v.to_ne_bytes());
+                                }
+                                pc_bytes.resize(128, 0u8);
+                                unsafe {
+                                    d.cmd_push_constants(
+                                        cmd,
+                                        hdr_pll,
+                                        vk::ShaderStageFlags::VERTEX,
+                                        0,
+                                        &pc_bytes,
+                                    );
+                                }
+
+                                // ── Bind vertex/index buffers ──
+                                let vk_vb = self
+                                    .device
+                                    .buffers
+                                    .get(
+                                        mesh.vertex_buffer.index,
+                                        mesh.vertex_buffer.generation,
+                                    )
+                                    .map(|e| e.buffer)
+                                    .unwrap_or(vk::Buffer::null());
+                                let vk_ib = self
+                                    .device
+                                    .buffers
+                                    .get(
+                                        mesh.index_buffer.index,
+                                        mesh.index_buffer.generation,
+                                    )
+                                    .map(|e| e.buffer)
+                                    .unwrap_or(vk::Buffer::null());
+
+                                if vk_vb != vk::Buffer::null() {
+                                    let vbs = [vk_vb];
+                                    let offsets = [0u64];
+                                    let idx_ty = match mesh.index_format {
+                                        IndexFormat::U16 => vk::IndexType::UINT16,
+                                        IndexFormat::U32 => vk::IndexType::UINT32,
+                                    };
+                                    unsafe {
+                                        d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
+                                        d.cmd_bind_index_buffer(cmd, vk_ib, 0, idx_ty);
+                                    }
+
+                                    // ── Issue indirect indexed draw ──
+                                    let cmd_offset = cmd_idx as u64 * 20;
+                                    unsafe {
+                                        d.cmd_draw_indexed_indirect(
+                                            cmd,
+                                            indirect_buf,
+                                            cmd_offset,
+                                            1,  // draw_count (per-drawable)
+                                            20, // stride
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Update stats to reflect indirect path usage.
+                            stats.visible_drawables = visible_indices.len() as u32;
+                            stats.culled_drawables =
+                                input.drawables.len() as u32 - visible_indices.len() as u32;
+                        }
+                    }
                 }
 
                 // End HDR render pass

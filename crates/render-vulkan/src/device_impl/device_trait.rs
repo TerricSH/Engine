@@ -695,6 +695,32 @@ impl render_core::Device for VulkanDevice {
                 detail: format!("{e}"),
             })?;
         self.last_image_index = ii;
+
+        // Phase 5.3: CPU-wait for the timeline semaphore to reach the current
+        // value for this frame slot.  This ensures that the previous GPU work
+        // targeting this slot has fully completed before we begin recording
+        // new commands.
+        let timeline_value = self.frame_sync[fi].timeline_value;
+        let timeline_semaphore = self.frame_sync[fi].timeline_semaphore;
+        if timeline_value > 0 {
+            let sems = [timeline_semaphore];
+            let vals = [timeline_value];
+            let wait_info = vk::SemaphoreWaitInfo::default()
+                .semaphores(&sems)
+                .values(&vals);
+            // SAFETY: `self.logical_device.device` is a valid AshDevice;
+            // `timeline_semaphore` is a valid timeline semaphore;
+            // `timeline_value` is the last known signalled value.
+            unsafe {
+                self.logical_device
+                    .device
+                    .wait_semaphores(&wait_info, u64::MAX)
+                    .map_err(|r| render_core::RhiError::Backend {
+                        detail: format!("tw: {r:?}"),
+                    })?;
+            }
+        }
+
         self.begin_cb(fi)
             .map_err(|e| render_core::RhiError::Backend {
                 detail: format!("{e}"),

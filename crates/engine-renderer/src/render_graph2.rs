@@ -11,9 +11,14 @@
 //! Custom orderings can be expressed via `build_with_config()` which
 //! honours `PassGraphConfig` (loadable from scene settings).
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::{render_graph, RenderFrameInput, RenderView, ViewCompose};
+use crate::{
+    render_graph::{self, CompiledBarrier, CompiledRenderGraph, PipeStage, ResourceState},
+    RenderFrameInput, RenderView, ViewCompose,
+};
 
 // ── Pass kind (extensible) ──────────────────────────────────────────────────
 
@@ -476,6 +481,82 @@ impl RenderGraph {
         self.passes.len()
     }
 
+    /// Phase 5.4: Compile this render graph into an explicit submit order
+    /// with backend-agnostic pipeline barriers.
+    ///
+    /// 1. Topologically sorts the passes (Kahn's algorithm).
+    /// 2. Tracks resource state transitions across the sorted order.
+    /// 3. Inserts a [`CompiledBarrier`] whenever a resource changes between
+    ///    read and write (or between different write roles).
+    ///
+    /// Returns a [`CompiledRenderGraph`] that backends can turn into concrete
+    /// `VkImageMemoryBarrier` / `VkPipelineBarrier` calls.
+    pub fn compile(&self) -> Result<CompiledRenderGraph, String> {
+        let pass_order = self.topological_sort()?;
+        let n = pass_order.len();
+
+        // ── Resource state tracking ────────────────────────────────────
+        let mut resource_states: HashMap<String, ResourceState> = HashMap::new();
+        let mut barriers_per_pass: Vec<Vec<CompiledBarrier>> = vec![Vec::new(); n];
+
+        for (sorted_idx, &pass_idx) in pass_order.iter().enumerate() {
+            let pass = &self.passes[pass_idx];
+
+            // ── Inputs (read-only) ──
+            for input in &pass.inputs {
+                let old = resource_states.get(&input.name).copied().unwrap_or(ResourceState::Undefined);
+                let new = ResourceState::ShaderReadOnlyOptimal;
+                if old != new {
+                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
+                        resource_name: input.name.clone(),
+                        src_stage: previous_stage(&old),
+                        dst_stage: PipeStage::FragmentShader,
+                        old_state: old,
+                        new_state: new,
+                    });
+                }
+                resource_states.insert(input.name.clone(), new);
+            }
+
+            // ── Depth-stencil attachment ──
+            if let Some(ref ds) = pass.depth_stencil {
+                let old = resource_states.get(&ds.name).copied().unwrap_or(ResourceState::Undefined);
+                let new = ResourceState::DepthStencilAttachmentOptimal;
+                if old != new {
+                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
+                        resource_name: ds.name.clone(),
+                        src_stage: previous_stage(&old),
+                        dst_stage: PipeStage::EarlyFragmentTests,
+                        old_state: old,
+                        new_state: new,
+                    });
+                }
+                resource_states.insert(ds.name.clone(), new);
+            }
+
+            // ── Outputs (written by the pass) ──
+            for output in &pass.outputs {
+                let old = resource_states.get(&output.name).copied().unwrap_or(ResourceState::Undefined);
+                let new = output_resource_state(&output.name);
+                if old != new {
+                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
+                        resource_name: output.name.clone(),
+                        src_stage: previous_stage(&old),
+                        dst_stage: output_stage(&output.name),
+                        old_state: old,
+                        new_state: new,
+                    });
+                }
+                resource_states.insert(output.name.clone(), new);
+            }
+        }
+
+        Ok(CompiledRenderGraph {
+            pass_order,
+            barriers_per_pass,
+        })
+    }
+
     /// Convert this new-style `RenderGraph` into the legacy
     /// `render_graph::RenderGraph` so it can be consumed by the existing
     /// `BackendRenderer::execute_pass` trait.
@@ -542,4 +623,45 @@ pub struct PassConfigEntry {
     pub kind: String,
     /// Whether this pass is enabled in the graph.
     pub enabled: bool,
+}
+
+// ============================================================================
+// Helper functions for graph compilation
+// ============================================================================
+
+/// Map a [`ResourceState`] to the pipeline stage that most recently wrote /
+/// produced it.  Used as the `src_stage` of a barrier.
+fn previous_stage(state: &ResourceState) -> PipeStage {
+    match state {
+        ResourceState::ColorAttachmentOptimal => PipeStage::ColorAttachmentOutput,
+        ResourceState::DepthStencilAttachmentOptimal => PipeStage::LateFragmentTests,
+        ResourceState::DepthStencilReadOnlyOptimal => PipeStage::EarlyFragmentTests,
+        ResourceState::ShaderReadOnlyOptimal => PipeStage::FragmentShader,
+        ResourceState::TransferSrcOptimal | ResourceState::TransferDstOptimal => PipeStage::Transfer,
+        ResourceState::PresentSrc => PipeStage::BottomOfPipe,
+        ResourceState::Undefined | ResourceState::General => PipeStage::TopOfPipe,
+    }
+}
+
+/// Determine the [`ResourceState`] that an output attachment should be in
+/// after the pass produces it.
+fn output_resource_state(name: &str) -> ResourceState {
+    match name {
+        "swapchain" => ResourceState::PresentSrc,
+        "shadow_map" | "shadow_depth" => ResourceState::DepthStencilAttachmentOptimal,
+        "hdr_color" => ResourceState::ColorAttachmentOptimal,
+        "ldr_color" => ResourceState::ColorAttachmentOptimal,
+        "ssao_output" => ResourceState::ShaderReadOnlyOptimal,
+        _ => ResourceState::ColorAttachmentOptimal,
+    }
+}
+
+/// Determine the [`PipeStage`] at which an output is produced.
+fn output_stage(name: &str) -> PipeStage {
+    match name {
+        "swapchain" => PipeStage::ColorAttachmentOutput,
+        "shadow_map" | "shadow_depth" => PipeStage::LateFragmentTests,
+        "hdr_color" | "ldr_color" => PipeStage::ColorAttachmentOutput,
+        _ => PipeStage::ColorAttachmentOutput,
+    }
 }

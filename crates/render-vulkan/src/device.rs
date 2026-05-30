@@ -1,4 +1,4 @@
-//! Logical device + single graphics/present queue.
+//! Logical device + single graphics/present queue + optional compute queue.
 
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +13,11 @@ pub struct Device {
     pub device: AshDevice,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
+    /// Optional dedicated compute queue (may share family with graphics).
+    pub compute_queue: Option<vk::Queue>,
+    /// Queue family index of the compute queue (same as graphics if no
+    /// dedicated compute family was found).
+    pub compute_queue_family_index: u32,
     pub(crate) allocator: Option<SharedAllocator>,
 }
 
@@ -20,11 +25,26 @@ impl Device {
     /// # Safety
     /// `instance` and `adapter.physical_device` must be valid.
     pub unsafe fn new(instance: &AshInstance, adapter: &AdapterSelection) -> VkResult<Self> {
-        let queue_priorities = [1.0_f32];
-        let queue_info = vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(adapter.queue_family_index)
-            .queue_priorities(&queue_priorities);
-        let queue_infos = [queue_info];
+        let priorities = [1.0_f32];
+
+        // ── Queue creation infos ────────────────────────────────────────
+        // Always create the graphics queue.  If the compute queue family is
+        // different from the graphics family, request a second queue.
+        let gfx_qfi = adapter.queue_family_index;
+        let compute_qfi = adapter.compute_queue_family_index.unwrap_or(gfx_qfi);
+
+        let gfx_queue_info = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(gfx_qfi)
+            .queue_priorities(&priorities);
+
+        let queue_infos = if compute_qfi != gfx_qfi {
+            let compute_queue_info = vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(compute_qfi)
+                .queue_priorities(&priorities);
+            vec![gfx_queue_info, compute_queue_info]
+        } else {
+            vec![gfx_queue_info]
+        };
 
         let device_extensions = [swapchain::NAME.as_ptr()];
         let features = vk::PhysicalDeviceFeatures::default();
@@ -37,11 +57,21 @@ impl Device {
         let device = unsafe { instance.create_device(adapter.physical_device, &device_info, None) }
             .map_err(|r| VulkanError::vk("create_device", r))?;
         // SAFETY: device + queue family index are valid.
-        let queue = unsafe { device.get_device_queue(adapter.queue_family_index, 0) };
+        let queue = unsafe { device.get_device_queue(gfx_qfi, 0) };
+        let compute_queue = if compute_qfi != gfx_qfi {
+            // SAFETY: the compute queue family index is valid and a queue was
+            // requested during device creation.
+            Some(unsafe { device.get_device_queue(compute_qfi, 0) })
+        } else {
+            // No dedicated compute family; share the graphics queue.
+            Some(queue)
+        };
 
         tracing::info!(
             target: "vulkan",
-            queue_family = adapter.queue_family_index,
+            queue_family = gfx_qfi,
+            compute_queue_family = compute_qfi,
+            dedicated_compute = compute_qfi != gfx_qfi,
             "logical device created"
         );
 
@@ -52,7 +82,9 @@ impl Device {
         Ok(Self {
             device,
             queue,
-            queue_family_index: adapter.queue_family_index,
+            queue_family_index: gfx_qfi,
+            compute_queue,
+            compute_queue_family_index: compute_qfi,
             allocator: Some(Arc::new(Mutex::new(allocator))),
         })
     }

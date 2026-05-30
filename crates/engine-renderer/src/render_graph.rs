@@ -9,6 +9,74 @@
 
 use crate::{RenderFrameInput, RenderView, ViewCompose};
 
+// ============================================================================
+// CompiledRenderGraph — output of render-graph compilation
+// ============================================================================
+
+/// Backend-agnostic state that a resource can be in.  The Vulkan backend maps
+/// these to `VkImageLayout` values when inserting pipeline barriers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceState {
+    Undefined,
+    ColorAttachmentOptimal,
+    DepthStencilAttachmentOptimal,
+    DepthStencilReadOnlyOptimal,
+    ShaderReadOnlyOptimal,
+    TransferSrcOptimal,
+    TransferDstOptimal,
+    PresentSrc,
+    General,
+}
+
+/// Backend-agnostic pipeline stage flags, used to describe when a barrier's
+/// source / destination work executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeStage {
+    TopOfPipe,
+    ColorAttachmentOutput,
+    EarlyFragmentTests,
+    LateFragmentTests,
+    FragmentShader,
+    ComputeShader,
+    Transfer,
+    BottomOfPipe,
+}
+
+/// A single pipeline-barrier command produced by the graph compiler.
+#[derive(Clone, Debug)]
+pub struct CompiledBarrier {
+    pub resource_name: String,
+    pub src_stage: PipeStage,
+    pub dst_stage: PipeStage,
+    pub old_state: ResourceState,
+    pub new_state: ResourceState,
+}
+
+/// The result of compiling a [`RenderGraph`](super::render_graph2::RenderGraph).
+///
+/// Contains the topologically-sorted pass execution order and a list of
+/// pipeline barriers that must be inserted *before* each pass to ensure
+/// correct resource transitions.
+#[derive(Clone, Debug)]
+pub struct CompiledRenderGraph {
+    /// Indices into the original `passes` array, in submission order.
+    pub pass_order: Vec<usize>,
+    /// Barriers to apply before each pass (indexed by position in
+    /// `pass_order`).
+    pub barriers_per_pass: Vec<Vec<CompiledBarrier>>,
+}
+
+impl CompiledRenderGraph {
+    /// Number of passes in the compiled graph.
+    pub fn pass_count(&self) -> usize {
+        self.pass_order.len()
+    }
+}
+
+// ============================================================================
+// PassKind (legacy)
+// ============================================================================
+
 /// The kinds of passes in the Gate 3 render graph.
 ///
 /// The `Custom` variant allows backend-specific pass types (e.g. bloom,
@@ -55,6 +123,22 @@ pub struct RenderGraph {
 }
 
 impl RenderGraph {
+    /// Phase 5.4: Compile this legacy render graph.
+    ///
+    /// Because the legacy graph has no edge or resource-usage metadata,
+    /// the compiled order is simply sequential (0, 1, …, n-1) with no
+    /// barriers.  Backends that need proper barrier insertion should use
+    /// [`render_graph2::RenderGraph::compile`] instead.
+    pub fn compile(&self) -> CompiledRenderGraph {
+        let n = self.passes.len();
+        let pass_order: Vec<usize> = (0..n).collect();
+        let barriers_per_pass: Vec<Vec<CompiledBarrier>> = vec![Vec::new(); n];
+        CompiledRenderGraph {
+            pass_order,
+            barriers_per_pass,
+        }
+    }
+
     /// Build the canonical Gate 3 render graph from frame input.
     ///
     /// For each active view, the graph contains:

@@ -10,6 +10,10 @@ use crate::error::{VkResult, VulkanError};
 pub struct AdapterSelection {
     pub physical_device: vk::PhysicalDevice,
     pub queue_family_index: u32,
+    /// Separate compute queue family index, if one exists that is different
+    /// from the graphics queue family. When `None`, compute work shares the
+    /// graphics queue.
+    pub compute_queue_family_index: Option<u32>,
     pub properties: vk::PhysicalDeviceProperties,
 }
 
@@ -68,6 +72,11 @@ unsafe fn evaluate_device(
     // SAFETY: physical_device + surface are valid.
     let queue_families =
         unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+
+    // ── Find graphics+present queue family ──────────────────────────────
+    let mut graphics_family: Option<u32> = None;
+    let mut compute_family: Option<u32> = None;
+
     for (index, family) in queue_families.iter().enumerate() {
         let supports_graphics = family.queue_flags.contains(vk::QueueFlags::GRAPHICS);
         // SAFETY: physical_device + surface are valid.
@@ -79,13 +88,42 @@ unsafe fn evaluate_device(
             )
         }
         .map_err(|r| VulkanError::vk("get_physical_device_surface_support", r))?;
-        if supports_graphics && supports_present {
-            return Ok(Some(AdapterSelection {
-                physical_device,
-                queue_family_index: index as u32,
-                properties,
-            }));
+
+        // Candidate for graphics + present
+        if supports_graphics && supports_present && graphics_family.is_none() {
+            graphics_family = Some(index as u32);
         }
+
+        // Candidate for dedicated compute (no GRAPHICS, no TRANSFER-only, has COMPUTE)
+        if !supports_graphics
+            && family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+            && compute_family.is_none()
+        {
+            compute_family = Some(index as u32);
+        }
+    }
+
+    if let Some(gfx_qfi) = graphics_family {
+        // Determine compute queue family: prefer a dedicated compute-only
+        // family; fall back to the graphics family (which supports compute
+        // implicitly on all modern GPUs).
+        let compute_qfi = compute_family.or_else(|| {
+            // Check if the graphics queue family also supports COMPUTE
+            // (most do, but verify anyway).
+            if let Some(fam) = queue_families.get(gfx_qfi as usize) {
+                if fam.queue_flags.contains(vk::QueueFlags::COMPUTE) {
+                    return Some(gfx_qfi);
+                }
+            }
+            None
+        });
+
+        return Ok(Some(AdapterSelection {
+            physical_device,
+            queue_family_index: gfx_qfi,
+            compute_queue_family_index: compute_qfi,
+            properties,
+        }));
     }
     Ok(None)
 }

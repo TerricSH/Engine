@@ -65,8 +65,7 @@ impl Drop for VulkanDevice {
             // fences, semaphores, and pools.
             unsafe {
                 d.destroy_fence(fs.in_flight_fence, None);
-                d.destroy_semaphore(fs.image_available, None);
-                d.destroy_semaphore(fs.render_finished, None);
+                d.destroy_semaphore(fs.timeline_semaphore, None);
                 d.destroy_command_pool(fs.command_pool, None);
             }
         }
@@ -120,6 +119,13 @@ impl Drop for VulkanDevice {
             }
         }
 
+        // Destroy async compute queue resources (Phase 5.2).
+        if let Some(cp) = self.compute_pool.take() {
+            // SAFETY: `cp` was created by this device; the command buffer
+            // allocated from it is implicitly freed when the pool is destroyed.
+            unsafe { d.destroy_command_pool(cp, None); }
+        }
+
         // Save pipeline cache data to disk before destroying.
         self.save_pipeline_cache();
 
@@ -142,6 +148,7 @@ impl Drop for VulkanDevice {
         }
 
         self.destroy_light_ssbo();
+        self.destroy_indirect_buffers();
         self.destroy_material_textures();
         // Destroy post-process resources (bloom + SSAO) before HDR and
         // shadow since they may reference HDR colour / depth images.

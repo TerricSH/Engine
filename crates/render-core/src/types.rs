@@ -112,6 +112,7 @@ impl BufferUsage {
     pub const STORAGE: Self = Self(1 << 3);
     pub const COPY_SRC: Self = Self(1 << 4);
     pub const COPY_DST: Self = Self(1 << 5);
+    pub const INDIRECT: Self = Self(1 << 6);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
