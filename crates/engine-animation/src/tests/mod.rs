@@ -666,6 +666,7 @@ fn register_animation_extensions_registers_components() {
     // Components
     assert!(component_reg.is_registered("engine.animation_player"));
     assert!(component_reg.is_registered("engine.skeleton"));
+    assert!(component_reg.is_registered("engine.ik_target"));
 
     // Asset types
     assert!(asset_type_reg.get("skeleton").is_some());
@@ -676,8 +677,8 @@ fn register_animation_extensions_registers_components() {
     // Render extension
     assert_eq!(render_ext_reg.producer_count(), 1);
 
-    // Debug draw
-    assert_eq!(debug_draw_reg.provider_count(), 1);
+    // Debug draw — SkeletonDebugDraw + IkDebugDraw
+    assert_eq!(debug_draw_reg.provider_count(), 2);
 }
 
 // ── Advanced evaluator tests ───────────────────────────────────────────
