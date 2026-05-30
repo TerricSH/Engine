@@ -1,13 +1,19 @@
 //! Minimal render graph for Gate 3.
 //!
 //! Defines the canonical pass ordering:
-//!   directional_shadow_pass → opaque_pbr_forward_pass → tone_map_pass → present
+//!   directional_shadow_pass → opaque_pbr_forward_pass → ssao_pass → bloom_pass → tone_map_pass → present
 //!
 //! Each pass is recorded with a `tracing` span so per-pass timing and
 //! diagnostics are visible in the log. The graph is rebuilt every frame
 //! from `RenderFrameInput` and executed by the renderer backend.
 
 use crate::{RenderFrameInput, RenderView, ViewCompose};
+
+// Re-export v2 render-graph types so that backend passes written against
+// the new-style `PassAttachment` / `ResourceAccess` / `SizeSource` can
+// import them from `engine_renderer::render_graph` without change.
+#[doc(inline)]
+pub use crate::render_graph2::{PassAttachment, ResourceAccess, SizeSource};
 
 // ============================================================================
 // CompiledRenderGraph — output of render-graph compilation
@@ -191,7 +197,25 @@ impl RenderGraph {
                 writes_swapchain: false,
             });
 
-            // 3. Tone-map pass
+            // 3. SSAO pass (ambient occlusion)
+            passes.push(PassNode {
+                kind: PassKind::Custom("ssao"),
+                name: "ssao_pass",
+                view_id: view.view_id,
+                reads_depth: true,
+                writes_swapchain: false,
+            });
+
+            // 4. Bloom pass (brightness extraction + blur)
+            passes.push(PassNode {
+                kind: PassKind::Custom("bloom"),
+                name: "bloom_pass",
+                view_id: view.view_id,
+                reads_depth: false,
+                writes_swapchain: false,
+            });
+
+            // 5. Tone-map pass
             passes.push(PassNode {
                 kind: PassKind::ToneMap,
                 name: "tone_map_pass",
@@ -200,7 +224,7 @@ impl RenderGraph {
                 writes_swapchain: false,
             });
 
-            // 4. Present
+            // 6. Present
             passes.push(PassNode {
                 kind: PassKind::Present,
                 name: "present",

@@ -2,7 +2,7 @@
 
 mod clip;
 pub(crate) mod pose;
-mod skeleton;
+pub mod skeleton;
 mod convert;
 
 pub mod assets;
@@ -13,6 +13,7 @@ pub mod extract;
 pub mod ik;
 pub mod layers;
 pub mod loader;
+pub mod locomotion_clips;
 pub mod player;
 pub mod root_motion;
 pub mod state_machine;
@@ -22,6 +23,7 @@ pub use pose::Pose;
 pub use skeleton::{AnimationError, BoneIndex, BoneTransform};
 
 pub use assets::{AnimationChannel, AnimationClip, Joint, JointTransform, Keyframe, Skeleton};
+pub use locomotion_clips::*;
 
 pub use convert::*;
 pub use components::{AnimationPlayer, IkTargetComponent, SkeletonComponent};

@@ -74,29 +74,44 @@ pub struct CharacterOutput {
 /// The function implements the following state transitions each frame:
 ///
 /// ```text
-///                          ┌──────────┐
-///                      ┌──│ Grounded │<──────┐
-///                      │   └────┬─────┘      │
-///                      │        │            │
-///                 jump │   walk off     land │
-///                      │   edge             │
-///                      │   ┌────▼─────┐     │
-///                      │   │ Jumping  │     │
-///                      │   └────┬─────┘     │
-///                      │        │           │
-///                      │   apex│            │
-///                      │   ┌────▼─────┐     │
-///                      └───│ Falling  │─────┘
-///                          └──────────┘
+///                         ┌──────────┐
+///                     ┌──>│ Grounded │<─────┐
+///                     │   └────┬─────┘      │
+///                     │        │            │
+///                     │   timer│       land │
+///                     │        │            │
+///                     │   ┌────▼─────┐      │
+///                     │   │ Landing  │──────┘
+///                     │   └────┬─────┘
+///                     │        │
+///                     │   jump/│
+///                     │   walk │
+///                     │   off  │
+///                     │   edge │
+///                     │   ┌────▼─────┐
+///                     │   │ Jumping  │
+///                     │   └────┬─────┘
+///                     │        │
+///                     │   apex │
+///                     │        │
+///                     │   ┌────▼─────┐
+///                     └───│ Falling  │
+///                         └──────────┘
+///
+///                     ┌──────────┐
+///                     │   Free   │ (manual entry/exit only)
+///                     └──────────┘
 /// ```
 ///
-/// | Step | Condition                          | Transition               |
-/// |------|------------------------------------|--------------------------|
-/// | 6    | Ground detected                   | any → `Grounded`         |
-/// | 7    | `wish_jump` && grounded           | `Grounded` → `Jumping`   |
-/// | 8    | Not grounded, was `Grounded`      | `Grounded` → `Falling`   |
-/// | 8    | Not grounded, was `Jumping`, v≤0  | `Jumping` → `Falling`    |
-/// | —    | All other cases                   | State unchanged          |
+/// | Step | Condition                          | Transition                     |
+/// |------|------------------------------------|--------------------------------|
+/// | 6    | Ground detected, was `Jumping`/`Falling` | → `Landing`             |
+/// | 6    | Ground detected, was `Free`        | → `Grounded`                   |
+/// | 6    | Ground detected, was `Landing`/`Grounded` | Keep current state     |
+/// | 7    | `wish_jump` && grounded           | Any → `Jumping`                |
+/// | 8    | Not grounded, was `Grounded`      | `Grounded` → `Falling`         |
+/// | 8    | Not grounded, was `Jumping`, v≤0  | `Jumping` → `Falling`          |
+/// | —    | All other cases                   | State unchanged                |
 ///
 /// # Physics
 ///
@@ -119,14 +134,14 @@ pub fn process_movement(
     // accumulated downward velocity so the character does not sink into
     // the ground between frames. Gravity is then reapplied so that the
     // character immediately starts falling when it walks off an edge.
-    if state == CharacterState::Grounded && velocity.y <= 0.0 {
+    if matches!(state, CharacterState::Grounded | CharacterState::Landing) && velocity.y <= 0.0 {
         velocity.y = 0.0;
     }
     velocity.y += GRAVITY.y * controller.gravity_scale * input.delta_time;
 
     // ── 2. Horizontal acceleration / deceleration ───────────────────────
     let wish_dir = Vec3::new(input.direction.x, 0.0, input.direction.z);
-    let on_ground = state == CharacterState::Grounded;
+    let on_ground = matches!(state, CharacterState::Grounded | CharacterState::Landing);
 
     if wish_dir.length_squared() > 0.01_f32 {
         // Accelerate towards the input direction.
@@ -186,7 +201,7 @@ pub fn process_movement(
     }
 
     // ── 6. Ground detection ─────────────────────────────────────────────
-    // Transition: any state → Grounded (when ground is found)
+    // Transition: airborne states → Landing, Free/Grounded → Grounded
     let mut grounded = false;
     if let Some(pw) = physics {
         if let Some(ground_dist) = ground_check(position, controller, pw) {
@@ -199,25 +214,43 @@ pub fn process_movement(
                 velocity.y = 0.0;
             }
 
-            if state != CharacterState::Grounded {
-                debug!(
-                    old_state = ?state,
-                    new_state = ?CharacterState::Grounded,
-                    "character landed"
-                );
+            match state {
+                // Coming from airborne — enter Landing recovery.
+                CharacterState::Jumping | CharacterState::Falling => {
+                    debug!(
+                        old_state = ?state,
+                        new_state = ?CharacterState::Landing,
+                        "character landed (entering Landing)"
+                    );
+                    state = CharacterState::Landing;
+                }
+                // Free transitions directly to Grounded.
+                CharacterState::Free => {
+                    debug!(
+                        old_state = ?state,
+                        new_state = ?CharacterState::Grounded,
+                        "character landed from Free → Grounded"
+                    );
+                    state = CharacterState::Grounded;
+                }
+                // Already Landing or Grounded — keep current state.
+                _ => {}
             }
-            state = CharacterState::Grounded;
         }
     }
 
     // ── 7. Jump ─────────────────────────────────────────────────────────
-    // Transition: Grounded → Jumping (when wish_jump && grounded)
-    if input.wish_jump && grounded {
+    // Transition: Grounded → Jumping or Landing → Jumping
+    if input.wish_jump
+        && grounded
+        && matches!(state, CharacterState::Grounded | CharacterState::Landing)
+    {
+        let old_state = state;
         velocity.y = controller.jump_velocity;
         state = CharacterState::Jumping;
         grounded = false;
         debug!(
-            old_state = ?CharacterState::Grounded,
+            old_state = ?old_state,
             new_state = ?CharacterState::Jumping,
             "character jumped"
         );
@@ -226,6 +259,7 @@ pub fn process_movement(
     // ── 8. Air state transitions ────────────────────────────────────────
     // Transition: Grounded → Falling (walked off edge)
     // Transition: Jumping  → Falling (reached apex, v.y ≤ 0)
+    // Transition: Landing  → Falling (left ground during recovery)
     if !grounded && state != CharacterState::Free {
         match state {
             CharacterState::Grounded => {
@@ -243,6 +277,15 @@ pub fn process_movement(
                     old_state = ?CharacterState::Jumping,
                     new_state = ?CharacterState::Falling,
                     "character reached jump apex"
+                );
+            }
+            CharacterState::Landing => {
+                // Left the ground during landing recovery.
+                state = CharacterState::Falling;
+                debug!(
+                    old_state = ?CharacterState::Landing,
+                    new_state = ?CharacterState::Falling,
+                    "character left ground during landing recovery"
                 );
             }
             _ => {}

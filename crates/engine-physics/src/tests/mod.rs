@@ -552,16 +552,38 @@ fn sensor_collider_generates_trigger_events() {
     );
     world.backend.sync_query_pipeline();
 
-    // First step → should produce trigger Entered (Rapier fires event on state change).
-    let events = world.backend.step();
+    // First step → Entered (Rapier fires event on new overlap).
+    let step1 = world.backend.step();
     assert!(
-        events.triggers.iter().any(|t| t.kind == TriggerEventKind::Entered),
+        step1.triggers.iter().any(|t| t.kind == TriggerEventKind::Entered),
         "new sensor overlap should produce Entered, got: {:?}",
-        events.triggers,
+        step1.triggers,
     );
     assert!(
-        events.collisions.is_empty(),
+        step1.collisions.is_empty(),
         "sensor overlap should not produce collision events"
+    );
+
+    // Second step → Stay (persistent overlap detected by post-step query).
+    let step2 = world.backend.step();
+    assert!(
+        step2.triggers.iter().any(|t| t.kind == TriggerEventKind::Stay),
+        "persistent sensor overlap should produce Stay, got: {:?}",
+        step2.triggers,
+    );
+
+    // Verify Entered → Stay → Exited order by moving one body far away.
+    // (Removing the body would also remove its collider from collider_map,
+    // preventing event resolution; teleporting keeps the entity alive.)
+    // Teleport body 1 far away and update the query pipeline.
+    world.backend.set_body_transform(1, glam::Vec3::new(100.0, 0.0, 0.0), glam::Quat::IDENTITY);
+    world.backend.sync_query_pipeline();
+
+    let step3 = world.backend.step();
+    assert!(
+        step3.triggers.iter().any(|t| t.kind == TriggerEventKind::Exited),
+        "separated sensor should produce Exited, got: {:?}",
+        step3.triggers,
     );
 }
 

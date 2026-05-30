@@ -2,6 +2,7 @@
 
 pub(crate) mod depth;
 pub(crate) mod descriptor;
+pub(crate) mod graph_barriers;
 pub(crate) mod device_trait;
 pub(crate) mod drop;
 pub(crate) mod encoder;

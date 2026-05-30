@@ -76,6 +76,7 @@ impl AnimParams {
 
         let move_state = match state {
             CharacterState::Jumping => AnimMoveState::Jump,
+            CharacterState::Landing => AnimMoveState::Land,
             CharacterState::Falling if !grounded => AnimMoveState::Fall,
             CharacterState::Grounded if is_moving => {
                 if h_speed > 3.0 {
@@ -198,6 +199,15 @@ mod tests {
         assert_eq!(AnimMoveState::Jump.to_string(), "jump");
         assert_eq!(AnimMoveState::Fall.to_string(), "fall");
         assert_eq!(AnimMoveState::Land.to_string(), "land");
+    }
+
+    #[test]
+    fn anim_params_land() {
+        let ctrl = make_ctrl(true, 0.0, 0.0, CharacterState::Landing);
+        let p = AnimParams::from_controller(&ctrl);
+        assert_eq!(p.move_state, AnimMoveState::Land);
+        assert!(!p.grounded, "Landing is not Grounded — is_grounded() is false");
+        assert!(!p.is_moving);
     }
 
     #[test]

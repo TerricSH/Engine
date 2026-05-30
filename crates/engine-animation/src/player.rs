@@ -6,7 +6,7 @@ use crate::components::IkTargetComponent;
 use crate::ik::solve_pose_multi;
 use crate::pose::Pose;
 use crate::skeleton;
-use crate::state_machine::AnimStateMachineInstance;
+use crate::state_machine::{AnimParamValue, AnimStateMachineInstance, BlendSpace1D};
 
 // ---------------------------------------------------------------------------
 // AnimationEvaluator
@@ -204,25 +204,55 @@ fn evaluate_sm_to_pose(
     // Advance the state machine and get the active state + blend weight.
     let (_state_name, blend_weight) = sm.update(dt);
 
-    // Resolve the current state's animation clip.
+    // Resolve the current state's animation.
     let state = match sm.state_machine.find_state(&sm.current_state) {
         Some(s) => s,
         None => return None,
     };
-    let clip = match clips.iter().find(|(id, _)| *id == state.clip_asset) {
-        Some((_, c)) => c,
-        None => return None,
-    };
 
-    // Compute the effective clip time (handle looping).
-    let clip_time = if state.looping && clip.duration() > 0.0 {
-        sm.current_time % clip.duration()
+    // Evaluate according to clip source type (single clip vs blend space)
+    let current_pose = if let Some(ref bs) = state.blend_space_1d {
+        // Blend space: sample multiple clips and blend
+        let param = match sm.get_param(&bs.parameter_name) {
+            Some(AnimParamValue::Float(f)) => *f,
+            _ => 0.0,
+        };
+        let (lo_idx, t) = bs.sample_weight(param);
+
+        let clip_time = if state.looping { sm.current_time % 1.0 } else { sm.current_time };
+
+        let lo_clip = match clips.iter().find(|(id, _)| *id == bs.clips[lo_idx].1) {
+            Some((_, c)) => c,
+            None => return None,
+        };
+        let hi_idx = (lo_idx + 1).min(bs.clips.len() - 1);
+        let hi_clip = match clips.iter().find(|(id, _)| *id == bs.clips[hi_idx].1) {
+            Some((_, c)) => c,
+            None => return None,
+        };
+
+        // Sync clip times based on normalized progress
+        let lo_duration = lo_clip.duration().max(0.001);
+        let hi_duration = hi_clip.duration().max(0.001);
+        let lo_time = clip_time % lo_duration;
+        let hi_time = (clip_time * lo_duration / hi_duration) % hi_duration;
+
+        let lo_pose = AnimationEvaluator::evaluate_pose(lo_clip, lo_time, skel);
+        let hi_pose = AnimationEvaluator::evaluate_pose(hi_clip, hi_time, skel);
+        Pose::blend(&lo_pose, &hi_pose, t)
     } else {
-        sm.current_time.min(clip.duration())
+        // Single clip (existing behavior)
+        let clip = match clips.iter().find(|(id, _)| *id == state.clip_asset) {
+            Some((_, c)) => c,
+            None => return None,
+        };
+        let clip_time = if state.looping && clip.duration() > 0.0 {
+            sm.current_time % clip.duration()
+        } else {
+            sm.current_time.min(clip.duration())
+        };
+        AnimationEvaluator::evaluate_pose(clip, clip_time, skel)
     };
-
-    // Evaluate the current clip as a Pose.
-    let current_pose = AnimationEvaluator::evaluate_pose(clip, clip_time, skel);
 
     let final_pose = if sm.transitioning && blend_weight < 1.0 {
         // Resolve the from-state clip for crossfade blending.

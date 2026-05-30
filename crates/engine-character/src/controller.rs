@@ -36,19 +36,19 @@ pub enum CharacterError {
 ///
 /// ```text
 ///                         ┌──────────┐
-///                     ┌──>│ Grounded │<──┐
-///                     │   └─────┬────┘   │
-///                     │         │        │
-///                     │    jump │   land │
-///                     │         │        │
-///                     │   ┌─────▼────┐   │
-///                     │   │ Jumping  │   │
-///                     │   └─────┬────┘   │
-///                     │         │        │
-///                     │    apex │        │
-///                     │         │        │
-///                     │   ┌─────▼────┐   │
-///                     └───│ Falling  │───┘
+///                     ┌──>│ Grounded │<──────┐
+///                     │   └─────┬────┘       │
+///                     │         │            │
+///                     │    jump │        land │
+///                     │         │      timer │
+///                     │   ┌─────▼────┐   ┌───┴────┐
+///                     │   │ Jumping  │   │ Landing│
+///                     │   └─────┬────┘   └───┬────┘
+///                     │         │            │
+///                     │    apex │       land │
+///                     │         │            │
+///                     │   ┌─────▼────┐       │
+///                     └───│ Falling  │───────┘
 ///                     │   └──────────┘
 ///                     │
 ///                     │   ┌──────────┐
@@ -58,16 +58,17 @@ pub enum CharacterError {
 ///
 /// # Transitions
 ///
-/// | From        | To         | Trigger              |
-/// |-------------|------------|----------------------|
-/// | Grounded    | Grounded   | Stay on ground       |
-/// | Grounded    | Jumping    | Jump input           |
-/// | Grounded    | Falling    | Walk off edge        |
-/// | Jumping     | Falling    | Reach apex (v.y ≤ 0) |
-/// | Jumping     | Grounded   | Land on surface      |
-/// | Falling     | Grounded   | Land on surface      |
-/// | *           | Free       | Set explicitly       |
-/// | Free        | *          | Set explicitly       |
+/// | From        | To         | Trigger               |
+/// |-------------|------------|-----------------------|
+/// | Grounded    | Grounded   | Stay on ground        |
+/// | Grounded    | Jumping    | Jump input            |
+/// | Grounded    | Falling    | Walk off edge         |
+/// | Jumping     | Falling    | Reach apex (v.y ≤ 0)  |
+/// | Jumping     | Landing    | Land on surface       |
+/// | Falling     | Landing    | Land on surface       |
+/// | Landing     | Grounded   | Recovery timer expires (200 ms) |
+/// | *           | Free       | Set explicitly        |
+/// | Free        | *          | Set explicitly        |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CharacterState {
     /// On the ground; can jump.
@@ -76,6 +77,12 @@ pub enum CharacterState {
     Jumping,
     /// Descending (after jump peak or walking off an edge).
     Falling,
+    /// Landing recovery — on the ground but not yet ready to jump.
+    ///
+    /// Entered automatically when ground is detected after falling or
+    /// jumping. After a brief recovery period (200 ms) the controller
+    /// transitions to [`Grounded`](CharacterState::Grounded).
+    Landing,
     /// No constraints (e.g., in air from external launch).
     ///
     /// The controller will not automatically transition out of `Free`;
@@ -98,8 +105,12 @@ impl CharacterState {
     /// # use engine_character::CharacterState;
     /// assert!(CharacterState::Grounded.can_transition_to(CharacterState::Jumping));
     /// assert!(CharacterState::Jumping.can_transition_to(CharacterState::Falling));
+    /// assert!(CharacterState::Jumping.can_transition_to(CharacterState::Landing));
+    /// assert!(CharacterState::Falling.can_transition_to(CharacterState::Landing));
+    /// assert!(CharacterState::Landing.can_transition_to(CharacterState::Grounded));
     /// assert!(CharacterState::Free.can_transition_to(CharacterState::Grounded));
     /// assert!(!CharacterState::Jumping.can_transition_to(CharacterState::Grounded)); // must land first
+    /// assert!(!CharacterState::Falling.can_transition_to(CharacterState::Grounded)); // must go through Landing
     /// ```
     pub fn can_transition_to(self, other: CharacterState) -> bool {
         if self == other {
@@ -113,8 +124,12 @@ impl CharacterState {
             // Jumping transitions to falling at the apex.
             (CharacterState::Jumping, CharacterState::Falling) => true,
 
-            // Falling lands on the ground.
-            (CharacterState::Falling, CharacterState::Grounded) => true,
+            // Jumping or Falling can land (entering Landing recovery).
+            (CharacterState::Jumping, CharacterState::Landing)
+            | (CharacterState::Falling, CharacterState::Landing) => true,
+
+            // Landing recovery complete → Grounded.
+            (CharacterState::Landing, CharacterState::Grounded) => true,
 
             // Free state can go anywhere and anywhere can go to Free.
             (CharacterState::Free, _) | (_, CharacterState::Free) => true,
@@ -248,6 +263,13 @@ pub struct CharacterController {
     pub(crate) state: CharacterState,
     pub(crate) position: Vec3,
     pub(crate) velocity: Vec3,
+
+    /// Timer for Landing recovery state (seconds).
+    ///
+    /// Accumulated each frame while in [`CharacterState::Landing`]; when
+    /// it exceeds 200 ms the controller transitions to [`Grounded`](CharacterState::Grounded).
+    #[serde(skip)]
+    pub landing_timer: f32,
 }
 
 impl Component for CharacterController {
@@ -274,6 +296,7 @@ impl CharacterController {
             state: CharacterState::Falling,
             position: Vec3::ZERO,
             velocity: Vec3::ZERO,
+            landing_timer: 0.0,
         }
     }
 
@@ -321,16 +344,17 @@ impl CharacterController {
     /// callers (and the movement system) cannot accidentally put the
     /// controller into an invalid state. The valid transitions are:
     ///
-    /// | From        | To         | Trigger              |
-    /// |-------------|------------|----------------------|
-    /// | Grounded    | Grounded   | Stay on ground       |
-    /// | Grounded    | Jumping    | Jump input           |
-    /// | Grounded    | Falling    | Walk off edge        |
-    /// | Jumping     | Falling    | Reach apex (v.y ≤ 0) |
-    /// | Jumping     | Grounded   | Land on surface      |
-    /// | Falling     | Grounded   | Land on surface      |
-    /// | *           | Free       | Set explicitly       |
-    /// | Free        | *          | Set explicitly       |
+    /// | From        | To         | Trigger               |
+    /// |-------------|------------|-----------------------|
+    /// | Grounded    | Grounded   | Stay on ground        |
+    /// | Grounded    | Jumping    | Jump input            |
+    /// | Grounded    | Falling    | Walk off edge         |
+    /// | Jumping     | Falling    | Reach apex (v.y ≤ 0)  |
+    /// | Jumping     | Landing    | Land on surface       |
+    /// | Falling     | Landing    | Land on surface       |
+    /// | Landing     | Grounded   | Recovery timer expires |
+    /// | *           | Free       | Set explicitly        |
+    /// | Free        | *          | Set explicitly        |
     pub fn transition_state(&mut self, new_state: CharacterState) -> Result<(), CharacterError> {
         if self.state.can_transition_to(new_state) {
             self.state = new_state;
@@ -388,7 +412,27 @@ impl CharacterController {
         let output = crate::movement::process_movement(self, &cmd, physics);
         self.position = output.new_position;
         self.velocity = output.new_velocity;
-        self.state = output.state;
+
+        // ── Landing recovery timer ──────────────────────────────────────
+        // We inspect `output.state` (this frame's result) and `self.state`
+        // (previous frame's state, still intact) to detect entering Landing.
+        if output.state == CharacterState::Landing {
+            if self.state != CharacterState::Landing {
+                // Just entered Landing — start fresh timer.
+                self.landing_timer = 0.0;
+            }
+            self.landing_timer += cmd.delta_time;
+            if self.landing_timer > 0.2 {
+                self.state = CharacterState::Grounded;
+            } else {
+                self.state = CharacterState::Landing;
+            }
+        } else {
+            self.state = output.state;
+            // Reset timer whenever we leave the Landing state.
+            self.landing_timer = 0.0;
+        }
+
         output.moved
     }
 }
