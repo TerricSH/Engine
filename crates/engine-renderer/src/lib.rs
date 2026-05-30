@@ -6,6 +6,7 @@ pub mod pipeline_library;
 pub mod render_extension;
 pub mod render_graph;
 pub mod render_graph2;
+pub mod render_pass;
 pub mod screenshot;
 mod traits;
 mod types;
@@ -17,10 +18,12 @@ pub use debug_draw::{
 pub use material_resolver::{MaterialPipelineContext, MaterialResolver};
 pub use pipeline_library::{hash_vertex_layout, PipelineCacheKey, PipelineLibrary};
 pub use render_extension::{RenderExtensionProducer, RenderExtensionRegistry};
+pub use render_graph::PassKind;
 pub use render_graph2::{
     AliasSlot, AliasingPlan, PassConfigEntry, PassGraphConfig, PassKind as PassKind2,
     ResourceAccess, TransientResourcePool,
 };
+pub use render_pass::{PassRegistry, RenderPass};
 pub use traits::*;
 pub use types::*;
 pub use validation::validate_frame_input;

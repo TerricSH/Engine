@@ -236,8 +236,17 @@ impl RapierBackend {
         }
 
         // ── 2. Collect intersection (sensor/trigger) events ───────────────
+        //
+        // Rapier fires IntersectionEvent only on state changes (start/stop
+        // intersecting).  Persistent overlaps between frames do NOT produce
+        // events.  We therefore use a two-pass approach:
+        //
+        //   a) Read the event channel → Entered / Exited.
+        //   b) Post-step query-pipeline scan → derive Stay for overlapping
+        //      pairs that were already active last frame.
+
         let mut triggers = Vec::new();
-        let mut current_overlaps: HashSet<(u32, u32)> = HashSet::new();
+        let mut event_overlaps: HashSet<(u32, u32)> = HashSet::new();
 
         // Helper: build a canonical entity-index key.
         let entity_key = |c1: ColliderHandle, c2: ColliderHandle| -> Option<(u32, u32)> {
@@ -246,6 +255,7 @@ impl RapierBackend {
             Some(if ea < eb { (ea, eb) } else { (eb, ea) })
         };
 
+        // ── 2a. Process intersection events from the channel ────────────
         while let Ok(raw) = rx_int.try_recv() {
             if raw.intersecting {
                 let key = match entity_key(raw.collider1, raw.collider2) {
@@ -260,8 +270,9 @@ impl RapierBackend {
                 if let (Some(a), Some(b)) = (resolve(raw.collider1), resolve(raw.collider2)) {
                     triggers.push(TriggerEvent { kind, entity_a: a, entity_b: b });
                 }
-                current_overlaps.insert(key);
+                event_overlaps.insert(key);
             } else {
+                // Exited — Rapier reports when two colliders stop intersecting.
                 let key = match entity_key(raw.collider1, raw.collider2) {
                     Some(k) => k,
                     None => continue,
@@ -278,7 +289,67 @@ impl RapierBackend {
             }
         }
 
-        self.active_sensor_overlaps = current_overlaps;
+        // ── 2b. Post-step query-pipeline scan for Stay events ──────────
+        //
+        // For every sensor collider, query which entities intersect it
+        // right now (after the physics step).  Pairs that were already
+        // active last frame but did NOT appear in this frame's event
+        // stream are persistent overlaps → generate Stay.
+        let mut full_overlaps: HashSet<(u32, u32)> = HashSet::new();
+
+        for (&entity_idx, &(ch, ref shape)) in &self.collider_map {
+            let is_sensor = self
+                .colliders
+                .get(ch)
+                .map(|c| c.is_sensor())
+                .unwrap_or(false);
+            if !is_sensor {
+                continue;
+            }
+
+            let Some(collider) = self.colliders.get(ch) else { continue };
+            let Some(parent) = collider.parent() else { continue };
+            let Some(body) = self.bodies.get(parent) else { continue };
+            let iso = body.position();
+
+            let rapier_shape = to_rapier_shared_shape(shape);
+
+            // Exclude the querying collider itself (avoids self-intersection).
+            let filter = QueryFilter::default().exclude_collider(ch);
+
+            self.query_pipeline.intersections_with_shape(
+                &self.bodies,
+                &self.colliders,
+                iso,
+                &*rapier_shape,
+                filter,
+                |other| {
+                    if let Some(&other_entity) = collider_to_entity.get(&other) {
+                        let key = if entity_idx < other_entity {
+                            (entity_idx, other_entity)
+                        } else {
+                            (other_entity, entity_idx)
+                        };
+                        full_overlaps.insert(key);
+                    }
+                    true
+                },
+            );
+        }
+
+        // Generate Stay for overlaps that persisted from the previous frame
+        // but were NOT reported as new intersections by Rapier's event stream.
+        for &key in &full_overlaps {
+            if self.active_sensor_overlaps.contains(&key) && !event_overlaps.contains(&key) {
+                triggers.push(TriggerEvent {
+                    kind: TriggerEventKind::Stay,
+                    entity_a: Entity::new(key.0, 0),
+                    entity_b: Entity::new(key.1, 0),
+                });
+            }
+        }
+
+        self.active_sensor_overlaps = full_overlaps;
 
         PhysicsEvents { collisions, triggers }
     }
@@ -306,6 +377,7 @@ impl RapierBackend {
 
         let rapier_body = builder
             .position(iso)
+            .additional_mass(body.mass)
             .linear_damping(body.linear_damping)
             .angular_damping(body.angular_damping)
             .gravity_scale(body.gravity_scale)

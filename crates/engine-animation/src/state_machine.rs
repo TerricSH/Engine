@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::blend_space::BlendSpace1D;
+
 // ---------------------------------------------------------------------------
 // Animation parameter types
 // ---------------------------------------------------------------------------
@@ -40,11 +42,35 @@ pub struct TransitionCondition {
 // State machine asset types
 // ---------------------------------------------------------------------------
 
+/// A single sample point in a blend space.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlendSpaceSample {
+    /// Parameter threshold (e.g. speed value) at this sample point.
+    pub threshold: f32,
+    /// Clip to blend at this point.
+    pub clip_asset: String,
+}
+
+/// A 1D blend space that interpolates between animation clips based on a
+/// scalar parameter (e.g. speed → walk/run blend).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlendSpace1D {
+    /// Name of the state-machine parameter that drives the blend.
+    pub parameter_name: String,
+    /// Sample points sorted by threshold. Blending is performed between the
+    /// two surrounding samples.
+    pub clips: Vec<BlendSpaceSample>,
+}
+
 /// A state in the animation state machine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AnimationState {
     pub name: String,
     pub clip_asset: String,
+    /// Optional 1D blend space. When present the state evaluates the blend
+    /// space instead of the single `clip_asset`.
+    #[serde(default)]
+    pub blend_space_1d: Option<BlendSpace1D>,
     pub speed: f32,
     pub looping: bool,
 }
@@ -55,6 +81,8 @@ pub struct StateTransition {
     pub from_state: String,
     pub to_state: String,
     pub conditions: Vec<TransitionCondition>,
+    #[serde(default)]
+    pub priority: u8,
     pub blend_duration: f32,
 }
 
@@ -172,13 +200,19 @@ impl AnimStateMachineInstance {
         })
     }
 
-    /// Find the first transition whose origin matches `current_state` and whose
-    /// conditions are all satisfied.
+    /// Find the highest-priority matching transition whose origin matches
+    /// `current_state` and whose conditions are all satisfied. If multiple
+    /// transitions have the same priority, the first one is returned (stable).
     fn find_active_transition(&self) -> Option<&StateTransition> {
         self.state_machine
             .transitions
             .iter()
-            .find(|t| t.from_state == self.current_state && self.evaluate_conditions(&t.conditions))
+            .filter(|t| t.from_state == self.current_state && self.evaluate_conditions(&t.conditions))
+            .fold(None, |best, t| match best {
+                None => Some(t),
+                Some(b) if t.priority > b.priority => Some(t),
+                _ => best,
+            })
     }
 
     /// Advance the state machine by `dt` seconds.

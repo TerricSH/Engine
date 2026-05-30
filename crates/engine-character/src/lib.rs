@@ -28,16 +28,19 @@
 //!
 //! | Module        | Contents                                           |
 //! |---------------|----------------------------------------------------|
+//! | `animation_bridge` | [`update_character_animation`] — wires controller → animation pipeline |
 //! | `controller`  | [`CharacterController`], [`CharacterState`], [`CharacterError`] |
 //! | `movement`    | [`process_movement`], [`CharacterMovement`], [`CharacterOutput`] |
 //! | `collision`   | [`ground_check`], [`resolve_collision`]             |
 
+mod animation_bridge;
 mod animation_params;
 mod collision;
 mod controller;
 mod ffi;
 mod movement;
 
+pub use animation_bridge::update_character_animation;
 pub use animation_params::{anim_params, AnimMoveState, AnimParams};
 pub use collision::{ground_check, resolve_collision};
 pub use controller::{CharacterCommand, CharacterController, CharacterError, CharacterState};
@@ -99,8 +102,18 @@ mod tests {
     }
 
     #[test]
-    fn character_state_falling_to_grounded() {
-        assert!(CharacterState::Falling.can_transition_to(CharacterState::Grounded));
+    fn character_state_falling_to_landing() {
+        assert!(CharacterState::Falling.can_transition_to(CharacterState::Landing));
+    }
+
+    #[test]
+    fn character_state_jumping_to_landing() {
+        assert!(CharacterState::Jumping.can_transition_to(CharacterState::Landing));
+    }
+
+    #[test]
+    fn character_state_landing_to_grounded() {
+        assert!(CharacterState::Landing.can_transition_to(CharacterState::Grounded));
     }
 
     #[test]
@@ -120,12 +133,21 @@ mod tests {
         assert!(CharacterState::Grounded.can_transition_to(CharacterState::Grounded));
         assert!(CharacterState::Jumping.can_transition_to(CharacterState::Jumping));
         assert!(CharacterState::Falling.can_transition_to(CharacterState::Falling));
+        assert!(CharacterState::Landing.can_transition_to(CharacterState::Landing));
         assert!(CharacterState::Free.can_transition_to(CharacterState::Free));
     }
 
     #[test]
     fn character_state_illegal_transitions() {
+        // Cannot skip Landing
         assert!(!CharacterState::Jumping.can_transition_to(CharacterState::Grounded));
+        assert!(!CharacterState::Falling.can_transition_to(CharacterState::Grounded));
+        // Cannot enter Landing from Grounded
+        assert!(!CharacterState::Grounded.can_transition_to(CharacterState::Landing));
+        // Cannot jump or fall directly from Landing
+        assert!(!CharacterState::Landing.can_transition_to(CharacterState::Jumping));
+        assert!(!CharacterState::Landing.can_transition_to(CharacterState::Falling));
+        // General illegal transitions
         assert!(!CharacterState::Falling.can_transition_to(CharacterState::Jumping));
     }
 
@@ -135,6 +157,7 @@ mod tests {
         assert_eq!(format!("{:?}", CharacterState::Jumping), "Jumping");
         assert_eq!(format!("{:?}", CharacterState::Falling), "Falling");
         assert_eq!(format!("{:?}", CharacterState::Free), "Free");
+        assert_eq!(format!("{:?}", CharacterState::Landing), "Landing");
     }
 
     // ── CharacterController tests ────────────────────────────────────────
@@ -154,6 +177,7 @@ mod tests {
         assert_eq!(ctrl.max_fall_speed, 20.0);
         assert_eq!(ctrl.step_height, 0.3);
         assert_eq!(ctrl.slope_limit, 45.0);
+        assert_eq!(ctrl.landing_timer, 0.0);
     }
 
     #[test]
@@ -190,7 +214,10 @@ mod tests {
     #[test]
     fn character_controller_transition_state_valid() {
         let mut ctrl = CharacterController::new();
-        // Starts at Falling
+        // Starts at Falling → can transition to Landing
+        assert!(ctrl.transition_state(CharacterState::Landing).is_ok());
+        assert_eq!(ctrl.state(), CharacterState::Landing);
+        // Landing → Grounded is valid
         assert!(ctrl.transition_state(CharacterState::Grounded).is_ok());
         assert_eq!(ctrl.state(), CharacterState::Grounded);
     }

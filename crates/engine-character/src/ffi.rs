@@ -24,8 +24,10 @@ const STATE_GROUNDED: i32 = 0;
 const STATE_JUMPING: i32 = 1;
 /// Falling state value returned to C#.
 const STATE_FALLING: i32 = 2;
+/// Landing recovery state value returned to C#.
+const STATE_LANDING: i32 = 3;
 /// Free state value returned to C#.
-const STATE_FREE: i32 = 3;
+const STATE_FREE: i32 = 4;
 
 /// Move the character in the given direction at the given speed.
 ///
@@ -131,7 +133,8 @@ pub extern "C" fn character_is_grounded(controller: *const CharacterController) 
 /// | 0     | Grounded  |
 /// | 1     | Jumping   |
 /// | 2     | Falling   |
-/// | 3     | Free      |
+/// | 3     | Landing   |
+/// | 4     | Free      |
 ///
 /// # Safety
 ///
@@ -149,6 +152,7 @@ pub extern "C" fn character_get_move_state(controller: *const CharacterControlle
         CharacterState::Grounded => STATE_GROUNDED,
         CharacterState::Jumping => STATE_JUMPING,
         CharacterState::Falling => STATE_FALLING,
+        CharacterState::Landing => STATE_LANDING,
         CharacterState::Free => STATE_FREE,
     }
 }
@@ -267,7 +271,8 @@ mod tests {
     #[test]
     fn character_jump_grounded_success() {
         let mut ctrl = CharacterController::new();
-        // Put into grounded state via the proper API
+        // Starts at Falling → Landing → Grounded (required path)
+        let _ = ctrl.transition_state(CharacterState::Landing);
         let _ = ctrl.transition_state(CharacterState::Grounded);
 
         let jumped = character_jump(&mut ctrl as *mut CharacterController);
@@ -290,6 +295,8 @@ mod tests {
     #[test]
     fn character_is_grounded_true() {
         let mut ctrl = CharacterController::new();
+        // Starts at Falling → Landing → Grounded (required path)
+        let _ = ctrl.transition_state(CharacterState::Landing);
         let _ = ctrl.transition_state(CharacterState::Grounded);
         assert_eq!(
             character_is_grounded(&ctrl as *const CharacterController),
@@ -310,6 +317,8 @@ mod tests {
     fn character_get_move_state_values() {
         let mut ctrl = CharacterController::new();
 
+        // Starts at Falling → Landing → Grounded (required path)
+        let _ = ctrl.transition_state(CharacterState::Landing);
         let _ = ctrl.transition_state(CharacterState::Grounded);
         assert_eq!(
             character_get_move_state(&ctrl as *const CharacterController),
@@ -327,6 +336,13 @@ mod tests {
         assert_eq!(
             character_get_move_state(&ctrl as *const CharacterController),
             STATE_FALLING
+        );
+
+        // Falling → Landing is valid
+        let _ = ctrl.transition_state(CharacterState::Landing);
+        assert_eq!(
+            character_get_move_state(&ctrl as *const CharacterController),
+            STATE_LANDING
         );
 
         let _ = ctrl.transition_state(CharacterState::Free);
