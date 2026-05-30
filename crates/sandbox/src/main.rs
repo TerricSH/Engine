@@ -575,6 +575,9 @@ fn run_static_lit_scene() {
                 engine_renderer::render_graph::PassKind::Present => {
                     // Present is handled by end_frame
                 }
+                engine_renderer::render_graph::PassKind::Custom(_) => {
+                    // Custom passes are no-ops until explicitly wired.
+                }
             }
             Ok(())
         }

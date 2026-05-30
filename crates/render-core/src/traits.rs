@@ -50,6 +50,21 @@ pub trait CommandEncoder: Send {
         vertex_offset: i32,
         first_instance: u32,
     );
+    /// Issue indirect indexed draws from a GPU buffer.
+    ///
+    /// `buffer` contains an array of [`VkDrawIndexedIndirectCommand`]-compatible
+    /// structs (each 20 bytes: index_count, instance_count, first_index,
+    /// vertex_offset, first_instance).
+    ///
+    /// The default implementation is a no-op; Vulkan backends override this.
+    fn draw_indexed_indirect(
+        &mut self,
+        _buffer: BufferHandle,
+        _offset: u64,
+        _draw_count: u32,
+        _stride: u32,
+    ) {
+    }
     fn end_render_pass(&mut self);
     fn push_constants(
         &mut self,

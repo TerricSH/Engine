@@ -96,8 +96,15 @@ pub(crate) struct PlEntry {
 // ============================================================================
 
 pub(crate) struct FrameSync {
-    pub(crate) image_available: vk::Semaphore,
-    pub(crate) render_finished: vk::Semaphore,
+    /// Single timeline semaphore replacing the old binary pair
+    /// (image_available + render_finished).  After each acquire the
+    /// semaphore value increments by 1; after each submit+present the
+    /// value increments by another 1.
+    pub(crate) timeline_semaphore: vk::Semaphore,
+    /// Tracks the last signalled value for this frame slot.
+    /// In begin_frame we CPU-wait for this value; after submit we
+    /// signal value+2 (one from acquire, one from submit).
+    pub(crate) timeline_value: u64,
     pub(crate) in_flight_fence: vk::Fence,
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) command_buffer: vk::CommandBuffer,

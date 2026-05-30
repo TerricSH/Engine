@@ -87,6 +87,11 @@ pub struct VulkanDevice {
     pub(crate) model_rp: Option<vk::RenderPass>,
     pub(crate) model_framebuffers: Vec<vk::Framebuffer>,
 
+    // Phase 5.2: Async compute queue
+    pub(crate) compute_queue: Option<vk::Queue>,
+    pub(crate) compute_pool: Option<vk::CommandPool>,
+    pub(crate) compute_cmd_buffer: Option<vk::CommandBuffer>,
+
     pub(crate) frame_sync: Vec<FrameSync>,
     pub(crate) current_frame: usize,
     pub(crate) retired_pipelines: Vec<Vec<vk::Pipeline>>,
@@ -145,6 +150,13 @@ pub struct VulkanDevice {
     pub(crate) light_ssbo_allocation: Option<crate::allocator::Allocation>,
     pub(crate) light_ssbo_size: vk::DeviceSize,
     pub(crate) max_lights: u32,
+
+    // Phase 5.1: Indirect draw buffer (for GPU-driven culling)
+    pub(crate) indirect_draw_buffer: Option<vk::Buffer>,
+    pub(crate) indirect_draw_alloc: Option<crate::allocator::Allocation>,
+    /// Buffer for compute-shader cull arguments (future use).
+    pub(crate) cull_args_buffer: Option<vk::Buffer>,
+    pub(crate) cull_args_alloc: Option<crate::allocator::Allocation>,
 
     // Shadow mapping (directional light, 2048×2048, 3-cascade CSM)
     pub(crate) shadow_map: Option<vk::Image>,
@@ -351,6 +363,9 @@ impl VulkanDevice {
             model_pipeline_layout: None,
             model_rp: None,
             model_framebuffers: Vec::new(),
+            compute_queue: None,
+            compute_pool: None,
+            compute_cmd_buffer: None,
             frame_sync: Vec::new(),
             current_frame: 0,
             retired_pipelines: vec![Vec::new(), Vec::new()],
@@ -439,6 +454,12 @@ impl VulkanDevice {
             light_ssbo_size: 16384, // 256 lights × 64 bytes each
             max_lights: 256,
 
+            // Phase 5.1: Indirect draw buffers
+            indirect_draw_buffer: None,
+            indirect_draw_alloc: None,
+            cull_args_buffer: None,
+            cull_args_alloc: None,
+
             // Post-processing (Phase 4.5)
             bloom_downsample_pipelines: Vec::new(),
             bloom_upsample_pipelines: Vec::new(),
@@ -466,6 +487,41 @@ impl VulkanDevice {
 
         // Phase 3.3: Initialize PSO cache (load from disk if cache_dir provided).
         device.init_pipeline_cache(cache_dir);
+
+        // Phase 5.2: Create compute queue, pool, and command buffer.
+        {
+            let d = &device.logical_device.device;
+            let compute_queue = device.logical_device.compute_queue;
+            let compute_qfi = device.logical_device.compute_queue_family_index;
+            device.compute_queue = compute_queue;
+
+            // SAFETY: `d` is a valid AshDevice; `compute_qfi` is a valid queue
+            // family index for this device; `None` means no custom allocator.
+            let cp = unsafe {
+                d.create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(compute_qfi)
+                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+            }
+            .map_err(|r| VulkanError::vk("ccp_compute", r))?;
+
+            // SAFETY: `cp` was just created and is valid; allocate one primary
+            // command buffer from it.
+            let cbs = unsafe {
+                d.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(cp)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+            }
+            .map_err(|r| VulkanError::vk("acb_compute", r))?;
+
+            device.compute_pool = Some(cp);
+            device.compute_cmd_buffer = Some(cbs[0]);
+        }
 
         Ok(device)
     }
@@ -658,6 +714,112 @@ impl VulkanDevice {
     pub(crate) fn drain_all_retired_pipelines(&mut self) {
         for frame_index in 0..self.retired_pipelines.len() {
             self.drain_retired_pipelines(frame_index);
+        }
+    }
+
+    /// Create (or recreate) the indirect draw and cull-args buffers.
+    ///
+    /// `max_draws` is the maximum number of `VkDrawIndexedIndirectCommand`
+    /// entries the indirect buffer should hold. The buffer is created with
+    /// `INDIRECT_BUFFER` usage and `CpuToGpu` memory so the CPU can fill it
+    /// each frame before issuing `draw_indexed_indirect`.
+    ///
+    /// Idempotent: if buffers already exist they are destroyed first.
+    pub(crate) fn create_indirect_buffers(&mut self, max_draws: u32) -> VkResult<()> {
+        // Destroy previous buffers before creating new immutable references.
+        self.destroy_indirect_buffers();
+
+        let d = &self.logical_device.device;
+        let allocator = self.logical_device.allocator();
+
+        let indirect_size = max_draws as u64 * 20; // 20 bytes per VkDrawIndexedIndirectCommand
+
+        // ── Indirect draw buffer ────────────────────────────────────────
+        let ibi = vk::BufferCreateInfo::default()
+            .size(indirect_size.max(64))
+            .usage(vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let indirect_buf = unsafe { d.create_buffer(&ibi, None) }
+            .map_err(|r| VulkanError::vk("create_indirect_draw_buffer", r))?;
+        let req = unsafe { d.get_buffer_memory_requirements(indirect_buf) };
+        let indirect_alloc = allocator
+            .lock()
+            .map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
+            .allocate(&crate::allocator::AllocationCreateDesc {
+                name: "indirect-draw-buffer",
+                requirements: req,
+                location: crate::allocator::MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
+            })
+            .map_err(|e| VulkanError::Allocation(e.to_string()))?;
+        unsafe {
+            d.bind_buffer_memory(indirect_buf, indirect_alloc.memory(), indirect_alloc.offset())
+        }
+        .map_err(|r| VulkanError::vk("bind_indirect_draw_buffer", r))?;
+
+        // ── Cull-args buffer (compute shader indirect args, Phase 5.2+) ─
+        let cabi = vk::BufferCreateInfo::default()
+            .size(64) // Large enough for DispatchIndirectCommand (12 B) or DrawIndirectCommand
+            .usage(vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let cull_buf = unsafe { d.create_buffer(&cabi, None) }
+            .map_err(|r| VulkanError::vk("create_cull_args_buffer", r))?;
+        let cull_req = unsafe { d.get_buffer_memory_requirements(cull_buf) };
+        let cull_alloc = allocator
+            .lock()
+            .map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
+            .allocate(&crate::allocator::AllocationCreateDesc {
+                name: "cull-args-buffer",
+                requirements: cull_req,
+                location: crate::allocator::MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
+            })
+            .map_err(|e| VulkanError::Allocation(e.to_string()))?;
+        unsafe {
+            d.bind_buffer_memory(cull_buf, cull_alloc.memory(), cull_alloc.offset())
+        }
+        .map_err(|r| VulkanError::vk("bind_cull_args_buffer", r))?;
+
+        self.indirect_draw_buffer = Some(indirect_buf);
+        self.indirect_draw_alloc = Some(indirect_alloc);
+        self.cull_args_buffer = Some(cull_buf);
+        self.cull_args_alloc = Some(cull_alloc);
+
+        Ok(())
+    }
+
+    /// Write draw-command data into the indirect draw buffer at the given
+    /// byte offset.  Silently returns if the buffer has not been created.
+    pub(crate) fn write_indirect_draw_buffer(&mut self, data: &[u8], offset: u64) {
+        if let Some(ref mut alloc) = self.indirect_draw_alloc {
+            if let Some(slice) = alloc.mapped_slice_mut() {
+                let start = offset as usize;
+                let end = (start + data.len()).min(slice.len());
+                slice[start..end].copy_from_slice(&data[..end - start]);
+            }
+        }
+    }
+
+    /// Destroy the indirect draw and cull-args buffers.
+    pub(crate) fn destroy_indirect_buffers(&mut self) {
+        let d = &self.logical_device.device;
+        if let Some(buf) = self.indirect_draw_buffer.take() {
+            unsafe { d.destroy_buffer(buf, None); }
+        }
+        if let Some(mut a) = self.indirect_draw_alloc.take() {
+            if let Ok(mut guard) = self.logical_device.allocator().lock() {
+                guard.free(&mut a);
+            }
+        }
+        if let Some(buf) = self.cull_args_buffer.take() {
+            unsafe { d.destroy_buffer(buf, None); }
+        }
+        if let Some(mut a) = self.cull_args_alloc.take() {
+            if let Ok(mut guard) = self.logical_device.allocator().lock() {
+                guard.free(&mut a);
+            }
         }
     }
 
