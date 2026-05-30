@@ -222,6 +222,36 @@ impl World {
                 );
             }
 
+            // ── Registered external components (e.g. physics) ──────────
+            if let Some(ref registry) = self.component_registry {
+                for (&type_id, storage) in &self.storages {
+                    if matches!(
+                        type_id,
+                        Name::TYPE_ID
+                            | Transform::TYPE_ID
+                            | Renderable::TYPE_ID
+                            | Camera::TYPE_ID
+                            | Light::TYPE_ID
+                            | Bounds::TYPE_ID
+                    ) {
+                        continue;
+                    }
+                    let Some(ext) = registry.get(type_id) else { continue };
+                    let Some(ser_fn) = ext.serialize else { continue };
+                    if let Some(any_ref) = storage.get_any(entity) {
+                        let fields = ser_fn(any_ref);
+                        components.insert(
+                            type_id.to_string(),
+                            ComponentRecord {
+                                schema_version: SchemaVersion::new(0, 1, 0),
+                                enabled: true,
+                                fields,
+                            },
+                        );
+                    }
+                }
+            }
+
             scene_entities.push(EntityRecord {
                 persistent_id: persistent_id.clone(),
                 parent: self.resolve_parent_to_persistent(entity),
@@ -543,7 +573,19 @@ impl World {
                 );
             }
             _ => {
-                // Unknown component type — skip (future extensibility).
+                // Deserialise a registered component type via its hook.
+                if let Some(ref registry) = self.component_registry {
+                    if let Some(ext) = registry.get(comp_type_id) {
+                        if let Some(de_fn) = ext.deserialize {
+                            let component = de_fn(fields);
+                            let storage = self
+                                .storages
+                                .entry(ext.meta.type_id)
+                                .or_insert_with(|| (ext.storage_factory)());
+                            let _ = storage.insert_any(entity, component);
+                        }
+                    }
+                }
             }
         }
     }

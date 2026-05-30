@@ -52,8 +52,6 @@ pub use movement::{process_movement, CharacterMovement, CharacterOutput};
 pub fn register_character_extensions(
     component_registry: &mut engine_scene::registry::ComponentRegistry,
     _debug_draw_registry: Option<&mut engine_renderer::DebugDrawRegistry>,
-    _editor_registry: Option<&mut ()>,
-    _script_registry: Option<&mut ()>,
 ) {
     use engine_scene::registry::{ComponentExtension, ComponentMeta};
     use engine_scene::{Component, ComponentStorageDyn, SparseSet};

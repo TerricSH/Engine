@@ -201,7 +201,7 @@ pub fn build_specialization_data(
     for sc in constants {
         let offset = data.len() as u32;
         let (val_bytes, size): ([u8; 4], u32) = match sc.value {
-            SpecValue::Bool(b) => ([(b as u8), 0, 0, 0], 1),
+            SpecValue::Bool(b) => ([(b as u8), 0, 0, 0], 4),
             SpecValue::U32(v) => (v.to_ne_bytes(), 4),
             SpecValue::F32(v) => (v.to_ne_bytes(), 4),
         };

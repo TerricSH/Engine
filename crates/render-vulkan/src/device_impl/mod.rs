@@ -77,9 +77,9 @@ pub struct VulkanDevice {
     pub(crate) mvp_rp: Option<vk::RenderPass>,
     pub(crate) mvp_pipeline_layout: Option<vk::PipelineLayout>,
     pub(crate) mvp_pipeline: Option<vk::Pipeline>,
-    pub(crate) mvp_vert_spv: Option<&'static [u8]>,
-    pub(crate) mvp_frag_spv: Option<&'static [u8]>,
-    pub(crate) skinned_vert_spv: Option<&'static [u8]>,
+    pub(crate) mvp_vert_spv: Option<Vec<u8>>,
+    pub(crate) mvp_frag_spv: Option<Vec<u8>>,
+    pub(crate) skinned_vert_spv: Option<Vec<u8>>,
 
     // Model rendering pipeline (forward shaders + vertex input state)
     pub(crate) model_pipeline: Option<vk::Pipeline>,
@@ -606,13 +606,13 @@ impl VulkanDevice {
         }
     }
 
-    pub fn set_mvp_shaders(&mut self, vert: &'static [u8], frag: &'static [u8]) {
-        self.mvp_vert_spv = Some(vert);
-        self.mvp_frag_spv = Some(frag);
+    pub fn set_mvp_shaders(&mut self, vert: &[u8], frag: &[u8]) {
+        self.mvp_vert_spv = Some(vert.to_vec());
+        self.mvp_frag_spv = Some(frag.to_vec());
     }
 
-    pub fn set_skinned_vertex_shader(&mut self, vert: &'static [u8]) {
-        self.skinned_vert_spv = Some(vert);
+    pub fn set_skinned_vertex_shader(&mut self, vert: &[u8]) {
+        self.skinned_vert_spv = Some(vert.to_vec());
     }
 
     /// Returns the index of the current in-flight frame (0 or 1 for double

@@ -3,6 +3,7 @@
 mod clip;
 pub(crate) mod pose;
 mod skeleton;
+mod convert;
 
 pub mod assets;
 pub mod components;
@@ -21,6 +22,8 @@ pub use pose::Pose;
 pub use skeleton::{AnimationError, BoneIndex, BoneTransform};
 
 pub use assets::{AnimationChannel, AnimationClip, Joint, JointTransform, Keyframe, Skeleton};
+
+pub use convert::*;
 pub use components::{AnimationPlayer, IkTargetComponent, SkeletonComponent};
 pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
 pub use events::{check_event_trigger, AnimEvent, AnimEventCollector, AnimEventDef};
