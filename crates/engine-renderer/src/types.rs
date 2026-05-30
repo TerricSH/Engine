@@ -340,6 +340,8 @@ pub struct UiVertex {
 pub struct RenderOptions {
     pub tone_mapping: ToneMapping,
     pub exposure_ev100: Option<f32>,
+    /// Number of MSAA samples (1 = disabled, 2/4/8 = MSAA).
+    pub msaa_samples: u8,
 }
 
 impl Default for RenderOptions {
@@ -347,6 +349,7 @@ impl Default for RenderOptions {
         Self {
             tone_mapping: ToneMapping::Aces,
             exposure_ev100: None,
+            msaa_samples: 1,
         }
     }
 }

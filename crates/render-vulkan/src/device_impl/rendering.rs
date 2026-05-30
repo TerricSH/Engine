@@ -96,7 +96,7 @@ impl VulkanDevice {
 
         // ── Record commands ────────────────────────────────────────────
         self.begin_cb(fi)?;
-        self.record_shadow_pass(fi, &light_mvp, vertex_buf, index_buf, index_count)?;
+        self.record_shadow_pass(fi, 0, &light_mvp, vertex_buf, index_buf, index_count)?;
         self.record_model(fi, ii, vertex_buf, index_buf, index_count)?;
         self.submit_and_present(fi, ii)?;
         if subopt {

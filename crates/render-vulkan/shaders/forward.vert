@@ -15,15 +15,19 @@ layout(location = 2) in vec2 in_uv;
 //   offset 128: vec4 light_dir      (16 B)
 //   offset 144: vec4 light_color    (16 B)
 //   offset 160: vec4 camera_pos     (16 B)
-//   offset 176: mat4 light_view_proj (64 B)
-// Total: 240 B  (fits in 256 B UBO)
+//   offset 176: vec4 cascade_splits (16 B)  — x=split0, y=split1, z=split2, w=far
+//   offset 192: mat4 light_vp[0]    (64 B)
+//   offset 256: mat4 light_vp[1]    (64 B)
+//   offset 320: mat4 light_vp[2]    (64 B)
+// Total: 384 B  (fits in 512 B UBO)
 layout(set = 0, binding = 0) uniform UBO {
     mat4 model;
     mat4 view_proj;
     vec4 light_dir;
     vec4 light_color;
     vec4 camera_pos;
-    mat4 light_view_proj;
+    vec4 cascade_splits;
+    mat4 light_vp[3];
 } ubo;
 
 layout(location = 0) out vec3 v_world_pos;

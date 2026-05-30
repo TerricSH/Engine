@@ -40,14 +40,14 @@ impl PassKind {
     }
 
     /// Try to convert this new `PassKind` to the legacy `render_graph::PassKind`.
-    /// Returns `None` if this is a `Custom` variant that has no legacy equivalent.
+    /// Custom variants are passed through.
     pub fn to_legacy(&self) -> Option<render_graph::PassKind> {
         match self {
             Self::DirectionalShadow => Some(render_graph::PassKind::DirectionalShadow),
             Self::OpaquePbrForward => Some(render_graph::PassKind::OpaquePbrForward),
             Self::ToneMap => Some(render_graph::PassKind::ToneMap),
             Self::Present => Some(render_graph::PassKind::Present),
-            Self::Custom(_) => None,
+            Self::Custom(name) => Some(render_graph::PassKind::Custom(name)),
         }
     }
 
@@ -111,8 +111,6 @@ pub struct PassNode {
 impl PassNode {
     /// Convert this new-style `PassNode` to the legacy `render_graph::PassNode`
     /// for use with the existing `BackendRenderer` trait.
-    ///
-    /// Returns `None` if the pass kind is `Custom` (no legacy equivalent).
     pub fn to_legacy(&self) -> Option<render_graph::PassNode> {
         let legacy_kind = self.kind.to_legacy()?;
         Some(render_graph::PassNode {
@@ -388,7 +386,14 @@ impl RenderGraph {
                         outputs: vec![],
                         depth_stencil: None,
                     },
-                    PassKind::Custom(_) => continue,
+                    PassKind::Custom(custom_name) => PassNode {
+                        kind: PassKind::Custom(custom_name),
+                        name: custom_name,
+                        view_id: view.view_id,
+                        inputs: vec![],
+                        outputs: vec![],
+                        depth_stencil: None,
+                    },
                 };
 
                 graph.add_pass(pass);
@@ -474,8 +479,6 @@ impl RenderGraph {
     /// Convert this new-style `RenderGraph` into the legacy
     /// `render_graph::RenderGraph` so it can be consumed by the existing
     /// `BackendRenderer::execute_pass` trait.
-    ///
-    /// Passes with `Custom` kind are silently skipped (no legacy equivalent).
     pub fn to_legacy(&self) -> render_graph::RenderGraph {
         let legacy_passes: Vec<render_graph::PassNode> =
             self.passes.iter().filter_map(|p| p.to_legacy()).collect();

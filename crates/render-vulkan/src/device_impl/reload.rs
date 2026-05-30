@@ -286,29 +286,65 @@ impl VulkanDevice {
     // Shadow-map swap
     // ------------------------------------------------------------------
 
-    /// Atomically replace the shadow-map texture.
+    /// Atomically replace the CSM shadow-map texture (3-layer array).
     ///
-    /// Returns the **old** shadow-map resources `(image, view, allocation)`
-    /// so the caller can queue them for deferred destruction.
+    /// Takes the new 3-layer image, layered view (for descriptor), per-layer views
+    /// (for framebuffers), and allocation. Recreates cascade framebuffers internally.
+    ///
+    /// Returns the **old** resources `(image, layered_view, [layer_views], allocation,
+    /// [framebuffers])` so the caller can queue them for deferred destruction.
     pub(crate) fn replace_shadow_map(
         &mut self,
         new_image: vk::Image,
-        new_view: vk::ImageView,
+        new_layered_view: vk::ImageView,
+        new_layer_views: Vec<vk::ImageView>,
         new_allocation: Allocation,
-    ) -> Option<(vk::Image, vk::ImageView, Option<Allocation>)> {
+    ) -> Option<(
+        vk::Image,
+        vk::ImageView,
+        Vec<vk::ImageView>,
+        Option<Allocation>,
+        Vec<vk::Framebuffer>,
+    )> {
         let old_image = self.shadow_map.take();
-        let old_view = self.shadow_map_view.take();
+        let old_layered_view = self.shadow_map_view.take();
+        let old_layer_views = std::mem::take(&mut self.shadow_layer_views);
         let old_alloc = self.shadow_allocation.take();
+        let old_fbs = std::mem::take(&mut self.shadow_fbs);
 
         self.shadow_map = Some(new_image);
-        self.shadow_map_view = Some(new_view);
+        self.shadow_map_view = Some(new_layered_view);
+        self.shadow_layer_views = new_layer_views;
         self.shadow_allocation = Some(new_allocation);
 
-        // Update the shadow descriptor set to point at the new view.
+        // Recreate cascade framebuffers from the new layer views.
+        if let Some(rp) = self.shadow_rp {
+            let mut new_fbs = Vec::with_capacity(self.shadow_layer_views.len());
+            for &lv in &self.shadow_layer_views {
+                // SAFETY: device is valid; framebuffer info references valid
+                // render pass and layer image view.
+                let fb = unsafe {
+                    self.logical_device.device.create_framebuffer(
+                        &vk::FramebufferCreateInfo::default()
+                            .render_pass(rp)
+                            .attachments(&[lv])
+                            .width(2048)
+                            .height(2048)
+                            .layers(1),
+                        None,
+                    )
+                }
+                .ok()?;
+                new_fbs.push(fb);
+            }
+            self.shadow_fbs = new_fbs;
+        }
+
+        // Update the shadow descriptor set to point at the new layered view.
         if let (Some(ds), Some(sampler)) = (self.shadow_desc_set, self.shadow_sampler) {
             let image_info = [vk::DescriptorImageInfo::default()
                 .sampler(sampler)
-                .image_view(new_view)
+                .image_view(self.shadow_map_view.unwrap_or(vk::ImageView::null()))
                 .image_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)];
             let writes = [vk::WriteDescriptorSet::default()
                 .dst_set(ds)
@@ -323,8 +359,8 @@ impl VulkanDevice {
             }
         }
 
-        if let (Some(img), Some(vw)) = (old_image, old_view) {
-            Some((img, vw, old_alloc))
+        if let (Some(img), Some(vw)) = (old_image, old_layered_view) {
+            Some((img, vw, old_layer_views, old_alloc, old_fbs))
         } else {
             None
         }

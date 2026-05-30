@@ -193,18 +193,16 @@ impl GpuReloadCoordinator {
                         // Swap the shadow map if this reload targets it.
                         match req.target {
                             ReloadTarget::ShadowMap => {
-                                let old =
-                                    device.replace_shadow_map(new_image, new_view, new_allocation);
-                                if let Some((old_img, old_vw, old_alloc)) = old {
-                                    self.retiring.push(RetiringResource {
-                                        resource: GpuResource::Texture {
-                                            old_image: old_img,
-                                            old_view: old_vw,
-                                            old_allocation: old_alloc,
-                                        },
-                                        frames_left: 2,
-                                    });
-                                }
+                                // CSM shadow maps are 3-layer depth arrays, not
+                                // single 2D color textures.  The reload system
+                                // cannot recreate the array + per-layer views,
+                                // so we destroy the new texture and keep the
+                                // existing shadow map.
+                                device.destroy_sampled_texture(new_image, new_view, new_allocation);
+                                tracing::warn!(
+                                    target: "vulkan::reload",
+                                    "shadow map reload is unsupported for CSM; keeping existing"
+                                );
                             }
                             ReloadTarget::MvpPipeline
                             | ReloadTarget::ModelPipeline
