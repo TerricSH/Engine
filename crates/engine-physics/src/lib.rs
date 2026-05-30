@@ -7,13 +7,14 @@ mod debug;
 pub mod events;
 pub mod joints;
 pub mod queries;
+mod serde;
 mod world;
 
 pub use backend::{RapierBackend, RaycastHit};
 pub use components::{BodyType, Collider, ColliderShape, PhysicsMaterial, RigidBody};
 pub use convert::{from_rapier_vec, to_rapier_vec};
 pub use debug::{ColliderDebugInfo, PhysicsDebugDraw};
-pub use events::{CollisionEvent, CollisionEventKind, PhysicsEvents};
+pub use events::{CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind};
 pub use joints::{JointDescriptor, JointHandle, JointLimits, JointMotor, JointType};
 pub use queries::{
     OverlapHitResult, OverlapQuery, QueryBatcher, QueryResults, RaycastHitResult, RaycastQuery,
@@ -36,8 +37,6 @@ use engine_scene::registry::ComponentRegistry;
 pub fn register_physics_extensions(
     component_registry: &mut ComponentRegistry,
     debug_draw_registry: Option<&mut DebugDrawRegistry>,
-    _editor_registry: Option<&mut ()>,
-    _script_registry: Option<&mut ()>,
 ) {
     use crate::{ComponentStorageDyn, SparseSet};
     use engine_scene::registry::{ComponentExtension, ComponentMeta};
@@ -50,13 +49,13 @@ pub fn register_physics_extensions(
                 display_name: "RigidBody",
                 schema_version: (0, 1, 0),
                 has_editor: true,
-                has_script_binding: false,
+                has_script_binding: true,
             },
             storage_factory: || -> Box<dyn ComponentStorageDyn> {
                 Box::new(SparseSet::<RigidBody>::new())
             },
-            serialize: None,
-            deserialize: None,
+            serialize: Some(serde::serialize_rigid_body),
+            deserialize: Some(serde::deserialize_rigid_body),
         })
         .ok();
 
@@ -68,13 +67,13 @@ pub fn register_physics_extensions(
                 display_name: "Collider",
                 schema_version: (0, 1, 0),
                 has_editor: true,
-                has_script_binding: false,
+                has_script_binding: true,
             },
             storage_factory: || -> Box<dyn ComponentStorageDyn> {
                 Box::new(SparseSet::<Collider>::new())
             },
-            serialize: None,
-            deserialize: None,
+            serialize: Some(serde::serialize_collider),
+            deserialize: Some(serde::deserialize_collider),
         })
         .ok();
 
@@ -86,13 +85,13 @@ pub fn register_physics_extensions(
                 display_name: "PhysicsMaterial",
                 schema_version: (0, 1, 0),
                 has_editor: true,
-                has_script_binding: false,
+                has_script_binding: true,
             },
             storage_factory: || -> Box<dyn ComponentStorageDyn> {
                 Box::new(SparseSet::<PhysicsMaterial>::new())
             },
-            serialize: None,
-            deserialize: None,
+            serialize: Some(serde::serialize_physics_material),
+            deserialize: Some(serde::deserialize_physics_material),
         })
         .ok();
 

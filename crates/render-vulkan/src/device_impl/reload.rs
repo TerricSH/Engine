@@ -390,12 +390,8 @@ impl VulkanDevice {
             "MVP pipeline layout not created".into(),
         ))?;
 
-        // Leak the SPIR-V so the device can store `&'static` references.
-        let vert_static: &'static [u8] = Box::leak(vert_spirv.to_vec().into_boxed_slice());
-        let frag_static: &'static [u8] = Box::leak(frag_spirv.to_vec().into_boxed_slice());
-
-        let saved_vert = self.mvp_vert_spv.replace(vert_static);
-        let saved_frag = self.mvp_frag_spv.replace(frag_static);
+        let saved_vert = self.mvp_vert_spv.replace(vert_spirv.to_vec());
+        let saved_frag = self.mvp_frag_spv.replace(frag_spirv.to_vec());
 
         // Rebuild (this reads self.mvp_vert_spv / mvp_frag_spv).
         match self.build_mvp() {
@@ -426,12 +422,8 @@ impl VulkanDevice {
             "model pipeline layout not created".into(),
         ))?;
 
-        // Leak the SPIR-V so the device can store `&'static` references.
-        let vert_static: &'static [u8] = Box::leak(vert_spirv.to_vec().into_boxed_slice());
-        let frag_static: &'static [u8] = Box::leak(frag_spirv.to_vec().into_boxed_slice());
-
-        let saved_vert = self.mvp_vert_spv.replace(vert_static);
-        let saved_frag = self.mvp_frag_spv.replace(frag_static);
+        let saved_vert = self.mvp_vert_spv.replace(vert_spirv.to_vec());
+        let saved_frag = self.mvp_frag_spv.replace(frag_spirv.to_vec());
 
         match self.build_model_pipeline() {
             Ok(()) => Ok((old_pipeline, old_layout)),

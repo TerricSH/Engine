@@ -47,12 +47,9 @@ impl VulkanDevice {
         &self,
         barrier: &CompiledBarrier,
     ) -> Option<vk::ImageMemoryBarrier<'static>> {
-        if matches!(
-            barrier.new_state,
-            ResourceState::ColorAttachmentOptimal
-                | ResourceState::DepthStencilAttachmentOptimal
-                | ResourceState::PresentSrc
-        ) {
+        // Skip transitions FROM Undefined (no layout to preserve) and
+        // PresentSrc (swapchain images managed externally).
+        if matches!(barrier.old_state, ResourceState::Undefined | ResourceState::PresentSrc) {
             return None;
         }
 

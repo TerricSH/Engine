@@ -5,7 +5,7 @@ use tracing::debug;
 use crate::backend::{RapierBackend, RaycastHit};
 use crate::components::{ColliderShape, RigidBody};
 use crate::debug::{ColliderDebugInfo, PhysicsDebugDraw};
-use crate::events::{CollisionEvent, PhysicsEvents};
+use crate::events::{CollisionEvent, PhysicsEvents, TriggerEvent};
 use crate::joints::{JointDescriptor, JointHandle};
 use crate::queries::{OverlapQuery, QueryBatcher, QueryResults, RaycastQuery, SweepQuery};
 use crate::{Collider, Entity, PhysicsMaterial, Transform};
@@ -52,6 +52,7 @@ pub struct PhysicsWorld {
     accumulator: f32,
     pending_commands: Vec<PhysicsCommand>,
     pending_events: Vec<CollisionEvent>,
+    pending_triggers: Vec<TriggerEvent>,
     debug_colliders: Arc<Mutex<Vec<ColliderDebugInfo>>>,
     /// Accumulated queries waiting for batched execution.
     query_batcher: QueryBatcher,
@@ -67,6 +68,7 @@ impl PhysicsWorld {
             accumulator: 0.0,
             pending_commands: Vec::new(),
             pending_events: Vec::new(),
+            pending_triggers: Vec::new(),
             debug_colliders: Arc::new(Mutex::new(Vec::new())),
             query_batcher: QueryBatcher::new(),
         }
@@ -164,9 +166,10 @@ impl PhysicsWorld {
         while self.accumulator >= self.fixed_timestep && steps_taken < max_steps {
             self.backend.integration.dt = self.fixed_timestep;
 
-            // Run one physics step and capture events.
+            // Run one physics step and capture both collision and trigger events.
             let events = self.backend.step();
-            self.pending_events.extend(events);
+            self.pending_events.extend(events.collisions);
+            self.pending_triggers.extend(events.triggers);
 
             self.accumulator -= self.fixed_timestep;
             steps_taken += 1;
@@ -311,16 +314,22 @@ impl PhysicsWorld {
 
     // ── Collision events ────────────────────────────────────────────────
 
-    /// Drain all collision events that were collected during the last step.
+    /// Drain all events (collisions + triggers) collected during the last step.
     pub fn drain_events(&mut self) -> PhysicsEvents {
         PhysicsEvents {
-            events: std::mem::take(&mut self.pending_events),
+            collisions: std::mem::take(&mut self.pending_events),
+            triggers: std::mem::take(&mut self.pending_triggers),
         }
     }
 
     /// Read (without draining) the pending collision events.
     pub fn pending_events(&self) -> &[CollisionEvent] {
         &self.pending_events
+    }
+
+    /// Read (without draining) the pending trigger events.
+    pub fn pending_triggers(&self) -> &[TriggerEvent] {
+        &self.pending_triggers
     }
 
     // ── Queries ─────────────────────────────────────────────────────────

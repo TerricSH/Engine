@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crossbeam_channel::Sender;
 use rapier3d::na;
@@ -6,7 +6,7 @@ use rapier3d::prelude::*;
 
 use crate::components::{BodyType, Collider, ColliderShape, RigidBody};
 use crate::convert::{from_rapier_isometry, from_rapier_vec, to_rapier_isometry, to_rapier_vec};
-use crate::events::{CollisionEvent, CollisionEventKind};
+use crate::events::{CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind};
 use crate::joints::{JointDescriptor, JointHandle, JointType};
 use crate::queries::{
     OverlapHitResult, QueryBatcher, QueryResults, RaycastHitResult, SweepHitResult,
@@ -50,7 +50,7 @@ pub(crate) fn to_rapier_shared_shape(shape: &ColliderShape) -> SharedShape {
 
 // ── Internal event handler ──────────────────────────────────────────────────
 
-/// Internal event data sent over the channel during physics step.
+/// Internal data for a collision (non-trigger) event.
 #[derive(Debug, Clone)]
 struct RawContactEvent {
     collider1: ColliderHandle,
@@ -58,23 +58,54 @@ struct RawContactEvent {
     started: bool,
 }
 
+/// Internal data for a trigger / sensor intersection event.
+#[derive(Debug, Clone)]
+struct RawIntersectionEvent {
+    collider1: ColliderHandle,
+    collider2: ColliderHandle,
+    intersecting: bool,
+}
+
 struct BackendEventHandler {
-    tx: Sender<RawContactEvent>,
+    tx_col: Sender<RawContactEvent>,
+    tx_int: Sender<RawIntersectionEvent>,
 }
 
 impl EventHandler for BackendEventHandler {
     fn handle_collision_event(
         &self,
         _bodies: &RigidBodySet,
-        _colliders: &ColliderSet,
+        colliders: &ColliderSet,
         event: rapier3d::geometry::CollisionEvent,
         _contact_pair: Option<&ContactPair>,
     ) {
-        let _ = self.tx.send(RawContactEvent {
-            collider1: event.collider1(),
-            collider2: event.collider2(),
-            started: event.started(),
-        });
+        let c1 = event.collider1();
+        let c2 = event.collider2();
+
+        // Route sensor (trigger) events through the intersection channel;
+        // regular collisions go through the collision channel.
+        let is_sensor = colliders
+            .get(c1)
+            .map(|c| c.is_sensor())
+            .unwrap_or(false)
+            || colliders
+                .get(c2)
+                .map(|c| c.is_sensor())
+                .unwrap_or(false);
+
+        if is_sensor {
+            let _ = self.tx_int.send(RawIntersectionEvent {
+                collider1: c1,
+                collider2: c2,
+                intersecting: event.started(),
+            });
+        } else {
+            let _ = self.tx_col.send(RawContactEvent {
+                collider1: c1,
+                collider2: c2,
+                started: event.started(),
+            });
+        }
     }
 
     fn handle_contact_force_event(
@@ -121,6 +152,11 @@ pub struct RapierBackend {
     pub(crate) joint_handle_lookup: HashMap<u32, ImpulseJointHandle>,
     /// Auto-incrementing counter for JointHandle IDs.
     next_joint_id: u32,
+
+    /// Active sensor (trigger) overlaps from the previous frame.
+    /// Used to derive Entered vs Stay [`TriggerEvent`]s.
+    /// Keys are sorted `(entity_index, entity_index)` — smaller index first.
+    active_sensor_overlaps: HashSet<(u32, u32)>,
 }
 
 impl RapierBackend {
@@ -144,16 +180,20 @@ impl RapierBackend {
             joint_entity_map: HashMap::new(),
             joint_handle_lookup: HashMap::new(),
             next_joint_id: 0,
+            active_sensor_overlaps: HashSet::new(),
         }
     }
 
-    /// Advance the simulation by one fixed timestep and return collision events.
-    pub fn step(&mut self) -> Vec<CollisionEvent> {
-        // Drain stale events.
-        // (No stale events in our design since we create a new channel each step.)
-
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handler = BackendEventHandler { tx };
+    /// Advance the simulation by one fixed timestep.
+    ///
+    /// Returns both collision (contact) events and trigger (sensor) events.
+    pub fn step(&mut self) -> PhysicsEvents {
+        let (tx_col, rx_col) = crossbeam_channel::unbounded();
+        let (tx_int, rx_int) = crossbeam_channel::unbounded();
+        let handler = BackendEventHandler {
+            tx_col,
+            tx_int,
+        };
 
         self.pipeline.step(
             &self.gravity,
@@ -171,39 +211,76 @@ impl RapierBackend {
             &handler,
         );
 
-        // Build reverse collider map for event resolution.
+        // ── Build reverse collider → entity map ──────────────────────────
         let mut collider_to_entity = HashMap::new();
         for (&entity_idx, &(ch, _)) in &self.collider_map {
             collider_to_entity.insert(ch, entity_idx);
         }
 
-        let mut events = Vec::new();
-        while let Ok(raw) = rx.try_recv() {
+        // ── Resolve collider handle → entity helper ──────────────────────
+        let resolve = |handle: ColliderHandle| -> Option<Entity> {
+            collider_to_entity.get(&handle).copied().map(|i| Entity::new(i, 0))
+        };
+
+        // ── 1. Collect collision (non-trigger) events ─────────────────────
+        let mut collisions = Vec::new();
+        while let Ok(raw) = rx_col.try_recv() {
             let kind = if raw.started {
                 CollisionEventKind::ContactStarted
             } else {
                 CollisionEventKind::ContactStopped
             };
-
-            let entity_a = collider_to_entity
-                .get(&raw.collider1)
-                .copied()
-                .map(|i| Entity::new(i, 0));
-            let entity_b = collider_to_entity
-                .get(&raw.collider2)
-                .copied()
-                .map(|i| Entity::new(i, 0));
-
-            if let (Some(a), Some(b)) = (entity_a, entity_b) {
-                events.push(CollisionEvent {
-                    kind,
-                    entity_a: a,
-                    entity_b: b,
-                });
+            if let (Some(a), Some(b)) = (resolve(raw.collider1), resolve(raw.collider2)) {
+                collisions.push(CollisionEvent { kind, entity_a: a, entity_b: b });
             }
         }
 
-        events
+        // ── 2. Collect intersection (sensor/trigger) events ───────────────
+        let mut triggers = Vec::new();
+        let mut current_overlaps: HashSet<(u32, u32)> = HashSet::new();
+
+        // Helper: build a canonical entity-index key.
+        let entity_key = |c1: ColliderHandle, c2: ColliderHandle| -> Option<(u32, u32)> {
+            let ea = resolve(c1)?.index();
+            let eb = resolve(c2)?.index();
+            Some(if ea < eb { (ea, eb) } else { (eb, ea) })
+        };
+
+        while let Ok(raw) = rx_int.try_recv() {
+            if raw.intersecting {
+                let key = match entity_key(raw.collider1, raw.collider2) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let kind = if self.active_sensor_overlaps.contains(&key) {
+                    TriggerEventKind::Stay
+                } else {
+                    TriggerEventKind::Entered
+                };
+                if let (Some(a), Some(b)) = (resolve(raw.collider1), resolve(raw.collider2)) {
+                    triggers.push(TriggerEvent { kind, entity_a: a, entity_b: b });
+                }
+                current_overlaps.insert(key);
+            } else {
+                let key = match entity_key(raw.collider1, raw.collider2) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                if self.active_sensor_overlaps.contains(&key) {
+                    if let (Some(a), Some(b)) = (resolve(raw.collider1), resolve(raw.collider2)) {
+                        triggers.push(TriggerEvent {
+                            kind: TriggerEventKind::Exited,
+                            entity_a: a,
+                            entity_b: b,
+                        });
+                    }
+                }
+            }
+        }
+
+        self.active_sensor_overlaps = current_overlaps;
+
+        PhysicsEvents { collisions, triggers }
     }
 
     // ── Body management ─────────────────────────────────────────────────
@@ -275,6 +352,7 @@ impl RapierBackend {
             .restitution(restitution)
             .sensor(collider.is_trigger)
             .collision_groups(groups)
+            .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
 
         let collider_handle =

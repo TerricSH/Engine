@@ -155,6 +155,7 @@ impl render_core::Device for VulkanDevice {
         // placeholder.  This establishes the storage pipeline.
         let spv = self
             .mvp_vert_spv
+            .as_deref()
             .ok_or_else(|| render_core::RhiError::Backend {
                 detail: "create_shader_module: no embedded shaders available".into(),
             })?;
@@ -440,11 +441,11 @@ impl render_core::Device for VulkanDevice {
         let (sr, destroy_temp_modules) = if desc.shader_modules.is_empty() {
             // Fallback: use mvp_vert_spv / mvp_frag_spv (or skinned vert)
             let vert = if is_skinned {
-                self.skinned_vert_spv.or(self.mvp_vert_spv)
+                self.skinned_vert_spv.as_deref().or(self.mvp_vert_spv.as_deref())
             } else {
-                self.mvp_vert_spv
+                self.mvp_vert_spv.as_deref()
             };
-            let frag = self.mvp_frag_spv;
+            let frag = self.mvp_frag_spv.as_deref();
             let (vs, fs) = (
                 vert.ok_or_else(|| render_core::RhiError::Backend {
                     detail: "no vert spv".into(),

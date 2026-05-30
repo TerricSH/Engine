@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::component::ComponentStorageDyn;
+use crate::registry::ComponentRegistry;
 use crate::scene::SceneSettings;
 use crate::{Component, Entity, EntityManager, SparseSet};
 
@@ -20,6 +21,8 @@ pub struct World {
     pub(crate) scene_settings: SceneSettings,
     pub(crate) scene_id: String,
     pub(crate) scene_name: String,
+    /// Optional registry for serialize/deserialize hooks of external components.
+    pub(crate) component_registry: Option<ComponentRegistry>,
 }
 
 impl World {
@@ -32,7 +35,14 @@ impl World {
             scene_settings: SceneSettings::default(),
             scene_id: "ecs-world".to_string(),
             scene_name: "ECS World".to_string(),
+            component_registry: None,
         }
+    }
+
+    /// Attach a [`ComponentRegistry`] to enable serialization of registered
+    /// component types (e.g. physics) through their extension hooks.
+    pub fn set_component_registry(&mut self, registry: ComponentRegistry) {
+        self.component_registry = Some(registry);
     }
 
     // ── Entity management ─────────────────────────────────────────────

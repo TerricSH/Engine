@@ -140,9 +140,11 @@ impl VulkanDevice {
             .ok_or(VulkanError::Loader("no HDR texture".into()))?;
         let vert = self
             .mvp_vert_spv
+            .clone()
             .ok_or(VulkanError::MissingShader("hdr_forward.vert"))?;
         let frag = self
             .mvp_frag_spv
+            .clone()
             .ok_or(VulkanError::MissingShader("hdr_forward.frag"))?;
 
         // ---- Render pass: color(RGBA16F) + depth(D32) ----
@@ -219,8 +221,8 @@ impl VulkanDevice {
 
         // ---- Shader modules ----
         // SAFETY: `d` is a valid AshDevice; `vert`/`frag` are valid SPIR-V.
-        let vm = unsafe { mk_sm(&d, vert)? };
-        let fm = unsafe { mk_sm(&d, frag)? };
+        let vm = unsafe { mk_sm(&d, &vert)? };
+        let fm = unsafe { mk_sm(&d, &frag)? };
 
         // ---- Graphics pipeline ----
         let stride = 32u32;

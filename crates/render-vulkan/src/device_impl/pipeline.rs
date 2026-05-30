@@ -73,9 +73,11 @@ impl VulkanDevice {
     pub(crate) fn build_mvp(&mut self) -> VkResult<()> {
         let vert = self
             .mvp_vert_spv
+            .clone()
             .ok_or(VulkanError::MissingShader("mvp.vert"))?;
         let frag = self
             .mvp_frag_spv
+            .clone()
             .ok_or(VulkanError::MissingShader("mvp.frag"))?;
         let sc = self
             .swapchain
@@ -85,9 +87,9 @@ impl VulkanDevice {
         let ext = self.swapchain_extent;
         let d = &self.logical_device.device;
         // SAFETY: `d` is a valid AshDevice; `vert` contains valid SPIR-V code.
-        let vm = unsafe { mk_sm(d, vert)? };
+        let vm = unsafe { mk_sm(d, &vert)? };
         // SAFETY: `d` is a valid AshDevice; `frag` contains valid SPIR-V code.
-        let fm = unsafe { mk_sm(d, frag)? };
+        let fm = unsafe { mk_sm(d, &frag)? };
         let at = vk::AttachmentDescription::default()
             .format(fmt)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -209,9 +211,11 @@ impl VulkanDevice {
     pub(crate) fn build_model_pipeline(&mut self) -> VkResult<()> {
         let vert = self
             .mvp_vert_spv
+            .clone()
             .ok_or(VulkanError::MissingShader("model.vert"))?;
         let frag = self
             .mvp_frag_spv
+            .clone()
             .ok_or(VulkanError::MissingShader("model.frag"))?;
         let sc = self
             .swapchain
@@ -221,9 +225,9 @@ impl VulkanDevice {
         let ext = self.swapchain_extent;
         let d = &self.logical_device.device;
         // SAFETY: `d` is a valid AshDevice; `vert` contains valid SPIR-V code.
-        let vm = unsafe { mk_sm(d, vert)? };
+        let vm = unsafe { mk_sm(d, &vert)? };
         // SAFETY: `d` is a valid AshDevice; `frag` contains valid SPIR-V code.
-        let fm = unsafe { mk_sm(d, frag)? };
+        let fm = unsafe { mk_sm(d, &frag)? };
 
         // --- Pipeline layout: set=0 (UBO) + set=1 (shadow) + set=2 (material) ---
         let mut set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();

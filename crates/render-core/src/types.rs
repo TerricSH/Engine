@@ -367,3 +367,20 @@ pub struct DepthState {
 pub struct BlendState {
     pub mode: Option<String>,
 }
+
+// ── Specialization constants for pipeline variants (Phase C) ──────────────
+
+/// Value of a single specialization constant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SpecValue {
+    Bool(bool),
+    U32(u32),
+    F32(f32),
+}
+
+/// A single specialization constant entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpecConstant {
+    pub id: u32,
+    pub value: SpecValue,
+}

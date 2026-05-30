@@ -81,13 +81,10 @@ impl ShaderWatcher {
         )
         .map_err(|e| format!("failed to create file watcher: {e}"))?;
 
-        Ok((
-            Self {
-                _watcher: watcher,
-                receiver: debounce_rx,
-            },
-            debounce_rx,
-        ))
+        Ok(Self {
+            _watcher: watcher,
+            receiver: debounce_rx,
+        })
     }
 
     /// Watch a directory recursively for shader-source changes.

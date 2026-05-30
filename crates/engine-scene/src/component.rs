@@ -182,6 +182,16 @@ pub trait ComponentStorageDyn: Send {
 
     /// Downcast to `&mut dyn std::any::Any` for typed access.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// Borrow a component as `&dyn Any` by entity.
+    fn get_any(&self, entity: Entity) -> Option<&dyn std::any::Any>;
+
+    /// Iterate all `(Entity, &dyn Any)` component references.
+    fn iter_any(&self) -> Vec<(Entity, &dyn std::any::Any)>;
+
+    /// Insert a boxed (type-erased) component.
+    fn insert_any(&mut self, entity: Entity, component: Box<dyn std::any::Any>)
+        -> Result<(), Box<dyn std::any::Any>>;
 }
 
 impl<T: Component> ComponentStorageDyn for SparseSet<T> {
@@ -211,6 +221,29 @@ impl<T: Component> ComponentStorageDyn for SparseSet<T> {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn get_any(&self, entity: Entity) -> Option<&dyn std::any::Any> {
+        self.get(entity).map(|c| c as &dyn std::any::Any)
+    }
+
+    fn iter_any(&self) -> Vec<(Entity, &dyn std::any::Any)> {
+        self.dense
+            .iter()
+            .map(|(idx, comp)| (Entity::new(*idx, 0), comp as &dyn std::any::Any))
+            .collect()
+    }
+
+    fn insert_any(&mut self, entity: Entity, component: Box<dyn std::any::Any>)
+        -> Result<(), Box<dyn std::any::Any>>
+    {
+        match component.downcast::<T>() {
+            Ok(c) => {
+                self.insert(entity, *c);
+                Ok(())
+            }
+            Err(c) => Err(c),
+        }
     }
 }
 
