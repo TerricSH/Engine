@@ -422,6 +422,8 @@ impl VulkanDevice {
             "model pipeline layout not created".into(),
         ))?;
 
+        // Note: model pipeline reuses the same mvp_vert_spv/mvp_frag_spv
+        // fields (both MVP and model share the embedded forward shaders).
         let saved_vert = self.mvp_vert_spv.replace(vert_spirv.to_vec());
         let saved_frag = self.mvp_frag_spv.replace(frag_spirv.to_vec());
 

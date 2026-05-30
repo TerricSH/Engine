@@ -396,6 +396,7 @@ fn run_static_lit_scene() {
                 polygon_mode: Some("fill".into()),
                 sample_count: Some(1),
                 render_pass: None,
+                specialization: Vec::new(),
             };
             let pl = self.device.create_pipeline(&pl_desc).map_err(|e| {
                 vec![Diagnostic::new(

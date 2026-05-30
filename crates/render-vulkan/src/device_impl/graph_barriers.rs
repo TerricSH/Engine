@@ -30,6 +30,8 @@ impl VulkanDevice {
         let d = &self.logical_device.device;
         let cmd = self.frame_sync[fi].command_buffer;
 
+        // SAFETY: command buffer is in recording state; barriers reference
+        // valid images with the declared stage/access masks; device is alive.
         unsafe {
             d.cmd_pipeline_barrier(
                 cmd,
