@@ -65,13 +65,13 @@ impl<T: Component> SparseSet<T> {
 
         if (dense_idx as usize) != last {
             // Swap-remove: pop the last entry and move it into the vacated slot.
-            let last_entry = self.dense.pop().unwrap();
+            let last_entry = self.dense.pop()?;
             // Update sparse entry for the moved entity.
             self.sparse[last_entry.0 as usize] = Some(dense_idx);
             let old_entry = std::mem::replace(&mut self.dense[dense_idx as usize], last_entry);
             Some(old_entry.1)
         } else {
-            let entry = self.dense.pop().unwrap();
+            let entry = self.dense.pop()?;
             Some(entry.1)
         }
     }

@@ -149,6 +149,9 @@ pub unsafe extern "C" fn ffi_async_http_get(
     }
 
     // Fallback: basic thread with simulated delay.
+    // SAFETY: `url` was not null-checked here, but the caller (ffi_async_http_get)
+    // guards against null before reaching this point. The caller guarantees a
+    // valid NUL-terminated C string for the duration of this FFI call.
     let c_str = unsafe { std::ffi::CStr::from_ptr(url) };
     let url_str = match c_str.to_str() {
         Ok(s) => s.to_string(),

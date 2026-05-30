@@ -37,25 +37,7 @@ pub struct AudioSource {
 }
 
 impl AudioSource {
-    /// Create a new `AudioSource` bound to the given engine.
-    pub(crate) fn _new(
-        clip: Arc<AudioClip>,
-        cmd_tx: crossbeam_channel::Sender<AudioCommand>,
-        id: u64,
-        finished: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            clip,
-            cmd_tx,
-            id,
-            volume: 1.0,
-            loop_enabled: false,
-            playing: false,
-            paused: false,
-            position_secs: 0.0,
-            finished,
-        }
-    }
+    // AudioSource is created by the engine only; constructor not yet wired.
 
     /// Start or resume playback.
     pub fn play(&mut self) {

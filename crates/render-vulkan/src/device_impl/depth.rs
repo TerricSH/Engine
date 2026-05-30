@@ -87,7 +87,4 @@ impl VulkanDevice {
         }
     }
 
-    pub(crate) fn _depth_view(&self) -> Option<vk::ImageView> {
-        self.depth_image_view
-    }
 }

@@ -24,13 +24,6 @@ fn convert_texture_format(format: TextureFormat) -> (i32, u32, u32) {
     }
 }
 
-fn _convert_index_format(format: IndexFormat) -> u32 {
-    match format {
-        IndexFormat::U16 => glow::UNSIGNED_SHORT,
-        IndexFormat::U32 => glow::UNSIGNED_INT,
-    }
-}
-
 /// Returns the GL buffer target for a given usage.
 fn buffer_target(usage: BufferUsage) -> u32 {
     if usage.0 & BufferUsage::INDEX.0 != 0 {
@@ -151,6 +144,8 @@ impl Backend for OpenGlBackend {
     fn enumerate_adapters(&self) -> Result<Vec<AdapterInfo>, RhiError> {
         // OpenGL does not have physical-device enumeration like Vulkan.
         // Return a single generic adapter built from the driver string.
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the device is alive and not yet destroyed.
         let name = unsafe { self.gl.get_parameter_string(glow::RENDERER) };
         Ok(vec![AdapterInfo {
             backend: BackendKind::OpenGl,
@@ -160,9 +155,15 @@ impl Backend for OpenGlBackend {
             driver_version: None,
             capabilities: BackendCapabilities {
                 max_texture_dimension_2d: unsafe {
+                    // SAFETY: `self.gl` is a valid `glow::Context` created by
+                    // this device; `MAX_TEXTURE_SIZE` is a valid GL parameter
+                    // whose value is populated by the driver.
                     self.gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) as u32
                 },
                 max_color_attachments: unsafe {
+                    // SAFETY: `self.gl` is a valid `glow::Context` created by
+                    // this device; `MAX_COLOR_ATTACHMENTS` is a valid GL
+                    // parameter whose value is populated by the driver.
                     self.gl.get_parameter_i32(glow::MAX_COLOR_ATTACHMENTS) as u8
                 },
                 supports_swapchain: false,
@@ -266,6 +267,9 @@ impl Device for OpenGlDevice {
                 .map_err(|e| RhiError::Backend { detail: e })?
         };
         let target = buffer_target(descriptor.usage_flags);
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // `gl_buffer` was just created by the same context, and the device is
+        // not yet destroyed.
         unsafe {
             self.gl.bind_buffer(target, Some(gl_buffer));
             self.gl
@@ -292,6 +296,9 @@ impl Device for OpenGlDevice {
             .filter(|s| s.generation == buffer.generation)
             .ok_or(RhiError::InvalidHandle)?;
         let target = buffer_target(slot.value.usage);
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // `slot.value.gl_buffer` was created by the same context, the slot was
+        // validated by generation check above, and the device is not yet destroyed.
         unsafe {
             self.gl.bind_buffer(target, Some(slot.value.gl_buffer));
             self.gl
@@ -304,6 +311,9 @@ impl Device for OpenGlDevice {
         let slot = self.buffers.get(handle.index);
         if let Some(slot) = slot {
             if slot.generation == handle.generation {
+                // SAFETY: `self.gl` is a valid `glow::Context` created by this
+                // device; `slot.value.gl_buffer` was created by the same context
+                // and is not in use elsewhere (the handle generation matched).
                 unsafe { self.gl.delete_buffer(slot.value.gl_buffer) };
             }
         }
@@ -324,6 +334,9 @@ impl Device for OpenGlDevice {
         };
         let (internal_fmt, fmt, pixel_type) = convert_texture_format(descriptor.format);
 
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // `gl_texture` was just created by the same context, and the device is
+        // not yet destroyed.
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(gl_texture));
             self.gl.tex_parameter_i32(
@@ -372,6 +385,9 @@ impl Device for OpenGlDevice {
         let slot = self.textures.get(handle.index);
         if let Some(slot) = slot {
             if slot.generation == handle.generation {
+                // SAFETY: `self.gl` is a valid `glow::Context` created by this
+                // device; `slot.value.gl_texture` was created by the same context
+                // and is not in use elsewhere (the handle generation matched).
                 unsafe { self.gl.delete_texture(slot.value.gl_texture) };
             }
         }
@@ -417,12 +433,17 @@ impl Device for OpenGlDevice {
         &mut self,
         descriptor: &FramebufferDescriptor,
     ) -> Result<FramebufferHandle, RhiError> {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the device is not yet destroyed; the returned framebuffer handle is
+        // checked for errors before use.
         let gl_framebuffer = unsafe {
             self.gl
                 .create_framebuffer()
                 .map_err(|e| RhiError::Backend { detail: e })?
         };
 
+        // SAFETY: `self.gl` is a valid `glow::Context`; `gl_framebuffer` was
+        // just created by the same context, and the device is not yet destroyed.
         unsafe {
             self.gl
                 .bind_framebuffer(glow::FRAMEBUFFER, Some(gl_framebuffer));
@@ -435,6 +456,10 @@ impl Device for OpenGlDevice {
                 .get(color_handle.index)
                 .filter(|s| s.generation == color_handle.generation)
             {
+                // SAFETY: `self.gl` is a valid `glow::Context` created by this
+                // device; `gl_framebuffer` is bound and `tex_slot.value.gl_texture`
+                // was created by the same context; both handles were validated
+                // by generation checks above.
                 unsafe {
                     self.gl.framebuffer_texture_2d(
                         glow::FRAMEBUFFER,
@@ -454,6 +479,9 @@ impl Device for OpenGlDevice {
                 .get(depth_handle.index)
                 .filter(|s| s.generation == depth_handle.generation)
             {
+                // SAFETY: Same as the color-attachment case above —
+                // `self.gl` is valid, `gl_framebuffer` is bound, and
+                // `tex_slot.value.gl_texture` was validated by generation check.
                 unsafe {
                     self.gl.framebuffer_texture_2d(
                         glow::FRAMEBUFFER,
@@ -478,6 +506,9 @@ impl Device for OpenGlDevice {
         let slot = self.framebuffers.get(handle.index);
         if let Some(slot) = slot {
             if slot.generation == handle.generation {
+                // SAFETY: `self.gl` is a valid `glow::Context` created by this
+                // device; `slot.value.gl_framebuffer` was created by the same
+                // context and is not in use elsewhere (generation matched).
                 unsafe { self.gl.delete_framebuffer(slot.value.gl_framebuffer) };
             }
         }
@@ -506,6 +537,9 @@ impl Device for OpenGlDevice {
         &mut self,
         descriptor: &PipelineDescriptor,
     ) -> Result<PipelineHandle, RhiError> {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the device is not yet destroyed; the returned program handle is
+        // checked for errors before use.
         let gl_program = unsafe {
             self.gl
                 .create_program()
@@ -527,11 +561,16 @@ impl Device for OpenGlDevice {
             {
                 // Clean up and bail on invalid handle.
                 for a in &attached {
+                    // SAFETY: `self.gl` is a valid `glow::Context` created by
+                    // this device; `gl_program` and `a.shader` were created by
+                    // the same context and are still alive.
                     unsafe {
                         self.gl.detach_shader(gl_program, a.shader);
                         self.gl.delete_shader(a.shader);
                     }
                 }
+                // SAFETY: Same justification — program handle is valid and
+                // was created by this context.
                 unsafe { self.gl.delete_program(gl_program) };
                 return Err(RhiError::InvalidHandle);
             }
@@ -542,6 +581,9 @@ impl Device for OpenGlDevice {
                 glow::FRAGMENT_SHADER
             };
 
+            // SAFETY: `self.gl` is a valid `glow::Context` created by this
+            // device; the device is not yet destroyed; the returned shader
+            // handle is checked for errors before use.
             let gl_shader = unsafe {
                 self.gl
                     .create_shader(shader_type)
@@ -550,6 +592,8 @@ impl Device for OpenGlDevice {
 
             // Set empty source for now. Real source loading would look up
             // source_hash in an external cache and call shader_source() here.
+            // SAFETY: `self.gl` is valid; `gl_shader` was just created by the
+            // same context and `gl_program` is alive.
             unsafe {
                 self.gl.shader_source(gl_shader, "");
                 self.gl.compile_shader(gl_shader);
@@ -563,6 +607,9 @@ impl Device for OpenGlDevice {
             attached.push(Attached { shader: gl_shader });
         }
 
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // `gl_program` and all shader handles were created by the same context;
+        // the device is not yet destroyed.
         unsafe {
             self.gl.link_program(gl_program);
             if !self.gl.get_program_link_status(gl_program) {
@@ -591,6 +638,9 @@ impl Device for OpenGlDevice {
         let slot = self.pipelines.get(handle.index);
         if let Some(slot) = slot {
             if slot.generation == handle.generation {
+                // SAFETY: `self.gl` is a valid `glow::Context` created by this
+                // device; `slot.value.gl_program` was created by the same context
+                // and is not in use elsewhere (the handle generation matched).
                 unsafe { self.gl.delete_program(slot.value.gl_program) };
             }
         }
@@ -618,6 +668,8 @@ impl Device for OpenGlDevice {
         _encoder: Box<dyn CommandEncoder>,
         _image_index: u32,
     ) -> Result<RendererStatistics, RhiError> {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the device is alive and not yet destroyed.
         unsafe {
             self.gl.finish();
         }
@@ -634,6 +686,8 @@ impl Device for OpenGlDevice {
     }
 
     fn wait_idle(&self) {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the device is alive and not yet destroyed.
         unsafe {
             self.gl.finish();
         }

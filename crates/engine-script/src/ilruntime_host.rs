@@ -143,6 +143,8 @@ impl ScriptInstance for ILRuntimeInstance {
         if self.runtime.is_null() {
             return Err(ScriptError::HostError("ILRuntime not initialized".into()));
         }
+        // SAFETY: `self.runtime` was checked non-null above; it was allocated by
+        // the ILRuntime initializer and is only destroyed in `Drop`.
         let rt = unsafe { &*self.runtime };
 
         // Serialize args to JSON for the FFI call
@@ -193,6 +195,8 @@ impl ScriptInstance for ILRuntimeInstance {
         if self.runtime.is_null() {
             return Err(ScriptError::HostError("ILRuntime not initialized".into()));
         }
+        // SAFETY: `self.runtime` checked non-null above; allocated by ILRuntime
+        // initializer, destroyed only in `Drop`.
         let rt = unsafe { &*self.runtime };
 
         let value_json = serde_json::to_string(&value)
@@ -219,6 +223,8 @@ impl ScriptInstance for ILRuntimeInstance {
         if self.runtime.is_null() {
             return None;
         }
+        // SAFETY: `self.runtime` checked non-null above; allocated by ILRuntime
+        // initializer, destroyed only in `Drop`.
         let rt = unsafe { &*self.runtime };
 
         let mut result_buf = [0u8; 4096];

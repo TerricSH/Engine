@@ -1,3 +1,4 @@
+// Some fields are kept for future spatial-audio integration.
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};

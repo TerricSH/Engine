@@ -74,6 +74,9 @@ impl CommandEncoder for OpenGlCommandEncoder {
     ) {
         let fb = self.resolve_framebuffer(framebuffer);
 
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the framebuffer handle was created by the same context, and the
+        // encoder is dropped before the device.
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, fb);
             self.gl.clear_color(
@@ -96,6 +99,9 @@ impl CommandEncoder for OpenGlCommandEncoder {
 
     fn bind_pipeline(&mut self, pipeline: PipelineHandle) {
         if let Some(program) = self.resolve_pipeline(pipeline) {
+            // SAFETY: `self.gl` is a valid `glow::Context` created by this
+            // device; the `program` handle was created by the same context,
+            // and the encoder is dropped before the device.
             unsafe {
                 self.gl.use_program(Some(program));
             }
@@ -106,6 +112,9 @@ impl CommandEncoder for OpenGlCommandEncoder {
     fn bind_vertex_buffers(&mut self, buffers: &[BufferHandle], _offsets: &[u64]) {
         for &handle in buffers {
             if let Some(slot) = self.buffer_slot(handle) {
+                // SAFETY: `self.gl` is a valid `glow::Context` created by this
+                // device; `slot.gl_buffer` was created by the same context,
+                // and the encoder is dropped before the device.
                 unsafe {
                     self.gl
                         .bind_buffer(glow::ARRAY_BUFFER, Some(slot.gl_buffer));
@@ -121,6 +130,9 @@ impl CommandEncoder for OpenGlCommandEncoder {
         _index_format: IndexFormat,
     ) {
         if let Some(slot) = self.buffer_slot(buffer) {
+            // SAFETY: `self.gl` is a valid `glow::Context` created by this
+            // device; `slot.gl_buffer` was created by the same context,
+            // and the encoder is dropped before the device.
             unsafe {
                 self.gl
                     .bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(slot.gl_buffer));
@@ -139,12 +151,16 @@ impl CommandEncoder for OpenGlCommandEncoder {
     }
 
     fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, _min_depth: f32, _max_depth: f32) {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the encoder is dropped before the device.
         unsafe {
             self.gl.viewport(x as i32, y as i32, w as i32, h as i32);
         }
     }
 
     fn set_scissor(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the encoder is dropped before the device.
         unsafe {
             self.gl.scissor(x, y, w as i32, h as i32);
         }
@@ -157,6 +173,9 @@ impl CommandEncoder for OpenGlCommandEncoder {
         first_vertex: u32,
         _first_instance: u32,
     ) {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the encoder is dropped before the device; all bound GL state was
+        // set by this encoder in the same frame.
         unsafe {
             if instance_count > 1 {
                 self.gl.draw_arrays_instanced(
@@ -180,6 +199,9 @@ impl CommandEncoder for OpenGlCommandEncoder {
         vertex_offset: i32,
         _first_instance: u32,
     ) {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // the encoder is dropped before the device; all bound GL state was
+        // set by this encoder in the same frame.
         unsafe {
             let offset_bytes = (first_index as i32) * 4 + vertex_offset * 4;
             if instance_count > 1 {
@@ -212,6 +234,9 @@ impl CommandEncoder for OpenGlCommandEncoder {
     }
 
     fn end_render_pass(&mut self) {
+        // SAFETY: `self.gl` is a valid `glow::Context` created by this device;
+        // binding None (the default framebuffer) is always valid regardless of
+        // context state; the encoder is dropped before the device.
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
