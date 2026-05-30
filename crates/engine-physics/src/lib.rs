@@ -11,6 +11,7 @@ mod world;
 
 pub use backend::{RapierBackend, RaycastHit};
 pub use components::{BodyType, Collider, ColliderShape, PhysicsMaterial, RigidBody};
+pub use joints::{JointDescriptor, JointHandle, JointLimits, JointMotor, JointType};
 pub use convert::{from_rapier_vec, to_rapier_vec};
 pub use debug::{ColliderDebugInfo, PhysicsDebugDraw};
 pub use events::{CollisionEvent, CollisionEventKind, PhysicsEvents};

@@ -5,6 +5,7 @@ use engine_serialize::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
 use std::path::Path;
 
 pub const ECS_SCENE_CONTRACT: &str = "ECSScene-v0.1.0";
@@ -74,6 +75,19 @@ pub enum DiagnosticsPolicy {
     EditorRepair,
 }
 
+// ── Scene errors ────────────────────────────────────────────────────────────
+
+/// Errors that can occur during scene serialization.
+#[derive(Debug, Error)]
+pub enum SceneError {
+    /// I/O error (file read/write).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// RON error (serialization or deserialization).
+    #[error("RON error: {0}")]
+    Ron(#[from] ron::Error),
+}
+
 // ── Scene serialization / validation helpers ────────────────────────────────
 
 impl Scene {
@@ -81,7 +95,7 @@ impl Scene {
     ///
     /// Creates parent directories if they don't exist.  The file is written in
     /// a human-readable RON format.
-    pub fn save_to_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save_to_file(&self, path: &Path) -> Result<(), SceneError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -96,9 +110,10 @@ impl Scene {
     /// Load a scene from a RON file.
     ///
     /// Returns an error if the file cannot be read or parsed.
-    pub fn load_from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load_from_file(path: &Path) -> Result<Self, SceneError> {
         let ron_string = std::fs::read_to_string(path)?;
-        let scene: Scene = ron::de::from_str(&ron_string)?;
+        let scene: Scene = ron::de::from_str(&ron_string)
+            .map_err(|e| SceneError::Ron(e.code))?;
         Ok(scene)
     }
 

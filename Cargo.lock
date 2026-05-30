@@ -966,6 +966,7 @@ dependencies = [
  "image",
  "render-core",
  "serde",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -979,6 +980,7 @@ dependencies = [
  "indexmap",
  "ron",
  "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

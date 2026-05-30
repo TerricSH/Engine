@@ -97,6 +97,8 @@ pub unsafe extern "C" fn ffi_component_type_id(
     if name.is_null() {
         return FfiComponentTypeId::INVALID;
     }
+    // SAFETY: `name` was null-checked above; the caller guarantees a valid
+    // NUL-terminated C string that lives for the duration of this FFI call.
     let c_str = unsafe { CStr::from_ptr(name) };
     match c_str.to_str() {
         Ok(s) => lookup_component_type(s).unwrap_or(FfiComponentTypeId::INVALID),

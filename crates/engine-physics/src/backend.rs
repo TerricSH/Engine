@@ -298,7 +298,14 @@ impl RapierBackend {
             );
         }
         self.collider_map.remove(&entity_index);
+
+        // Clean up joint tracking: Rapier's bodies.remove() already removed
+        // any joints attached to this body from impulse_joints, so we clean
+        // up our own tracking maps to prevent stale handle entries.
         self.joint_entity_map.remove(&entity_index);
+        self.joint_handle_lookup.retain(|_, rapier_handle| {
+            self.impulse_joints.get(*rapier_handle).is_some()
+        });
     }
 
     // ── Joint management ────────────────────────────────────────────────
@@ -640,7 +647,10 @@ impl RapierBackend {
             let dir = if max_dist > f32::EPSILON {
                 delta / max_dist
             } else {
-                delta
+                // Zero-length sweep (from == to) — no movement, skip
+                let no_hits: Vec<SweepHitResult> = Vec::new();
+                sweep_details.push(no_hits);
+                continue;
             };
 
             let filter = QueryFilter::default().exclude_sensors();

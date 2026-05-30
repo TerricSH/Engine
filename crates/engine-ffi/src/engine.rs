@@ -4,6 +4,7 @@
 //! logging, sound, timing, etc.
 
 use std::ffi::CStr;
+use std::os::raw::c_char;
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -15,14 +16,15 @@ use std::ffi::CStr;
 ///
 /// `msg` must be a valid, null-terminated C string pointer or null.
 #[no_mangle]
-pub unsafe extern "C" fn ffi_log_info(msg: *const std::ffi::c_char) {
+pub extern "C" fn ffi_log_info(msg: *const c_char) {
     if msg.is_null() {
         return;
     }
+    // SAFETY: `msg` was null-checked; caller guarantees a valid NUL-terminated
+    // C string that lives for the duration of this FFI call.
     let c_str = unsafe { CStr::from_ptr(msg) };
-    if let Ok(s) = c_str.to_str() {
-        tracing::info!(target: "script", "{s}");
-    }
+    let message = c_str.to_string_lossy();
+    tracing::info!(target: "ffi", "{message}");
 }
 
 /// Log a warning from the scripting layer.
@@ -35,6 +37,8 @@ pub unsafe extern "C" fn ffi_log_warn(msg: *const std::ffi::c_char) {
     if msg.is_null() {
         return;
     }
+    // SAFETY: `msg` was null-checked; caller guarantees a valid NUL-terminated
+    // C string that lives for the duration of this FFI call.
     let c_str = unsafe { CStr::from_ptr(msg) };
     if let Ok(s) = c_str.to_str() {
         tracing::warn!(target: "script", "{s}");
@@ -51,6 +55,8 @@ pub unsafe extern "C" fn ffi_log_error(msg: *const std::ffi::c_char) {
     if msg.is_null() {
         return;
     }
+    // SAFETY: `msg` was null-checked; caller guarantees a valid NUL-terminated
+    // C string that lives for the duration of this FFI call.
     let c_str = unsafe { CStr::from_ptr(msg) };
     if let Ok(s) = c_str.to_str() {
         tracing::error!(target: "script", "{s}");

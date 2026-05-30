@@ -1,7 +1,9 @@
 use crate::JointTransform;
+use glam::Quat;
+use serde::{Deserialize, Serialize};
 
 /// Defines how root motion is extracted and applied.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RootMotionApplyTo {
     /// Do not apply root motion (animation-driven movement disabled for this character).
     None,
@@ -13,7 +15,7 @@ pub enum RootMotionApplyTo {
 }
 
 /// Configuration for root motion extraction.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RootMotionConfig {
     /// How root motion deltas are applied.
     pub apply_to: RootMotionApplyTo,
@@ -35,7 +37,7 @@ impl Default for RootMotionConfig {
 }
 
 /// Extracted root motion delta for one frame.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RootMotionDelta {
     /// Translation delta (in local space).
     pub translation: [f32; 3],
@@ -77,13 +79,19 @@ pub fn extract_root_motion(
         None => return RootMotionDelta::identity(),
     };
 
+    // Compute proper quaternion delta: q_prev.inverse() * q_current
+    // This gives the rotation from prev to current in prev's local space.
+    let q_prev = Quat::from_xyzw(prev.rotation[0], prev.rotation[1], prev.rotation[2], prev.rotation[3]);
+    let q_current = Quat::from_xyzw(current.rotation[0], current.rotation[1], current.rotation[2], current.rotation[3]);
+    let q_delta = q_prev.inverse() * q_current;
+
     let mut delta = RootMotionDelta {
         translation: [
             current.translation[0] - prev.translation[0],
             current.translation[1] - prev.translation[1],
             current.translation[2] - prev.translation[2],
         ],
-        rotation: current.rotation, // simplified — proper delta would invert prev
+        rotation: [q_delta.x, q_delta.y, q_delta.z, q_delta.w],
     };
 
     if config.horizontal_only {

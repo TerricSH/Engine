@@ -1,5 +1,7 @@
 //! Per-frame command pools, command buffers, semaphores, fences, and
 //! secondary command buffer support for multi-threaded recording.
+// Many items are reserved for multi-threaded/render-graph use but not yet
+// consumed by the single-threaded MVP path.
 #![allow(dead_code)]
 
 use std::sync::Mutex;
@@ -138,10 +140,6 @@ impl FrameContext {
             device,
             secondary_pool: Mutex::new(secondary_pool),
         })
-    }
-
-    pub fn _current_frame(&self) -> &Frame {
-        &self.frames[self.current]
     }
 
     pub fn advance(&mut self) {

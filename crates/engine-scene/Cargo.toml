@@ -12,6 +12,7 @@ default = []
 engine-renderer = { path = "../engine-renderer" }
 engine-serialize = { path = "../engine-serialize" }
 serde.workspace = true
+thiserror.workspace = true
 glam.workspace = true
 ron.workspace = true
 indexmap.workspace = true

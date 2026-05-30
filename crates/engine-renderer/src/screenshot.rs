@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use render_core::{Device, RhiError};
+use thiserror::Error;
 
 const _CHANNELS: usize = 4; // RGBA
 
@@ -44,33 +45,18 @@ pub fn save_framebuffer(
 }
 
 /// Errors that can occur during screenshot capture.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ScreenshotError {
     /// The device does not support framebuffer readback or encountered an error.
-    Device(RhiError),
+    #[error("device error: {0}")]
+    Device(#[from] RhiError),
     /// PNG encoding failed.
+    #[error("encode error: {0}")]
     Encode(String),
     /// File I/O failed.
+    #[error("I/O error: {0}")]
     Io(String),
 }
-
-impl From<RhiError> for ScreenshotError {
-    fn from(e: RhiError) -> Self {
-        ScreenshotError::Device(e)
-    }
-}
-
-impl std::fmt::Display for ScreenshotError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Device(e) => write!(f, "device error: {e}"),
-            Self::Encode(msg) => write!(f, "encode error: {msg}"),
-            Self::Io(msg) => write!(f, "I/O error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ScreenshotError {}
 
 #[cfg(test)]
 mod tests {
