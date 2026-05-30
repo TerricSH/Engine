@@ -3,6 +3,7 @@
 //! Contains the [`CharacterController`] struct, the [`CharacterState`] enum
 //! implementing the **State** design pattern, and the [`CharacterError`] type.
 
+use engine_scene::Component;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -197,10 +198,14 @@ pub struct CharacterController {
     /// purposes.
     pub slope_limit: f32,
 
-    // ── Internal state (private) ────────────────────────────────────────
-    state: CharacterState,
-    position: Vec3,
-    velocity: Vec3,
+    // ── Internal state (crate-visible for FFI) ──────────────────────────
+    pub(crate) state: CharacterState,
+    pub(crate) position: Vec3,
+    pub(crate) velocity: Vec3,
+}
+
+impl Component for CharacterController {
+    const TYPE_ID: &'static str = "engine.character_controller";
 }
 
 impl CharacterController {

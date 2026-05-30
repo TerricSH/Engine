@@ -9,7 +9,10 @@ license.workspace = true
 default = []
 
 [dependencies]
+engine-animation = { path = "../engine-animation" }
 engine-physics = { path = "../engine-physics" }
+engine-renderer = { path = "../engine-renderer" }
+engine-scene = { path = "../engine-scene" }
 glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true
