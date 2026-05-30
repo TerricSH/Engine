@@ -37,9 +37,7 @@ impl VulkanDevice {
             .array_layers(6)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-            )
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE);
         // SAFETY: `d` is a valid AshDevice; `image_info` describes a valid
@@ -280,8 +278,7 @@ impl VulkanDevice {
 
         // End command buffer
         // SAFETY: `cmd` is in recording state.
-        unsafe { d.end_command_buffer(cmd) }
-            .map_err(|r| VulkanError::vk("end_env_cmd_buf", r))?;
+        unsafe { d.end_command_buffer(cmd) }.map_err(|r| VulkanError::vk("end_env_cmd_buf", r))?;
 
         // Submit with a temporary fence
         let fence_info = vk::FenceCreateInfo::default();
@@ -294,10 +291,8 @@ impl VulkanDevice {
         let submit_info = [vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
         // SAFETY: `d` is a valid AshDevice; `self.logical_device.queue` is a
         // valid queue; `submit_info` and `fence` are valid.
-        unsafe {
-            d.queue_submit(self.logical_device.queue, &submit_info, fence)
-        }
-        .map_err(|r| VulkanError::vk("submit_env_upload", r))?;
+        unsafe { d.queue_submit(self.logical_device.queue, &submit_info, fence) }
+            .map_err(|r| VulkanError::vk("submit_env_upload", r))?;
 
         // Wait for completion
         // SAFETY: `d` is a valid AshDevice; `fence` was just signalled by the
@@ -328,15 +323,21 @@ impl VulkanDevice {
 
         if let Some(s) = self.env_sampler.take() {
             // SAFETY: `s` was created by this device and is still alive.
-            unsafe { d.destroy_sampler(s, None); }
+            unsafe {
+                d.destroy_sampler(s, None);
+            }
         }
         if let Some(iv) = self.env_cubemap_view.take() {
             // SAFETY: `iv` was created by this device and is still alive.
-            unsafe { d.destroy_image_view(iv, None); }
+            unsafe {
+                d.destroy_image_view(iv, None);
+            }
         }
         if let Some(img) = self.env_cubemap.take() {
             // SAFETY: `img` was created by this device and is still alive.
-            unsafe { d.destroy_image(img, None); }
+            unsafe {
+                d.destroy_image(img, None);
+            }
         }
         if let Some(mut a) = self.env_cubemap_allocation.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
@@ -352,9 +353,15 @@ impl VulkanDevice {
     /// yet created, so it is safe to call at any point after
     /// [`create_shadow_resources`].
     fn update_env_descriptor_set(&self) {
-        let Some(ds) = self.shadow_desc_set else { return };
-        let Some(sampler) = self.env_sampler else { return };
-        let Some(image_view) = self.env_cubemap_view else { return };
+        let Some(ds) = self.shadow_desc_set else {
+            return;
+        };
+        let Some(sampler) = self.env_sampler else {
+            return;
+        };
+        let Some(image_view) = self.env_cubemap_view else {
+            return;
+        };
         let d = &self.logical_device.device;
 
         let image_info = [vk::DescriptorImageInfo::default()

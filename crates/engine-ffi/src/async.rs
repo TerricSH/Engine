@@ -201,13 +201,7 @@ mod tests {
 
     #[test]
     fn queue_and_dispatch() {
-        extern "C" fn test_cb(
-            _handle: FfiAsyncHandle,
-            _data: *mut u8,
-            _len: u32,
-            _user: u64,
-        ) {
-        }
+        extern "C" fn test_cb(_handle: FfiAsyncHandle, _data: *mut u8, _len: u32, _user: u64) {}
 
         let handle = FfiAsyncHandle(42);
         queue_main_thread_callback(handle, test_cb, vec![1, 2, 3], 0);

@@ -205,4 +205,3 @@ impl EditorScene {
 
 /// Convenience alias for [`engine_serialize::PersistentId`].
 pub type PersistentId = engine_serialize::PersistentId;
-

@@ -86,5 +86,4 @@ impl VulkanDevice {
             self.logical_device.allocator().lock().unwrap().free(&mut a);
         }
     }
-
 }

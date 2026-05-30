@@ -147,13 +147,10 @@ pub fn resolve_collision(
         let available = base_avail.min(step_avail).min(mid_avail);
 
         // ── Step-up ──────────────────────────────────────────────────────
-        if available < dist
-            && controller.step_height > 0.0
-            && base_avail < dist * 0.5
-        {
+        if available < dist && controller.step_height > 0.0 && base_avail < dist * 0.5 {
             let lifted_y = final_pos.y + controller.step_height;
-            let lifted_base = cast_at_level(final_pos, bottom_y + controller.step_height)
-                .unwrap_or(dist);
+            let lifted_base =
+                cast_at_level(final_pos, bottom_y + controller.step_height).unwrap_or(dist);
             let lifted_mid = cast_at_level(final_pos, lifted_y).unwrap_or(dist);
 
             if lifted_base >= dist && lifted_mid >= dist {

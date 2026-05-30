@@ -562,9 +562,9 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use crate::World;
     use crate::components::{Camera, Name, Renderable};
     use crate::scene::sample_scene;
+    use crate::World;
     use engine_serialize::{AssetId, Value};
 
     #[test]

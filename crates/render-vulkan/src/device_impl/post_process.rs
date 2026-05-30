@@ -219,12 +219,13 @@ impl VulkanDevice {
                         .name(c"main"),
                 )
                 .layout(pll);
-            let pipe = unsafe {
-                d.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None)
-            }
-            .map_err(|(_, r)| VulkanError::vk("cgp_bloom_down", r))?;
+            let pipe =
+                unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None) }
+                    .map_err(|(_, r)| VulkanError::vk("cgp_bloom_down", r))?;
             down_pipes = pipe;
-            unsafe { d.destroy_shader_module(sm_down, None); }
+            unsafe {
+                d.destroy_shader_module(sm_down, None);
+            }
         }
 
         if !BLOOM_UPSAMPLE_COMP_SPV.is_empty() {
@@ -237,12 +238,13 @@ impl VulkanDevice {
                         .name(c"main"),
                 )
                 .layout(pll);
-            let pipe = unsafe {
-                d.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None)
-            }
-            .map_err(|(_, r)| VulkanError::vk("cgp_bloom_up", r))?;
+            let pipe =
+                unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None) }
+                    .map_err(|(_, r)| VulkanError::vk("cgp_bloom_up", r))?;
             up_pipes = pipe;
-            unsafe { d.destroy_shader_module(sm_up, None); }
+            unsafe {
+                d.destroy_shader_module(sm_up, None);
+            }
         }
 
         // ---- Store ----
@@ -323,7 +325,9 @@ impl VulkanDevice {
             Some(l) => l,
             None => return,
         };
-        let Some(ds) = self.bloom_desc_sets.first().copied() else { return };
+        let Some(ds) = self.bloom_desc_sets.first().copied() else {
+            return;
+        };
         let sampler = match self.bloom_sampler {
             Some(s) => s,
             None => return,
@@ -337,30 +341,31 @@ impl VulkanDevice {
         }
 
         // ---- Helper: update descriptor for a specific source→target pair ----
-        let update_bloom_ds = |ds: vk::DescriptorSet,
-                               src_view: vk::ImageView,
-                               dst_view: vk::ImageView| {
-            let src_image_info = [vk::DescriptorImageInfo::default()
-                .sampler(sampler)
-                .image_view(src_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let dst_image_info = [vk::DescriptorImageInfo::default()
-                .image_view(dst_view)
-                .image_layout(vk::ImageLayout::GENERAL)];
-            let writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(ds)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&src_image_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(ds)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(&dst_image_info),
-            ];
-            unsafe { d.update_descriptor_sets(&writes, &[]); }
-        };
+        let update_bloom_ds =
+            |ds: vk::DescriptorSet, src_view: vk::ImageView, dst_view: vk::ImageView| {
+                let src_image_info = [vk::DescriptorImageInfo::default()
+                    .sampler(sampler)
+                    .image_view(src_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let dst_image_info = [vk::DescriptorImageInfo::default()
+                    .image_view(dst_view)
+                    .image_layout(vk::ImageLayout::GENERAL)];
+                let writes = [
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&src_image_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&dst_image_info),
+                ];
+                unsafe {
+                    d.update_descriptor_sets(&writes, &[]);
+                }
+            };
 
         // ---- Downsample chain ----
         for level in 0..mip_count.saturating_sub(1) {
@@ -374,34 +379,22 @@ impl VulkanDevice {
             }
 
             // Update DS: read level N as sampled, write level N+1 as storage
-            update_bloom_ds(ds, self.bloom_image_views[level as usize], self.bloom_image_views[level as usize + 1]);
+            update_bloom_ds(
+                ds,
+                self.bloom_image_views[level as usize],
+                self.bloom_image_views[level as usize + 1],
+            );
 
             let img_w = (self.bloom_image_width(level) / 16).max(1);
             let img_h = (self.bloom_image_height(level) / 16).max(1);
 
             unsafe {
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
-                d.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pll,
-                    0,
-                    &[ds],
-                    &[],
-                );
+                d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pll, 0, &[ds], &[]);
                 // Push constants: (width, height, 0, 0)
                 let pc = [img_w as f32, img_h as f32, 0.0f32, 0.0f32];
-                let pc_bytes: &[u8] = std::slice::from_raw_parts(
-                    &pc as *const _ as *const u8,
-                    16,
-                );
-                d.cmd_push_constants(
-                    cmd,
-                    pll,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    pc_bytes,
-                );
+                let pc_bytes: &[u8] = std::slice::from_raw_parts(&pc as *const _ as *const u8, 16);
+                d.cmd_push_constants(cmd, pll, vk::ShaderStageFlags::COMPUTE, 0, pc_bytes);
                 d.cmd_dispatch(cmd, img_w, img_h, 1);
             }
         }
@@ -418,33 +411,21 @@ impl VulkanDevice {
             }
 
             // Update DS: read level N as sampled, write level N-1 as storage
-            update_bloom_ds(ds, self.bloom_image_views[level as usize], self.bloom_image_views[level as usize - 1]);
+            update_bloom_ds(
+                ds,
+                self.bloom_image_views[level as usize],
+                self.bloom_image_views[level as usize - 1],
+            );
 
             let img_w = (self.bloom_image_width(level - 1) / 16).max(1);
             let img_h = (self.bloom_image_height(level - 1) / 16).max(1);
 
             unsafe {
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
-                d.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    pll,
-                    0,
-                    &[ds],
-                    &[],
-                );
+                d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pll, 0, &[ds], &[]);
                 let pc = [img_w as f32, img_h as f32, BLOOM_INTENSITY, 0.0f32];
-                let pc_bytes: &[u8] = std::slice::from_raw_parts(
-                    &pc as *const _ as *const u8,
-                    16,
-                );
-                d.cmd_push_constants(
-                    cmd,
-                    pll,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    pc_bytes,
-                );
+                let pc_bytes: &[u8] = std::slice::from_raw_parts(&pc as *const _ as *const u8, 16);
+                d.cmd_push_constants(cmd, pll, vk::ShaderStageFlags::COMPUTE, 0, pc_bytes);
                 d.cmd_dispatch(cmd, img_w, img_h, 1);
             }
         }
@@ -460,7 +441,9 @@ impl VulkanDevice {
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&hdr_image_info)];
-            unsafe { d.update_descriptor_sets(&writes, &[]); }
+            unsafe {
+                d.update_descriptor_sets(&writes, &[]);
+            }
         }
     }
 
@@ -570,8 +553,14 @@ impl VulkanDevice {
                 allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
-        unsafe { d.bind_image_memory(noise_image, noise_allocation.memory(), noise_allocation.offset()) }
-            .map_err(|r| VulkanError::vk("bind_ssao_noise", r))?;
+        unsafe {
+            d.bind_image_memory(
+                noise_image,
+                noise_allocation.memory(),
+                noise_allocation.offset(),
+            )
+        }
+        .map_err(|r| VulkanError::vk("bind_ssao_noise", r))?;
 
         let noise_view_info = vk::ImageViewCreateInfo::default()
             .image(noise_image)
@@ -607,8 +596,10 @@ impl VulkanDevice {
                 allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
-        unsafe { d.bind_buffer_memory(staging_buf, staging_alloc.memory(), staging_alloc.offset()) }
-            .map_err(|r| VulkanError::vk("bind_ssao_staging", r))?;
+        unsafe {
+            d.bind_buffer_memory(staging_buf, staging_alloc.memory(), staging_alloc.offset())
+        }
+        .map_err(|r| VulkanError::vk("bind_ssao_staging", r))?;
         // Copy noise data into staging buffer
         let staging_ptr = unsafe {
             d.map_memory(
@@ -620,7 +611,11 @@ impl VulkanDevice {
         }
         .map_err(|r| VulkanError::vk("map_ssao_staging", r))?;
         unsafe {
-            std::ptr::copy_nonoverlapping(noise_pixels.as_ptr(), staging_ptr as *mut u8, noise_size);
+            std::ptr::copy_nonoverlapping(
+                noise_pixels.as_ptr(),
+                staging_ptr as *mut u8,
+                noise_size,
+            );
             d.unmap_memory(staging_alloc.memory());
         }
 
@@ -726,8 +721,7 @@ impl VulkanDevice {
 
         // Submit and wait
         let temp_cmds_slice = [temp_cmd];
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(&temp_cmds_slice);
+        let submit_info = vk::SubmitInfo::default().command_buffers(&temp_cmds_slice);
         unsafe {
             d.queue_submit(self.logical_device.queue, &[submit_info], vk::Fence::null())
                 .map_err(|r| VulkanError::vk("submit_ssao_temp", r))?;
@@ -864,7 +858,9 @@ impl VulkanDevice {
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&out_image_info),
         ];
-        unsafe { d.update_descriptor_sets(&writes, &[]); }
+        unsafe {
+            d.update_descriptor_sets(&writes, &[]);
+        }
 
         // ---- 6. Pipeline layout (push constants: kernel params) ----
         let pc_range = [vk::PushConstantRange {
@@ -890,12 +886,13 @@ impl VulkanDevice {
                         .name(c"main"),
                 )
                 .layout(pll);
-            let pipes = unsafe {
-                d.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None)
-            }
-            .map_err(|(_, r)| VulkanError::vk("cgp_ssao", r))?;
+            let pipes =
+                unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None) }
+                    .map_err(|(_, r)| VulkanError::vk("cgp_ssao", r))?;
             self.ssao_pipeline = Some(pipes[0]);
-            unsafe { d.destroy_shader_module(sm, None); }
+            unsafe {
+                d.destroy_shader_module(sm, None);
+            }
         }
 
         // ---- Store ----
@@ -917,8 +914,12 @@ impl VulkanDevice {
     /// Update the SSAO descriptor set with the current depth image view.
     pub(crate) fn update_ssao_depth_descriptor(&mut self) {
         let Some(ds) = self.ssao_desc_set else { return };
-        let Some(sampler) = self.ssao_depth_sampler else { return };
-        let Some(depth_view) = self.depth_image_view else { return };
+        let Some(sampler) = self.ssao_depth_sampler else {
+            return;
+        };
+        let Some(depth_view) = self.depth_image_view else {
+            return;
+        };
         let d = &self.logical_device.device;
 
         let depth_image_info = [vk::DescriptorImageInfo::default()
@@ -930,12 +931,16 @@ impl VulkanDevice {
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&depth_image_info)];
-        unsafe { d.update_descriptor_sets(&writes, &[]); }
+        unsafe {
+            d.update_descriptor_sets(&writes, &[]);
+        }
     }
 
     /// Transition SSAO output to GENERAL layout for compute write access.
     pub(crate) fn barrier_ssao_output_for_compute(&self, fi: usize) {
-        let Some(img) = self.ssao_output_image else { return };
+        let Some(img) = self.ssao_output_image else {
+            return;
+        };
         let cmd = self.frame_sync[fi].command_buffer;
         let d = &self.logical_device.device;
 
@@ -967,7 +972,9 @@ impl VulkanDevice {
 
     /// Transition SSAO output back to SHADER_READ_ONLY_OPTIMAL after compute.
     pub(crate) fn barrier_ssao_output_for_read(&self, fi: usize) {
-        let Some(img) = self.ssao_output_image else { return };
+        let Some(img) = self.ssao_output_image else {
+            return;
+        };
         let cmd = self.frame_sync[fi].command_buffer;
         let d = &self.logical_device.device;
 
@@ -1006,28 +1013,44 @@ impl VulkanDevice {
 
         // ── Bloom ──────────────────────────────────────────────────────
         for pipe in self.bloom_downsample_pipelines.drain(..) {
-            unsafe { d.destroy_pipeline(pipe, None); }
+            unsafe {
+                d.destroy_pipeline(pipe, None);
+            }
         }
         for pipe in self.bloom_upsample_pipelines.drain(..) {
-            unsafe { d.destroy_pipeline(pipe, None); }
+            unsafe {
+                d.destroy_pipeline(pipe, None);
+            }
         }
         if let Some(l) = self.bloom_pipeline_layout.take() {
-            unsafe { d.destroy_pipeline_layout(l, None); }
+            unsafe {
+                d.destroy_pipeline_layout(l, None);
+            }
         }
         if let Some(pool) = self.bloom_desc_pool.take() {
-            unsafe { d.destroy_descriptor_pool(pool, None); }
+            unsafe {
+                d.destroy_descriptor_pool(pool, None);
+            }
         }
         if let Some(layout) = self.bloom_desc_layout.take() {
-            unsafe { d.destroy_descriptor_set_layout(layout, None); }
+            unsafe {
+                d.destroy_descriptor_set_layout(layout, None);
+            }
         }
         if let Some(s) = self.bloom_sampler.take() {
-            unsafe { d.destroy_sampler(s, None); }
+            unsafe {
+                d.destroy_sampler(s, None);
+            }
         }
         for iv in self.bloom_image_views.drain(..) {
-            unsafe { d.destroy_image_view(iv, None); }
+            unsafe {
+                d.destroy_image_view(iv, None);
+            }
         }
         for img in self.bloom_images.drain(..) {
-            unsafe { d.destroy_image(img, None); }
+            unsafe {
+                d.destroy_image(img, None);
+            }
         }
         for mut a in self.bloom_allocations.drain(..) {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
@@ -1037,25 +1060,39 @@ impl VulkanDevice {
 
         // ── SSAO ───────────────────────────────────────────────────────
         if let Some(p) = self.ssao_pipeline.take() {
-            unsafe { d.destroy_pipeline(p, None); }
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
         }
         if let Some(l) = self.ssao_pipeline_layout.take() {
-            unsafe { d.destroy_pipeline_layout(l, None); }
+            unsafe {
+                d.destroy_pipeline_layout(l, None);
+            }
         }
         if let Some(pool) = self.ssao_desc_pool.take() {
-            unsafe { d.destroy_descriptor_pool(pool, None); }
+            unsafe {
+                d.destroy_descriptor_pool(pool, None);
+            }
         }
         if let Some(layout) = self.ssao_desc_layout.take() {
-            unsafe { d.destroy_descriptor_set_layout(layout, None); }
+            unsafe {
+                d.destroy_descriptor_set_layout(layout, None);
+            }
         }
         if let Some(s) = self.ssao_depth_sampler.take() {
-            unsafe { d.destroy_sampler(s, None); }
+            unsafe {
+                d.destroy_sampler(s, None);
+            }
         }
         if let Some(iv) = self.ssao_noise_view.take() {
-            unsafe { d.destroy_image_view(iv, None); }
+            unsafe {
+                d.destroy_image_view(iv, None);
+            }
         }
         if let Some(img) = self.ssao_noise_image.take() {
-            unsafe { d.destroy_image(img, None); }
+            unsafe {
+                d.destroy_image(img, None);
+            }
         }
         if let Some(mut a) = self.ssao_noise_allocation.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
@@ -1063,10 +1100,14 @@ impl VulkanDevice {
             }
         }
         if let Some(iv) = self.ssao_output_view.take() {
-            unsafe { d.destroy_image_view(iv, None); }
+            unsafe {
+                d.destroy_image_view(iv, None);
+            }
         }
         if let Some(img) = self.ssao_output_image.take() {
-            unsafe { d.destroy_image(img, None); }
+            unsafe {
+                d.destroy_image(img, None);
+            }
         }
         if let Some(mut a) = self.ssao_output_allocation.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
@@ -1080,8 +1121,12 @@ impl VulkanDevice {
     /// Reads depth buffer, writes occlusion factor to the R8 output texture.
     /// No-op when the SSAO pipeline hasn't been initialized.
     pub(crate) fn dispatch_ssao(&self, fi: usize) {
-        let Some(pipe) = self.ssao_pipeline else { return };
-        let Some(pll) = self.ssao_pipeline_layout else { return };
+        let Some(pipe) = self.ssao_pipeline else {
+            return;
+        };
+        let Some(pll) = self.ssao_pipeline_layout else {
+            return;
+        };
         let Some(ds) = self.ssao_desc_set else { return };
         let cmd = self.frame_sync[fi].command_buffer;
         let d = &self.logical_device.device;
@@ -1094,20 +1139,10 @@ impl VulkanDevice {
 
         unsafe {
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
-            d.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                pll,
-                0,
-                &[ds],
-                &[],
-            );
+            d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pll, 0, &[ds], &[]);
             // Push constants: (radius, power, kernel_size, pad)
             let pc = [SSAO_RADIUS, SSAO_POWER, SSAO_KERNEL_SIZE as f32, 0.0];
-            let pc_bytes: &[u8] = std::slice::from_raw_parts(
-                &pc as *const _ as *const u8,
-                16,
-            );
+            let pc_bytes: &[u8] = std::slice::from_raw_parts(&pc as *const _ as *const u8, 16);
             d.cmd_push_constants(cmd, pll, vk::ShaderStageFlags::COMPUTE, 0, pc_bytes);
             d.cmd_dispatch(cmd, gw, gh, 1);
         }
@@ -1132,7 +1167,7 @@ fn generate_ssao_noise() -> Vec<u8> {
         let x = next_f32() * 2.0 - 1.0;
         let y = next_f32() * 2.0 - 1.0;
         let z = next_f32(); // [0, 1) → always positive hemisphere
-        // Normalise
+                            // Normalise
         let len = (x * x + y * y + z * z).sqrt();
         let nx = (x / len * 0.5 + 0.5).clamp(0.0, 1.0);
         let ny = (y / len * 0.5 + 0.5).clamp(0.0, 1.0);

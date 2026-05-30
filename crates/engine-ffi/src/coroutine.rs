@@ -94,7 +94,10 @@ mod tests {
 
     #[test]
     fn yield_instruction_names() {
-        assert_eq!(yield_instruction_name(&FfiYieldInstruction::NextFrame), "NextFrame");
+        assert_eq!(
+            yield_instruction_name(&FfiYieldInstruction::NextFrame),
+            "NextFrame"
+        );
         assert_eq!(
             yield_instruction_name(&FfiYieldInstruction::WaitForSeconds(1.0)),
             "WaitForSeconds"

@@ -45,11 +45,18 @@ pub struct FfiRegistry {
 
     // ── Component access ────────────────────────────────────────────────
     /// Read a component's raw data as a byte slice.
-    pub component_get_ptr:
-        extern "C" fn(entity: FfiEntityId, type_id: FfiComponentTypeId, out_len: &mut u32) -> *mut u8,
+    pub component_get_ptr: extern "C" fn(
+        entity: FfiEntityId,
+        type_id: FfiComponentTypeId,
+        out_len: &mut u32,
+    ) -> *mut u8,
     /// Write component data from a byte slice.
-    pub component_set_ptr:
-        extern "C" fn(entity: FfiEntityId, type_id: FfiComponentTypeId, data: *const u8, len: u32) -> bool,
+    pub component_set_ptr: extern "C" fn(
+        entity: FfiEntityId,
+        type_id: FfiComponentTypeId,
+        data: *const u8,
+        len: u32,
+    ) -> bool,
 
     // ── Coroutines ──────────────────────────────────────────────────────
     /// Start a coroutine from an opaque enumerator pointer.
@@ -57,18 +64,26 @@ pub struct FfiRegistry {
     /// Cancel a running coroutine.
     pub coroutine_cancel: extern "C" fn(handle: FfiCoroutineHandle),
     /// Advance a coroutine and write the next yield instruction.
-    pub coroutine_move_next:
-        extern "C" fn(enumerator_ptr: *mut std::ffi::c_void, instruction_out: &mut FfiYieldInstruction) -> bool,
+    pub coroutine_move_next: extern "C" fn(
+        enumerator_ptr: *mut std::ffi::c_void,
+        instruction_out: &mut FfiYieldInstruction,
+    ) -> bool,
 
     // ── Async I/O ───────────────────────────────────────────────────────
     /// Check whether an async operation has completed.
     pub async_is_complete: extern "C" fn(handle: FfiAsyncHandle) -> bool,
     /// Begin an async image load.
-    pub async_load_image:
-        extern "C" fn(url: *const std::ffi::c_char, callback: FfiAsyncCallback, user_data: u64) -> FfiAsyncHandle,
+    pub async_load_image: extern "C" fn(
+        url: *const std::ffi::c_char,
+        callback: FfiAsyncCallback,
+        user_data: u64,
+    ) -> FfiAsyncHandle,
     /// Begin an async HTTP GET.
-    pub async_http_get:
-        extern "C" fn(url: *const std::ffi::c_char, callback: FfiAsyncCallback, user_data: u64) -> FfiAsyncHandle,
+    pub async_http_get: extern "C" fn(
+        url: *const std::ffi::c_char,
+        callback: FfiAsyncCallback,
+        user_data: u64,
+    ) -> FfiAsyncHandle,
 
     // ── Condition evaluation ────────────────────────────────────────────
     /// Evaluate a WaitUntil condition identified by `condition_id`.

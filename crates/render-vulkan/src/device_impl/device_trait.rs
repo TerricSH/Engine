@@ -800,7 +800,9 @@ impl render_core::Device for VulkanDevice {
         if subopt {
             // SAFETY: `self.logical_device` is alive by type invariant
             // (ManuallyDrop ensures destruction order).
-            unsafe { let _ = self.logical_device.device.device_wait_idle(); };
+            unsafe {
+                let _ = self.logical_device.device.device_wait_idle();
+            };
             self.swapchain = None;
         }
         self.current_frame = (fi + 1) % 2;
@@ -819,7 +821,9 @@ impl render_core::Device for VulkanDevice {
     ) -> Result<(), render_core::RhiError> {
         // SAFETY: `self.logical_device` is alive by type invariant
         // (ManuallyDrop ensures destruction order).
-        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
+        unsafe {
+            let _ = self.logical_device.device.device_wait_idle();
+        };
         self.window_width = w.max(1);
         self.window_height = h.max(1);
         self.swapchain = None;
@@ -829,7 +833,9 @@ impl render_core::Device for VulkanDevice {
     fn wait_idle(&self) {
         // SAFETY: `self.logical_device` is alive by type invariant
         // (ManuallyDrop ensures destruction order).
-        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
+        unsafe {
+            let _ = self.logical_device.device.device_wait_idle();
+        };
     }
 
     fn read_pixels(
@@ -843,7 +849,9 @@ impl render_core::Device for VulkanDevice {
         // deterministic layout (PRESENT_SRC_KHR after the last render pass).
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures destruction order).
-        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
+        unsafe {
+            let _ = self.logical_device.device.device_wait_idle();
+        };
 
         let sc = self
             .swapchain

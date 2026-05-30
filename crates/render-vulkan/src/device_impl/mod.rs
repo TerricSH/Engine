@@ -7,11 +7,11 @@ pub(crate) mod drop;
 pub(crate) mod encoder;
 pub(crate) mod env;
 pub(crate) mod frame;
+pub(crate) mod hdr;
 pub(crate) mod pipeline;
+pub(crate) mod post_process;
 pub(crate) mod reload;
 pub(crate) mod rendering;
-pub(crate) mod hdr;
-pub(crate) mod post_process;
 pub(crate) mod shadow;
 pub(crate) mod slab;
 pub(crate) mod texture;
@@ -629,7 +629,10 @@ impl VulkanDevice {
         &mut self,
         render_pass: vk::RenderPass,
     ) -> VkResult<Vec<FramebufferHandle>> {
-        let sc = self.swapchain.as_ref().ok_or(VulkanError::Loader("no swapchain".into()))?;
+        let sc = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("no swapchain".into()))?;
         let dv = self.depth_image_view.unwrap_or(vk::ImageView::null());
         let ext = self.swapchain_extent;
         let mut handles = Vec::with_capacity(sc.image_views.len());
@@ -662,7 +665,9 @@ impl VulkanDevice {
             if let Some(fb) = self.framebuffers.remove(h.index, h.generation) {
                 // SAFETY: `fb` was created by this device and is no longer
                 // referenced by any in-flight frame.
-                unsafe { d.destroy_framebuffer(fb, None); }
+                unsafe {
+                    d.destroy_framebuffer(fb, None);
+                }
             }
         }
     }
@@ -754,7 +759,11 @@ impl VulkanDevice {
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         unsafe {
-            d.bind_buffer_memory(indirect_buf, indirect_alloc.memory(), indirect_alloc.offset())
+            d.bind_buffer_memory(
+                indirect_buf,
+                indirect_alloc.memory(),
+                indirect_alloc.offset(),
+            )
         }
         .map_err(|r| VulkanError::vk("bind_indirect_draw_buffer", r))?;
 
@@ -777,10 +786,8 @@ impl VulkanDevice {
                 allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
-        unsafe {
-            d.bind_buffer_memory(cull_buf, cull_alloc.memory(), cull_alloc.offset())
-        }
-        .map_err(|r| VulkanError::vk("bind_cull_args_buffer", r))?;
+        unsafe { d.bind_buffer_memory(cull_buf, cull_alloc.memory(), cull_alloc.offset()) }
+            .map_err(|r| VulkanError::vk("bind_cull_args_buffer", r))?;
 
         self.indirect_draw_buffer = Some(indirect_buf);
         self.indirect_draw_alloc = Some(indirect_alloc);
@@ -806,7 +813,9 @@ impl VulkanDevice {
     pub(crate) fn destroy_indirect_buffers(&mut self) {
         let d = &self.logical_device.device;
         if let Some(buf) = self.indirect_draw_buffer.take() {
-            unsafe { d.destroy_buffer(buf, None); }
+            unsafe {
+                d.destroy_buffer(buf, None);
+            }
         }
         if let Some(mut a) = self.indirect_draw_alloc.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
@@ -814,7 +823,9 @@ impl VulkanDevice {
             }
         }
         if let Some(buf) = self.cull_args_buffer.take() {
-            unsafe { d.destroy_buffer(buf, None); }
+            unsafe {
+                d.destroy_buffer(buf, None);
+            }
         }
         if let Some(mut a) = self.cull_args_alloc.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
@@ -846,13 +857,17 @@ impl VulkanDevice {
         self.minimized = w == 0 || h == 0;
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures VkLogicalDevice is not dropped before VulkanDevice).
-        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
+        unsafe {
+            let _ = self.logical_device.device.device_wait_idle();
+        };
         self.destroy_mvp();
     }
     pub fn wait_idle(&self) {
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop
         // ensures VkLogicalDevice is not dropped before VulkanDevice).
-        unsafe { let _ = self.logical_device.device.device_wait_idle(); };
+        unsafe {
+            let _ = self.logical_device.device.device_wait_idle();
+        };
     }
 }
 

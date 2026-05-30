@@ -128,7 +128,9 @@ impl VulkanRenderer {
 
     pub fn wait_idle(&self) {
         // SAFETY: device handle is valid.
-        unsafe { let _ = self.device.device.device_wait_idle(); };
+        unsafe {
+            let _ = self.device.device.device_wait_idle();
+        };
     }
 
     /// Submit one frame. Returns `Ok(())` even when the frame is skipped
@@ -429,6 +431,8 @@ impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         // Wait for the GPU to drain before tearing anything down.
         // SAFETY: device handle is valid.
-        unsafe { let _ = self.device.device.device_wait_idle(); };
+        unsafe {
+            let _ = self.device.device.device_wait_idle();
+        };
     }
 }

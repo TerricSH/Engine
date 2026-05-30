@@ -146,11 +146,19 @@ pub struct CharacterCommand {
 impl CharacterCommand {
     /// Create a movement-only command.
     pub fn move_towards(direction: Vec3) -> Self {
-        Self { direction, desired_speed: 0.0, jump_requested: false }
+        Self {
+            direction,
+            desired_speed: 0.0,
+            jump_requested: false,
+        }
     }
     /// Create a jump command.
     pub fn jump() -> Self {
-        Self { direction: Vec3::ZERO, desired_speed: 0.0, jump_requested: true }
+        Self {
+            direction: Vec3::ZERO,
+            desired_speed: 0.0,
+            jump_requested: true,
+        }
     }
 }
 
@@ -230,7 +238,7 @@ pub struct CharacterController {
     /// purposes.
     pub slope_limit: f32,
 
-        // ── Command queue ────────────────────────────────────────────────────
+    // ── Command queue ────────────────────────────────────────────────────
     /// Pending movement commands (queued by input/AI/C#).
     /// Flushed each frame by [`update`](Self::update).
     #[serde(skip)]

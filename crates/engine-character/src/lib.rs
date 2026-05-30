@@ -306,7 +306,10 @@ mod tests {
 
         ctrl.update(&input, Some(&pw));
         // Gravity should produce negative vertical velocity
-        assert!(ctrl.velocity().y < 0.0, "gravity should pull character down");
+        assert!(
+            ctrl.velocity().y < 0.0,
+            "gravity should pull character down"
+        );
         // Position should drop (velocity * dt)
         assert!(ctrl.position().y < 5.0, "character should descend");
     }

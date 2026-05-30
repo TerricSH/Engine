@@ -99,7 +99,10 @@ impl AnimParams {
 
     /// Apply these parameters to an engine_animation state machine instance.
     pub fn apply_to_state_machine(&self, sm: &mut engine_animation::AnimStateMachineInstance) {
-        sm.set_param(anim_params::SPEED, engine_animation::AnimParamValue::Float(self.speed));
+        sm.set_param(
+            anim_params::SPEED,
+            engine_animation::AnimParamValue::Float(self.speed),
+        );
         sm.set_param(
             anim_params::GROUNDED,
             engine_animation::AnimParamValue::Bool(self.grounded),
@@ -130,7 +133,12 @@ impl AnimParams {
 mod tests {
     use super::*;
 
-    fn make_ctrl(_grounded: bool, vy: f32, h_speed: f32, state: CharacterState) -> CharacterController {
+    fn make_ctrl(
+        _grounded: bool,
+        vy: f32,
+        h_speed: f32,
+        state: CharacterState,
+    ) -> CharacterController {
         let mut ctrl = CharacterController::new();
         ctrl.state = state;
         ctrl.velocity = Vec3::new(h_speed, vy, 0.0);
@@ -203,10 +211,18 @@ mod tests {
 
         // Verify parameters were set
         let speed = sm.get_param("speed");
-        assert!(matches!(speed, Some(engine_animation::AnimParamValue::Float(v)) if (*v - 2.0).abs() < 1e-6));
+        assert!(
+            matches!(speed, Some(engine_animation::AnimParamValue::Float(v)) if (*v - 2.0).abs() < 1e-6)
+        );
         let grounded = sm.get_param("grounded");
-        assert!(matches!(grounded, Some(engine_animation::AnimParamValue::Bool(true))));
+        assert!(matches!(
+            grounded,
+            Some(engine_animation::AnimParamValue::Bool(true))
+        ));
         let is_moving = sm.get_param("is_moving");
-        assert!(matches!(is_moving, Some(engine_animation::AnimParamValue::Bool(true))));
+        assert!(matches!(
+            is_moving,
+            Some(engine_animation::AnimParamValue::Bool(true))
+        ));
     }
 }
