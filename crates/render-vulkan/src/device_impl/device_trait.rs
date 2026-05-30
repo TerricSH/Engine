@@ -429,10 +429,22 @@ impl render_core::Device for VulkanDevice {
         // ── Shader stages ──────────────────────────────────────────────
         // If the descriptor provides shader module handles, resolve them
         // from the shader_modules slab.  Otherwise fall back to the
-        // embedded MVP vertex/fragment SPIR-V.
+        // embedded vertex/fragment SPIR-V.  Skinned pipelines use the
+        // dedicated skinned vertex shader (detected by the presence of a
+        // uint32x4 vertex attribute, which indicates joints).
+        let is_skinned = desc
+            .vertex_layout
+            .attributes
+            .iter()
+            .any(|a| a.format == "uint32x4");
         let (sr, destroy_temp_modules) = if desc.shader_modules.is_empty() {
-            // Fallback: use mvp_vert_spv / mvp_frag_spv
-            let (vert, frag) = (self.mvp_vert_spv, self.mvp_frag_spv);
+            // Fallback: use mvp_vert_spv / mvp_frag_spv (or skinned vert)
+            let vert = if is_skinned {
+                self.skinned_vert_spv.or(self.mvp_vert_spv)
+            } else {
+                self.mvp_vert_spv
+            };
+            let frag = self.mvp_frag_spv;
             let (vs, fs) = (
                 vert.ok_or_else(|| render_core::RhiError::Backend {
                     detail: "no vert spv".into(),

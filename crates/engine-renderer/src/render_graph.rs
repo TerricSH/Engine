@@ -10,12 +10,16 @@
 use crate::{RenderFrameInput, RenderView, ViewCompose};
 
 /// The kinds of passes in the Gate 3 render graph.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// The `Custom` variant allows backend-specific pass types (e.g. bloom,
+/// SSAO) to be dispatched by name without modifying the front-end graph.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PassKind {
     DirectionalShadow,
     OpaquePbrForward,
     ToneMap,
     Present,
+    Custom(&'static str),
 }
 
 impl PassKind {
@@ -25,6 +29,7 @@ impl PassKind {
             Self::OpaquePbrForward => "opaque_pbr_forward_pass",
             Self::ToneMap => "tone_map_pass",
             Self::Present => "present",
+            Self::Custom(name) => name,
         }
     }
 }

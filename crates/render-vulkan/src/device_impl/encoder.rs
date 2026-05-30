@@ -270,6 +270,7 @@ impl CmdEncoderTrait for VkCmdEncoder {
         if self.shadow_map == vk::Image::null() {
             return;
         }
+        // Barrier covers all 3 cascade layers (CSM).
         let barrier = vk::ImageMemoryBarrier::default()
             .image(self.shadow_map)
             .subresource_range(vk::ImageSubresourceRange {
@@ -277,7 +278,7 @@ impl CmdEncoderTrait for VkCmdEncoder {
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: 1,
+                layer_count: 3,
             })
             .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)

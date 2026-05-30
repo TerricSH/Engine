@@ -11,6 +11,7 @@ pub(crate) mod pipeline;
 pub(crate) mod reload;
 pub(crate) mod rendering;
 pub(crate) mod hdr;
+pub(crate) mod post_process;
 pub(crate) mod shadow;
 pub(crate) mod slab;
 pub(crate) mod texture;
@@ -78,6 +79,7 @@ pub struct VulkanDevice {
     pub(crate) mvp_pipeline: Option<vk::Pipeline>,
     pub(crate) mvp_vert_spv: Option<&'static [u8]>,
     pub(crate) mvp_frag_spv: Option<&'static [u8]>,
+    pub(crate) skinned_vert_spv: Option<&'static [u8]>,
 
     // Model rendering pipeline (forward shaders + vertex input state)
     pub(crate) model_pipeline: Option<vk::Pipeline>,
@@ -138,15 +140,25 @@ pub struct VulkanDevice {
     pub(crate) material_desc_set_layout: Option<vk::DescriptorSetLayout>,
     pub(crate) material_desc_pool: Option<vk::DescriptorPool>,
 
-    // Shadow mapping (directional light, 2048×2048)
+    // Light storage buffer (set=1, binding=2) — clustered lighting
+    pub(crate) light_ssbo: Option<vk::Buffer>,
+    pub(crate) light_ssbo_allocation: Option<crate::allocator::Allocation>,
+    pub(crate) light_ssbo_size: vk::DeviceSize,
+    pub(crate) max_lights: u32,
+
+    // Shadow mapping (directional light, 2048×2048, 3-cascade CSM)
     pub(crate) shadow_map: Option<vk::Image>,
+    /// Layered image view (TYPE_2D_ARRAY) for shader sampling.
     pub(crate) shadow_map_view: Option<vk::ImageView>,
+    /// Per-layer image views (TYPE_2D) for cascade framebuffer attachments.
+    pub(crate) shadow_layer_views: Vec<vk::ImageView>,
     pub(crate) shadow_allocation: Option<crate::allocator::Allocation>,
     pub(crate) shadow_sampler: Option<vk::Sampler>,
     pub(crate) shadow_rp: Option<vk::RenderPass>,
     pub(crate) shadow_pipeline_layout: Option<vk::PipelineLayout>,
     pub(crate) shadow_pipeline: Option<vk::Pipeline>,
-    pub(crate) shadow_fb: Option<vk::Framebuffer>,
+    /// Per-cascade framebuffers (one per array layer).
+    pub(crate) shadow_fbs: Vec<vk::Framebuffer>,
     pub(crate) shadow_desc_set: Option<vk::DescriptorSet>,
     pub(crate) shadow_desc_layout: Option<vk::DescriptorSetLayout>,
     pub(crate) shadow_desc_pool: Option<vk::DescriptorPool>,
@@ -175,11 +187,65 @@ pub struct VulkanDevice {
     /// Framebuffer for forward HDR pass (HDR color view + depth view).
     pub(crate) hdr_forward_fb: Option<vk::Framebuffer>,
 
+    /// What sample count the HDR forward resources were created with.
+    pub(crate) hdr_msaa_samples: vk::SampleCountFlags,
+
+    // MSAA resources (Phase 4.2)
+    /// Maximum sample count supported by the device.
+    pub(crate) max_msaa_samples: vk::SampleCountFlags,
+    /// Multisampled color image for HDR forward pass (MSAA > 1 only).
+    pub(crate) msaa_color_image: Option<vk::Image>,
+    pub(crate) msaa_color_view: Option<vk::ImageView>,
+    pub(crate) msaa_color_allocation: Option<crate::allocator::Allocation>,
+    /// Multisampled depth image for HDR forward pass (MSAA > 1 only).
+    pub(crate) msaa_depth_image: Option<vk::Image>,
+    pub(crate) msaa_depth_view: Option<vk::ImageView>,
+    pub(crate) msaa_depth_allocation: Option<crate::allocator::Allocation>,
+
     // Material texture cache (Phase 3.1)
     /// Uploaded GPU textures indexed by asset ID string.
     pub(crate) textures: HashMap<String, GpuTexture>,
     /// Cached descriptor sets per material ID (allocated from material_desc_pool).
     pub(crate) material_desc_sets: HashMap<String, vk::DescriptorSet>,
+
+    // Post-processing (Phase 4.5)
+    // -- Bloom resources --
+    /// Downsample compute pipelines (one per mip level).
+    pub(crate) bloom_downsample_pipelines: Vec<vk::Pipeline>,
+    /// Upsample compute pipelines (one per mip level).
+    pub(crate) bloom_upsample_pipelines: Vec<vk::Pipeline>,
+    /// Pipeline layout shared by all bloom compute shaders.
+    pub(crate) bloom_pipeline_layout: Option<vk::PipelineLayout>,
+    /// Bloom mip-chain images (RGBA16F, halves per level).
+    pub(crate) bloom_images: Vec<vk::Image>,
+    pub(crate) bloom_image_views: Vec<vk::ImageView>,
+    pub(crate) bloom_allocations: Vec<crate::allocator::Allocation>,
+    /// Bloom mip descriptor sets (storage image access per level).
+    pub(crate) bloom_desc_sets: Vec<vk::DescriptorSet>,
+    pub(crate) bloom_desc_pool: Option<vk::DescriptorPool>,
+    pub(crate) bloom_desc_layout: Option<vk::DescriptorSetLayout>,
+    /// Sampler for bloom texture reads (linear clamp).
+    pub(crate) bloom_sampler: Option<vk::Sampler>,
+
+    // -- SSAO resources --
+    /// SSAO compute pipeline.
+    pub(crate) ssao_pipeline: Option<vk::Pipeline>,
+    /// SSAO pipeline layout.
+    pub(crate) ssao_pipeline_layout: Option<vk::PipelineLayout>,
+    /// SSAO noise texture (4x4 random rotations, RGBA8).
+    pub(crate) ssao_noise_image: Option<vk::Image>,
+    pub(crate) ssao_noise_view: Option<vk::ImageView>,
+    pub(crate) ssao_noise_allocation: Option<crate::allocator::Allocation>,
+    /// SSAO output texture (R8_UNORM occlusion factor).
+    pub(crate) ssao_output_image: Option<vk::Image>,
+    pub(crate) ssao_output_view: Option<vk::ImageView>,
+    pub(crate) ssao_output_allocation: Option<crate::allocator::Allocation>,
+    /// Descriptor set for SSAO (depth + noise + output).
+    pub(crate) ssao_desc_set: Option<vk::DescriptorSet>,
+    pub(crate) ssao_desc_pool: Option<vk::DescriptorPool>,
+    pub(crate) ssao_desc_layout: Option<vk::DescriptorSetLayout>,
+    /// Sampler for SSAO depth reads (nearest clamp).
+    pub(crate) ssao_depth_sampler: Option<vk::Sampler>,
 }
 
 impl VulkanDevice {
@@ -218,6 +284,25 @@ impl VulkanDevice {
         let name = unsafe { CStr::from_ptr(adapter.properties.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+
+        // ---- Determine max MSAA sample count ----
+        let sample_flags = adapter.properties.limits.framebuffer_color_sample_counts;
+        let max_msaa = if sample_flags.contains(vk::SampleCountFlags::TYPE_8) {
+            vk::SampleCountFlags::TYPE_8
+        } else if sample_flags.contains(vk::SampleCountFlags::TYPE_4) {
+            vk::SampleCountFlags::TYPE_4
+        } else if sample_flags.contains(vk::SampleCountFlags::TYPE_2) {
+            vk::SampleCountFlags::TYPE_2
+        } else {
+            vk::SampleCountFlags::TYPE_1
+        };
+        let max_sample_count_u8 = match max_msaa {
+            vk::SampleCountFlags::TYPE_8 => 8u8,
+            vk::SampleCountFlags::TYPE_4 => 4u8,
+            vk::SampleCountFlags::TYPE_2 => 2u8,
+            _ => 1u8,
+        };
+
         let info = AdapterInfo {
             backend: BackendKind::Vulkan,
             name,
@@ -238,7 +323,7 @@ impl VulkanDevice {
                     max_bind_groups: 4,
                     max_vertex_attributes: 16,
                     max_color_attachments: 8,
-                    max_sample_count: 1,
+                    max_sample_count: max_sample_count_u8,
                 },
             },
         };
@@ -261,6 +346,7 @@ impl VulkanDevice {
             mvp_pipeline: None,
             mvp_vert_spv: None,
             mvp_frag_spv: None,
+            skinned_vert_spv: None,
             model_pipeline: None,
             model_pipeline_layout: None,
             model_rp: None,
@@ -284,7 +370,7 @@ impl VulkanDevice {
             desc_pool: None,
             frame_desc_sets: Vec::new(),
             frame_ubos: Vec::new(),
-            ubo_size: 256,
+            ubo_size: 512,
             ubo_allocations: Vec::new(),
             ubo_alignment: 256,
             depth_image: None,
@@ -304,12 +390,13 @@ impl VulkanDevice {
             // Shadow mapping
             shadow_map: None,
             shadow_map_view: None,
+            shadow_layer_views: Vec::new(),
             shadow_allocation: None,
             shadow_sampler: None,
             shadow_rp: None,
             shadow_pipeline_layout: None,
             shadow_pipeline: None,
-            shadow_fb: None,
+            shadow_fbs: Vec::new(),
             shadow_desc_set: None,
             shadow_desc_layout: None,
             shadow_desc_pool: None,
@@ -331,10 +418,50 @@ impl VulkanDevice {
             hdr_forward_pipeline: None,
             hdr_forward_pipeline_layout: None,
             hdr_forward_fb: None,
+            hdr_msaa_samples: vk::SampleCountFlags::TYPE_1,
+
+            // MSAA resources (Phase 4.2)
+            max_msaa_samples: max_msaa,
+            msaa_color_image: None,
+            msaa_color_view: None,
+            msaa_color_allocation: None,
+            msaa_depth_image: None,
+            msaa_depth_view: None,
+            msaa_depth_allocation: None,
 
             // Material texture cache (Phase 3.1)
             textures: HashMap::new(),
             material_desc_sets: HashMap::new(),
+
+            // Light SSBO (Phase 4.3)
+            light_ssbo: None,
+            light_ssbo_allocation: None,
+            light_ssbo_size: 16384, // 256 lights × 64 bytes each
+            max_lights: 256,
+
+            // Post-processing (Phase 4.5)
+            bloom_downsample_pipelines: Vec::new(),
+            bloom_upsample_pipelines: Vec::new(),
+            bloom_pipeline_layout: None,
+            bloom_images: Vec::new(),
+            bloom_image_views: Vec::new(),
+            bloom_allocations: Vec::new(),
+            bloom_desc_sets: Vec::new(),
+            bloom_desc_pool: None,
+            bloom_desc_layout: None,
+            bloom_sampler: None,
+            ssao_pipeline: None,
+            ssao_pipeline_layout: None,
+            ssao_noise_image: None,
+            ssao_noise_view: None,
+            ssao_noise_allocation: None,
+            ssao_output_image: None,
+            ssao_output_view: None,
+            ssao_output_allocation: None,
+            ssao_desc_set: None,
+            ssao_desc_pool: None,
+            ssao_desc_layout: None,
+            ssao_depth_sampler: None,
         };
 
         // Phase 3.3: Initialize PSO cache (load from disk if cache_dir provided).
@@ -426,6 +553,10 @@ impl VulkanDevice {
     pub fn set_mvp_shaders(&mut self, vert: &'static [u8], frag: &'static [u8]) {
         self.mvp_vert_spv = Some(vert);
         self.mvp_frag_spv = Some(frag);
+    }
+
+    pub fn set_skinned_vertex_shader(&mut self, vert: &'static [u8]) {
+        self.skinned_vert_spv = Some(vert);
     }
 
     /// Returns the index of the current in-flight frame (0 or 1 for double
@@ -530,6 +661,23 @@ impl VulkanDevice {
         }
     }
 
+    /// Return the MSAA sample count flags for the given requested count,
+    /// capped to the device's maximum.
+    pub(crate) fn msaa_samples(&self, requested: u8) -> vk::SampleCountFlags {
+        let capped = match requested {
+            8 if self.max_msaa_samples.contains(vk::SampleCountFlags::TYPE_8) => 8,
+            4 if self.max_msaa_samples.contains(vk::SampleCountFlags::TYPE_4) => 4,
+            2 if self.max_msaa_samples.contains(vk::SampleCountFlags::TYPE_2) => 2,
+            _ => 1,
+        };
+        match capped {
+            8 => vk::SampleCountFlags::TYPE_8,
+            4 => vk::SampleCountFlags::TYPE_4,
+            2 => vk::SampleCountFlags::TYPE_2,
+            _ => vk::SampleCountFlags::TYPE_1,
+        }
+    }
+
     pub fn resize(&mut self, w: u32, h: u32) {
         self.window_width = w.max(1);
         self.window_height = h.max(1);
@@ -609,6 +757,7 @@ fn vfmt(f: &str) -> vk::Format {
         "float32x2" => vk::Format::R32G32_SFLOAT,
         "float32x3" => vk::Format::R32G32B32_SFLOAT,
         "float32x4" => vk::Format::R32G32B32A32_SFLOAT,
+        "uint32x4" => vk::Format::R32G32B32A32_UINT,
         _ => vk::Format::R32G32B32_SFLOAT,
     }
 }

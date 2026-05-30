@@ -141,7 +141,11 @@ impl Drop for VulkanDevice {
             unsafe { d.destroy_descriptor_set_layout(layout, None); }
         }
 
+        self.destroy_light_ssbo();
         self.destroy_material_textures();
+        // Destroy post-process resources (bloom + SSAO) before HDR and
+        // shadow since they may reference HDR colour / depth images.
+        self.destroy_post_process_resources();
         self.destroy_hdr_resources();
         self.destroy_env_resources();
         self.destroy_shadow_resources();
