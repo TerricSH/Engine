@@ -3038,6 +3038,7 @@ version = "0.1.0"
 dependencies = [
  "engine-asset",
  "engine-core",
+ "engine-editor",
  "engine-renderer",
  "engine-scene",
  "engine-serialize",
