@@ -855,8 +855,15 @@ dependencies = [
 name = "engine-character"
 version = "0.1.0"
 dependencies = [
+ "engine-animation",
  "engine-physics",
+ "engine-renderer",
+ "engine-scene",
  "glam",
+ "platform",
+ "raw-window-handle",
+ "render-core",
+ "render-vulkan",
  "serde",
  "thiserror 1.0.69",
  "tracing",
@@ -3041,9 +3048,12 @@ dependencies = [
 name = "sandbox"
 version = "0.1.0"
 dependencies = [
+ "engine-animation",
  "engine-asset",
+ "engine-character",
  "engine-core",
  "engine-editor",
+ "engine-physics",
  "engine-renderer",
  "engine-scene",
  "engine-serialize",

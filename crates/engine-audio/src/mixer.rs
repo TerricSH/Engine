@@ -1,5 +1,6 @@
-// Some fields are kept for future spatial-audio integration.
-#![allow(dead_code)]
+// Some items are kept for future spatial-audio integration
+// and are suppressed from dead-code warnings explicitly.
+#![allow(dead_code, reason = "spatial audio scaffolding")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
