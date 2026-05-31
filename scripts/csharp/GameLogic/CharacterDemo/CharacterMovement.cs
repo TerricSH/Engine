@@ -36,7 +36,14 @@ public class CharacterMovement
             Console.WriteLine($"[Frame {_frameCount}] Moving: vel=({_controller.VelocityX:F2}, {_controller.VelocityY:F2}, {_controller.VelocityZ:F2})");
         }
 
-        // 3. Log state transitions
+        // 3. Log ground normal when grounded
+        if (_controller.IsGrounded && _frameCount % 120 == 0)
+        {
+            var gn = _controller.GroundNormal;
+            Console.WriteLine($"[Frame {_frameCount}] GroundNormal=({gn.X:F3}, {gn.Y:F3}, {gn.Z:F3})");
+        }
+
+        // 4. Log state transitions
         int currentState = (int)_controller.CurrentMoveState;
         if (currentState != _previousState)
         {

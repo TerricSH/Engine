@@ -58,4 +58,19 @@ public class CharacterController
         get => EngineAPI.character_get_foot_ik_enabled(_nativePtr);
         set => EngineAPI.character_set_foot_ik_enabled(_nativePtr, value);
     }
+
+    /// <summary>
+    /// Surface normal of the ground when grounded, or zero vector when airborne.
+    /// Updated every frame after controller update.
+    /// </summary>
+    public Vector3 GroundNormal
+    {
+        get
+        {
+            float x = EngineAPI.character_get_ground_normal_x(_nativePtr);
+            float y = EngineAPI.character_get_ground_normal_y(_nativePtr);
+            float z = EngineAPI.character_get_ground_normal_z(_nativePtr);
+            return new Vector3(x, y, z);
+        }
+    }
 }

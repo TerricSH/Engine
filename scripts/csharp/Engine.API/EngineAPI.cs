@@ -111,6 +111,15 @@ internal static class EngineAPI
     [return: MarshalAs(UnmanagedType.I1)]
     internal static extern bool character_get_foot_ik_enabled(IntPtr controller);
 
+    [DllImport("engine_ffi")]
+    internal static extern float character_get_ground_normal_x(IntPtr controller);
+
+    [DllImport("engine_ffi")]
+    internal static extern float character_get_ground_normal_y(IntPtr controller);
+
+    [DllImport("engine_ffi")]
+    internal static extern float character_get_ground_normal_z(IntPtr controller);
+
     // ── Animation Player ───────────────────────────────────────────────
 
     [DllImport("engine_ffi")]
