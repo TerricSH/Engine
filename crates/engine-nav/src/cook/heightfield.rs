@@ -99,68 +99,66 @@ impl Heightfield {
         if smin >= smax { return; }
         let idx = self.cell_index(x, z);
 
-        // Collect all existing spans, merge with new one, then re-write.
-        let mut spans_in_col: Vec<Span> = Vec::new();
+        // If column is empty, just insert the new span.
+        if self.cells[idx] == NULL_SPAN {
+            let new_idx = self.spans.len() as u32;
+            self.spans.push(Span { smin, smax, next: NULL_SPAN, area });
+            self.cells[idx] = new_idx;
+            return;
+        }
+
+        // Walk the linked list to find insertion/merge point.
+        let mut prev = NULL_SPAN;
         let mut curr = self.cells[idx];
+        let mut new_smin = smin;
+        let mut new_smax = smax;
+        let mut new_area = area;
+
         while curr != NULL_SPAN {
-            spans_in_col.push(self.spans[curr as usize]);
-            curr = self.spans[curr as usize].next;
-        }
+            let s_smin = self.spans[curr as usize].smin;
+            let s_smax = self.spans[curr as usize].smax;
+            let s_area = self.spans[curr as usize].area;
+            let s_next = self.spans[curr as usize].next;
 
-        // Find insertion point and merge.
-        let mut merged_smin = smin;
-        let mut merged_smax = smax;
-        let mut merged_area = area;
-        let mut to_remove = Vec::new();
-        let mut insert_before = spans_in_col.len();
+            // Check overlap or adjacency within threshold.
+            if new_smax + merge_threshold >= s_smin && new_smin <= s_smax + merge_threshold {
+                // Merge: extend bounds.
+                if s_smin < new_smin { new_smin = s_smin; }
+                if s_smax > new_smax { new_smax = s_smax; }
+                if s_area > new_area { new_area = s_area; }
 
-        for (i, s) in spans_in_col.iter().enumerate() {
-            // Overlap or adjacency within threshold.
-            if merged_smax + merge_threshold >= s.smin && merged_smin <= s.smax + merge_threshold {
-                if s.smin < merged_smin { merged_smin = s.smin; }
-                if s.smax > merged_smax { merged_smax = s.smax; }
-                if s.area > merged_area { merged_area = s.area; }
-                to_remove.push(i);
-            } else if merged_smax < s.smin && insert_before == spans_in_col.len() {
-                // Goes before this existing span (but after all previous non-overlapping spans).
-                insert_before = i;
-            }
-        }
-
-        // Remove spans that were merged.
-        for &i in to_remove.iter().rev() {
-            spans_in_col.remove(i);
-            // Adjust insert_before if we removed something before it.
-            if i < insert_before { insert_before -= 1; }
-        }
-
-        // Insert merged span at the right position.
-        let merged = Span {
-            smin: merged_smin,
-            smax: merged_smax,
-            next: NULL_SPAN,
-            area: merged_area,
-        };
-        spans_in_col.insert(insert_before, merged);
-
-        // Rebuild linked list and update head.
-        let head_idx = if spans_in_col.is_empty() {
-            NULL_SPAN
-        } else {
-            let first = self.spans.len() as u32;
-            for (i, sp) in spans_in_col.iter().enumerate() {
-                let next = if i + 1 < spans_in_col.len() {
-                    first + i as u32 + 1
+                // Remove current span by unlinking it.
+                if prev == NULL_SPAN {
+                    self.cells[idx] = s_next;
                 } else {
-                    NULL_SPAN
-                };
-                let mut sp_copy = *sp;
-                sp_copy.next = next;
-                self.spans.push(sp_copy);
+                    self.spans[prev as usize].next = s_next;
+                }
+                curr = s_next;
+                continue; // re-check with next span (merged might overlap more)
+            } else if new_smax < s_smin {
+                // Insert before current span.
+                let new_idx = self.spans.len() as u32;
+                self.spans.push(Span { smin: new_smin, smax: new_smax, next: curr, area: new_area });
+                if prev == NULL_SPAN {
+                    self.cells[idx] = new_idx;
+                } else {
+                    self.spans[prev as usize].next = new_idx;
+                }
+                return;
             }
-            first
-        };
-        self.cells[idx] = head_idx;
+
+            prev = curr;
+            curr = s_next;
+        }
+
+        // Append at end of list.
+        let new_idx = self.spans.len() as u32;
+        self.spans.push(Span { smin: new_smin, smax: new_smax, next: NULL_SPAN, area: new_area });
+        if prev == NULL_SPAN {
+            self.cells[idx] = new_idx;
+        } else {
+            self.spans[prev as usize].next = new_idx;
+        }
     }
 
     /// Rasterise a set of triangles into the heightfield.
@@ -353,29 +351,48 @@ impl Heightfield {
                         let nx = x as i32 + dx;
                         let nz = z as i32 + dz;
                         if nx < 0 || nx >= self.width as i32 || nz < 0 || nz >= self.height as i32 {
-                            is_ledge = true;
-                            break;
+                            continue; // world edge — not a ledge
                         }
                         let nidx = self.cell_index(nx as u32, nz as u32);
+                        if self.cells[nidx] == NULL_SPAN {
+                            continue; // empty neighbour — not a ledge
+                        }
                         let mut ncurr = self.cells[nidx];
-                        let mut found_overlap = false;
+                        let mut found_connection = false;
 
                         while ncurr != NULL_SPAN {
-                            let ns_smin = self.spans[ncurr as usize].smin;
                             let ns_smax = self.spans[ncurr as usize].smax;
                             let ns_next = self.spans[ncurr as usize].next;
-                            let overlap_bot = s_smin.max(ns_smin);
-                            let overlap_top = s_smax.min(ns_smax);
-                            if overlap_top > overlap_bot + walkable_height {
-                                let floor_diff = (ns_smin as i32 - s_smin as i32).abs();
-                                if floor_diff as u16 <= walkable_climb {
-                                    found_overlap = true;
-                                }
+
+                            // Floor-height difference (agent walks on top of solid).
+                            let floor_diff = (ns_smax as i32 - s_smax as i32).abs();
+                            if floor_diff as u16 > walkable_climb {
+                                ncurr = ns_next;
+                                continue;
+                            }
+
+                            // Headroom above this span: distance to next solid (or infinity).
+                            let headroom_n = if ns_next != NULL_SPAN {
+                                self.spans[ns_next as usize].smin.saturating_sub(ns_smax)
+                            } else {
+                                u16::MAX
+                            };
+
+                            // Check that BOTH this span and neighbour have enough headroom.
+                            let headroom_s = if s_next != NULL_SPAN {
+                                self.spans[s_next as usize].smin.saturating_sub(s_smax)
+                            } else {
+                                u16::MAX
+                            };
+
+                            if headroom_n >= walkable_height && headroom_s >= walkable_height {
+                                found_connection = true;
+                                break;
                             }
                             ncurr = ns_next;
                         }
 
-                        if !found_overlap {
+                        if !found_connection {
                             is_ledge = true;
                             break;
                         }

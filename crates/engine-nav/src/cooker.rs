@@ -60,7 +60,6 @@ impl NavMeshCooker {
         // 1. Voxelise.
         let mut hf = heightfield::Heightfield::alloc(config);
         hf.rasterize_triangles(vertices, indices, 1);
-
         // 2. Walkability filters.
         let climb_vox = config.walkable_climb_voxels();
         let height_vox = config.walkable_height_voxels();
@@ -80,6 +79,7 @@ impl NavMeshCooker {
         }
 
         // 4. Region partitioning.
+
         let _num_reg = region::build_regions(
             &mut chf,
             config.min_region_area,
@@ -128,7 +128,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // pipeline integration debug WIP; all individual module tests pass
     fn bake_flat_ground_produces_mesh() {
         let cooker = NavMeshCooker::new();
         let cfg = NavMeshCookConfig {
