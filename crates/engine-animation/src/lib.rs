@@ -6,10 +6,12 @@ pub mod skeleton;
 mod convert;
 
 pub mod assets;
+pub mod blend_space;
 pub mod components;
 pub mod debug;
 pub mod events;
 pub mod extract;
+pub mod foot_ik;
 pub mod ik;
 pub mod layers;
 pub mod loader;
@@ -23,6 +25,7 @@ pub use pose::Pose;
 pub use skeleton::{AnimationError, BoneIndex, BoneTransform};
 
 pub use assets::{AnimationChannel, AnimationClip, Joint, JointTransform, Keyframe, Skeleton};
+pub use blend_space::*;
 pub use locomotion_clips::*;
 
 pub use convert::*;
@@ -30,6 +33,7 @@ pub use components::{AnimationPlayer, IkTargetComponent, SkeletonComponent};
 pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
 pub use events::{check_event_trigger, AnimEvent, AnimEventCollector, AnimEventDef};
 pub use extract::{PendingSkinnedItem, SkinnedExtractProducer};
+pub use foot_ik::*;
 pub use ik::{
     solve_pose, solve_pose_multi, IkChain, IkConstraint, IkConstraintSet, IkDebugDraw, IkDebugInfo,
     IkEffector, IkEffectorSpace, IkSolverType,

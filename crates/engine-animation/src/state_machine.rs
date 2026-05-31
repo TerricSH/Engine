@@ -42,26 +42,6 @@ pub struct TransitionCondition {
 // State machine asset types
 // ---------------------------------------------------------------------------
 
-/// A single sample point in a blend space.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BlendSpaceSample {
-    /// Parameter threshold (e.g. speed value) at this sample point.
-    pub threshold: f32,
-    /// Clip to blend at this point.
-    pub clip_asset: String,
-}
-
-/// A 1D blend space that interpolates between animation clips based on a
-/// scalar parameter (e.g. speed → walk/run blend).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BlendSpace1D {
-    /// Name of the state-machine parameter that drives the blend.
-    pub parameter_name: String,
-    /// Sample points sorted by threshold. Blending is performed between the
-    /// two surrounding samples.
-    pub clips: Vec<BlendSpaceSample>,
-}
-
 /// A state in the animation state machine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AnimationState {
@@ -174,6 +154,19 @@ impl AnimStateMachineInstance {
             .iter()
             .find(|p| p.name == name)
             .map(|p| &p.value)
+    }
+
+    /// Force-transition to a named state immediately, bypassing conditions.
+    /// This is useful for script-driven animation control (cutscenes, etc.).
+    pub fn force_transition_to(&mut self, state_name: &str) -> bool {
+        if self.state_machine.states.iter().any(|s| s.name == state_name) {
+            self.current_state = state_name.to_string();
+            self.current_time = 0.0;
+            self.transitioning = false;
+            true
+        } else {
+            false
+        }
     }
 
     /// Evaluate all given conditions — returns `true` only if every condition passes.
