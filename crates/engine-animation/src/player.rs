@@ -1,4 +1,4 @@
-use glam::{Mat4, Quat, Vec3};
+use glam::Quat;
 
 use crate::assets::{AnimationClip, JointTransform, Keyframe, Skeleton};
 use crate::components::AnimationPlayer;
@@ -491,14 +491,6 @@ pub fn update_animation_pipeline(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Convert a [`JointTransform`] to a glam [`Mat4`].
-fn joint_transform_to_glam(jt: &JointTransform) -> Mat4 {
-    let t = Vec3::from(jt.translation);
-    let r = Quat::from_array(jt.rotation);
-    let s = Vec3::from(jt.scale);
-    Mat4::from_scale_rotation_translation(s, r, t)
-}
 
 // ---------------------------------------------------------------------------
 // update_animation

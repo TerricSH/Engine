@@ -236,7 +236,7 @@ fn solve_fabrik(
                     };
                     let delta_local = gp_rot.inverse() * delta_global * gp_rot;
 
-                    let mut pose_local = pose.local_transforms_mut();
+                    let pose_local = pose.local_transforms_mut();
                     let bone = &mut pose_local[parent_bone.0 as usize];
                     bone.rotation = delta_local * bone.rotation;
 
@@ -256,7 +256,7 @@ fn solve_fabrik(
 
     // ── Base bone translation correction ───────────────────────────────
     if skeleton.parent_of(chain.bones[n - 1]).is_none() {
-        let mut local_base = pose.local_transforms_mut();
+        let local_base = pose.local_transforms_mut();
         local_base[chain.bones[n - 1].0 as usize].translation = pos[n - 1];
         let _ = local_base;
     }
