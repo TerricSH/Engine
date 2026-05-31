@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -68,15 +70,34 @@ pub(crate) struct Polygon {
 pub struct NavMesh {
     vertices: Vec<Vec3>,
     pub(crate) polygons: Vec<Polygon>,
+
+    // ── Spatial acceleration grid (not serialized) ───────────────────────
+    /// Grid cell size in world units (default: 5.0).
+    /// Smaller = finer spatial queries but more memory.
+    #[serde(skip)]
+    grid_cell_size: f32,
+    /// Map from grid cell `(cell_x, cell_z)` → polygon indices whose AABB
+    /// overlaps that cell.  Built lazily; rebuilt by
+    /// [`rebuild_spatial_grid`](Self::rebuild_spatial_grid).
+    #[serde(skip)]
+    spatial_grid: HashMap<(i32, i32), Vec<PolygonIndex>>,
 }
 
 impl NavMesh {
-    /// Create an empty navigation mesh.
+    /// Create an empty navigation mesh with default grid cell size (5.0).
     pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
             polygons: Vec::new(),
+            grid_cell_size: 5.0,
+            spatial_grid: HashMap::new(),
         }
+    }
+
+    /// Set the spatial grid cell size.  Call before adding polygons or
+    /// call [`rebuild_spatial_grid`](Self::rebuild_spatial_grid) afterwards.
+    pub fn set_grid_cell_size(&mut self, size: f32) {
+        self.grid_cell_size = size.max(0.1);
     }
 
     /// Add a vertex and return its index.
@@ -86,12 +107,80 @@ impl NavMesh {
         VertexIndex(idx)
     }
 
+    /// Convert a world position to grid cell coordinates.
+    fn pos_to_cell(&self, p: Vec3) -> (i32, i32) {
+        (
+            (p.x / self.grid_cell_size).floor() as i32,
+            (p.z / self.grid_cell_size).floor() as i32,
+        )
+    }
+
+    /// Compute the axis-aligned bounding box of a polygon in the XZ plane.
+    fn poly_aabb(&self, verts: &[VertexIndex]) -> Option<(f32, f32, f32, f32)> {
+        let mut iter = verts.iter().filter_map(|vi| self.vertex(*vi).copied());
+        let first = iter.next()?;
+        let (mut min_x, mut max_x, mut min_z, mut max_z) =
+            (first.x, first.x, first.z, first.z);
+        for v in iter {
+            if v.x < min_x { min_x = v.x; }
+            if v.x > max_x { max_x = v.x; }
+            if v.z < min_z { min_z = v.z; }
+            if v.z > max_z { max_z = v.z; }
+        }
+        Some((min_x, max_x, min_z, max_z))
+    }
+
+    /// Rebuild the spatial acceleration grid from scratch.
+    /// Call this after loading a serialized NavMesh or after changing
+    /// `grid_cell_size`.
+    pub fn rebuild_spatial_grid(&mut self) {
+        self.spatial_grid.clear();
+        if self.grid_cell_size <= 0.0 { return; }
+        for (i, poly) in self.polygons.iter().enumerate() {
+            let Some((min_x, max_x, min_z, max_z)) = self.poly_aabb(&poly.vertices) else { continue; };
+            let cell_min = self.pos_to_cell(Vec3::new(min_x, 0.0, min_z));
+            let cell_max = self.pos_to_cell(Vec3::new(max_x, 0.0, max_z));
+            for cz in cell_min.1..=cell_max.1 {
+                for cx in cell_min.0..=cell_max.0 {
+                    self.spatial_grid
+                        .entry((cx, cz))
+                        .or_default()
+                        .push(PolygonIndex(i as u32));
+                }
+            }
+        }
+    }
+
+    /// Return the grid cell candidates for a point query.
+    /// Includes the cell containing the point and its 8 neighbours (3×3
+    /// region) to catch edge cases.
+    fn query_cells(&self, point: Vec3) -> Vec<PolygonIndex> {
+        let (cx, cz) = self.pos_to_cell(point);
+        let mut seen = Vec::new();
+        let mut dedup = 0u64;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let key = (cx + dx, cz + dz);
+                if let Some(polys) = self.spatial_grid.get(&key) {
+                    for &pi in polys {
+                        let bit = 1u64 << (pi.0 % 64);
+                        if dedup & bit == 0 {
+                            dedup |= bit;
+                            seen.push(pi);
+                        }
+                    }
+                }
+            }
+        }
+        seen
+    }
+
     /// Add a convex polygon defined by an ordered list of vertex indices.
     ///
     /// The polygon's *neighbors* are detected automatically: any existing
     /// polygon that shares at least 2 vertices with this one is considered
     /// adjacent.  The new polygon records those neighbors, and the existing
-    /// polygons are updated symmetrically.
+    /// polygons are updated symmetrically.  The spatial grid is also updated.
     ///
     /// `cost` — movement-cost multiplier (≥ 0).  1.0 is normal terrain;
     /// values > 1 make the polygon more expensive for A*.
@@ -126,7 +215,22 @@ impl NavMesh {
             }
         }
 
-        PolygonIndex(idx)
+        // Update spatial grid for the new polygon.
+        let pi = PolygonIndex(idx);
+        if let Some((min_x, max_x, min_z, max_z)) = self.poly_aabb(vertices) {
+            let cell_min = self.pos_to_cell(Vec3::new(min_x, 0.0, min_z));
+            let cell_max = self.pos_to_cell(Vec3::new(max_x, 0.0, max_z));
+            for cz in cell_min.1..=cell_max.1 {
+                for cx in cell_min.0..=cell_max.0 {
+                    self.spatial_grid
+                        .entry((cx, cz))
+                        .or_default()
+                        .push(pi);
+                }
+            }
+        }
+
+        pi
     }
 
     /// Number of vertices in the mesh.
@@ -157,57 +261,30 @@ impl NavMesh {
 
     /// Find the first polygon whose **XZ projection** contains `point`.
     ///
-    /// Uses a convex-point test (signed cross product against every edge).
+    /// Uses the spatial acceleration grid to narrow candidates, then performs
+    /// a convex-point test (signed cross product against every edge).
     /// If the point is on an edge or vertex it is considered inside.
     pub fn find_polygon_containing(&self, point: Vec3) -> Option<PolygonIndex> {
         let px = point.x;
         let pz = point.z;
 
+        // Try spatially indexed lookup first (3×3 neighbourhood).
+        if !self.spatial_grid.is_empty() {
+            for &pi in &self.query_cells(point) {
+                if let Some(polygon) = self.polygons.get(pi.0 as usize) {
+                    if polygon.vertices.len() < 3 { continue; }
+                    if point_in_convex_polygon_xz(px, pz, &polygon.vertices, &self.vertices) {
+                        return Some(pi);
+                    }
+                }
+            }
+            return None; // not found in any nearby cell
+        }
+
+        // Fallback: linear scan (used when grid is empty / not built).
         for (i, polygon) in self.polygons.iter().enumerate() {
-            let n = polygon.vertices.len();
-            if n < 3 {
-                continue;
-            }
-
-            let mut positive = false;
-            let mut negative = false;
-            let mut valid = true;
-
-            for j in 0..n {
-                let a_idx = polygon.vertices[j];
-                let b_idx = polygon.vertices[(j + 1) % n];
-
-                let a = match self.vertices.get(a_idx.0 as usize) {
-                    Some(v) => v,
-                    None => {
-                        valid = false;
-                        break;
-                    }
-                };
-                let b = match self.vertices.get(b_idx.0 as usize) {
-                    Some(v) => v,
-                    None => {
-                        valid = false;
-                        break;
-                    }
-                };
-
-                // 2D cross product (edge × point-vertex) on XZ plane.
-                let cross = (b.x - a.x) * (pz - a.z) - (b.z - a.z) * (px - a.x);
-
-                if cross > 0.0 {
-                    positive = true;
-                } else if cross < 0.0 {
-                    negative = true;
-                }
-
-                if positive && negative {
-                    valid = false;
-                    break;
-                }
-            }
-
-            if valid {
+            if polygon.vertices.len() < 3 { continue; }
+            if point_in_convex_polygon_xz(px, pz, &polygon.vertices, &self.vertices) {
                 return Some(PolygonIndex(i as u32));
             }
         }
@@ -218,19 +295,49 @@ impl NavMesh {
     /// Return the polygon whose center is nearest (by XZ distance) to `point`.
     ///
     /// Always returns a valid index; panics only if the mesh has no polygons.
+    /// Uses the spatial grid to accelerate the search when available.
     pub fn find_nearest_polygon(&self, point: Vec3) -> PolygonIndex {
-        let mut best = PolygonIndex(0);
         let mut best_dist_sq = f32::MAX;
+        let mut best = PolygonIndex(0);
 
-        for i in 0..self.polygons.len() {
-            if let Some(center) = self.polygon_center(PolygonIndex(i as u32)) {
+        // Helper to check candidate polygons.
+        let mut check = |pi: PolygonIndex| {
+            if let Some(center) = self.polygon_center(pi) {
                 let dx = center.x - point.x;
                 let dz = center.z - point.z;
                 let dist_sq = dx * dx + dz * dz;
                 if dist_sq < best_dist_sq {
                     best_dist_sq = dist_sq;
-                    best = PolygonIndex(i as u32);
+                    best = pi;
                 }
+            }
+        };
+
+        if !self.spatial_grid.is_empty() {
+            // Search outward in expanding rings around the query point.
+            let (cx, cz) = self.pos_to_cell(point);
+            let max_r = 8i32;
+            for radius in 0i32..=max_r {
+                let mut found_any = false;
+                for dz in -radius..=radius {
+                    for dx in -radius..=radius {
+                        if dx.abs() != radius && dz.abs() != radius { continue; }
+                        if let Some(polys) = self.spatial_grid.get(&(cx + dx, cz + dz)) {
+                            for &pi in polys {
+                                check(pi);
+                                found_any = true;
+                            }
+                        }
+                    }
+                }
+                if found_any && radius > 0 {
+                    break; // found candidates in this ring, done expanding
+                }
+            }
+        } else {
+            // Fallback: linear scan.
+            for i in 0..self.polygons.len() {
+                check(PolygonIndex(i as u32));
             }
         }
 
@@ -275,4 +382,28 @@ impl Default for NavMesh {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Free helpers ─────────────────────────────────────────────────────────────
+
+/// Test whether `(px, pz)` is inside a convex polygon (XZ projection).
+/// Returns `true` if point is on an edge or vertex.
+fn point_in_convex_polygon_xz(
+    px: f32, pz: f32,
+    verts: &[VertexIndex],
+    all_verts: &[Vec3],
+) -> bool {
+    let n = verts.len();
+    if n < 3 { return false; }
+    let mut positive = false;
+    let mut negative = false;
+    for j in 0..n {
+        let a = match all_verts.get(verts[j].0 as usize) { Some(v) => v, None => return false };
+        let b = match all_verts.get(verts[(j + 1) % n].0 as usize) { Some(v) => v, None => return false };
+        let cross = (b.x - a.x) * (pz - a.z) - (b.z - a.z) * (px - a.x);
+        if cross > 0.0 { positive = true; }
+        else if cross < 0.0 { negative = true; }
+        if positive && negative { return false; }
+    }
+    true
 }

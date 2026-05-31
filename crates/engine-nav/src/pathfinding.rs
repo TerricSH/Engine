@@ -2,7 +2,7 @@ use crate::navmesh::{NavError, NavMesh, PolygonIndex};
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ impl Pathfinder {
         let mut g_score: BTreeMap<PolygonIndex, f32> = BTreeMap::new();
         let mut came_from: BTreeMap<PolygonIndex, PolygonIndex> = BTreeMap::new();
         let mut open_heap: BinaryHeap<AStarNode> = BinaryHeap::new();
-        let mut open_set: Vec<PolygonIndex> = Vec::new();
+        let mut open_set: std::collections::HashSet<PolygonIndex> = std::collections::HashSet::new();
 
         let start_center = navmesh
             .polygon_center(from_poly)
@@ -206,7 +206,7 @@ impl Pathfinder {
             f_score: self.distance_xz(start_center, goal_center),
             polygon: from_poly,
         });
-        open_set.push(from_poly);
+        open_set.insert(from_poly);
 
         // -- Search loop ---------------------------------------------------
         while let Some(node) = open_heap.pop() {
@@ -223,10 +223,8 @@ impl Pathfinder {
                 }
             }
 
-            // Remove from the tracking vec so re-insertion is fast.
-            if let Some(pos) = open_set.iter().position(|p| *p == node.polygon) {
-                open_set.swap_remove(pos);
-            }
+            // Remove from the tracking set so re-insertion is fast.
+            open_set.remove(&node.polygon);
 
             // Goal check.
             if node.polygon == to_poly {
@@ -275,7 +273,7 @@ impl Pathfinder {
                     });
 
                     if !open_set.contains(&neighbor) {
-                        open_set.push(neighbor);
+                        open_set.insert(neighbor);
                     }
                 }
             }
