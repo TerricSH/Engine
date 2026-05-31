@@ -31,11 +31,14 @@
 //!
 //! This crate is excepted from `#![forbid(unsafe_code)]` because it provides the FFI bridge between Rust and C#.
 
+pub mod animation;
 pub mod r#async;
+pub mod character;
 pub mod component;
 pub mod coroutine;
 pub mod engine;
 pub mod entity;
+pub mod ik;
 pub mod registry;
 pub mod types;
 pub mod world_bridge;
