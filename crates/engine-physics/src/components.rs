@@ -37,6 +37,11 @@ pub struct RigidBody {
     pub gravity_scale: f32,
     /// Whether the body can go to sleep when idle.
     pub can_sleep: bool,
+    /// Enable continuous collision detection (CCD) to prevent fast-moving
+    /// objects from tunnelling through thin geometry.  Adds a performance
+    /// cost — only enable on bodies that need it (projectiles, fast
+    /// characters, etc.).
+    pub ccd_enabled: bool,
 }
 
 impl Default for RigidBody {
@@ -49,6 +54,7 @@ impl Default for RigidBody {
             enabled: true,
             gravity_scale: 1.0,
             can_sleep: true,
+            ccd_enabled: false,
         }
     }
 }

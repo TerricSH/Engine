@@ -25,6 +25,8 @@ static COMPONENT_REGISTRY: LazyLock<RwLock<ComponentRegistryInner>> =
 struct ComponentRegistryInner {
     name_to_id: HashMap<String, FfiComponentTypeId>,
     id_to_name: HashMap<FfiComponentTypeId, String>,
+    /// Maps FFI type ID → engine Component::TYPE_ID (e.g. "engine.physics.rigid_body").
+    id_to_engine_type_id: HashMap<FfiComponentTypeId, &'static str>,
     next_id: u32,
 }
 
@@ -33,6 +35,7 @@ impl ComponentRegistryInner {
         Self {
             name_to_id: HashMap::new(),
             id_to_name: HashMap::new(),
+            id_to_engine_type_id: HashMap::new(),
             next_id: 1, // 0 = INVALID
         }
     }
@@ -77,6 +80,48 @@ pub fn lookup_component_name(type_id: FfiComponentTypeId) -> Option<String> {
         .id_to_name
         .get(&type_id)
         .cloned()
+}
+
+/// Register a component type with its engine TYPE_ID for FFI read/write.
+///
+/// `name` is the display name (e.g. `"RigidBody"`).
+/// `engine_type_id` is the value of `Component::TYPE_ID` (e.g. `"engine.physics.rigid_body"`).
+/// Returns the assigned FFI type ID.
+///
+/// This variant should be preferred over [`register_component_type`] because
+/// it enables C# to read and write component data through
+/// `component_get_ptr` / `component_set_ptr`.
+pub fn register_component_type_with_id(name: &str, engine_type_id: &'static str) -> FfiComponentTypeId {
+    let mut reg = COMPONENT_REGISTRY.write().unwrap();
+    if let Some(&id) = reg.name_to_id.get(name) {
+        reg.id_to_engine_type_id.insert(id, engine_type_id);
+        return id;
+    }
+    let id = FfiComponentTypeId(reg.next_id);
+    reg.next_id += 1;
+    reg.name_to_id.insert(name.to_string(), id);
+    reg.id_to_name.insert(id, name.to_string());
+    reg.id_to_engine_type_id.insert(id, engine_type_id);
+    tracing::info!(
+        component = name,
+        type_id = id.0,
+        engine_type = engine_type_id,
+        "Registered component type with engine TYPE_ID"
+    );
+    id
+}
+
+/// Look up the engine `Component::TYPE_ID` for a given FFI component type ID.
+///
+/// Returns `None` if the type was only registered via [`register_component_type`]
+/// (which doesn't store the engine TYPE_ID).
+pub fn lookup_engine_type_id(type_id: FfiComponentTypeId) -> Option<&'static str> {
+    COMPONENT_REGISTRY
+        .read()
+        .unwrap()
+        .id_to_engine_type_id
+        .get(&type_id)
+        .copied()
 }
 
 // ---------------------------------------------------------------------------

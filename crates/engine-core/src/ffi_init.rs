@@ -1,5 +1,5 @@
-//! FFI callback registration + component type registration — bridges the
-//! engine runtime to the `engine-ffi` extern "C" entry points.
+//! FFI callback registration — bridges the engine runtime to the
+//! `engine-ffi` extern "C" entry points.
 //!
 //! Called once during [`EngineRuntime::new`] to populate the
 //! [`engine_ffi::registry::FfiRegistry`] with real implementations that
@@ -9,42 +9,48 @@
 //! in [`engine_ffi::world_bridge`] (which is not subject to
 //! `forbid(unsafe_code)`).
 
-use engine_ffi::component::register_component_type;
+use engine_ffi::component::register_component_type_with_id;
+
+/// All (display_name, engine_TYPE_ID) pairs for registered component types.
+///
+/// The engine TYPE_ID string is the value of `Component::TYPE_ID` for that
+/// type.  These are stable contract strings that MUST match the constants
+/// defined in each component's `impl Component` block.
+const COMPONENT_TYPE_ENTRIES: &[(&str, &str)] = &[
+    // engine-scene core components
+    ("Name", "engine.name"),
+    ("Transform", "engine.transform"),
+    ("Renderable", "engine.renderable"),
+    ("Camera", "engine.camera"),
+    ("Light", "engine.light"),
+    ("Bounds", "engine.bounds"),
+    // engine-physics components
+    ("RigidBody", "engine.physics.rigid_body"),
+    ("Collider", "engine.physics.collider"),
+    ("PhysicsMaterial", "engine.physics.physics_material"),
+    // engine-character components
+    ("Character Controller", "engine.character_controller"),
+    // engine-animation components
+    ("AnimStateMachineInstance", "engine.animation.anim_state_machine_instance"),
+    ("BoneAttachment", "engine.animation.bone_attachment"),
+    ("RootMotion", "engine.animation.root_motion"),
+];
 
 /// Initialise the FFI callback registry and set the engine world pointer.
 ///
 /// Called exactly once during `EngineRuntime::new()`. If `world` is
 /// null, entity/component callbacks will return sentinel values until
 /// the world is set.
-///
-/// Also registers all known component type names with the FFI system so
-/// that C# scripts can look up component type IDs by name.
 pub fn initialise(world: *mut std::ffi::c_void) {
     engine_ffi::world_bridge::populate_registry(world);
 
-    // ── Register component type names with the FFI system ────────────
-    // so that C# scripts can look up component type IDs by name.
-    //
-    // Core engine components (defined in engine-scene):
-    register_component_type("Name");
-    register_component_type("Transform");
-    register_component_type("Renderable");
-    register_component_type("Camera");
-    register_component_type("Light");
-    register_component_type("Bounds");
-
-    // Physics components (defined in engine-physics):
-    register_component_type("RigidBody");
-    register_component_type("Collider");
-    register_component_type("PhysicsMaterial");
-
-    // Character controller (defined in engine-character):
-    register_component_type("Character Controller");
-
-    // Animation components (defined in engine-animation):
-    register_component_type("AnimStateMachineInstance");
-    register_component_type("BoneAttachment");
-    register_component_type("RootMotion");
-
-    tracing::info!(count = 14, "Registered component types for C# scripting");
+    // Register all component types with their engine TYPE_IDs
+    // so C# can read/write component data through component_get_ptr/set_ptr.
+    for &(name, type_id) in COMPONENT_TYPE_ENTRIES {
+        register_component_type_with_id(name, type_id);
+    }
+    tracing::info!(
+        count = COMPONENT_TYPE_ENTRIES.len(),
+        "Registered component types for C# scripting"
+    );
 }

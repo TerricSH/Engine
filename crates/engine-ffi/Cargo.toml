@@ -7,6 +7,11 @@ license.workspace = true
 description = "FFI bridge between Rust engine and C# scripting layer"
 
 [dependencies]
+engine-animation = { path = "../engine-animation" }
+engine-character = { path = "../engine-character" }
+engine-physics = { path = "../engine-physics" }
 engine-serialize = { path = "../engine-serialize" }
 engine-scene = { path = "../engine-scene" }
+glam.workspace = true
+serde_json.workspace = true
 tracing.workspace = true

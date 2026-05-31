@@ -903,8 +903,13 @@ dependencies = [
 name = "engine-ffi"
 version = "0.1.0"
 dependencies = [
+ "engine-animation",
+ "engine-character",
+ "engine-physics",
  "engine-scene",
  "engine-serialize",
+ "glam",
+ "serde_json",
  "tracing",
 ]
 
@@ -987,6 +992,7 @@ dependencies = [
  "indexmap",
  "ron",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

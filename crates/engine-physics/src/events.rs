@@ -9,6 +9,8 @@ use crate::Entity;
 pub enum CollisionEventKind {
     /// Two colliders started touching.
     ContactStarted,
+    /// Two colliders are still touching (reported every frame while touching).
+    ContactStaying,
     /// Two colliders stopped touching.
     ContactStopped,
 }
