@@ -4,9 +4,11 @@
 //! They delegate to `engine-character`'s implementation functions.
 
 use engine_character::{
-    character_get_move_state_ffi, character_get_velocity_x_ffi,
-    character_get_velocity_y_ffi, character_get_velocity_z_ffi,
-    character_is_grounded_ffi, character_jump_ffi, character_move_ffi,
+    character_get_ground_normal_x_ffi, character_get_ground_normal_y_ffi,
+    character_get_ground_normal_z_ffi, character_get_move_state_ffi,
+    character_get_velocity_x_ffi, character_get_velocity_y_ffi,
+    character_get_velocity_z_ffi, character_is_grounded_ffi, character_jump_ffi,
+    character_move_ffi,
 };
 
 /// Move the character in the given direction at the given speed.
@@ -89,6 +91,36 @@ pub unsafe extern "C" fn character_get_velocity_z(
     controller: *const std::ffi::c_void,
 ) -> f32 {
     character_get_velocity_z_ffi(controller as *const engine_character::CharacterController)
+}
+
+/// Returns the character's ground normal X component.
+/// # Safety
+/// `controller` must be a valid pointer to a CharacterController, or null.
+#[no_mangle]
+pub unsafe extern "C" fn character_get_ground_normal_x(
+    controller: *const std::ffi::c_void,
+) -> f32 {
+    character_get_ground_normal_x_ffi(controller as *const engine_character::CharacterController)
+}
+
+/// Returns the character's ground normal Y component.
+/// # Safety
+/// `controller` must be a valid pointer to a CharacterController, or null.
+#[no_mangle]
+pub unsafe extern "C" fn character_get_ground_normal_y(
+    controller: *const std::ffi::c_void,
+) -> f32 {
+    character_get_ground_normal_y_ffi(controller as *const engine_character::CharacterController)
+}
+
+/// Returns the character's ground normal Z component.
+/// # Safety
+/// `controller` must be a valid pointer to a CharacterController, or null.
+#[no_mangle]
+pub unsafe extern "C" fn character_get_ground_normal_z(
+    controller: *const std::ffi::c_void,
+) -> f32 {
+    character_get_ground_normal_z_ffi(controller as *const engine_character::CharacterController)
 }
 
 /// Enable or disable foot IK for the character.

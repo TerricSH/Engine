@@ -196,6 +196,50 @@ pub fn character_get_velocity_z_ffi(controller: *const CharacterController) -> f
     }
 }
 
+// ── Ground normal getters ──────────────────────────────────────────────────
+
+/// Returns the character's ground normal X component.
+///
+/// # Safety
+///
+/// `controller` must be a valid pointer to a `CharacterController`, or null.
+pub fn character_get_ground_normal_x_ffi(controller: *const CharacterController) -> f32 {
+    if controller.is_null() {
+        0.0
+    } else {
+        // SAFETY: Null-checked above.
+        unsafe { (*controller).ground_normal().x }
+    }
+}
+
+/// Returns the character's ground normal Y component.
+///
+/// # Safety
+///
+/// `controller` must be a valid pointer to a `CharacterController`, or null.
+pub fn character_get_ground_normal_y_ffi(controller: *const CharacterController) -> f32 {
+    if controller.is_null() {
+        0.0
+    } else {
+        // SAFETY: Null-checked above.
+        unsafe { (*controller).ground_normal().y }
+    }
+}
+
+/// Returns the character's ground normal Z component.
+///
+/// # Safety
+///
+/// `controller` must be a valid pointer to a `CharacterController`, or null.
+pub fn character_get_ground_normal_z_ffi(controller: *const CharacterController) -> f32 {
+    if controller.is_null() {
+        0.0
+    } else {
+        // SAFETY: Null-checked above.
+        unsafe { (*controller).ground_normal().z }
+    }
+}
+
 // ── Helpers (needed by character_jump) ──────────────────────────────────────
 
 use crate::controller::CharacterState;
@@ -361,6 +405,32 @@ mod tests {
         assert!(
             character_get_velocity_x_ffi(&ctrl as *const CharacterController) > 0.0,
             "velocity x should be positive after moving in +X"
+        );
+    }
+
+    // ── Ground normal getter tests ──────────────────────────────────────
+
+    #[test]
+    fn ground_normal_null_controller() {
+        assert_eq!(character_get_ground_normal_x_ffi(std::ptr::null()), 0.0);
+        assert_eq!(character_get_ground_normal_y_ffi(std::ptr::null()), 0.0);
+        assert_eq!(character_get_ground_normal_z_ffi(std::ptr::null()), 0.0);
+    }
+
+    #[test]
+    fn ground_normal_airborne_default() {
+        let ctrl = CharacterController::new();
+        assert_eq!(
+            character_get_ground_normal_x_ffi(&ctrl as *const CharacterController),
+            0.0
+        );
+        assert_eq!(
+            character_get_ground_normal_y_ffi(&ctrl as *const CharacterController),
+            0.0
+        );
+        assert_eq!(
+            character_get_ground_normal_z_ffi(&ctrl as *const CharacterController),
+            0.0
         );
     }
 }
