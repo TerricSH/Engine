@@ -859,6 +859,7 @@ dependencies = [
  "engine-physics",
  "engine-renderer",
  "engine-scene",
+ "engine-serialize",
  "glam",
  "platform",
  "raw-window-handle",

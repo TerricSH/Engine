@@ -19,6 +19,7 @@ engine-animation = { path = "../engine-animation" }
 engine-physics = { path = "../engine-physics" }
 engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
+engine-serialize = { path = "../engine-serialize" }
 glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true

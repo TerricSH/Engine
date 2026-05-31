@@ -40,6 +40,7 @@ mod controller;
 mod ffi;
 pub use ffi::*;
 mod movement;
+mod serde;
 
 pub use animation_bridge::update_character_animation;
 pub use animation_params::{anim_params, AnimMoveState, AnimParams};
@@ -71,8 +72,8 @@ pub fn register_character_extensions(
         storage_factory: || -> Box<dyn ComponentStorageDyn> {
             Box::new(SparseSet::<CharacterController>::new())
         },
-        serialize: None,
-        deserialize: None,
+        serialize: Some(crate::serde::serialize_character_controller),
+        deserialize: Some(crate::serde::deserialize_character_controller),
     });
 }
 
@@ -271,6 +272,7 @@ mod tests {
             state: CharacterState::Falling,
             grounded: false,
             moved: true,
+            ground_normal: glam::Vec3::ZERO,
         };
         assert_eq!(output.new_position, glam::Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(output.new_velocity, glam::Vec3::new(0.0, -5.0, 0.0));
@@ -287,6 +289,7 @@ mod tests {
             state: CharacterState::Grounded,
             grounded: true,
             moved: false,
+            ground_normal: glam::Vec3::Y,
         };
         let debug = format!("{:?}", output);
         assert!(debug.contains("CharacterOutput"));
