@@ -78,6 +78,69 @@ internal static class EngineAPI
 
     [DllImport("engine_ffi")]
     internal static extern double ffi_time_seconds();
+
+    // ── Character controller ──────────────────────────────────────────
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool character_move(IntPtr controller, float dirX, float dirZ, float speed, float dt, IntPtr physics);
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool character_jump(IntPtr controller);
+
+    [DllImport("engine_ffi")]
+    internal static extern int character_is_grounded(IntPtr controller);
+
+    [DllImport("engine_ffi")]
+    internal static extern int character_get_move_state(IntPtr controller);
+
+    [DllImport("engine_ffi")]
+    internal static extern float character_get_velocity_x(IntPtr controller);
+
+    [DllImport("engine_ffi")]
+    internal static extern float character_get_velocity_y(IntPtr controller);
+
+    [DllImport("engine_ffi")]
+    internal static extern float character_get_velocity_z(IntPtr controller);
+
+    [DllImport("engine_ffi")]
+    internal static extern void character_set_foot_ik_enabled(IntPtr controller, [MarshalAs(UnmanagedType.I1)] bool enabled);
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool character_get_foot_ik_enabled(IntPtr controller);
+
+    // ── Animation Player ───────────────────────────────────────────────
+
+    [DllImport("engine_ffi")]
+    internal static extern void animation_set_param_float(IntPtr player, string name, float value);
+
+    [DllImport("engine_ffi")]
+    internal static extern void animation_set_param_bool(IntPtr player, string name, [MarshalAs(UnmanagedType.I1)] bool value);
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool animation_force_state(IntPtr player, string stateName);
+
+    [DllImport("engine_ffi")]
+    internal static extern void animation_play_clip(IntPtr player, string clipAsset);
+
+    [DllImport("engine_ffi")]
+    internal static extern uint animation_bone_count(IntPtr player);
+
+    [DllImport("engine_ffi")]
+    internal static extern uint animation_get_bone_positions(IntPtr player, float[] output, uint maxCount);
+
+    // ── IK Target Component ────────────────────────────────────────────
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool ik_set_effector_target(IntPtr ik, string name, float x, float y, float z);
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool ik_get_effector_target(IntPtr ik, string name, out float x, out float y, out float z);
 }
 
 /// <summary>
