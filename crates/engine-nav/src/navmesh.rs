@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -71,33 +69,53 @@ pub struct NavMesh {
     vertices: Vec<Vec3>,
     pub(crate) polygons: Vec<Polygon>,
 
-    // ── Spatial acceleration grid (not serialized) ───────────────────────
-    /// Grid cell size in world units (default: 5.0).
-    /// Smaller = finer spatial queries but more memory.
+    // ── Quantized BVH for spatial acceleration (not serialized) ──────────
+    /// Quantized AABB tree for O(log n) polygon queries.
+    /// Built by [`rebuild_bvh`](Self::rebuild_bvh); not serialized because
+    /// it can be rebuilt cheaply from `polygons` on deserialization.
     #[serde(skip)]
-    grid_cell_size: f32,
-    /// Map from grid cell `(cell_x, cell_z)` → polygon indices whose AABB
-    /// overlaps that cell.  Built lazily; rebuilt by
-    /// [`rebuild_spatial_grid`](Self::rebuild_spatial_grid).
+    bvh_nodes: Vec<BvhNode>,
+    /// World-space AABB of the entire mesh (used for quantization).
     #[serde(skip)]
-    spatial_grid: HashMap<(i32, i32), Vec<PolygonIndex>>,
+    bvh_world_min: Vec3,
+    #[serde(skip)]
+    bvh_world_max: Vec3,
+    #[serde(skip)]
+    bvh_qfac: f32, // quantization scale factor
+}
+
+/// A single node in the quantized BVH.
+///
+/// Layout mirrors Detour's `dtBVNode`:
+/// - `bmin`/`bmax`: quantised AABB (each axis 0..65535).
+/// - `index`: if ≥ 0 → leaf, this is the polygon index.
+///           if < 0  → internal node, `-index` is the *escape offset*
+///             to skip this node's subtree during linear traversal.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct BvhNode {
+    bmin: [u16; 3],
+    bmax: [u16; 3],
+    index: i32,
+}
+
+/// Internal entry used during BVH construction.
+struct BvhEntry {
+    idx: u32,
+    bx: u16, by: u16, bz: u16,
+    ex: u16, ey: u16, ez: u16,
 }
 
 impl NavMesh {
-    /// Create an empty navigation mesh with default grid cell size (5.0).
+    /// Create an empty navigation mesh.
     pub fn new() -> Self {
         Self {
             vertices: Vec::new(),
             polygons: Vec::new(),
-            grid_cell_size: 5.0,
-            spatial_grid: HashMap::new(),
+            bvh_nodes: Vec::new(),
+            bvh_world_min: Vec3::ZERO,
+            bvh_world_max: Vec3::ZERO,
+            bvh_qfac: 1.0,
         }
-    }
-
-    /// Set the spatial grid cell size.  Call before adding polygons or
-    /// call [`rebuild_spatial_grid`](Self::rebuild_spatial_grid) afterwards.
-    pub fn set_grid_cell_size(&mut self, size: f32) {
-        self.grid_cell_size = size.max(0.1);
     }
 
     /// Add a vertex and return its index.
@@ -105,14 +123,6 @@ impl NavMesh {
         let idx = self.vertices.len() as u32;
         self.vertices.push(position);
         VertexIndex(idx)
-    }
-
-    /// Convert a world position to grid cell coordinates.
-    fn pos_to_cell(&self, p: Vec3) -> (i32, i32) {
-        (
-            (p.x / self.grid_cell_size).floor() as i32,
-            (p.z / self.grid_cell_size).floor() as i32,
-        )
     }
 
     /// Compute the axis-aligned bounding box of a polygon in the XZ plane.
@@ -130,47 +140,190 @@ impl NavMesh {
         Some((min_x, max_x, min_z, max_z))
     }
 
-    /// Rebuild the spatial acceleration grid from scratch.
-    /// Call this after loading a serialized NavMesh or after changing
-    /// `grid_cell_size`.
-    pub fn rebuild_spatial_grid(&mut self) {
-        self.spatial_grid.clear();
-        if self.grid_cell_size <= 0.0 { return; }
-        for (i, poly) in self.polygons.iter().enumerate() {
-            let Some((min_x, max_x, min_z, max_z)) = self.poly_aabb(&poly.vertices) else { continue; };
-            let cell_min = self.pos_to_cell(Vec3::new(min_x, 0.0, min_z));
-            let cell_max = self.pos_to_cell(Vec3::new(max_x, 0.0, max_z));
-            for cz in cell_min.1..=cell_max.1 {
-                for cx in cell_min.0..=cell_max.0 {
-                    self.spatial_grid
-                        .entry((cx, cz))
-                        .or_default()
-                        .push(PolygonIndex(i as u32));
-                }
+    // ── BVH construction ─────────────────────────────────────────────────
+
+    /// Rebuild the quantised BVH from all polygons.
+    ///
+    /// Must be called after loading a serialised `NavMesh` or after adding
+    /// polygons incrementally (the BVH is not updated per-`add_polygon`).
+    pub fn rebuild_bvh(&mut self) {
+        self.bvh_nodes.clear();
+        let n = self.polygons.len();
+        if n == 0 { return; }
+
+        // 1. Compute world AABB of entire mesh (for quantisation).
+        let mut world_min = Vec3::splat(f32::MAX);
+        let mut world_max = Vec3::splat(f32::MIN);
+        let mut poly_boxes: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(n);
+
+        for poly in &self.polygons {
+            if let Some((min_x, max_x, min_z, max_z)) = self.poly_aabb(&poly.vertices) {
+                if min_x < world_min.x { world_min.x = min_x; }
+                if min_z < world_min.z { world_min.z = min_z; }
+                if max_x > world_max.x { world_max.x = max_x; }
+                if max_z > world_max.z { world_max.z = max_z; }
+                poly_boxes.push((min_x, max_x, min_z, max_z));
+            } else {
+                poly_boxes.push((0.0, 0.0, 0.0, 0.0));
             }
         }
+
+        // 2. Compute quantisation factor.
+        // qfac maps world-unit distance to u16 range (0…65535).
+        let span_x = (world_max.x - world_min.x).max(0.01);
+        let span_z = (world_max.z - world_min.z).max(0.01);
+        let span = span_x.max(span_z);
+        self.bvh_qfac = 65535.0 / span;
+        self.bvh_world_min = world_min;
+        self.bvh_world_max = world_max;
+
+        // 3. Build a list of quantised AABBs.
+        let q = self.bvh_qfac;
+        let ox = world_min.x;
+        let oz = world_min.z;
+        let oy = world_min.y;
+
+        let mut entries: Vec<BvhEntry> = poly_boxes.iter().enumerate().map(|(i, &(min_x, max_x, min_z, max_z))| {
+            let qx = |v: f32| ((v - ox) * q).clamp(0.0, 65535.0) as u16;
+            let qz = |v: f32| ((v - oz) * q).clamp(0.0, 65535.0) as u16;
+            let qy = |v: f32| ((v - oy) * q).clamp(0.0, 65535.0) as u16;
+            BvhEntry {
+                idx: i as u32,
+                bx: qx(min_x), by: qy(0.0), bz: qz(min_z),
+                ex: qx(max_x), ey: qy(0.0), ez: qz(max_z),
+            }
+        }).collect();
+
+        // 4. Sort by X midpoint (simple SAH-like heuristic in 2D).
+        entries.sort_by_key(|e| e.bx);
+
+        // 5. Build nodes bottom-up, then flatten with escape offsets.
+        let nodes = Self::build_bvh_recursive(&entries, 0, entries.len());
+        self.bvh_nodes = nodes;
     }
 
-    /// Return the grid cell candidates for a point query.
-    /// Includes the cell containing the point and its 8 neighbours (3×3
-    /// region) to catch edge cases.
-    fn query_cells(&self, point: Vec3) -> Vec<PolygonIndex> {
-        let (cx, cz) = self.pos_to_cell(point);
-        let mut seen_set = std::collections::HashSet::new();
-        let mut seen = Vec::new();
-        for dz in -1..=1 {
-            for dx in -1..=1 {
-                let key = (cx + dx, cz + dz);
-                if let Some(polys) = self.spatial_grid.get(&key) {
-                    for &pi in polys {
-                        if seen_set.insert(pi) {
-                            seen.push(pi);
-                        }
-                    }
+    /// Recursively build BVH nodes. Returns a flat list with Detour-style
+    /// escape offsets: internal node's `index` is `-escape_count`.
+    fn build_bvh_recursive(entries: &[BvhEntry], lo: usize, hi: usize) -> Vec<BvhNode> {
+        let mut nodes = Vec::new();
+        let count = hi - lo;
+
+        if count == 0 { return nodes; }
+
+        // Compute AABB of the range.
+        let mut bmin = [u16::MAX; 3];
+        let mut bmax = [0u16; 3];
+        for e in &entries[lo..hi] {
+            bmin[0] = bmin[0].min(e.bx);
+            bmin[1] = bmin[1].min(e.by);
+            bmin[2] = bmin[2].min(e.bz);
+            bmax[0] = bmax[0].max(e.ex);
+            bmax[1] = bmax[1].max(e.ey);
+            bmax[2] = bmax[2].max(e.ez);
+        }
+
+        if count == 1 {
+            // Leaf node.
+            nodes.push(BvhNode {
+                bmin, bmax,
+                index: entries[lo].idx as i32,
+            });
+            return nodes;
+        }
+
+        // Internal node: split at midpoint of the longest axis.
+        let axis = if bmax[0] - bmin[0] >= bmax[2] - bmin[2] { 0usize } else { 2usize };
+        let mid_val = (bmin[axis] as u32 + bmax[axis] as u32) / 2;
+
+        // Find split point.
+        let split = match entries[lo..hi].binary_search_by(|e| {
+            let center = match axis {
+                0 => (e.bx as u32 + e.ex as u32) / 2,
+                _ => (e.bz as u32 + e.ez as u32) / 2,
+            };
+            center.cmp(&mid_val)
+        }) {
+            Ok(p) | Err(p) => lo + p,
+        };
+
+        let split = if split == lo || split == hi {
+            // All on one side — split in the middle.
+            lo + count / 2
+        } else {
+            split
+        };
+
+        // Build children.
+        let left = Self::build_bvh_recursive(entries, lo, split);
+        let right = Self::build_bvh_recursive(entries, split, hi);
+
+        let left_count = left.len();
+        let right_count = right.len();
+
+        // Internal node: escape offset = -(total children + 1 (self)).
+        // This is the Detour convention: when `index < 0`, skip
+        // `-index` nodes (including self) to reach the next sibling.
+        // For an internal node, the escape jumps over both children.
+        let escape = -(1i32 + left_count as i32 + right_count as i32);
+
+        let mut result = Vec::with_capacity(1 + left_count + right_count);
+        result.push(BvhNode {
+            bmin, bmax,
+            index: escape,
+        });
+        result.extend(left);
+        result.extend(right);
+        result
+    }
+
+    // ── BVH queries ──────────────────────────────────────────────────────
+
+    /// BVH linear traversal: collect all polygon indices whose AABB
+    /// overlaps the query point (XZ plane).
+    fn bvh_query(&self, px: f32, pz: f32) -> Vec<PolygonIndex> {
+        if self.bvh_nodes.is_empty() {
+            // Fallback: linear scan.
+            return (0..self.polygons.len() as u32).map(PolygonIndex).collect();
+        }
+
+        let q = self.bvh_qfac;
+        let ox = self.bvh_world_min.x;
+        let oz = self.bvh_world_min.z;
+
+        // Quantize query point.
+        let qpx = ((px - ox) * q).clamp(0.0, 65535.0) as u16;
+        let qpz = ((pz - oz) * q).clamp(0.0, 65535.0) as u16;
+        let qpy = 0u16; // Y ignored for XZ queries
+
+        let mut results = Vec::new();
+        let mut i = 0usize;
+        while i < self.bvh_nodes.len() {
+            let node = &self.bvh_nodes[i];
+            // Overlap test (point in AABB).
+            if qpx >= node.bmin[0] && qpx <= node.bmax[0]
+                && qpz >= node.bmin[2] && qpz <= node.bmax[2]
+                && qpy >= node.bmin[1] && qpy <= node.bmax[1]
+            {
+                if node.index >= 0 {
+                    // Leaf.
+                    results.push(PolygonIndex(node.index as u32));
+                    i += 1;
+                } else {
+                    // Internal — descend into children.
+                    i += 1;
+                }
+            } else {
+                // No overlap — escape subtree.
+                if node.index >= 0 {
+                    i += 1; // leaf, just skip
+                } else {
+                    // Jump over the entire subtree.
+                    let skip = (-node.index) as usize;
+                    i = i.checked_add(skip).unwrap_or(self.bvh_nodes.len());
                 }
             }
         }
-        seen
+        results
     }
 
     /// Add a convex polygon defined by an ordered list of vertex indices.
@@ -178,10 +331,13 @@ impl NavMesh {
     /// The polygon's *neighbors* are detected automatically: any existing
     /// polygon that shares at least 2 vertices with this one is considered
     /// adjacent.  The new polygon records those neighbors, and the existing
-    /// polygons are updated symmetrically.  The spatial grid is also updated.
+    /// polygons are updated symmetrically.
     ///
     /// `cost` — movement-cost multiplier (≥ 0).  1.0 is normal terrain;
     /// values > 1 make the polygon more expensive for A*.
+    ///
+    /// **Note**: after adding all polygons, call [`rebuild_bvh`](Self::rebuild_bvh)
+    /// to build the spatial acceleration structure.
     pub fn add_polygon(&mut self, vertices: &[VertexIndex], cost: f32) -> PolygonIndex {
         let idx = self.polygons.len() as u32;
 
@@ -213,22 +369,15 @@ impl NavMesh {
             }
         }
 
-        // Update spatial grid for the new polygon.
-        let pi = PolygonIndex(idx);
-        if let Some((min_x, max_x, min_z, max_z)) = self.poly_aabb(vertices) {
-            let cell_min = self.pos_to_cell(Vec3::new(min_x, 0.0, min_z));
-            let cell_max = self.pos_to_cell(Vec3::new(max_x, 0.0, max_z));
-            for cz in cell_min.1..=cell_max.1 {
-                for cx in cell_min.0..=cell_max.0 {
-                    self.spatial_grid
-                        .entry((cx, cz))
-                        .or_default()
-                        .push(pi);
-                }
-            }
-        }
+        PolygonIndex(idx)
+    }
 
-        pi
+    /// Rebuild the spatial acceleration structure (BVH).
+    ///
+    /// Call this after adding all polygons or after deserialising a `NavMesh`.
+    /// This replaces the old `rebuild_spatial_grid`.
+    pub fn rebuild_spatial_grid(&mut self) {
+        self.rebuild_bvh();
     }
 
     /// Number of vertices in the mesh.
@@ -259,47 +408,34 @@ impl NavMesh {
 
     /// Find the first polygon whose **XZ projection** contains `point`.
     ///
-    /// Uses the spatial acceleration grid to narrow candidates, then performs
-    /// a convex-point test (signed cross product against every edge).
+    /// Uses the BVH to narrow candidates, then performs a convex-point test
+    /// (signed cross product against every edge).
     /// If the point is on an edge or vertex it is considered inside.
     pub fn find_polygon_containing(&self, point: Vec3) -> Option<PolygonIndex> {
         let px = point.x;
         let pz = point.z;
 
-        // Try spatially indexed lookup first (3×3 neighbourhood).
-        if !self.spatial_grid.is_empty() {
-            for &pi in &self.query_cells(point) {
-                if let Some(polygon) = self.polygons.get(pi.0 as usize) {
-                    if polygon.vertices.len() < 3 { continue; }
-                    if point_in_convex_polygon_xz(px, pz, &polygon.vertices, &self.vertices) {
-                        return Some(pi);
-                    }
+        let candidates = self.bvh_query(px, pz);
+        for &pi in &candidates {
+            if let Some(polygon) = self.polygons.get(pi.0 as usize) {
+                if polygon.vertices.len() < 3 { continue; }
+                if point_in_convex_polygon_xz(px, pz, &polygon.vertices, &self.vertices) {
+                    return Some(pi);
                 }
             }
-            return None; // not found in any nearby cell
         }
-
-        // Fallback: linear scan (used when grid is empty / not built).
-        for (i, polygon) in self.polygons.iter().enumerate() {
-            if polygon.vertices.len() < 3 { continue; }
-            if point_in_convex_polygon_xz(px, pz, &polygon.vertices, &self.vertices) {
-                return Some(PolygonIndex(i as u32));
-            }
-        }
-
         None
     }
 
     /// Return the polygon whose center is nearest (by XZ distance) to `point`.
     ///
     /// Always returns a valid index; panics only if the mesh has no polygons.
-    /// Uses the spatial grid to accelerate the search when available.
     pub fn find_nearest_polygon(&self, point: Vec3) -> PolygonIndex {
+        let candidates = self.bvh_query(point.x, point.z);
         let mut best_dist_sq = f32::MAX;
         let mut best = PolygonIndex(0);
 
-        // Helper to check candidate polygons.
-        let mut check = |pi: PolygonIndex| {
+        for &pi in &candidates {
             if let Some(center) = self.polygon_center(pi) {
                 let dx = center.x - point.x;
                 let dz = center.z - point.z;
@@ -309,39 +445,20 @@ impl NavMesh {
                     best = pi;
                 }
             }
-        };
+        }
 
-        if !self.spatial_grid.is_empty() {
-            // Search outward in expanding rings around the query point.
-            let (cx, cz) = self.pos_to_cell(point);
-            let max_r = 8i32;
-            let mut found_any = false;
-            for radius in 0i32..=max_r {
-                for dz in -radius..=radius {
-                    for dx in -radius..=radius {
-                        if dx.abs() != radius && dz.abs() != radius { continue; }
-                        if let Some(polys) = self.spatial_grid.get(&(cx + dx, cz + dz)) {
-                            for &pi in polys {
-                                check(pi);
-                                found_any = true;
-                            }
-                        }
+        // Fallback: if BVH returned nothing (empty mesh), linear scan.
+        if best_dist_sq == f32::MAX {
+            for i in 0..self.polygons.len() {
+                if let Some(center) = self.polygon_center(PolygonIndex(i as u32)) {
+                    let dx = center.x - point.x;
+                    let dz = center.z - point.z;
+                    let dist_sq = dx * dx + dz * dz;
+                    if dist_sq < best_dist_sq {
+                        best_dist_sq = dist_sq;
+                        best = PolygonIndex(i as u32);
                     }
                 }
-                if found_any && radius > 0 {
-                    break;
-                }
-            }
-            // Fallback: if ring search found nothing, scan all polygons.
-            if !found_any {
-                for i in 0..self.polygons.len() {
-                    check(PolygonIndex(i as u32));
-                }
-            }
-        } else {
-            // Fallback: linear scan (grid is empty / not built).
-            for i in 0..self.polygons.len() {
-                check(PolygonIndex(i as u32));
             }
         }
 
