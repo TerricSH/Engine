@@ -41,7 +41,7 @@ pub struct CharacterMovement {
 /// Result of processing one frame of character movement.
 ///
 /// Returned by [`process_movement`] and contains the updated position,
-/// velocity, state, and grounded flag.
+/// velocity, state, grounded flag, and ground normal.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CharacterOutput {
     /// New world-space position (center of the capsule) after movement.
@@ -58,6 +58,9 @@ pub struct CharacterOutput {
 
     /// Whether the character moved this frame (position changed).
     pub moved: bool,
+
+    /// Surface normal of the ground when grounded (zero vector if airborne).
+    pub ground_normal: Vec3,
 }
 
 // ── Core movement ────────────────────────────────────────────────────────────
@@ -203,9 +206,11 @@ pub fn process_movement(
     // ── 6. Ground detection ─────────────────────────────────────────────
     // Transition: airborne states → Landing, Free/Grounded → Grounded
     let mut grounded = false;
+    let mut ground_normal = Vec3::Y;
     if let Some(pw) = physics {
-        if let Some(ground_dist) = ground_check(position, controller, pw) {
+        if let Some((ground_dist, normal)) = ground_check(position, controller, pw) {
             grounded = true;
+            ground_normal = normal;
             // Snap the character to the ground surface.
             position.y -= ground_dist;
 
@@ -300,5 +305,6 @@ pub fn process_movement(
         state,
         grounded,
         moved,
+        ground_normal,
     }
 }

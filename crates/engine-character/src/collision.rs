@@ -40,9 +40,9 @@ fn capsule_overlaps(
 
 /// Cast a ray downward from the character's capsule base to find the ground.
 ///
-/// Returns `Some(distance)` when ground is within `step_height + ε` and the
-/// surface slope is within [`CharacterController::slope_limit`]. Returns
-/// `None` when no suitable ground is found.
+/// Returns `Some((distance, normal))` when ground is within `step_height + ε`
+/// and the surface slope is within [`CharacterController::slope_limit`].
+/// Returns `None` when no suitable ground is found.
 ///
 /// The ray origin is placed just below the capsule's bottom to avoid
 /// self-intersection with the character's own collider.
@@ -50,7 +50,7 @@ pub fn ground_check(
     position: Vec3,
     controller: &CharacterController,
     physics: &PhysicsWorld,
-) -> Option<f32> {
+) -> Option<(f32, Vec3)> {
     // Bottom of the capsule in world-space.
     let bottom_y = position.y - controller.height * 0.5;
     let ray_origin = Vec3::new(position.x, bottom_y + EPSILON, position.z);
@@ -64,7 +64,7 @@ pub fn ground_check(
         return None;
     }
 
-    Some(hit.distance)
+    Some((hit.distance, hit.normal))
 }
 
 // ── Collision resolution ─────────────────────────────────────────────────────

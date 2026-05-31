@@ -273,6 +273,11 @@ pub struct CharacterController {
 
     /// Whether foot IK post-processing is enabled for this character (default: true).
     pub foot_ik_enabled: bool,
+
+    /// Surface normal of the ground when grounded (zero vector if airborne).
+    /// Updated each frame by [`update`](Self::update).
+    #[serde(skip)]
+    pub ground_normal: Vec3,
 }
 
 impl Component for CharacterController {
@@ -301,6 +306,7 @@ impl CharacterController {
             velocity: Vec3::ZERO,
             landing_timer: 0.0,
             foot_ik_enabled: true,
+            ground_normal: Vec3::ZERO,
         }
     }
 
@@ -332,6 +338,12 @@ impl CharacterController {
     /// For continuous movement use [`process_movement`] instead.
     pub fn set_position(&mut self, pos: Vec3) {
         self.position = pos;
+    }
+
+    /// Returns the surface normal of the ground when grounded,
+    /// or `Vec3::ZERO` when airborne.
+    pub fn ground_normal(&self) -> Vec3 {
+        self.ground_normal
     }
 
     /// Enable or disable foot IK for this character.
@@ -426,6 +438,7 @@ impl CharacterController {
         let output = crate::movement::process_movement(self, &cmd, physics);
         self.position = output.new_position;
         self.velocity = output.new_velocity;
+        self.ground_normal = output.ground_normal;
 
         // ── Landing recovery timer ──────────────────────────────────────
         // We inspect `output.state` (this frame's result) and `self.state`
