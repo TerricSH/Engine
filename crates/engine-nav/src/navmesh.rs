@@ -198,13 +198,14 @@ impl NavMesh {
         entries.sort_by_key(|e| e.bx);
 
         // 5. Build nodes bottom-up, then flatten with escape offsets.
-        let nodes = Self::build_bvh_recursive(&entries, 0, entries.len());
+        let entry_count = entries.len();
+        let nodes = Self::build_bvh_recursive(&mut entries, 0, entry_count);
         self.bvh_nodes = nodes;
     }
 
     /// Recursively build BVH nodes. Returns a flat list with Detour-style
     /// escape offsets: internal node's `index` is `-escape_count`.
-    fn build_bvh_recursive(entries: &[BvhEntry], lo: usize, hi: usize) -> Vec<BvhNode> {
+    fn build_bvh_recursive(entries: &mut [BvhEntry], lo: usize, hi: usize) -> Vec<BvhNode> {
         let mut nodes = Vec::new();
         let count = hi - lo;
 
@@ -231,27 +232,16 @@ impl NavMesh {
             return nodes;
         }
 
-        // Internal node: split at midpoint of the longest axis.
+        // Internal node: split at median of the longest axis.
+        // Sort sub-range by the midpoint of the split axis so the median
+        // produces a balanced partition.
         let axis = if bmax[0] - bmin[0] >= bmax[2] - bmin[2] { 0usize } else { 2usize };
-        let mid_val = (bmin[axis] as u32 + bmax[axis] as u32) / 2;
-
-        // Find split point.
-        let split = match entries[lo..hi].binary_search_by(|e| {
-            let center = match axis {
-                0 => (e.bx as u32 + e.ex as u32) / 2,
-                _ => (e.bz as u32 + e.ez as u32) / 2,
-            };
-            center.cmp(&mid_val)
-        }) {
-            Ok(p) | Err(p) => lo + p,
-        };
-
-        let split = if split == lo || split == hi {
-            // All on one side — split in the middle.
-            lo + count / 2
-        } else {
-            split
-        };
+        entries[lo..hi].sort_by(|a, b| {
+            let ca = if axis == 0 { (a.bx as u32 + a.ex as u32) / 2 } else { (a.bz as u32 + a.ez as u32) / 2 };
+            let cb = if axis == 0 { (b.bx as u32 + b.ex as u32) / 2 } else { (b.bz as u32 + b.ez as u32) / 2 };
+            ca.cmp(&cb)
+        });
+        let split = lo + count / 2;
 
         // Build children.
         let left = Self::build_bvh_recursive(entries, lo, split);
