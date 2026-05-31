@@ -3,6 +3,7 @@
 mod agent;
 pub mod behavior;
 pub mod components;
+mod cook;
 mod cooker;
 pub mod debug;
 mod navmesh;
