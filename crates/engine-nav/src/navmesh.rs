@@ -156,16 +156,14 @@ impl NavMesh {
     /// region) to catch edge cases.
     fn query_cells(&self, point: Vec3) -> Vec<PolygonIndex> {
         let (cx, cz) = self.pos_to_cell(point);
+        let mut seen_set = std::collections::HashSet::new();
         let mut seen = Vec::new();
-        let mut dedup = 0u64;
         for dz in -1..=1 {
             for dx in -1..=1 {
                 let key = (cx + dx, cz + dz);
                 if let Some(polys) = self.spatial_grid.get(&key) {
                     for &pi in polys {
-                        let bit = 1u64 << (pi.0 % 64);
-                        if dedup & bit == 0 {
-                            dedup |= bit;
+                        if seen_set.insert(pi) {
                             seen.push(pi);
                         }
                     }
@@ -317,8 +315,8 @@ impl NavMesh {
             // Search outward in expanding rings around the query point.
             let (cx, cz) = self.pos_to_cell(point);
             let max_r = 8i32;
+            let mut found_any = false;
             for radius in 0i32..=max_r {
-                let mut found_any = false;
                 for dz in -radius..=radius {
                     for dx in -radius..=radius {
                         if dx.abs() != radius && dz.abs() != radius { continue; }
@@ -331,11 +329,17 @@ impl NavMesh {
                     }
                 }
                 if found_any && radius > 0 {
-                    break; // found candidates in this ring, done expanding
+                    break;
+                }
+            }
+            // Fallback: if ring search found nothing, scan all polygons.
+            if !found_any {
+                for i in 0..self.polygons.len() {
+                    check(PolygonIndex(i as u32));
                 }
             }
         } else {
-            // Fallback: linear scan.
+            // Fallback: linear scan (grid is empty / not built).
             for i in 0..self.polygons.len() {
                 check(PolygonIndex(i as u32));
             }
