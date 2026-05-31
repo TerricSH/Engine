@@ -2,6 +2,7 @@ use crate::ik::chain::IkChain;
 use crate::ik::constraint::IkConstraintSet;
 use crate::ik::effector::IkEffector;
 use crate::layers::AnimLayer;
+use crate::skeleton::BoneTransform;
 use crate::state_machine::{AnimParamValue, AnimStateMachineInstance};
 use engine_scene::Component;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,9 @@ pub struct AnimationPlayer {
     pub state_machine: Option<AnimStateMachineInstance>,
     #[serde(default)]
     pub layers: Vec<AnimLayer>,
+    /// Cached bone world-space positions, populated by the pipeline after evaluation.
+    #[serde(skip)]
+    pub cached_bone_positions: Vec<[f32; 3]>,
 }
 
 impl Component for AnimationPlayer {
@@ -35,6 +39,7 @@ impl AnimationPlayer {
             layer: 0,
             state_machine: None,
             layers: vec![AnimLayer::new("base")],
+            cached_bone_positions: Vec::new(),
         }
     }
     pub fn with_clip(clip_asset: impl Into<String>) -> Self {
@@ -47,6 +52,7 @@ impl AnimationPlayer {
             layer: 0,
             state_machine: None,
             layers: vec![AnimLayer::new("base")],
+            cached_bone_positions: Vec::new(),
         }
     }
     pub fn set_state_machine(&mut self, sm: AnimStateMachineInstance) {
@@ -59,6 +65,21 @@ impl AnimationPlayer {
     }
     pub fn add_layer(&mut self, layer: AnimLayer) {
         self.layers.push(layer);
+    }
+    /// Play a specific animation clip by asset ID, bypassing the state machine.
+    /// Sets state_machine to None to force direct clip playback.
+    pub fn play_clip(&mut self, clip_asset: &str) {
+        self.clip_asset = Some(clip_asset.to_string());
+        self.playing = true;
+        self.current_time = 0.0;
+        self.state_machine = None;
+    }
+    /// Set the cached bone world positions (called by the pipeline after evaluation).
+    pub fn set_cached_bone_positions(&mut self, global_transforms: &[BoneTransform]) {
+        self.cached_bone_positions = global_transforms
+            .iter()
+            .map(|bt| bt.translation.to_array())
+            .collect();
     }
 }
 

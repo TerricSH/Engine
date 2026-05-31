@@ -6,7 +6,8 @@ use crate::components::IkTargetComponent;
 use crate::ik::solve_pose_multi;
 use crate::pose::Pose;
 use crate::skeleton;
-use crate::state_machine::{AnimParamValue, AnimStateMachineInstance, BlendSpace1D};
+use crate::blend_space::BlendSpace1D;
+use crate::state_machine::{AnimParamValue, AnimStateMachineInstance};
 
 // ---------------------------------------------------------------------------
 // AnimationEvaluator
@@ -204,44 +205,16 @@ fn evaluate_sm_to_pose(
     // Advance the state machine and get the active state + blend weight.
     let (_state_name, blend_weight) = sm.update(dt);
 
-    // Resolve the current state's animation.
+    // Resolve the current state.
     let state = match sm.state_machine.find_state(&sm.current_state) {
         Some(s) => s,
         None => return None,
     };
 
-    // Evaluate according to clip source type (single clip vs blend space)
+    // Evaluate the current pose: either via blend space or single clip.
     let current_pose = if let Some(ref bs) = state.blend_space_1d {
-        // Blend space: sample multiple clips and blend
-        let param = match sm.get_param(&bs.parameter_name) {
-            Some(AnimParamValue::Float(f)) => *f,
-            _ => 0.0,
-        };
-        let (lo_idx, t) = bs.sample_weight(param);
-
-        let clip_time = if state.looping { sm.current_time % 1.0 } else { sm.current_time };
-
-        let lo_clip = match clips.iter().find(|(id, _)| *id == bs.clips[lo_idx].1) {
-            Some((_, c)) => c,
-            None => return None,
-        };
-        let hi_idx = (lo_idx + 1).min(bs.clips.len() - 1);
-        let hi_clip = match clips.iter().find(|(id, _)| *id == bs.clips[hi_idx].1) {
-            Some((_, c)) => c,
-            None => return None,
-        };
-
-        // Sync clip times based on normalized progress
-        let lo_duration = lo_clip.duration().max(0.001);
-        let hi_duration = hi_clip.duration().max(0.001);
-        let lo_time = clip_time % lo_duration;
-        let hi_time = (clip_time * lo_duration / hi_duration) % hi_duration;
-
-        let lo_pose = AnimationEvaluator::evaluate_pose(lo_clip, lo_time, skel);
-        let hi_pose = AnimationEvaluator::evaluate_pose(hi_clip, hi_time, skel);
-        Pose::blend(&lo_pose, &hi_pose, t)
+        evaluate_blend_space_1d(bs, sm, clips, skel, sm.current_time)
     } else {
-        // Single clip (existing behavior)
         let clip = match clips.iter().find(|(id, _)| *id == state.clip_asset) {
             Some((_, c)) => c,
             None => return None,
@@ -255,16 +228,19 @@ fn evaluate_sm_to_pose(
     };
 
     let final_pose = if sm.transitioning && blend_weight < 1.0 {
-        // Resolve the from-state clip for crossfade blending.
+        // Resolve the from-state for crossfade blending.
         let from_state = match sm.state_machine.find_state(&sm.transition_from) {
             Some(s) => s,
             None => return Some(current_pose),
         };
-        let from_clip = match clips.iter().find(|(id, _)| *id == from_state.clip_asset) {
-            Some((_, c)) => c,
-            None => return Some(current_pose),
+        let from_pose = if let Some(ref bs) = from_state.blend_space_1d {
+            evaluate_blend_space_1d(bs, sm, clips, skel, sm.current_time)
+        } else {
+            match clips.iter().find(|(id, _)| *id == from_state.clip_asset) {
+                Some((_, c)) => AnimationEvaluator::evaluate_pose(c, sm.current_time, skel),
+                None => return Some(current_pose),
+            }
         };
-        let from_pose = AnimationEvaluator::evaluate_pose(from_clip, sm.current_time, skel);
 
         // Crossfade using Pose::blend.
         Pose::blend(&from_pose, &current_pose, blend_weight)
@@ -273,6 +249,112 @@ fn evaluate_sm_to_pose(
     };
 
     Some(final_pose)
+}
+
+// ---------------------------------------------------------------------------
+// evaluate_blend_space_1d — 1D blend space evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluate a [`BlendSpace1D`] by sampling between the two surrounding clips
+/// based on the current parameter value.  If the parameter falls outside the
+/// sample range the closest clip is used directly.
+fn evaluate_blend_space_1d(
+    bs: &BlendSpace1D,
+    sm: &AnimStateMachineInstance,
+    clips: &[(&str, AnimationClip)],
+    skel: &skeleton::Skeleton,
+    time: f32,
+) -> Pose {
+    // Get the parameter value that drives the blend.
+    let param = match sm.get_param(&bs.parameter_name) {
+        Some(AnimParamValue::Float(v)) => *v,
+        _ => {
+            return if bs.clips.is_empty() {
+                skel.rest_pose()
+            } else if let Some((_, clip)) =
+                clips.iter().find(|(id, _)| *id == bs.clips[0].clip_asset)
+            {
+                AnimationEvaluator::evaluate_pose(clip, time, skel)
+            } else {
+                skel.rest_pose()
+            };
+        }
+    };
+
+    // No samples → rest pose.
+    if bs.clips.is_empty() {
+        return skel.rest_pose();
+    }
+
+    // Single sample → evaluate it directly.
+    if bs.clips.len() == 1 {
+        return if let Some((_, clip)) =
+            clips.iter().find(|(id, _)| *id == bs.clips[0].clip_asset)
+        {
+            AnimationEvaluator::evaluate_pose(clip, time, skel)
+        } else {
+            skel.rest_pose()
+        };
+    }
+
+    let first = &bs.clips[0];
+    let last = bs.clips.last().unwrap();
+
+    if param <= first.threshold {
+        // Below range → sample first clip.
+        return if let Some((_, clip)) =
+            clips.iter().find(|(id, _)| *id == first.clip_asset)
+        {
+            AnimationEvaluator::evaluate_pose(clip, time, skel)
+        } else {
+            skel.rest_pose()
+        };
+    }
+
+    if param >= last.threshold {
+        // Above range → sample last clip.
+        return if let Some((_, clip)) =
+            clips.iter().find(|(id, _)| *id == last.clip_asset)
+        {
+            AnimationEvaluator::evaluate_pose(clip, time, skel)
+        } else {
+            skel.rest_pose()
+        };
+    }
+
+    // Find the surrounding pair via linear scan.
+    let n = bs.clips.len();
+    let mut lower_idx = 0;
+    for i in 0..n - 1 {
+        if param >= bs.clips[i].threshold && param < bs.clips[i + 1].threshold {
+            lower_idx = i;
+            break;
+        }
+    }
+    let upper_idx = lower_idx + 1;
+
+    let lower = &bs.clips[lower_idx];
+    let upper = &bs.clips[upper_idx];
+    let range = upper.threshold - lower.threshold;
+    let t = if range > 0.0 {
+        ((param - lower.threshold) / range).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let lower_pose = clips
+        .iter()
+        .find(|(id, _)| *id == lower.clip_asset)
+        .map(|(_, clip)| AnimationEvaluator::evaluate_pose(clip, time, skel))
+        .unwrap_or_else(|| skel.rest_pose());
+
+    let upper_pose = clips
+        .iter()
+        .find(|(id, _)| *id == upper.clip_asset)
+        .map(|(_, clip)| AnimationEvaluator::evaluate_pose(clip, time, skel))
+        .unwrap_or_else(|| skel.rest_pose());
+
+    Pose::blend(&lower_pose, &upper_pose, t)
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +405,7 @@ fn evaluate_clip_to_pose(
 ///
 /// Returns the bone palette — one 4×4 matrix per skeleton joint, ready for GPU skinning.
 pub fn update_animation_pipeline(
-    player: &AnimationPlayer,
+    player: &mut AnimationPlayer,
     sm: &mut Option<AnimStateMachineInstance>,
     clips: &[(&str, AnimationClip)],
     skel: &skeleton::Skeleton,
@@ -392,7 +474,14 @@ pub fn update_animation_pipeline(
         pose
     };
 
-    // ── 4. Compute skin matrices ─────────────────────────────────────────
+    // ── 4. Cache bone world positions for C# query ───────────────────────
+    let global = pose.global_transforms(skel);
+    player.cached_bone_positions = global
+        .iter()
+        .map(|bt| bt.translation.to_array())
+        .collect();
+
+    // ── 5. Compute skin matrices ─────────────────────────────────────────
     pose.skin_matrices(skel)
         .iter()
         .map(|m| m.to_cols_array_2d())

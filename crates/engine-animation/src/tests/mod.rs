@@ -489,6 +489,7 @@ fn animation_player_roundtrip() {
         layer: 1,
         state_machine: None,
         layers: vec![AnimLayer::new("base")],
+        cached_bone_positions: Vec::new(),
     };
     let bytes = bincode::serialize(&p).unwrap();
     let restored: AnimationPlayer = bincode::deserialize(&bytes).unwrap();
@@ -857,7 +858,8 @@ fn pipeline_evaluate_to_skin_matrices() {
         ..Default::default()
     };
 
-    let matrices = update_animation_pipeline(&player, &mut None, &[("test_clip", clip)], &skel, None, 0.0);
+    let mut player = player;
+    let matrices = update_animation_pipeline(&mut player, &mut None, &[("test_clip", clip)], &skel, None, 0.0);
 
     assert_eq!(matrices.len(), skel.bone_count());
     // First matrix should be near identity (no animation, root at origin).
@@ -896,12 +898,12 @@ fn pipeline_ik_via_orchestrator() {
         blend_weight: 1.0,
     };
 
-    let player = AnimationPlayer {
+    let mut player = AnimationPlayer {
         playing: false, // uses rest pose
         ..Default::default()
     };
 
-    let matrices = update_animation_pipeline(&player, &mut None, &[], &skel, Some(&ik), 0.0);
+    let matrices = update_animation_pipeline(&mut player, &mut None, &[], &skel, Some(&ik), 0.0);
 
     assert_eq!(matrices.len(), 4);
 
@@ -954,13 +956,13 @@ fn pipeline_constraint_enforced() {
         blend_weight: 1.0,
     };
 
-    let player = AnimationPlayer {
+    let mut player = AnimationPlayer {
         playing: false,
         ..Default::default()
     };
 
     // ── Smoke test: pipeline runs without panicking ──────────────────────
-    let matrices = update_animation_pipeline(&player, &mut None, &[], &skel, Some(&ik), 0.0);
+    let matrices = update_animation_pipeline(&mut player, &mut None, &[], &skel, Some(&ik), 0.0);
     assert_eq!(matrices.len(), 4);
 
     // ── Direct constraint verification via solve_pose_multi ──────────────
@@ -1014,7 +1016,7 @@ fn pipeline_empty_state_machine_no_crash() {
     let sm_instance = AnimStateMachineInstance::new(sm);
     let mut sm_opt = Some(sm_instance);
 
-    let player = AnimationPlayer {
+    let mut player = AnimationPlayer {
         playing: true,
         ..Default::default()
     };
@@ -1022,7 +1024,7 @@ fn pipeline_empty_state_machine_no_crash() {
     // 0-bone skeleton so the resulting palette is also empty.
     let skel = crate::skeleton::Skeleton::new("empty".into());
 
-    let matrices = update_animation_pipeline(&player, &mut sm_opt, &[], &skel, None, 0.0);
+    let matrices = update_animation_pipeline(&mut player, &mut sm_opt, &[], &skel, None, 0.0);
 
     assert!(
         matrices.is_empty(),
@@ -1075,7 +1077,7 @@ fn pipeline_clip_advances_time() {
         joint_indices: vec![0],
     };
 
-    let player = AnimationPlayer {
+    let mut player = AnimationPlayer {
         clip_asset: Some("test_clip".into()),
         playing: true,
         speed: 1.0,
@@ -1084,7 +1086,7 @@ fn pipeline_clip_advances_time() {
     };
 
     let matrices = update_animation_pipeline(
-        &player,
+        &mut player,
         &mut None,
         &[("test_clip", clip)],
         &skel,
