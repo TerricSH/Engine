@@ -12,7 +12,7 @@ use std::ffi::CStr;
 /// # Safety
 ///
 /// `ik` must be a valid pointer to `IkTargetComponent`, or null.
-/// `name` must be a valid C string.
+/// `name` must be a valid C string (null-terminated UTF-8).
 #[no_mangle]
 pub unsafe extern "C" fn ik_set_effector_target(
     ik: *mut std::ffi::c_void,
@@ -24,11 +24,16 @@ pub unsafe extern "C" fn ik_set_effector_target(
     if ik.is_null() || name.is_null() {
         return false;
     }
+    // SAFETY: Both pointers null-checked above; caller guarantees valid objects or null.
     let ik = &mut *(ik as *mut engine_animation::IkTargetComponent);
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => return false,
     };
+    // Validate floats to prevent NaN/Inf from corrupting the IK solver.
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return false;
+    }
     ik.set_target(name, glam::Vec3::new(x, y, z));
     true
 }
@@ -41,7 +46,7 @@ pub unsafe extern "C" fn ik_set_effector_target(
 /// # Safety
 ///
 /// `ik` must be a valid pointer to `IkTargetComponent`, or null.
-/// `name` must be a valid C string.
+/// `name` must be a valid C string (null-terminated UTF-8).
 /// `out_x`, `out_y`, `out_z` must be valid writable f32 pointers.
 #[no_mangle]
 pub unsafe extern "C" fn ik_get_effector_target(
@@ -54,6 +59,7 @@ pub unsafe extern "C" fn ik_get_effector_target(
     if ik.is_null() || name.is_null() || out_x.is_null() || out_y.is_null() || out_z.is_null() {
         return false;
     }
+    // SAFETY: All pointers null-checked above; caller guarantees valid objects or null.
     let ik = &*(ik as *const engine_animation::IkTargetComponent);
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,

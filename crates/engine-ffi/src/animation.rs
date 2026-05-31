@@ -13,7 +13,7 @@ use engine_animation::AnimParamValue;
 /// # Safety
 ///
 /// `player` must be a valid pointer to `AnimationPlayer`, or null.
-/// `name` must be a valid C string.
+/// `name` must be a valid C string (null-terminated UTF-8).
 #[no_mangle]
 pub unsafe extern "C" fn animation_set_param_float(
     player: *mut std::ffi::c_void,
@@ -23,8 +23,14 @@ pub unsafe extern "C" fn animation_set_param_float(
     if player.is_null() || name.is_null() {
         return;
     }
+    // SAFETY: Both pointers null-checked above; caller guarantees valid objects or null.
     let player = &mut *(player as *mut engine_animation::AnimationPlayer);
-    let name = CStr::from_ptr(name).to_str().unwrap_or("");
+    // If the C# string is not valid UTF-8, return early instead of silently
+    // using an empty string (which would silently no-op).
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     if let Some(ref mut sm) = player.state_machine {
         sm.set_param(name, AnimParamValue::Float(value));
     }
@@ -35,7 +41,7 @@ pub unsafe extern "C" fn animation_set_param_float(
 /// # Safety
 ///
 /// `player` must be a valid pointer to `AnimationPlayer`, or null.
-/// `name` must be a valid C string.
+/// `name` must be a valid C string (null-terminated UTF-8).
 #[no_mangle]
 pub unsafe extern "C" fn animation_set_param_bool(
     player: *mut std::ffi::c_void,
@@ -45,8 +51,12 @@ pub unsafe extern "C" fn animation_set_param_bool(
     if player.is_null() || name.is_null() {
         return;
     }
+    // SAFETY: Both pointers null-checked above; caller guarantees valid objects or null.
     let player = &mut *(player as *mut engine_animation::AnimationPlayer);
-    let name = CStr::from_ptr(name).to_str().unwrap_or("");
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     if let Some(ref mut sm) = player.state_machine {
         sm.set_param(name, AnimParamValue::Bool(value));
     }
@@ -59,7 +69,7 @@ pub unsafe extern "C" fn animation_set_param_bool(
 /// # Safety
 ///
 /// `player` must be a valid pointer to `AnimationPlayer`, or null.
-/// `state_name` must be a valid C string.
+/// `state_name` must be a valid C string (null-terminated UTF-8).
 #[no_mangle]
 pub unsafe extern "C" fn animation_force_state(
     player: *mut std::ffi::c_void,
@@ -68,8 +78,12 @@ pub unsafe extern "C" fn animation_force_state(
     if player.is_null() || state_name.is_null() {
         return false;
     }
+    // SAFETY: Both pointers null-checked above; caller guarantees valid objects or null.
     let player = &mut *(player as *mut engine_animation::AnimationPlayer);
-    let name = CStr::from_ptr(state_name).to_str().unwrap_or("");
+    let name = match CStr::from_ptr(state_name).to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
     if let Some(ref mut sm) = player.state_machine {
         sm.force_transition_to(name)
     } else {
@@ -82,7 +96,7 @@ pub unsafe extern "C" fn animation_force_state(
 /// # Safety
 ///
 /// `player` must be a valid pointer to `AnimationPlayer`, or null.
-/// `clip_asset` must be a valid C string.
+/// `clip_asset` must be a valid C string (null-terminated UTF-8).
 #[no_mangle]
 pub unsafe extern "C" fn animation_play_clip(
     player: *mut std::ffi::c_void,
@@ -91,8 +105,12 @@ pub unsafe extern "C" fn animation_play_clip(
     if player.is_null() || clip_asset.is_null() {
         return;
     }
+    // SAFETY: Both pointers null-checked above; caller guarantees valid objects or null.
     let player = &mut *(player as *mut engine_animation::AnimationPlayer);
-    let name = CStr::from_ptr(clip_asset).to_str().unwrap_or("");
+    let name = match CStr::from_ptr(clip_asset).to_str() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     player.play_clip(name);
 }
 
@@ -108,6 +126,7 @@ pub unsafe extern "C" fn animation_bone_count(
     if player.is_null() {
         return 0;
     }
+    // SAFETY: Null-checked above; caller guarantees valid `AnimationPlayer` or null.
     let player = &*(player as *const engine_animation::AnimationPlayer);
     player.cached_bone_positions.len() as u32
 }
@@ -121,6 +140,7 @@ pub unsafe extern "C" fn animation_bone_count(
 ///
 /// `player` must be a valid pointer to `AnimationPlayer`, or null.
 /// `output` must be a valid writable buffer of at least `max_count * 3` floats.
+/// The caller is responsible for ensuring the output buffer is large enough.
 #[no_mangle]
 pub unsafe extern "C" fn animation_get_bone_positions(
     player: *const std::ffi::c_void,
@@ -130,6 +150,10 @@ pub unsafe extern "C" fn animation_get_bone_positions(
     if player.is_null() || output.is_null() {
         return 0;
     }
+    // SAFETY: Both pointers null-checked above. Output buffer size is the
+    // caller's responsibility per the doc contract. We bound writes to
+    // min(cached_bones, max_count) so we never write beyond what the caller
+    // declared as available.
     let player = &*(player as *const engine_animation::AnimationPlayer);
     let count = (player.cached_bone_positions.len() as u32).min(max_count);
     for i in 0..count as usize {

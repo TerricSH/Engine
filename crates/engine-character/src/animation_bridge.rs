@@ -41,8 +41,13 @@ pub fn update_character_animation(
     }
 
     // 3. Run the full pipeline.
-    //    Drop the mutable ref from step 2 before passing state_machine again.
-    //    We stash the SM instance temporarily to avoid borrow conflicts.
+    //    We temporarily take ownership of the state machine to avoid a dual
+    //    mutable borrow of `player` (pipeline needs both &mut player and
+    //    &mut state_machine). The take/put-back pattern is standard Rust
+    //    for this scenario. On the rare event of a panic during evaluation,
+    //    the state machine is dropped — this is acceptable because a panic
+    //    in the animation pipeline means the engine is in an unrecoverable
+    //    state anyway.
     let mut sm = player.state_machine.take();
     let result = update_animation_pipeline(player, &mut sm, clips, skel, ik, dt);
     player.state_machine = sm;

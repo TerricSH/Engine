@@ -253,6 +253,14 @@ pub struct CharacterController {
     /// purposes.
     pub slope_limit: f32,
 
+    /// Skin/contact offset in metres (default: 0.01).
+    ///
+    /// Used as a small tolerance when casting ground rays and resolving
+    /// collisions to prevent numerical issues at surface boundaries.
+    /// Larger values make the character feel slightly "floaty" but more
+    /// forgiving of uneven geometry.
+    pub skin_offset: f32,
+
     // ── Command queue ────────────────────────────────────────────────────
     /// Pending movement commands (queued by input/AI/C#).
     /// Flushed each frame by [`update`](Self::update).
@@ -300,6 +308,7 @@ impl CharacterController {
             max_fall_speed: 20.0,
             step_height: 0.3,
             slope_limit: 45.0,
+            skin_offset: 0.01,
             pending_commands: Vec::new(),
             state: CharacterState::Falling,
             position: Vec3::ZERO,

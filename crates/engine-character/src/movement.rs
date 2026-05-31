@@ -206,7 +206,7 @@ pub fn process_movement(
     // ── 6. Ground detection ─────────────────────────────────────────────
     // Transition: airborne states → Landing, Free/Grounded → Grounded
     let mut grounded = false;
-    let mut ground_normal = Vec3::Y;
+    let mut ground_normal = Vec3::ZERO;
     if let Some(pw) = physics {
         if let Some((ground_dist, normal)) = ground_check(position, controller, pw) {
             grounded = true;

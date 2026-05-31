@@ -179,6 +179,7 @@ mod tests {
         assert_eq!(ctrl.max_fall_speed, 20.0);
         assert_eq!(ctrl.step_height, 0.3);
         assert_eq!(ctrl.slope_limit, 45.0);
+        assert!((ctrl.skin_offset - 0.01).abs() < 1e-6);
         assert_eq!(ctrl.landing_timer, 0.0);
     }
 

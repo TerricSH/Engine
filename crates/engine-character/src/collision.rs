@@ -10,9 +10,6 @@ use crate::controller::CharacterController;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Small epsilon for ground-check ray offsets and tolerance comparisons.
-const EPSILON: f32 = 0.01;
-
 /// Additional tolerance added to `step_height` when casting the ground ray.
 const GROUND_RAY_EXTRA: f32 = 0.05;
 
@@ -52,8 +49,9 @@ pub fn ground_check(
     physics: &PhysicsWorld,
 ) -> Option<(f32, Vec3)> {
     // Bottom of the capsule in world-space.
+    let skin = controller.skin_offset;
     let bottom_y = position.y - controller.height * 0.5;
-    let ray_origin = Vec3::new(position.x, bottom_y + EPSILON, position.z);
+    let ray_origin = Vec3::new(position.x, bottom_y + skin, position.z);
     let max_distance = controller.step_height + GROUND_RAY_EXTRA;
 
     let hit = physics.cast_ray(ray_origin, Vec3::NEG_Y, max_distance)?;
@@ -136,7 +134,8 @@ pub fn resolve_collision(
                 .map(|hit| (hit.distance - offset).max(0.0))
         };
 
-        let base_y = bottom_y + offset * 0.5 + EPSILON;
+        let skin = controller.skin_offset;
+        let base_y = bottom_y + offset * 0.5 + skin;
         let step_y = bottom_y + controller.step_height;
         let mid_y = final_pos.y;
 

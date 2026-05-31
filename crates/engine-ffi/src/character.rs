@@ -134,6 +134,7 @@ pub unsafe extern "C" fn character_set_foot_ik_enabled(
     if controller.is_null() {
         return;
     }
+    // SAFETY: Null-checked above; caller guarantees a valid `CharacterController` or null.
     let ctrl = &mut *(controller as *mut engine_character::CharacterController);
     ctrl.set_foot_ik_enabled(enabled);
 }
@@ -148,6 +149,7 @@ pub unsafe extern "C" fn character_get_foot_ik_enabled(
     if controller.is_null() {
         return false;
     }
+    // SAFETY: Null-checked above; caller guarantees a valid `CharacterController` or null.
     let ctrl = &*(controller as *const engine_character::CharacterController);
     ctrl.is_foot_ik_enabled()
 }

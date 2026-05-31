@@ -1,6 +1,7 @@
 use glam::{Quat, Vec3};
 
 use crate::assets::{self, JointTransform};
+use tracing;
 use crate::clip;
 use crate::pose::Pose;
 use crate::skeleton::{self, BoneIndex, BoneTransform};
@@ -45,9 +46,9 @@ pub fn skeleton_asset_to_runtime(
 
     for joint in &asset_skel.joints {
         // Convert parent index: asset uses u32, runtime uses u16 via BoneIndex.
+        // Clamp to u16::MAX as a safe fallback if asset data is corrupted.
         let parent = joint.parent_index.map(|p| {
-            // Safe: skeleton joint indices are small; glTF/etc guarantee u16 range.
-            BoneIndex(p.try_into().unwrap())
+            BoneIndex(p.min(u16::MAX as u32) as u16)
         });
         let bone_idx = runtime.add_bone(
             parent,
@@ -82,7 +83,19 @@ pub fn clip_asset_to_runtime(
     for channel in &asset_clip.channels {
         // Map asset joint index through the joint map.
         let joint_idx = channel.joint_index as usize;
-        let bone = joint_map[joint_idx];
+        // Bounds check: if the asset references a joint beyond the skeleton,
+        // fall back to bone 0 (root) to avoid a panic on malformed data.
+        let bone = if joint_idx < joint_map.len() {
+            joint_map[joint_idx]
+        } else {
+            tracing::warn!(
+                "clip '{}' references joint index {} but skeleton has {} joints",
+                asset_clip.name,
+                joint_idx,
+                joint_map.len()
+            );
+            joint_map[0]
+        };
 
         // Zip the three parallel SRT tracks together by index.
         // All three tracks should have the same number of keyframes with

@@ -93,11 +93,18 @@ pub fn character_jump_ffi(controller: *mut CharacterController) -> bool {
     // SAFETY: Null-checked above; caller guarantees a valid `CharacterController`.
     let ctrl = unsafe { &mut *controller };
 
-    if ctrl.is_grounded() {
+    // Allow jumping from both Grounded and Landing (matching movement.rs jump logic).
+    let on_ground = matches!(
+        ctrl.state,
+        CharacterState::Grounded | CharacterState::Landing
+    );
+    if on_ground {
         // Apply jump velocity directly (bypasses frame input system).
         ctrl.velocity.y = ctrl.jump_velocity;
-        // Grounded → Jumping is a valid state transition per the state machine.
-        let _ = ctrl.transition_state(CharacterState::Jumping);
+        // Grounded/Landing → Jumping is a valid state transition per the state machine.
+        if let Err(e) = ctrl.transition_state(CharacterState::Jumping) {
+            tracing::warn!("jump transition failed: {e}");
+        }
         true
     } else {
         false

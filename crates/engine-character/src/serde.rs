@@ -50,6 +50,7 @@ pub fn serialize_character_controller(
     // ── Collision ────────────────────────────────────────────────────────
     fields.insert("step_height".into(), Value::Float32(ctrl.step_height));
     fields.insert("slope_limit".into(), Value::Float32(ctrl.slope_limit));
+    fields.insert("skin_offset".into(), Value::Float32(ctrl.skin_offset));
 
     // ── State ────────────────────────────────────────────────────────────
     fields.insert(
@@ -74,47 +75,59 @@ pub fn serialize_character_controller(
     fields
 }
 
+/// Helper: extract a f32 from a Value field, handling both Float32 and Float64.
+fn f32_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<f32> {
+    match fields.get(key) {
+        Some(Value::Float32(v)) => Some(*v),
+        Some(Value::Float64(v)) => Some(*v as f32),
+        _ => None,
+    }
+}
+
 /// Deserialize a `CharacterController` component from a field map.
 pub fn deserialize_character_controller(
     fields: &BTreeMap<String, Value>,
 ) -> Box<dyn std::any::Any> {
     let mut ctrl = CharacterController::new();
 
-    if let Some(Value::Float32(v)) = fields.get("height") {
-        ctrl.height = *v;
+    if let Some(v) = f32_field(fields, "height") {
+        ctrl.height = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("radius") {
-        ctrl.radius = *v;
+    if let Some(v) = f32_field(fields, "radius") {
+        ctrl.radius = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("move_speed") {
-        ctrl.move_speed = *v;
+    if let Some(v) = f32_field(fields, "move_speed") {
+        ctrl.move_speed = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("acceleration") {
-        ctrl.acceleration = *v;
+    if let Some(v) = f32_field(fields, "acceleration") {
+        ctrl.acceleration = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("deceleration") {
-        ctrl.deceleration = *v;
+    if let Some(v) = f32_field(fields, "deceleration") {
+        ctrl.deceleration = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("air_acceleration") {
-        ctrl.air_acceleration = *v;
+    if let Some(v) = f32_field(fields, "air_acceleration") {
+        ctrl.air_acceleration = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("air_deceleration") {
-        ctrl.air_deceleration = *v;
+    if let Some(v) = f32_field(fields, "air_deceleration") {
+        ctrl.air_deceleration = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("jump_velocity") {
-        ctrl.jump_velocity = *v;
+    if let Some(v) = f32_field(fields, "jump_velocity") {
+        ctrl.jump_velocity = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("gravity_scale") {
-        ctrl.gravity_scale = *v;
+    if let Some(v) = f32_field(fields, "gravity_scale") {
+        ctrl.gravity_scale = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("max_fall_speed") {
-        ctrl.max_fall_speed = *v;
+    if let Some(v) = f32_field(fields, "max_fall_speed") {
+        ctrl.max_fall_speed = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("step_height") {
-        ctrl.step_height = *v;
+    if let Some(v) = f32_field(fields, "step_height") {
+        ctrl.step_height = v;
     }
-    if let Some(Value::Float32(v)) = fields.get("slope_limit") {
-        ctrl.slope_limit = *v;
+    if let Some(v) = f32_field(fields, "slope_limit") {
+        ctrl.slope_limit = v;
+    }
+    if let Some(v) = f32_field(fields, "skin_offset") {
+        ctrl.skin_offset = v;
     }
     if let Some(Value::Enum(s)) = fields.get("state") {
         ctrl.state = match s.as_str() {
@@ -151,6 +164,7 @@ mod tests {
         ctrl.move_speed = 6.0;
         ctrl.jump_velocity = 6.0;
         ctrl.slope_limit = 50.0;
+        ctrl.skin_offset = 0.02;
         ctrl.foot_ik_enabled = false;
 
         let serialized = serialize_character_controller(&ctrl);
@@ -162,6 +176,7 @@ mod tests {
         assert!((restored.move_speed - 6.0).abs() < 1e-6);
         assert!((restored.jump_velocity - 6.0).abs() < 1e-6);
         assert!((restored.slope_limit - 50.0).abs() < 1e-6);
+        assert!((restored.skin_offset - 0.02).abs() < 1e-6);
         assert!(!restored.foot_ik_enabled);
     }
 
@@ -173,6 +188,7 @@ mod tests {
 
         assert!((restored.height - 1.8).abs() < 1e-6);
         assert!((restored.move_speed - 5.0).abs() < 1e-6);
+        assert!((restored.skin_offset - 0.01).abs() < 1e-6);
         assert!(restored.foot_ik_enabled);
     }
 }
