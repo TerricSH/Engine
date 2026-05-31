@@ -1,0 +1,50 @@
+//! Bridge between character controller and the animation pipeline.
+//!
+//! Wires [`CharacterController`] → [`AnimParams`] → state machine → [`update_animation_pipeline`].
+//! Call [`update_character_animation`] once per character per frame after the
+//! controller has been updated.
+
+use engine_animation::{
+    AnimStateMachineInstance, AnimationPlayer, IkTargetComponent,
+    locomotion_state_machine, skeleton, update_animation_pipeline,
+};
+
+use crate::{AnimParams, CharacterController};
+
+/// Run the full character animation pipeline for one character.
+///
+/// 1. Extracts [`AnimParams`] from the controller
+/// 2. Initialises the state machine if needed (using [`locomotion_state_machine`])
+/// 3. Applies parameters to the state machine
+/// 4. Calls [`update_animation_pipeline`] (evaluate → blend → IK → skin)
+/// 5. Returns bone palette matrices
+///
+/// Call this once per character per frame **after** `controller.update()`.
+pub fn update_character_animation(
+    controller: &CharacterController,
+    player: &mut AnimationPlayer,
+    clips: &[(&str, engine_animation::AnimationClip)],
+    skel: &skeleton::Skeleton,
+    ik: Option<&IkTargetComponent>,
+    dt: f32,
+) -> Vec<[[f32; 4]; 4]> {
+    // 1. Create a state machine instance if one doesn't exist yet
+    if player.state_machine.is_none() {
+        let sm_def = locomotion_state_machine();
+        player.state_machine = Some(AnimStateMachineInstance::new(sm_def));
+    }
+
+    // 2. Extract animation params from controller and apply to SM
+    let params = AnimParams::from_controller(controller);
+    if let Some(ref mut sm) = player.state_machine {
+        params.apply_to_state_machine(sm);
+    }
+
+    // 3. Run the full pipeline.
+    //    Drop the mutable ref from step 2 before passing state_machine again.
+    //    We stash the SM instance temporarily to avoid borrow conflicts.
+    let mut sm = player.state_machine.take();
+    let result = update_animation_pipeline(player, &mut sm, clips, skel, ik, dt);
+    player.state_machine = sm;
+    result
+}

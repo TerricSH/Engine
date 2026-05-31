@@ -1,15 +1,16 @@
-//! C# FFI bindings for the character controller.
+//! Character controller implementation functions.
 //!
-//! Exposes movement commands and state queries so C# gameplay scripts
-//! can control characters without accessing engine internals.
+//! These are the inner (non-FFI) versions of the character controller
+//! bindings.  The actual `#[no_mangle] extern "C"` forwarding layer
+//! lives in `engine-ffi/src/character.rs`.
 //!
 //! # Safety
 //!
-//! All FFI functions accept raw pointers and must be called with valid
+//! All functions accept raw pointers and must be called with valid
 //! pointers. Null pointers are checked and return safe defaults.
 //!
-//! This module is excepted from `#![deny(unsafe_code)]` because FFI
-//! bridging inherently requires unsafe pointer dereferencing.
+//! This module is excepted from `#![deny(unsafe_code)]` because pointer
+//! dereferencing inherently requires unsafe code.
 //! Every `unsafe` block has a `// SAFETY:` comment explaining its invariants.
 
 #![allow(unsafe_code)]
@@ -39,8 +40,7 @@ const STATE_FREE: i32 = 4;
 ///
 /// * `controller` must be a valid pointer to a `CharacterController`, or null.
 /// * `physics`   must be a valid pointer to a `PhysicsWorld`, or null.
-#[no_mangle]
-pub extern "C" fn character_move(
+pub fn character_move_ffi(
     controller: *mut CharacterController,
     dir_x: f32,
     dir_z: f32,
@@ -85,8 +85,7 @@ pub extern "C" fn character_move(
 /// # Safety
 ///
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
-#[no_mangle]
-pub extern "C" fn character_jump(controller: *mut CharacterController) -> bool {
+pub fn character_jump_ffi(controller: *mut CharacterController) -> bool {
     if controller.is_null() {
         return false;
     }
@@ -110,8 +109,7 @@ pub extern "C" fn character_jump(controller: *mut CharacterController) -> bool {
 /// # Safety
 ///
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
-#[no_mangle]
-pub extern "C" fn character_is_grounded(controller: *const CharacterController) -> i32 {
+pub fn character_is_grounded_ffi(controller: *const CharacterController) -> i32 {
     if controller.is_null() {
         return 0;
     }
@@ -139,8 +137,7 @@ pub extern "C" fn character_is_grounded(controller: *const CharacterController) 
 /// # Safety
 ///
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
-#[no_mangle]
-pub extern "C" fn character_get_move_state(controller: *const CharacterController) -> i32 {
+pub fn character_get_move_state_ffi(controller: *const CharacterController) -> i32 {
     if controller.is_null() {
         return STATE_FALLING;
     }
@@ -162,8 +159,7 @@ pub extern "C" fn character_get_move_state(controller: *const CharacterControlle
 /// # Safety
 ///
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
-#[no_mangle]
-pub extern "C" fn character_get_velocity_x(controller: *const CharacterController) -> f32 {
+pub fn character_get_velocity_x_ffi(controller: *const CharacterController) -> f32 {
     if controller.is_null() {
         0.0
     } else {
@@ -177,8 +173,7 @@ pub extern "C" fn character_get_velocity_x(controller: *const CharacterControlle
 /// # Safety
 ///
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
-#[no_mangle]
-pub extern "C" fn character_get_velocity_y(controller: *const CharacterController) -> f32 {
+pub fn character_get_velocity_y_ffi(controller: *const CharacterController) -> f32 {
     if controller.is_null() {
         0.0
     } else {
@@ -192,8 +187,7 @@ pub extern "C" fn character_get_velocity_y(controller: *const CharacterControlle
 /// # Safety
 ///
 /// `controller` must be a valid pointer to a `CharacterController`, or null.
-#[no_mangle]
-pub extern "C" fn character_get_velocity_z(controller: *const CharacterController) -> f32 {
+pub fn character_get_velocity_z_ffi(controller: *const CharacterController) -> f32 {
     if controller.is_null() {
         0.0
     } else {
@@ -215,7 +209,7 @@ mod tests {
 
     #[test]
     fn move_null_controller() {
-        assert!(!character_move(
+        assert!(!character_move_ffi(
             std::ptr::null_mut(),
             1.0,
             0.0,
@@ -227,24 +221,24 @@ mod tests {
 
     #[test]
     fn jump_null_controller() {
-        assert!(!character_jump(std::ptr::null_mut()));
+        assert!(!character_jump_ffi(std::ptr::null_mut()));
     }
 
     #[test]
     fn is_grounded_null_controller() {
-        assert_eq!(character_is_grounded(std::ptr::null()), 0);
+        assert_eq!(character_is_grounded_ffi(std::ptr::null()), 0);
     }
 
     #[test]
     fn get_move_state_null_controller() {
-        assert_eq!(character_get_move_state(std::ptr::null()), STATE_FALLING);
+        assert_eq!(character_get_move_state_ffi(std::ptr::null()), STATE_FALLING);
     }
 
     #[test]
     fn velocity_getters_null_controller() {
-        assert_eq!(character_get_velocity_x(std::ptr::null()), 0.0);
-        assert_eq!(character_get_velocity_y(std::ptr::null()), 0.0);
-        assert_eq!(character_get_velocity_z(std::ptr::null()), 0.0);
+        assert_eq!(character_get_velocity_x_ffi(std::ptr::null()), 0.0);
+        assert_eq!(character_get_velocity_y_ffi(std::ptr::null()), 0.0);
+        assert_eq!(character_get_velocity_z_ffi(std::ptr::null()), 0.0);
     }
 
     // ── Functional smoke tests ──────────────────────────────────────────
@@ -253,7 +247,7 @@ mod tests {
     fn character_move_no_physics_updates_velocity() {
         let mut ctrl = CharacterController::new();
         // Call update() through FFI — this is the real path
-        let result = character_move(
+        let result = character_move_ffi(
             &mut ctrl as *mut CharacterController,
             1.0,
             0.0,                  // dir_x, dir_z
@@ -275,7 +269,7 @@ mod tests {
         let _ = ctrl.transition_state(CharacterState::Landing);
         let _ = ctrl.transition_state(CharacterState::Grounded);
 
-        let jumped = character_jump(&mut ctrl as *mut CharacterController);
+        let jumped = character_jump_ffi(&mut ctrl as *mut CharacterController);
         assert!(jumped, "grounded character should be able to jump");
         assert_eq!(ctrl.state(), CharacterState::Jumping);
         assert!(
@@ -288,7 +282,7 @@ mod tests {
     fn character_jump_airborne_fails() {
         let mut ctrl = CharacterController::new();
         // Default state is Falling (not grounded)
-        let jumped = character_jump(&mut ctrl as *mut CharacterController);
+        let jumped = character_jump_ffi(&mut ctrl as *mut CharacterController);
         assert!(!jumped, "airborne character should not be able to jump");
     }
 
@@ -299,7 +293,7 @@ mod tests {
         let _ = ctrl.transition_state(CharacterState::Landing);
         let _ = ctrl.transition_state(CharacterState::Grounded);
         assert_eq!(
-            character_is_grounded(&ctrl as *const CharacterController),
+            character_is_grounded_ffi(&ctrl as *const CharacterController),
             1
         );
     }
@@ -308,7 +302,7 @@ mod tests {
     fn character_is_grounded_false() {
         let ctrl = CharacterController::new(); // starts as Falling
         assert_eq!(
-            character_is_grounded(&ctrl as *const CharacterController),
+            character_is_grounded_ffi(&ctrl as *const CharacterController),
             0
         );
     }
@@ -321,33 +315,33 @@ mod tests {
         let _ = ctrl.transition_state(CharacterState::Landing);
         let _ = ctrl.transition_state(CharacterState::Grounded);
         assert_eq!(
-            character_get_move_state(&ctrl as *const CharacterController),
+            character_get_move_state_ffi(&ctrl as *const CharacterController),
             STATE_GROUNDED
         );
 
         let _ = ctrl.transition_state(CharacterState::Jumping);
         assert_eq!(
-            character_get_move_state(&ctrl as *const CharacterController),
+            character_get_move_state_ffi(&ctrl as *const CharacterController),
             STATE_JUMPING
         );
 
         // Jumping → Falling is valid
         let _ = ctrl.transition_state(CharacterState::Falling);
         assert_eq!(
-            character_get_move_state(&ctrl as *const CharacterController),
+            character_get_move_state_ffi(&ctrl as *const CharacterController),
             STATE_FALLING
         );
 
         // Falling → Landing is valid
         let _ = ctrl.transition_state(CharacterState::Landing);
         assert_eq!(
-            character_get_move_state(&ctrl as *const CharacterController),
+            character_get_move_state_ffi(&ctrl as *const CharacterController),
             STATE_LANDING
         );
 
         let _ = ctrl.transition_state(CharacterState::Free);
         assert_eq!(
-            character_get_move_state(&ctrl as *const CharacterController),
+            character_get_move_state_ffi(&ctrl as *const CharacterController),
             STATE_FREE
         );
     }
@@ -365,7 +359,7 @@ mod tests {
         ctrl.update(&input, None);
 
         assert!(
-            character_get_velocity_x(&ctrl as *const CharacterController) > 0.0,
+            character_get_velocity_x_ffi(&ctrl as *const CharacterController) > 0.0,
             "velocity x should be positive after moving in +X"
         );
     }

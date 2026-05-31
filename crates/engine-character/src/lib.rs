@@ -38,6 +38,7 @@ mod animation_params;
 mod collision;
 mod controller;
 mod ffi;
+pub use ffi::*;
 mod movement;
 
 pub use animation_bridge::update_character_animation;

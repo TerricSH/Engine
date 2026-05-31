@@ -270,6 +270,9 @@ pub struct CharacterController {
     /// it exceeds 200 ms the controller transitions to [`Grounded`](CharacterState::Grounded).
     #[serde(skip)]
     pub landing_timer: f32,
+
+    /// Whether foot IK post-processing is enabled for this character (default: true).
+    pub foot_ik_enabled: bool,
 }
 
 impl Component for CharacterController {
@@ -297,6 +300,7 @@ impl CharacterController {
             position: Vec3::ZERO,
             velocity: Vec3::ZERO,
             landing_timer: 0.0,
+            foot_ik_enabled: true,
         }
     }
 
@@ -328,6 +332,16 @@ impl CharacterController {
     /// For continuous movement use [`process_movement`] instead.
     pub fn set_position(&mut self, pos: Vec3) {
         self.position = pos;
+    }
+
+    /// Enable or disable foot IK for this character.
+    pub fn set_foot_ik_enabled(&mut self, enabled: bool) {
+        self.foot_ik_enabled = enabled;
+    }
+
+    /// Returns whether foot IK is enabled for this character.
+    pub fn is_foot_ik_enabled(&self) -> bool {
+        self.foot_ik_enabled
     }
 
     // ── State pattern ───────────────────────────────────────────────────
