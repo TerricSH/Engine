@@ -141,6 +141,22 @@ internal static class EngineAPI
     [DllImport("engine_ffi")]
     internal static extern uint animation_get_bone_positions(IntPtr player, float[] output, uint maxCount);
 
+    // ── NavAgent (AI agent control) ──────────────────────────────────
+
+    [DllImport("engine_ffi")]
+    internal static extern void nav_agent_set_target(IntPtr agent, float x, float y, float z);
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool nav_agent_get_position(IntPtr agent, out float x, out float y, out float z);
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool nav_agent_is_path_finished(IntPtr agent);
+
+    [DllImport("engine_ffi")]
+    internal static extern float nav_agent_get_remaining_distance(IntPtr agent);
+
     // ── IK Target Component ────────────────────────────────────────────
 
     [DllImport("engine_ffi")]

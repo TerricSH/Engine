@@ -39,6 +39,7 @@ pub mod coroutine;
 pub mod engine;
 pub mod entity;
 pub mod ik;
+pub mod nav_agent;
 pub mod registry;
 pub mod types;
 pub mod world_bridge;

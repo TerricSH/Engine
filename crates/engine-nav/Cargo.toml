@@ -9,6 +9,9 @@ license.workspace = true
 default = []
 
 [dependencies]
+engine-character = { path = "../engine-character" }
+engine-renderer = { path = "../engine-renderer" }
+engine-scene = { path = "../engine-scene" }
 engine-serialize = { path = "../engine-serialize" }
 glam.workspace = true
 serde.workspace = true

@@ -244,6 +244,31 @@ impl NavMesh {
             .map(|p| p.neighbors.clone())
             .unwrap_or_default()
     }
+
+    // ── Debug / FFI accessors ──────────────────────────────────────────────
+
+    /// All vertices in the mesh.
+    pub fn vertices(&self) -> &[Vec3] {
+        &self.vertices
+    }
+
+    /// Get a vertex position by index.
+    pub fn vertex(&self, idx: VertexIndex) -> Option<&Vec3> {
+        self.vertices.get(idx.0 as usize)
+    }
+
+    /// The vertex indices of a polygon, in winding order.
+    pub fn polygon_vertex_indices(&self, idx: PolygonIndex) -> Option<&[VertexIndex]> {
+        self.polygons.get(idx.0 as usize).map(|p| p.vertices.as_slice())
+    }
+
+    /// The cost multiplier of a polygon (1.0 = normal).
+    pub fn polygon_cost(&self, idx: PolygonIndex) -> f32 {
+        self.polygons
+            .get(idx.0 as usize)
+            .map(|p| p.cost)
+            .unwrap_or(1.0)
+    }
 }
 
 impl Default for NavMesh {

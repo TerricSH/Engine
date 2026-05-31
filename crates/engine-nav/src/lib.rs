@@ -1,10 +1,18 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+pub mod behavior;
+pub mod components;
+mod cooker;
+pub mod debug;
 mod navmesh;
 mod pathfinding;
 
-pub use agent::{AgentUpdate, NavAgent};
+pub use agent::{AgentUpdate, MovementIntent, NavAgent};
+pub use behavior::{AiBehavior, AiState};
+pub use components::{register_nav_extensions, update_ai_agent, AiAgent};
+pub use cooker::NavMeshCooker;
+pub use debug::NavMeshDebugDraw;
 pub use navmesh::{NavError, NavMesh, PolygonIndex, VertexIndex};
 pub use pathfinding::{Path, PathPoint, Pathfinder};
 
@@ -230,7 +238,9 @@ mod tests {
     #[test]
     fn nav_agent_update_without_path_returns_stopped() {
         let mut agent = NavAgent::new();
-        assert_eq!(agent.update(0.016), AgentUpdate::Stopped);
+        let (update, intent) = agent.update(0.016);
+        assert_eq!(update, AgentUpdate::Stopped);
+        assert!(intent.is_none());
     }
 
     #[test]
@@ -242,7 +252,9 @@ mod tests {
         }]);
         agent.set_path(path);
         // Single waypoint → agent already at destination
-        assert_eq!(agent.update(0.016), AgentUpdate::Arrived);
+        let (update, intent) = agent.update(0.016);
+        assert_eq!(update, AgentUpdate::Arrived);
+        assert!(intent.is_none());
     }
 
     #[test]
@@ -264,7 +276,7 @@ mod tests {
         agent.set_path(path);
 
         // After 1 second at 1 m/s, should be at x=1
-        let update = agent.update(1.0);
+        let (update, intent) = agent.update(1.0);
         match update {
             AgentUpdate::Moving {
                 position,
@@ -274,6 +286,13 @@ mod tests {
                 assert!((position.x - 1.0).abs() < 0.001);
                 assert_eq!(target, Vec3::new(10.0, 0.0, 0.0));
                 assert_eq!(speed, 1.0);
+                // Should produce a MovementIntent when moving
+                let intent = intent.expect("Expected MovementIntent when Moving");
+                assert!((intent.direction.x - 1.0).abs() < 0.001);
+                assert!((intent.direction.y).abs() < 0.001);
+                assert!((intent.direction.z).abs() < 0.001);
+                assert_eq!(intent.desired_speed, 1.0);
+                assert!(!intent.jump_requested);
             }
             _ => panic!("Expected Moving, got {:?}", update),
         }
@@ -297,8 +316,9 @@ mod tests {
         ]);
         agent.set_path(path);
 
-        let update = agent.update(1.0);
+        let (update, intent) = agent.update(1.0);
         assert_eq!(update, AgentUpdate::Arrived);
+        assert!(intent.is_none());
     }
 
     #[test]

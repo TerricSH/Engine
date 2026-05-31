@@ -1,6 +1,27 @@
-use crate::pathfinding::Path;
+use crate::pathfinding::{Path, PathPoint};
 use glam::Vec3;
 use tracing::debug;
+
+// ---------------------------------------------------------------------------
+// MovementIntent
+// ---------------------------------------------------------------------------
+
+/// A movement intent produced by [`NavAgent::update`] when the agent is
+/// actively moving toward a waypoint.
+///
+/// This decouples path-following (NavAgent) from actual movement (e.g. a
+/// [`CharacterController`](engine_character::CharacterController)): the
+/// agent computes *where* it wants to go, and the caller applies the intent
+/// to the actual transform or controller.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MovementIntent {
+    /// Normalised direction toward the current target waypoint (XZ plane).
+    pub direction: Vec3,
+    /// Desired movement speed (m/s).
+    pub desired_speed: f32,
+    /// Whether the agent requests a jump.
+    pub jump_requested: bool,
+}
 
 // ---------------------------------------------------------------------------
 // AgentUpdate
@@ -37,8 +58,19 @@ pub enum AgentUpdate {
 /// waypoint.  When it reaches a waypoint (within `0.001` units) it advances
 /// to the next one.  Once all waypoints are consumed `update` returns
 /// [`AgentUpdate::Arrived`] and the path is cleared.
+///
+/// # Position vs. transform
+///
+/// [`NavAgent::position`] represents the **desired / planned** position along
+/// the path — it is **not** the actual world-space transform of the entity.
+/// Callers should use the returned [`MovementIntent`] to drive a
+/// [`CharacterController`](engine_character::CharacterController) or
+/// other movement system.  The internal position is kept for path-progress
+/// bookkeeping only.
 #[derive(Clone, Debug)]
 pub struct NavAgent {
+    /// Desired/planned position along the path (internal bookkeeping).
+    /// This is NOT the actual transform position.
     position: Vec3,
     path: Option<Path>,
     /// Index of the next waypoint to move toward.
@@ -87,16 +119,22 @@ impl NavAgent {
 
     /// Advance the agent along its path by `dt` seconds.
     ///
-    /// Returns [`AgentUpdate::Arrived`] once the final waypoint is reached.
-    /// After arrival the internal path is cleared.
-    pub fn update(&mut self, dt: f32) -> AgentUpdate {
+    /// Returns a tuple of:
+    /// - [`AgentUpdate`] describing the agent's progress state.
+    /// - An optional [`MovementIntent`] when the agent is actively moving
+    ///   (`Some`) or `None` when stopped / arrived.
+    ///
+    /// The agent's internal [`position`](Self::position) is updated for
+    /// path-progress tracking.  Callers should use the returned
+    /// `MovementIntent` to drive the actual transform or character controller.
+    pub fn update(&mut self, dt: f32) -> (AgentUpdate, Option<MovementIntent>) {
         let Some(ref path) = self.path else {
-            return AgentUpdate::Stopped;
+            return (AgentUpdate::Stopped, None);
         };
 
         if path.is_empty() || self.next_waypoint >= path.len() {
             self.path = None;
-            return AgentUpdate::Arrived;
+            return (AgentUpdate::Arrived, None);
         }
 
         // Advance through waypoints until we exhaust the path or run out of
@@ -113,7 +151,7 @@ impl NavAgent {
                     self.position = target;
                     self.path = None;
                     debug!("Agent arrived at destination");
-                    return AgentUpdate::Arrived;
+                    return (AgentUpdate::Arrived, None);
                 }
                 continue;
             }
@@ -126,7 +164,7 @@ impl NavAgent {
                 if self.next_waypoint >= path.len() {
                     self.path = None;
                     debug!("Agent arrived at destination");
-                    return AgentUpdate::Arrived;
+                    return (AgentUpdate::Arrived, None);
                 }
                 // Continue to the next waypoint (same frame).
                 continue;
@@ -136,16 +174,25 @@ impl NavAgent {
             let dir = to_target / dist;
             self.position += dir * step;
 
-            return AgentUpdate::Moving {
-                position: self.position,
-                target,
-                speed: self.speed,
+            let intent = MovementIntent {
+                direction: dir,
+                desired_speed: self.speed,
+                jump_requested: false,
             };
+
+            return (
+                AgentUpdate::Moving {
+                    position: self.position,
+                    target,
+                    speed: self.speed,
+                },
+                Some(intent),
+            );
         }
 
         // Finished all waypoints.
         self.path = None;
-        AgentUpdate::Arrived
+        (AgentUpdate::Arrived, None)
     }
 
     /// Whether the agent has finished its path (or never had one).
@@ -187,6 +234,24 @@ impl NavAgent {
         } else {
             None
         }
+    }
+
+    /// Set a direct target destination.
+    ///
+    /// Creates a straight‑line path from the agent's current position to
+    /// `target`.  This is a convenience for FFI/C# control; for navigation‑
+    /// mesh‑aware pathfinding use [`set_path`](Self::set_path) with a path
+    /// computed by [`Pathfinder`](crate::Pathfinder).
+    pub fn set_target(&mut self, target: Vec3) {
+        let from = PathPoint {
+            position: self.position,
+            polygon: crate::navmesh::PolygonIndex(0),
+        };
+        let to = PathPoint {
+            position: target,
+            polygon: crate::navmesh::PolygonIndex(0),
+        };
+        self.set_path(Path::new(vec![from, to]));
     }
 
     /// Clear the path and stop the agent.

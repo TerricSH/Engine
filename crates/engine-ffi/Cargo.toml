@@ -9,6 +9,7 @@ description = "FFI bridge between Rust engine and C# scripting layer"
 [dependencies]
 engine-animation = { path = "../engine-animation" }
 engine-character = { path = "../engine-character" }
+engine-nav = { path = "../engine-nav" }
 engine-physics = { path = "../engine-physics" }
 engine-serialize = { path = "../engine-serialize" }
 engine-scene = { path = "../engine-scene" }
