@@ -4,6 +4,7 @@ use crate::component::ComponentStorageDyn;
 use crate::registry::ComponentRegistry;
 use crate::scene::SceneSettings;
 use crate::{Component, Entity, EntityManager, SparseSet};
+use engine_serialize::Value;
 
 pub(crate) mod scene;
 
@@ -145,6 +146,69 @@ impl World {
         } else {
             None
         }
+    }
+
+    /// Borrow a component by its type ID string (type-erased).
+    pub fn get_any(&self, entity: Entity, type_id: &str) -> Option<&dyn std::any::Any> {
+        self.storages.get(type_id)?.get_any(entity)
+    }
+
+    /// Insert a type-erased component by its type ID string.
+    ///
+    /// Returns `false` if the storage doesn't exist or the type doesn't match.
+    pub fn set_any(
+        &mut self,
+        entity: Entity,
+        type_id: &str,
+        component: Box<dyn std::any::Any>,
+    ) -> bool {
+        let Some(storage) = self.storages.get_mut(type_id) else {
+            return false;
+        };
+        storage.insert_any(entity, component).is_ok()
+    }
+
+    /// Serialise a component to JSON via its registered extension hooks.
+    ///
+    /// Returns `None` if the entity has no such component, the type has no
+    /// [`ComponentRegistry`] entry, or the type has no serialise hook.
+    pub fn serialize_component(&self, entity: Entity, type_id: &str) -> Option<String> {
+        let registry = self.component_registry.as_ref()?;
+        let ext = registry.get(type_id)?;
+        let ser_fn = ext.serialize?;
+        let any_ref = self.storages.get(type_id)?.get_any(entity)?;
+        let fields = ser_fn(any_ref);
+        serde_json::to_string(&fields).ok()
+    }
+
+    /// Deserialise a component from JSON via its registered extension hooks.
+    ///
+    /// Returns `false` if the component cannot be deserialised (no registry
+    /// entry, no deserialise hook, or JSON doesn't match the schema).
+    pub fn deserialize_component(&mut self, entity: Entity, type_id: &str, json: &str) -> bool {
+        let registry = match self.component_registry.as_ref() {
+            Some(r) => r,
+            None => return false,
+        };
+        let ext = match registry.get(type_id) {
+            Some(e) => e,
+            None => return false,
+        };
+        let de_fn = match ext.deserialize {
+            Some(f) => f,
+            None => return false,
+        };
+        let fields: BTreeMap<String, Value> = match serde_json::from_str(json) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let component = de_fn(&fields);
+        let static_key = ext.meta.type_id;
+        let storage = self
+            .storages
+            .entry(static_key)
+            .or_insert_with(|| (ext.storage_factory)());
+        storage.insert_any(entity, component).is_ok()
     }
 
     /// Mutably borrow a component by type.

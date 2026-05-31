@@ -79,6 +79,7 @@ fn rigid_body_serde_roundtrip() {
         enabled: false,
         gravity_scale: 0.5,
         can_sleep: false,
+        ccd_enabled: true,
     };
     let json = serde_json::to_string(&rb).unwrap();
     let rb2: RigidBody = serde_json::from_str(&json).unwrap();
@@ -89,6 +90,7 @@ fn rigid_body_serde_roundtrip() {
     assert_eq!(rb.enabled, rb2.enabled);
     assert_eq!(rb.gravity_scale, rb2.gravity_scale);
     assert_eq!(rb.can_sleep, rb2.can_sleep);
+    assert_eq!(rb.ccd_enabled, rb2.ccd_enabled);
 }
 
 #[test]

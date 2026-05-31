@@ -37,6 +37,7 @@ pub(super) fn serialize_rigid_body(component: &dyn std::any::Any) -> BTreeMap<St
     fields.insert("enabled".into(), Value::Bool(rb.enabled));
     fields.insert("gravity_scale".into(), Value::Float32(rb.gravity_scale));
     fields.insert("can_sleep".into(), Value::Bool(rb.can_sleep));
+    fields.insert("ccd_enabled".into(), Value::Bool(rb.ccd_enabled));
     fields
 }
 
@@ -73,6 +74,10 @@ pub(super) fn deserialize_rigid_body(
         Some(Value::Bool(v)) => *v,
         _ => true,
     };
+    let ccd_enabled = match fields.get("ccd_enabled") {
+        Some(Value::Bool(v)) => *v,
+        _ => false,
+    };
     Box::new(RigidBody {
         body_type,
         mass,
@@ -81,6 +86,7 @@ pub(super) fn deserialize_rigid_body(
         enabled,
         gravity_scale,
         can_sleep,
+        ccd_enabled,
     })
 }
 

@@ -160,21 +160,72 @@ pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
         crate::r#async::dispatch_main_thread_callbacks();
     }
 
+    /// Thread-local buffer for FFI component data transfer.
+    /// Reused across calls. Only one FFI call executes per thread at a time.
+    std::thread_local! {
+        static FFI_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     extern "C" fn component_get_ptr(
-        _entity: FfiEntityId,
-        _type_id: FfiComponentTypeId,
+        entity: FfiEntityId,
+        type_id: FfiComponentTypeId,
         out_len: &mut u32,
     ) -> *mut u8 {
-        *out_len = 0;
-        std::ptr::null_mut()
+        let engine_type_id = match crate::component::lookup_engine_type_id(type_id) {
+            Some(id) => id,
+            None => { *out_len = 0; return std::ptr::null_mut(); }
+        };
+
+        let json = with_world(|world| {
+            let e = Entity::new(entity.index, entity.generation);
+            if !world.is_alive(e) { return None; }
+            world.serialize_component(e, engine_type_id)
+        });
+
+        match json.flatten() {
+            Some(s) => {
+                let bytes = s.into_bytes();
+                let len = bytes.len();
+                FFI_BUF.with(|buf| {
+                    *buf.borrow_mut() = bytes;
+                });
+                // SAFETY: FFI_BUF lives for the rest of this call; the C# caller
+                // must copy the data before calling any other FFI function.
+                let ptr = FFI_BUF.with(|buf| buf.borrow().as_ptr()) as *mut u8;
+                *out_len = len as u32;
+                ptr
+            }
+            None => {
+                *out_len = 0;
+                std::ptr::null_mut()
+            }
+        }
     }
+
     extern "C" fn component_set_ptr(
-        _entity: FfiEntityId,
-        _type_id: FfiComponentTypeId,
-        _data: *const u8,
-        _len: u32,
+        entity: FfiEntityId,
+        type_id: FfiComponentTypeId,
+        data: *const u8,
+        len: u32,
     ) -> bool {
-        false
+        let engine_type_id = match crate::component::lookup_engine_type_id(type_id) {
+            Some(id) => id,
+            None => return false,
+        };
+        if data.is_null() || len == 0 { return false; }
+        // SAFETY: caller guarantees data points to valid memory of at least len bytes.
+        let json = unsafe {
+            let slice = std::slice::from_raw_parts(data, len as usize);
+            std::str::from_utf8(slice).unwrap_or("")
+        };
+        if json.is_empty() { return false; }
+
+        with_world_mut(|world| {
+            let e = Entity::new(entity.index, entity.generation);
+            if !world.is_alive(e) { return false; }
+            world.deserialize_component(e, engine_type_id, json)
+        })
+        .unwrap_or(false)
     }
 
     extern "C" fn async_load_image(
