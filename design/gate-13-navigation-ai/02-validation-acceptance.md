@@ -54,7 +54,17 @@ Gate 13 is accepted only when AI agents can navigate using cooked navmesh data a
 
 ## Exit Decision
 
-- Gate owner:
-- Date:
-- Approved to proceed to Gate 14: yes/no
+> **Note**: Exit decision fields should be filled by the gate reviewer after
+> validation is complete.  The following implementation status is provided
+> for reference:
+>
+> - P0 items: 9/9 resolved (asset pipeline, query API, path smoothing,
+>   behavior asset registration).
+> - P1 items: agent target recalc, radius/height validation, debug draw
+>   wiring — all addressed.
+> - Performance measurements: pending (see [`04-performance-report.md`](04-performance-report.md)).
+
+- Gate owner: *TBD — assign before gate exit*
+- Date: *TBD*
+- Approved to proceed to Gate 14: *pending*
 

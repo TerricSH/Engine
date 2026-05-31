@@ -190,8 +190,11 @@ pub trait ComponentStorageDyn: Send {
     fn iter_any(&self) -> Vec<(Entity, &dyn std::any::Any)>;
 
     /// Insert a boxed (type-erased) component.
-    fn insert_any(&mut self, entity: Entity, component: Box<dyn std::any::Any>)
-        -> Result<(), Box<dyn std::any::Any>>;
+    fn insert_any(
+        &mut self,
+        entity: Entity,
+        component: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>>;
 }
 
 impl<T: Component> ComponentStorageDyn for SparseSet<T> {
@@ -234,9 +237,11 @@ impl<T: Component> ComponentStorageDyn for SparseSet<T> {
             .collect()
     }
 
-    fn insert_any(&mut self, entity: Entity, component: Box<dyn std::any::Any>)
-        -> Result<(), Box<dyn std::any::Any>>
-    {
+    fn insert_any(
+        &mut self,
+        entity: Entity,
+        component: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>> {
         match component.downcast::<T>() {
             Ok(c) => {
                 self.insert(entity, *c);

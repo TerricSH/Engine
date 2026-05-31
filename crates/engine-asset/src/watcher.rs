@@ -218,11 +218,18 @@ impl DebouncedWatcher {
 
 impl DebouncedWatcher {
     /// Create a `DebouncedWatcher` for testing with a dummy inner
-    /// `FileWatcher`. The inner watcher watches a temp directory so it
-    /// does not panic on drop.
+    /// `FileWatcher`. The inner watcher watches a unique temp directory so
+    /// parallel test runs do not conflict.
     #[cfg(test)]
     fn create_for_test(debounce: std::time::Duration) -> Self {
-        let dir = std::env::temp_dir().join("debounce_test_inner");
+        // Use a unique directory per invocation to avoid races when tests
+        // run in parallel.  Thread ID + timestamp provides sufficient entropy.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let unique = format!("debounce_test_{:x}", ts);
+        let dir = std::env::temp_dir().join(unique);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let inner = FileWatcher::watch(&dir).expect("test FileWatcher creation failed");
@@ -273,13 +280,20 @@ mod tests {
 
     #[test]
     fn debounced_watcher_creation() {
-        let dir = std::env::temp_dir().join("debounce_test_create");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("debounce_create_{:x}", ts));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let dw = DebouncedWatcher::watch(&dir, Duration::from_millis(200));
         assert!(dw.is_ok());
 
+        // Drop the watcher BEFORE removing the directory so the notify
+        // backend does not produce a PathNotFound error.
+        drop(dw);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -33,13 +33,16 @@
 
 pub mod animation;
 pub mod r#async;
+pub mod audio;
 pub mod character;
 pub mod component;
 pub mod coroutine;
 pub mod engine;
 pub mod entity;
+pub mod gameplay;
 pub mod ik;
 pub mod nav_agent;
 pub mod registry;
 pub mod types;
+pub mod ui;
 pub mod world_bridge;

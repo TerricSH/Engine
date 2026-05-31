@@ -175,4 +175,27 @@ impl Skeleton {
         let local: Vec<BoneTransform> = self.bones.iter().map(|b| b.rest_transform).collect();
         Pose { local }
     }
+
+    /// Create a runtime `Skeleton` from an `assets::Skeleton` by converting
+    /// each joint into a bone with the correct parent hierarchy.
+    pub fn from_asset(asset: &crate::assets::Skeleton) -> Self {
+        use glam::{Quat, Vec3};
+        let mut skel = Self::new("imported".into());
+        for joint in &asset.joints {
+            let parent = joint.parent_index.map(|p| BoneIndex(p as u16));
+            let t = joint.local_transform.translation;
+            let r = joint.local_transform.rotation;
+            let s = joint.local_transform.scale;
+            skel.add_bone(
+                parent,
+                joint.name.clone(),
+                BoneTransform {
+                    translation: Vec3::from(t),
+                    rotation: Quat::from_array(r),
+                    scale: Vec3::from(s),
+                },
+            );
+        }
+        skel
+    }
 }

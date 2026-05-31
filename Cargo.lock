@@ -843,9 +843,13 @@ dependencies = [
 name = "engine-audio"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "cpal",
  "crossbeam-channel",
+ "engine-scene",
+ "engine-serialize",
  "glam",
+ "serde",
  "symphonia",
  "thiserror 1.0.69",
  "tracing",
@@ -887,7 +891,11 @@ name = "engine-editor"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "engine-animation",
  "engine-asset",
+ "engine-audio",
+ "engine-nav",
+ "engine-physics",
  "engine-renderer",
  "engine-scene",
  "engine-script",
@@ -896,6 +904,7 @@ dependencies = [
  "glam",
  "ron",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -905,12 +914,28 @@ name = "engine-ffi"
 version = "0.1.0"
 dependencies = [
  "engine-animation",
+ "engine-audio",
  "engine-character",
+ "engine-gameplay",
+ "engine-nav",
  "engine-physics",
  "engine-scene",
  "engine-serialize",
+ "engine-ui",
  "glam",
  "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "engine-gameplay"
+version = "0.1.0"
+dependencies = [
+ "engine-serialize",
+ "glam",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -947,6 +972,10 @@ dependencies = [
 name = "engine-nav"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "engine-character",
+ "engine-renderer",
+ "engine-scene",
  "engine-serialize",
  "glam",
  "serde",
@@ -987,6 +1016,7 @@ dependencies = [
 name = "engine-scene"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "engine-renderer",
  "engine-serialize",
  "glam",
@@ -1024,9 +1054,12 @@ dependencies = [
 name = "engine-ui"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "engine-renderer",
+ "engine-scene",
  "engine-serialize",
  "glam",
+ "image",
  "serde",
  "thiserror 1.0.69",
  "tracing",

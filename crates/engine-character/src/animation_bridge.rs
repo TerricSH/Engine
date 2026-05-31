@@ -5,8 +5,8 @@
 //! controller has been updated.
 
 use engine_animation::{
-    AnimStateMachineInstance, AnimationPlayer, IkTargetComponent,
-    locomotion_state_machine, skeleton, update_animation_pipeline,
+    locomotion_state_machine, skeleton, update_animation_pipeline, AnimStateMachineInstance,
+    AnimationPlayer, IkTargetComponent,
 };
 
 use crate::{AnimParams, CharacterController};

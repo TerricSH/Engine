@@ -30,6 +30,7 @@ use glam::Vec3;
 // ---------------------------------------------------------------------------
 
 pub mod clip;
+pub mod components;
 pub mod engine;
 pub mod handle;
 pub(crate) mod mixer;
@@ -40,9 +41,12 @@ pub mod source;
 // ---------------------------------------------------------------------------
 
 pub use clip::AudioClip;
+pub use components::{register_audio_extensions, AudioListenerComponent, AudioSourceComponent};
 pub use engine::AudioEngine;
 pub use handle::AudioHandle;
 pub use source::AudioSource;
+
+pub use MixerGroup::*;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -106,6 +110,7 @@ pub(crate) enum AudioCommand {
         loop_enabled: bool,
         emitter: Option<AudioEmitter>,
         finished: Arc<AtomicBool>,
+        group: MixerGroup,
     },
     Stop {
         id: u64,
@@ -128,9 +133,58 @@ pub(crate) enum AudioCommand {
         id: u64,
         pos_frame: usize,
     },
+    /// Update the world-space position of a spatial emitter so the mixer
+    /// can recalculate pan and attenuation at mix time.
+    SetEmitterPosition {
+        id: u64,
+        position: glam::Vec3,
+    },
     SetMasterVolume(f32),
     SetListener(AudioListener),
+    SetGroupVolume(MixerGroup, f32),
     StopAll,
+}
+
+// ---------------------------------------------------------------------------
+// MixerGroup
+// ---------------------------------------------------------------------------
+
+/// Category groups for mixer bus routing.
+///
+/// Each voice is assigned a group at creation time.  Group volumes are
+/// multiplied with per-voice and master volume during mixing, allowing
+/// category-wide volume control (e.g. mute SFX while keeping music).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MixerGroup {
+    /// Background music.
+    Music,
+    /// Sound effects.
+    Sfx,
+    /// User-interface sounds.
+    Ui,
+    /// Ambient / environmental sounds.
+    Ambience,
+}
+
+impl Default for MixerGroup {
+    fn default() -> Self {
+        Self::Sfx
+    }
+}
+
+impl MixerGroup {
+    /// The number of mixer group variants.
+    pub const COUNT: usize = 4;
+
+    /// Return the index of this group for array lookups.
+    pub fn index(self) -> usize {
+        match self {
+            MixerGroup::Music => 0,
+            MixerGroup::Sfx => 1,
+            MixerGroup::Ui => 2,
+            MixerGroup::Ambience => 3,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

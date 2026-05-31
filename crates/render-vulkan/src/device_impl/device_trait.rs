@@ -441,7 +441,9 @@ impl render_core::Device for VulkanDevice {
         let (sr, destroy_temp_modules) = if desc.shader_modules.is_empty() {
             // Fallback: use mvp_vert_spv / mvp_frag_spv (or skinned vert)
             let vert = if is_skinned {
-                self.skinned_vert_spv.as_deref().or(self.mvp_vert_spv.as_deref())
+                self.skinned_vert_spv
+                    .as_deref()
+                    .or(self.mvp_vert_spv.as_deref())
             } else {
                 self.mvp_vert_spv.as_deref()
             };

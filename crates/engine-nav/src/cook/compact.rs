@@ -5,8 +5,8 @@
 //! [`Heightfield`] are flattened into contiguous arrays; neighbour
 //! connectivity is pre-computed ahead of region building.
 
-use glam::Vec3;
 use crate::cook::heightfield::{Heightfield, NULL_SPAN};
+use glam::Vec3;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -147,17 +147,19 @@ impl CompactHeightfield {
 
         // Compute neighbour connectivity.
         let dirs: [(i32, i32, usize); 4] = [
-            (1, 0, 0),   // +x
-            (0, 1, 1),   // +z
-            (-1, 0, 2),  // -x
-            (0, -1, 3),  // -z
+            (1, 0, 0),  // +x
+            (0, 1, 1),  // +z
+            (-1, 0, 2), // -x
+            (0, -1, 3), // -z
         ];
 
         for z in 0..hf.height {
             for x in 0..hf.width {
                 let ci = (z * hf.width + x) as usize;
                 let r = &ranges[ci];
-                if r.count == 0 { continue; }
+                if r.count == 0 {
+                    continue;
+                }
 
                 for local_i in 0..r.count {
                     let span_idx = (r.start + local_i) as usize;
@@ -171,18 +173,23 @@ impl CompactHeightfield {
                         }
                         let nci = (nz as u32 * hf.width + nx as u32) as usize;
                         let nr = &ranges[nci];
-                        if nr.count == 0 { continue; }
+                        if nr.count == 0 {
+                            continue;
+                        }
 
                         for n_local in 0..nr.count {
                             let n_idx = (nr.start + n_local) as usize;
                             let ns = spans[n_idx];
 
                             let y_diff = (ns.y as i32 - span.y as i32).abs();
-                            if y_diff as u16 > walkable_climb { continue; }
+                            if y_diff as u16 > walkable_climb {
+                                continue;
+                            }
 
                             let overlap_bot = span.y.max(ns.y);
                             let overlap_top = (span.y as u32 + span.h as u32)
-                                .min(ns.y as u32 + ns.h as u32) as u16;
+                                .min(ns.y as u32 + ns.h as u32)
+                                as u16;
                             if overlap_top > overlap_bot + walkable_height {
                                 // Copy address to avoid borrow conflict.
                                 let con_span = &mut spans[span_idx];
@@ -201,7 +208,13 @@ impl CompactHeightfield {
         Self {
             width: hf.width,
             height: hf.height,
-            cells: ranges.iter().map(|r| CompactCell { index: r.start, count: r.count }).collect(),
+            cells: ranges
+                .iter()
+                .map(|r| CompactCell {
+                    index: r.start,
+                    count: r.count,
+                })
+                .collect(),
             spans,
             areas,
             dist,
@@ -230,12 +243,15 @@ impl CompactHeightfield {
             for x in 0..self.width {
                 let ci = (z * self.width + x) as usize;
                 let cell = &self.cells[ci];
-                if cell.count == 0 { continue; }
+                if cell.count == 0 {
+                    continue;
+                }
                 for local in 0..cell.count {
                     let idx = (cell.index + local) as usize;
                     // Check if this span has all 4 neighbours.
                     let s = &self.spans[idx];
-                    let all_connected = (0..4).all(|d| (s.con >> (d * 6)) & 0x3f != RC_NOT_CONNECTED);
+                    let all_connected =
+                        (0..4).all(|d| (s.con >> (d * 6)) & 0x3f != RC_NOT_CONNECTED);
                     if !all_connected || self.areas[idx] == 0 {
                         dist[idx] = 0;
                     }
@@ -248,23 +264,35 @@ impl CompactHeightfield {
             for x in 0..w {
                 let ci = z * w + x;
                 let cell = &self.cells[ci];
-                if cell.count == 0 { continue; }
+                if cell.count == 0 {
+                    continue;
+                }
                 for local in 0..cell.count {
                     let idx = (cell.index + local) as usize;
-                    if dist[idx] <= 1 { continue; }
+                    if dist[idx] <= 1 {
+                        continue;
+                    }
                     for &(dx, dz, add) in &dirs_fwd {
                         let nx = x as i32 + dx;
                         let nz = z as i32 + dz;
-                        if nx < 0 || nx >= w as i32 || nz < 0 || nz >= h as i32 { continue; }
+                        if nx < 0 || nx >= w as i32 || nz < 0 || nz >= h as i32 {
+                            continue;
+                        }
                         let nci = (nz as u32 * self.width + nx as u32) as usize;
-                        if nci >= self.cells.len() { continue; }
+                        if nci >= self.cells.len() {
+                            continue;
+                        }
                         let ncell = &self.cells[nci];
-                        if ncell.count == 0 { continue; }
+                        if ncell.count == 0 {
+                            continue;
+                        }
                         // For each neighbour span, find the one with matching layer.
                         // Simplified: use the same layer index.
                         let nidx = (ncell.index + local.min(ncell.count - 1)) as usize;
                         let nd = dist[nidx] + add;
-                        if nd < dist[idx] { dist[idx] = nd; }
+                        if nd < dist[idx] {
+                            dist[idx] = nd;
+                        }
                     }
                 }
             }
@@ -275,21 +303,33 @@ impl CompactHeightfield {
             for x in (0..w).rev() {
                 let ci = z * w + x;
                 let cell = &self.cells[ci];
-                if cell.count == 0 { continue; }
+                if cell.count == 0 {
+                    continue;
+                }
                 for local in 0..cell.count {
                     let idx = (cell.index + local) as usize;
-                    if dist[idx] <= 1 { continue; }
+                    if dist[idx] <= 1 {
+                        continue;
+                    }
                     for &(dx, dz, add) in &dirs_bwd {
                         let nx = x as i32 + dx;
                         let nz = z as i32 + dz;
-                        if nx < 0 || nx >= w as i32 || nz < 0 || nz >= h as i32 { continue; }
+                        if nx < 0 || nx >= w as i32 || nz < 0 || nz >= h as i32 {
+                            continue;
+                        }
                         let nci = (nz as u32 * self.width + nx as u32) as usize;
-                        if nci >= self.cells.len() { continue; }
+                        if nci >= self.cells.len() {
+                            continue;
+                        }
                         let ncell = &self.cells[nci];
-                        if ncell.count == 0 { continue; }
+                        if ncell.count == 0 {
+                            continue;
+                        }
                         let nidx = (ncell.index + local.min(ncell.count - 1)) as usize;
                         let nd = dist[nidx] + add;
-                        if nd < dist[idx] { dist[idx] = nd; }
+                        if nd < dist[idx] {
+                            dist[idx] = nd;
+                        }
                     }
                 }
             }
@@ -305,7 +345,9 @@ impl CompactHeightfield {
     /// Any span whose distance to a non-walkable border is ≤ `radius`
     /// is marked non-walkable.  This is where `agent_radius` takes effect.
     pub fn erode_walkable_area(&mut self, radius: u32) {
-        if radius == 0 { return; }
+        if radius == 0 {
+            return;
+        }
         for (i, &d) in self.dist.iter().enumerate() {
             if d <= radius as u16 && self.areas[i] > 0 {
                 self.areas[i] = 0;

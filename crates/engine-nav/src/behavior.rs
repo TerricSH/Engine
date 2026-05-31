@@ -1,4 +1,5 @@
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // AiState
@@ -6,7 +7,7 @@ use glam::Vec3;
 
 /// The current high-level state of an AI agent's behaviour finite-state
 /// machine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AiState {
     /// Standing still, waiting.
     Idle,
@@ -48,7 +49,7 @@ pub enum AiState {
 /// | Patrol  | Chase   | `player_position` within `perception_radius` |
 /// | Chase   | Patrol  | `player_position` outside `perception_radius × 1.5` (hysteresis) |
 /// | Chase   | Idle    | `player_position` within `arrival_radius`    |
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AiBehavior {
     pub state: AiState,
     /// Current abstract target (updated each frame).
@@ -114,10 +115,7 @@ impl AiBehavior {
                     self.current_waypoint = 0;
                     self.idle_timer = 0.0;
 
-                    let target = self
-                        .waypoints
-                        .first()
-                        .copied();
+                    let target = self.waypoints.first().copied();
                     self.target = target;
                     (AiState::Patrol, target)
                 } else {
@@ -183,6 +181,60 @@ impl Default for AiBehavior {
 }
 
 // ---------------------------------------------------------------------------
+// BehaviorAsset schema & asset pipeline
+// ---------------------------------------------------------------------------
+
+/// A serialisable behaviour asset that can be cooked and loaded through the
+/// asset system.
+///
+/// This holds the *configuration* of a behaviour (patrol waypoints, radiuses,
+/// timing) without runtime state such as the current waypoint index or idle
+/// timer — those are managed by the runtime [`AiBehavior`] instance at play
+/// time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BehaviorAsset {
+    /// Patrol waypoints the agent should cycle through.
+    pub patrol_waypoints: Vec<Vec3>,
+    /// Distance at which the agent detects the player (m).
+    pub perception_radius: f32,
+    /// Distance threshold for "arriving" (m).
+    pub arrival_radius: f32,
+    /// How long the agent stays idle before patrolling (seconds).
+    pub idle_duration: f32,
+    /// Initial state (Idle / Patrol / Chase).
+    pub initial_state: AiState,
+}
+
+impl Default for BehaviorAsset {
+    fn default() -> Self {
+        Self {
+            patrol_waypoints: Vec::new(),
+            perception_radius: 10.0,
+            arrival_radius: 1.0,
+            idle_duration: 3.0,
+            initial_state: AiState::Idle,
+        }
+    }
+}
+
+// ── Cooker / loader ──────────────────────────────────────────────────────
+
+/// Behavior asset cooker: validates and bincode-encodes.
+pub fn behavior_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
+    let _asset: BehaviorAsset = bincode::deserialize(source)
+        .map_err(|e| format!("BehaviorAsset cook validation failed: {e}"))?;
+    output.extend_from_slice(source);
+    Ok(())
+}
+
+/// Behavior asset loader: bincode-deserialises into a `BehaviorAsset`.
+pub fn behavior_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any>, String> {
+    let asset: BehaviorAsset =
+        bincode::deserialize(cooked).map_err(|e| format!("BehaviorAsset load failed: {e}"))?;
+    Ok(Box::new(asset))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -192,10 +244,7 @@ mod tests {
 
     fn agent() -> AiBehavior {
         let mut b = AiBehavior::new();
-        b.set_patrol_route(vec![
-            Vec3::new(10.0, 0.0, 0.0),
-            Vec3::new(20.0, 0.0, 0.0),
-        ]);
+        b.set_patrol_route(vec![Vec3::new(10.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 0.0)]);
         b.perception_radius = 10.0;
         b.arrival_radius = 1.0;
         b.idle_duration = 2.0;

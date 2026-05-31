@@ -12,6 +12,30 @@ use crate::navmesh::NavMesh;
 use crate::pathfinding::Pathfinder;
 
 // ---------------------------------------------------------------------------
+// NavMesh asset cooker / loader (bincode round-trip)
+// ---------------------------------------------------------------------------
+
+/// NavMesh cooker: validates input, bincode-encodes ready for the asset system.
+fn navmesh_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
+    // Validate by attempting a full deserialise + BVH rebuild.
+    let mut mesh: NavMesh =
+        bincode::deserialize(source).map_err(|e| format!("NavMesh cook validation failed: {e}"))?;
+    mesh.rebuild_bvh();
+    // Re-serialise so the cooked artefact is always canonical.
+    bincode::serialize_into(output, &mesh)
+        .map_err(|e| format!("NavMesh cook serialisation failed: {e}"))?;
+    Ok(())
+}
+
+/// NavMesh loader: bincode-deserialise and rebuild the acceleration structure.
+fn navmesh_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any>, String> {
+    let mut mesh: NavMesh =
+        bincode::deserialize(cooked).map_err(|e| format!("NavMesh load failed: {e}"))?;
+    mesh.rebuild_bvh();
+    Ok(Box::new(mesh))
+}
+
+// ---------------------------------------------------------------------------
 // AiAgent
 // ---------------------------------------------------------------------------
 
@@ -46,6 +70,16 @@ pub struct AiAgent {
     /// Internal path-following agent (not serialized — rebuilt at runtime).
     #[serde(skip)]
     pub(crate) nav_agent: NavAgent,
+
+    /// Previously requested target, used to detect changes that should
+    /// trigger a path recalculation even when the current path is not
+    /// yet finished.
+    #[serde(skip)]
+    last_target: Option<Vec3>,
+
+    /// Cached character controller height from last frame (for validation).
+    #[serde(skip)]
+    cached_controller_height: f32,
 }
 
 impl Component for AiAgent {
@@ -64,6 +98,8 @@ impl AiAgent {
             target: None,
             controller_entity_id: 0,
             nav_agent: NavAgent::new(),
+            last_target: None,
+            cached_controller_height: 0.0,
         }
     }
 
@@ -87,8 +123,9 @@ impl Default for AiAgent {
 // ---------------------------------------------------------------------------
 
 /// Serialize an `AiAgent` component into a field map.
-pub fn serialize_ai_agent(component: &dyn std::any::Any) -> BTreeMap<String, engine_serialize::Value>
-{
+pub fn serialize_ai_agent(
+    component: &dyn std::any::Any,
+) -> BTreeMap<String, engine_serialize::Value> {
     let agent = component
         .downcast_ref::<AiAgent>()
         .expect("AiAgent expected");
@@ -108,7 +145,10 @@ pub fn serialize_ai_agent(component: &dyn std::any::Any) -> BTreeMap<String, eng
         "agent_height".into(),
         engine_serialize::Value::Float32(agent.agent_height),
     );
-    fields.insert("speed".into(), engine_serialize::Value::Float32(agent.speed));
+    fields.insert(
+        "speed".into(),
+        engine_serialize::Value::Float32(agent.speed),
+    );
     fields.insert(
         "stopping_distance".into(),
         engine_serialize::Value::Float32(agent.stopping_distance),
@@ -159,15 +199,21 @@ pub fn deserialize_ai_agent(
 // Extension registration
 // ---------------------------------------------------------------------------
 
-/// Register AI Agent extensions with the engine's component and debug-draw
-/// systems.
+/// Register AI Agent extensions with the engine's component, debug-draw,
+/// and asset-type systems.
 ///
 /// Follows the same pattern as
-/// [`engine_character::register_character_extensions`].
+/// [`engine_character::register_character_extensions`] and
+/// [`engine_audio::components::register_audio_extensions`].
 pub fn register_nav_extensions(
     component_registry: &mut engine_scene::registry::ComponentRegistry,
-    _debug_draw_registry: Option<&mut engine_renderer::DebugDrawRegistry>,
+    debug_draw_registry: Option<&mut engine_renderer::DebugDrawRegistry>,
+    asset_type_registry: &mut engine_scene::registry::AssetTypeRegistry,
 ) {
+    // Wire debug draw if a registry is provided.
+    if let Some(reg) = debug_draw_registry {
+        reg.register(Box::new(crate::debug::NavMeshDebugDraw::new()));
+    }
     use engine_scene::registry::{ComponentExtension, ComponentMeta};
     use engine_scene::{ComponentStorageDyn, SparseSet};
 
@@ -185,6 +231,32 @@ pub fn register_nav_extensions(
         serialize: Some(serialize_ai_agent),
         deserialize: Some(deserialize_ai_agent),
     });
+
+    // Register NavMesh asset type (cooked = bincode-serialised mesh).
+    use engine_scene::registry::{AssetTypeExtension, AssetTypeMeta};
+
+    let nav_ext = AssetTypeExtension {
+        meta: AssetTypeMeta {
+            type_id: "navmesh",
+            source_extensions: vec!["navmesh", "nav"],
+            display_name: "Navigation Mesh",
+        },
+        cooker: Some(navmesh_cooker),
+        loader: Some(navmesh_loader),
+    };
+    let _ = asset_type_registry.register(nav_ext);
+
+    // Register Behavior asset type.
+    let behavior_ext = AssetTypeExtension {
+        meta: AssetTypeMeta {
+            type_id: "behavior",
+            source_extensions: vec!["behavior", "beh"],
+            display_name: "Agent Behavior",
+        },
+        cooker: Some(crate::behavior::behavior_cooker),
+        loader: Some(crate::behavior::behavior_loader),
+    };
+    let _ = asset_type_registry.register(behavior_ext);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,10 +285,30 @@ pub fn update_ai_agent(
     agent.nav_agent.set_position(character.position());
     agent.nav_agent.set_speed(agent.speed);
 
-    // If a target is set and the agent has finished its current path (or
-    // has a different target), compute a new path.
+    // Validate agent <-> controller dimensions.
+    // If the character controller's capsule size has changed since the
+    // agent was configured, log a diagnostic so level designers can
+    // catch mismatches.
+    if (character.height - agent.cached_controller_height).abs() > 0.01
+        || (character.radius - agent.agent_radius).abs() > 0.01
+    {
+        tracing::warn!(
+            controller_height = character.height,
+            controller_radius = character.radius,
+            agent_height = agent.agent_height,
+            agent_radius = agent.agent_radius,
+            "AI agent dimensions differ from character controller"
+        );
+    }
+    agent.cached_controller_height = character.height;
+
+    // If a target is set and the agent has finished its current path
+    // (or the target changed since the last recalculation), compute a
+    // new path.
     if let Some(target) = agent.target {
-        if agent.nav_agent.is_path_finished() {
+        let target_changed = agent.last_target.map(|lt| lt != target).unwrap_or(true);
+        if agent.nav_agent.is_path_finished() || target_changed {
+            agent.last_target = Some(target);
             let pathfinder = Pathfinder::new();
             match pathfinder.find_path(navmesh, character.position(), target) {
                 Ok(path) => {
@@ -231,6 +323,7 @@ pub fn update_ai_agent(
     } else {
         // No target — ensure the agent stops.
         agent.nav_agent.stop();
+        agent.last_target = None;
     }
 
     // Advance the NavAgent along its path.

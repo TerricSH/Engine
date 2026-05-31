@@ -31,7 +31,10 @@ const COMPONENT_TYPE_ENTRIES: &[(&str, &str)] = &[
     // engine-character components
     ("Character Controller", "engine.character_controller"),
     // engine-animation components
-    ("AnimStateMachineInstance", "engine.animation.anim_state_machine_instance"),
+    (
+        "AnimStateMachineInstance",
+        "engine.animation.anim_state_machine_instance",
+    ),
     ("BoneAttachment", "engine.animation.bone_attachment"),
     ("RootMotion", "engine.animation.root_motion"),
 ];

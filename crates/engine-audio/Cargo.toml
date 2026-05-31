@@ -10,9 +10,13 @@ default = []
 subsystem-audio-cpal = []
 
 [dependencies]
+bincode.workspace = true
 cpal.workspace = true
 crossbeam-channel.workspace = true
+engine-scene = { path = "../engine-scene" }
+engine-serialize = { path = "../engine-serialize" }
 glam.workspace = true
+serde.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -83,7 +83,10 @@ impl OverrideSet {
     }
 
     /// Iterate over all records for a given instance.
-    pub fn iter_instance<'a>(&'a self, instance_id: &'a str) -> impl Iterator<Item = &'a OverrideRecord> + 'a {
+    pub fn iter_instance<'a>(
+        &'a self,
+        instance_id: &'a str,
+    ) -> impl Iterator<Item = &'a OverrideRecord> + 'a {
         self.0.iter().filter(move |r| r.instance_id == instance_id)
     }
 }
@@ -146,7 +149,13 @@ pub fn apply_overrides(world: &mut World, overrides: &OverrideSet) {
         //
         // For known core component types we apply directly; for external
         // (registered) types we use the component registry hooks.
-        apply_field_override(world, entity, &record.component_type, &record.property_path, &record.value);
+        apply_field_override(
+            world,
+            entity,
+            &record.component_type,
+            &record.property_path,
+            &record.value,
+        );
     }
 }
 
@@ -366,8 +375,8 @@ fn default_value_for_field(property_path: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prefab_instance::instantiate_prefab;
     use crate::prefab::Prefab;
+    use crate::prefab_instance::instantiate_prefab;
     use crate::scene::{ComponentRecord, EntityRecord};
     use crate::World;
     use engine_serialize::{AssetId, SchemaVersion};
@@ -399,7 +408,7 @@ mod tests {
             components,
         });
 
-        let result = instantiate_prefab(&mut world, &prefab).unwrap();
+        let result = instantiate_prefab(&mut world, &prefab, None).unwrap();
         let instance_id = world
             .get::<PrefabInstanceRef>(result.root_entity)
             .unwrap()
@@ -419,7 +428,13 @@ mod tests {
             value: Value::Vec3([2.0, 2.0, 2.0]),
         });
 
-        let value = resolve_override(&overrides, "inst_0", "ent-test", "engine.transform", "scale");
+        let value = resolve_override(
+            &overrides,
+            "inst_0",
+            "ent-test",
+            "engine.transform",
+            "scale",
+        );
         assert!(value.is_some());
         assert_eq!(value.unwrap(), &Value::Vec3([2.0, 2.0, 2.0]));
     }
@@ -427,7 +442,13 @@ mod tests {
     #[test]
     fn resolve_override_not_found() {
         let overrides = OverrideSet::new();
-        let value = resolve_override(&overrides, "inst_0", "ent-test", "engine.transform", "scale");
+        let value = resolve_override(
+            &overrides,
+            "inst_0",
+            "ent-test",
+            "engine.transform",
+            "scale",
+        );
         assert!(value.is_none());
     }
 
@@ -443,7 +464,13 @@ mod tests {
         });
 
         // Different instance_id should not match.
-        let value = resolve_override(&overrides, "inst_b", "ent-test", "engine.transform", "scale");
+        let value = resolve_override(
+            &overrides,
+            "inst_b",
+            "ent-test",
+            "engine.transform",
+            "scale",
+        );
         assert!(value.is_none());
     }
 
@@ -463,11 +490,7 @@ mod tests {
         apply_overrides(&mut world, &overrides);
 
         // Verify transform scale changed
-        let entity = world
-            .query::<PrefabInstanceRef>()
-            .next()
-            .unwrap()
-            .0;
+        let entity = world.query::<PrefabInstanceRef>().next().unwrap().0;
         let transform = world.get::<crate::components::Transform>(entity).unwrap();
         assert_eq!(transform.scale.x, 10.0);
         assert_eq!(transform.scale.y, 20.0);

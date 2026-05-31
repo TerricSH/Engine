@@ -859,7 +859,14 @@ fn pipeline_evaluate_to_skin_matrices() {
     };
 
     let mut player = player;
-    let matrices = update_animation_pipeline(&mut player, &mut None, &[("test_clip", clip)], &skel, None, 0.0);
+    let matrices = update_animation_pipeline(
+        &mut player,
+        &mut None,
+        &[("test_clip", clip)],
+        &skel,
+        None,
+        0.0,
+    );
 
     assert_eq!(matrices.len(), skel.bone_count());
     // First matrix should be near identity (no animation, root at origin).
@@ -1006,7 +1013,6 @@ fn pipeline_constraint_enforced() {
         twist_angle.to_degrees(),
         max_allowed_rad.to_degrees()
     );
-
 }
 
 #[test]

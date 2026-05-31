@@ -73,14 +73,24 @@ impl NavMeshCookConfig {
         (self.walkable_radius / self.cell_size).ceil() as u32
     }
     pub fn validate(&self) -> Result<(), String> {
-        if self.cell_size <= 0.0 { return Err("cell_size must be positive".into()); }
-        if self.cell_height <= 0.0 { return Err("cell_height must be positive".into()); }
+        if self.cell_size <= 0.0 {
+            return Err("cell_size must be positive".into());
+        }
+        if self.cell_height <= 0.0 {
+            return Err("cell_height must be positive".into());
+        }
         if self.walkable_slope < 0.0 || self.walkable_slope > 90.0 {
             return Err("walkable_slope must be in [0, 90]".into());
         }
-        if self.walkable_radius < 0.0 { return Err("walkable_radius must be non-negative".into()); }
-        if self.walkable_height <= 0.0 { return Err("walkable_height must be positive".into()); }
-        if self.max_verts_per_poly < 3 { return Err("max_verts_per_poly must be ≥ 3".into()); }
+        if self.walkable_radius < 0.0 {
+            return Err("walkable_radius must be non-negative".into());
+        }
+        if self.walkable_height <= 0.0 {
+            return Err("walkable_height must be positive".into());
+        }
+        if self.max_verts_per_poly < 3 {
+            return Err("max_verts_per_poly must be ≥ 3".into());
+        }
         let (w, h) = self.grid_size();
         if w > 1024 || h > 1024 {
             return Err(format!("grid too large: {}×{} (max 1024×1024)", w, h));
@@ -132,13 +142,17 @@ mod tests {
         cfg.bounds_max = Vec3::new(3.0, 1.0, 3.0);
         cfg.cell_size = 0.3;
         let (w, h) = cfg.grid_size();
-        assert_eq!(w, 10); assert_eq!(h, 10);
+        assert_eq!(w, 10);
+        assert_eq!(h, 10);
     }
     #[test]
     fn config_voxel_conversions() {
         let cfg = NavMeshCookConfig {
-            cell_height: 0.2, walkable_height: 2.0, walkable_climb: 0.5,
-            walkable_radius: 0.3, cell_size: 0.3,
+            cell_height: 0.2,
+            walkable_height: 2.0,
+            walkable_climb: 0.5,
+            walkable_radius: 0.3,
+            cell_size: 0.3,
             ..Default::default()
         };
         assert_eq!(cfg.walkable_height_voxels(), 10);

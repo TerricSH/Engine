@@ -118,16 +118,8 @@ mod tests {
         let nav = polymesh_to_navmesh(&pm);
 
         // Should have 4 unique vertices and 1 polygon (merged quad).
-        assert_eq!(
-            nav.vertex_count(),
-            4,
-            "square should have 4 vertices"
-        );
-        assert_eq!(
-            nav.polygon_count(),
-            1,
-            "square should produce 1 polygon"
-        );
+        assert_eq!(nav.vertex_count(), 4, "square should have 4 vertices");
+        assert_eq!(nav.polygon_count(), 1, "square should produce 1 polygon");
 
         // Polygon should have 4 vertices.
         let verts = nav.polygon_vertex_indices(crate::PolygonIndex(0)).unwrap();

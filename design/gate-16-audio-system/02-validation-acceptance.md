@@ -25,8 +25,8 @@ Gate 16 is accepted only when audio assets can be cooked, loaded, played, spatia
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
-- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp`
+- `cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp,subsystem-audio-cpal`
+- `cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp,subsystem-audio-cpal`
 - Audio asset cook/load tests.
 - Mixer state tests.
 - Spatial attenuation tests.
@@ -54,7 +54,14 @@ Gate 16 is accepted only when audio assets can be cooked, loaded, played, spatia
 
 ## Exit Decision
 
-- Gate owner:
-- Date:
-- Approved to proceed to Gate 17: yes/no
+> **Implementation status:**
+> - P0 items: 7/7 resolved (C# audio control, mixer fix, mixer groups,
+>   audio asset pipeline metadata, ECS spatial audio, feature-gate CI).
+> - P1 items: cpal acceptance test feature flag, audio pipeline metadata
+>   header — addressed.
+> - Performance measurements: pending (see [`04-performance-report.md`](04-performance-report.md)).
+
+- Gate owner: *TBD — assign before gate exit*
+- Date: *TBD*
+- Approved to proceed to Gate 17: *pending*
 

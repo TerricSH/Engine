@@ -236,8 +236,12 @@ impl World {
                     ) {
                         continue;
                     }
-                    let Some(ext) = registry.get(type_id) else { continue };
-                    let Some(ser_fn) = ext.serialize else { continue };
+                    let Some(ext) = registry.get(type_id) else {
+                        continue;
+                    };
+                    let Some(ser_fn) = ext.serialize else {
+                        continue;
+                    };
                     if let Some(any_ref) = storage.get_any(entity) {
                         let fields = ser_fn(any_ref);
                         components.insert(
@@ -337,7 +341,7 @@ impl World {
     }
 
     /// Populate a typed component from scene field data.
-    fn populate_component(
+    pub(crate) fn populate_component(
         &mut self,
         entity: Entity,
         comp_type_id: &str,

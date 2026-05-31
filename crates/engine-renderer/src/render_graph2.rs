@@ -661,14 +661,26 @@ impl RenderGraph {
         for &pass_idx in &all_sorted {
             let pass = &self.passes[pass_idx];
             for o in &pass.outputs {
-                resource_writers.entry(o.name.clone()).or_default().push(pass_idx);
+                resource_writers
+                    .entry(o.name.clone())
+                    .or_default()
+                    .push(pass_idx);
             }
             for i in &pass.inputs {
-                resource_readers.entry(i.name.clone()).or_default().push(pass_idx);
+                resource_readers
+                    .entry(i.name.clone())
+                    .or_default()
+                    .push(pass_idx);
             }
             if let Some(ref ds) = pass.depth_stencil {
-                resource_readers.entry(ds.name.clone()).or_default().push(pass_idx);
-                resource_writers.entry(ds.name.clone()).or_default().push(pass_idx);
+                resource_readers
+                    .entry(ds.name.clone())
+                    .or_default()
+                    .push(pass_idx);
+                resource_writers
+                    .entry(ds.name.clone())
+                    .or_default()
+                    .push(pass_idx);
             }
         }
 
@@ -718,8 +730,7 @@ impl RenderGraph {
             let pass = &self.passes[pass_idx];
             // A pass is terminal (always live) if it is the Present pass or
             // if it produces no outputs (operator / side-effect passes).
-            let is_terminal = matches!(pass.kind, PassKind::Present)
-                || pass.outputs.is_empty();
+            let is_terminal = matches!(pass.kind, PassKind::Present) || pass.outputs.is_empty();
             if is_terminal && !live[pass_idx] {
                 live[pass_idx] = true;
                 queue.push(pass_idx);
@@ -1252,11 +1263,7 @@ mod tests {
     fn compile_v2_barriers_between_transitions() {
         let graph = make_graph();
         let compiled = graph.compile_v2().expect("compile_v2 should succeed");
-        let total_barriers: usize = compiled
-            .barriers_per_pass
-            .iter()
-            .map(|b| b.len())
-            .sum();
+        let total_barriers: usize = compiled.barriers_per_pass.iter().map(|b| b.len()).sum();
         assert!(total_barriers >= 1, "expected at least 1 barrier");
     }
 

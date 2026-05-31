@@ -567,10 +567,19 @@ pub fn locomotion_blend_sm() -> AnimStateMachine {
     sm.add_state(AnimationState {
         name: "locomotion".into(),
         clip_asset: String::new(), // unused when blend_space is set
-        blend_space_1d: Some(BlendSpace1D::new("speed", vec![
-            BlendSpaceSample { threshold: 1.5, clip_asset: "walk".into() },
-            BlendSpaceSample { threshold: 5.0, clip_asset: "run".into() },
-        ])),
+        blend_space_1d: Some(BlendSpace1D::new(
+            "speed",
+            vec![
+                BlendSpaceSample {
+                    threshold: 1.5,
+                    clip_asset: "walk".into(),
+                },
+                BlendSpaceSample {
+                    threshold: 5.0,
+                    clip_asset: "run".into(),
+                },
+            ],
+        )),
         speed: 1.0,
         looping: true,
     });

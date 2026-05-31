@@ -9,9 +9,14 @@ license.workspace = true
 default = []
 
 [dependencies]
+ab_glyph.workspace = true
 engine-renderer = { path = "../engine-renderer" }
+engine-scene = { path = "../engine-scene" }
 engine-serialize = { path = "../engine-serialize" }
 glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+image.workspace = true

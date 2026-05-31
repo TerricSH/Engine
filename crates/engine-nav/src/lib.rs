@@ -10,7 +10,7 @@ mod navmesh;
 mod pathfinding;
 
 pub use agent::{AgentUpdate, MovementIntent, NavAgent};
-pub use behavior::{AiBehavior, AiState};
+pub use behavior::{AiBehavior, AiState, BehaviorAsset};
 pub use components::{register_nav_extensions, update_ai_agent, AiAgent};
 pub use cooker::NavMeshCooker;
 pub use debug::NavMeshDebugDraw;

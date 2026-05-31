@@ -21,9 +21,7 @@
 
 use glam::Vec3;
 
-use crate::ik::{
-    solve_pose_multi, IkChain, IkConstraintSet, IkEffector,
-};
+use crate::ik::{solve_pose_multi, IkChain, IkConstraintSet, IkEffector};
 use crate::skeleton::Skeleton;
 use crate::{BoneIndex, Pose};
 
@@ -295,7 +293,9 @@ mod tests {
             bone_mask: Vec::new(),
         };
 
-        let foot_y_before = pose.global_transforms(&sk)[foot_bone.0 as usize].translation.y;
+        let foot_y_before = pose.global_transforms(&sk)[foot_bone.0 as usize]
+            .translation
+            .y;
         // foot_y_before should be 1.0 (root lifted by 1.0, foot at rest Y = 0 → global = 1.0)
         assert!(
             (foot_y_before - 1.0).abs() < 1e-5,
@@ -307,7 +307,9 @@ mod tests {
 
         assert!(result, "foot IK should have corrected the pose");
 
-        let foot_y_after = pose.global_transforms(&sk)[foot_bone.0 as usize].translation.y;
+        let foot_y_after = pose.global_transforms(&sk)[foot_bone.0 as usize]
+            .translation
+            .y;
         assert!(
             foot_y_after < 0.1,
             "foot Y should be near ground (≈0.0) after IK, got {}",
@@ -342,7 +344,9 @@ mod tests {
             bone_mask: vec![0, 1, 2, 3], // all chain bones
         };
 
-        let foot_y_before = pose.global_transforms(&sk)[foot_bone.0 as usize].translation.y;
+        let foot_y_before = pose.global_transforms(&sk)[foot_bone.0 as usize]
+            .translation
+            .y;
         assert!(
             (foot_y_before - 1.0).abs() < 1e-5,
             "expected foot Y ≈ 1.0 before IK, got {}",
@@ -352,7 +356,9 @@ mod tests {
         let result = apply_foot_ik(&mut pose, &sk, &config, &flat_ground);
         assert!(result, "foot IK should have corrected the pose");
 
-        let foot_y_after = pose.global_transforms(&sk)[foot_bone.0 as usize].translation.y;
+        let foot_y_after = pose.global_transforms(&sk)[foot_bone.0 as usize]
+            .translation
+            .y;
         assert!(
             foot_y_after < 0.1,
             "foot Y should be near ground after IK with full-chain mask, got {}",
@@ -392,11 +398,19 @@ mod tests {
         let final_local = pose.local_transforms();
         let any_changed = (0..sk.bone_count()).any(|i| {
             (orig_local[i].translation - final_local[i].translation).length() > 1e-6
-                || orig_local[i].rotation.angle_between(final_local[i].rotation) > 1e-6
+                || orig_local[i]
+                    .rotation
+                    .angle_between(final_local[i].rotation)
+                    > 1e-6
         });
-        assert!(any_changed, "at least one bone should have changed with empty mask");
+        assert!(
+            any_changed,
+            "at least one bone should have changed with empty mask"
+        );
 
-        let foot_y = pose.global_transforms(&sk)[foot_bone.0 as usize].translation.y;
+        let foot_y = pose.global_transforms(&sk)[foot_bone.0 as usize]
+            .translation
+            .y;
         assert!(
             foot_y < 0.1,
             "foot Y should be near ground after IK with empty mask, got {}",
@@ -425,7 +439,9 @@ mod tests {
             bone_mask: Vec::new(),
         };
 
-        let foot_y_before = pose.global_transforms(&sk)[foot_bone.0 as usize].translation.y;
+        let foot_y_before = pose.global_transforms(&sk)[foot_bone.0 as usize]
+            .translation
+            .y;
         assert!(
             (foot_y_before - 1.0).abs() < 1e-5,
             "expected foot Y ≈ 1.0 before IK, got {}",
@@ -435,7 +451,9 @@ mod tests {
         let result = apply_foot_ik(&mut pose, &sk, &config, &flat_ground);
         assert!(result, "foot IK should have corrected the pose");
 
-        let foot_y_after = pose.global_transforms(&sk)[foot_bone.0 as usize].translation.y;
+        let foot_y_after = pose.global_transforms(&sk)[foot_bone.0 as usize]
+            .translation
+            .y;
         // With 50% blend, foot should be roughly halfway between original (1.0) and ground (0.0).
         // Due to solver dynamics, it may not be exactly 0.5, but should be significantly lower
         // than before and higher than with full weight.

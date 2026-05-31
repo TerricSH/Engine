@@ -528,11 +528,17 @@ fn sensor_collider_generates_trigger_events() {
     let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
 
     // Sensor (trigger) collider on body 0.
-    world.backend.create_body(0, &RigidBody::default(), &Transform::default());
+    world
+        .backend
+        .create_body(0, &RigidBody::default(), &Transform::default());
     world.backend.create_collider(
         0,
         &Collider {
-            shape: ColliderShape::Cuboid { hx: 5.0, hy: 5.0, hz: 5.0 },
+            shape: ColliderShape::Cuboid {
+                hx: 5.0,
+                hy: 5.0,
+                hz: 5.0,
+            },
             is_trigger: true,
             ..Collider::default()
         },
@@ -543,12 +549,18 @@ fn sensor_collider_generates_trigger_events() {
     // Regular collider on body 1, overlapping.
     world.backend.create_body(
         1,
-        &RigidBody { body_type: BodyType::Static, ..RigidBody::default() },
+        &RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
         &Transform::default(),
     );
     world.backend.create_collider(
         1,
-        &Collider { shape: ColliderShape::Ball { radius: 1.0 }, ..Collider::default() },
+        &Collider {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            ..Collider::default()
+        },
         1,
         None,
     );
@@ -557,7 +569,10 @@ fn sensor_collider_generates_trigger_events() {
     // First step → Entered (Rapier fires event on new overlap).
     let step1 = world.backend.step();
     assert!(
-        step1.triggers.iter().any(|t| t.kind == TriggerEventKind::Entered),
+        step1
+            .triggers
+            .iter()
+            .any(|t| t.kind == TriggerEventKind::Entered),
         "new sensor overlap should produce Entered, got: {:?}",
         step1.triggers,
     );
@@ -569,7 +584,10 @@ fn sensor_collider_generates_trigger_events() {
     // Second step → Stay (persistent overlap detected by post-step query).
     let step2 = world.backend.step();
     assert!(
-        step2.triggers.iter().any(|t| t.kind == TriggerEventKind::Stay),
+        step2
+            .triggers
+            .iter()
+            .any(|t| t.kind == TriggerEventKind::Stay),
         "persistent sensor overlap should produce Stay, got: {:?}",
         step2.triggers,
     );
@@ -578,12 +596,17 @@ fn sensor_collider_generates_trigger_events() {
     // (Removing the body would also remove its collider from collider_map,
     // preventing event resolution; teleporting keeps the entity alive.)
     // Teleport body 1 far away and update the query pipeline.
-    world.backend.set_body_transform(1, glam::Vec3::new(100.0, 0.0, 0.0), glam::Quat::IDENTITY);
+    world
+        .backend
+        .set_body_transform(1, glam::Vec3::new(100.0, 0.0, 0.0), glam::Quat::IDENTITY);
     world.backend.sync_query_pipeline();
 
     let step3 = world.backend.step();
     assert!(
-        step3.triggers.iter().any(|t| t.kind == TriggerEventKind::Exited),
+        step3
+            .triggers
+            .iter()
+            .any(|t| t.kind == TriggerEventKind::Exited),
         "separated sensor should produce Exited, got: {:?}",
         step3.triggers,
     );
@@ -1065,10 +1088,7 @@ fn register_physics_extensions_with_debug_draw() {
     let mut component_registry = engine_scene::registry::ComponentRegistry::new();
     let mut debug_registry = engine_renderer::debug_draw::DebugDrawRegistry::new();
 
-    crate::register_physics_extensions(
-        &mut component_registry,
-        Some(&mut debug_registry),
-    );
+    crate::register_physics_extensions(&mut component_registry, Some(&mut debug_registry));
 
     assert_eq!(debug_registry.provider_count(), 1);
 }

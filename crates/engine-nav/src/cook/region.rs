@@ -138,11 +138,7 @@ fn build_layers(chf: &CompactHeightfield) -> Vec<Vec<u32>> {
 /// if any of its 4 neighbours has a non-zero region ID, the span inherits
 /// that region.  This step is repeated for up to `max_iter` iterations
 /// (equivalent to a constrained morphological dilation).
-fn expand_regions(
-    chf: &mut CompactHeightfield,
-    level: u16,
-    max_iter: u32,
-) {
+fn expand_regions(chf: &mut CompactHeightfield, level: u16, max_iter: u32) {
     for _ in 0..max_iter {
         let mut expanded = false;
 
@@ -207,10 +203,7 @@ fn flood_region(
         for dir in 0..4 {
             if let Some(nidx) = neighbor_span_idx(chf, mc.x, mc.z, mc.local, dir) {
                 let nidx = nidx as usize;
-                if chf.spans[nidx].reg == 0
-                    && chf.areas[nidx] > 0
-                    && chf.dist[nidx] == level
-                {
+                if chf.spans[nidx].reg == 0 && chf.areas[nidx] > 0 && chf.dist[nidx] == level {
                     chf.spans[nidx].reg = new_reg_id;
                     stack.push(nidx);
                 }
@@ -231,12 +224,7 @@ fn filter_small_regions(chf: &mut CompactHeightfield, min_area: u32) {
     }
 
     // Find the highest region ID in use.
-    let max_reg = chf
-        .spans
-        .iter()
-        .map(|s| s.reg)
-        .max()
-        .unwrap_or(0) as usize;
+    let max_reg = chf.spans.iter().map(|s| s.reg).max().unwrap_or(0) as usize;
 
     if max_reg == 0 {
         return;
@@ -274,12 +262,7 @@ fn merge_regions(chf: &mut CompactHeightfield, merge_area: u32) {
     }
 
     // First pass: re-count regions (some may have been zeroed by filtering).
-    let max_reg = chf
-        .spans
-        .iter()
-        .map(|s| s.reg)
-        .max()
-        .unwrap_or(0) as usize;
+    let max_reg = chf.spans.iter().map(|s| s.reg).max().unwrap_or(0) as usize;
 
     if max_reg < 2 {
         return;
@@ -328,9 +311,7 @@ fn merge_regions(chf: &mut CompactHeightfield, merge_area: u32) {
                             continue;
                         }
                         for dir in 0..4 {
-                            if let Some(nidx) =
-                                neighbor_span_idx(chf, x, z, local, dir)
-                            {
+                            if let Some(nidx) = neighbor_span_idx(chf, x, z, local, dir) {
                                 let nreg = chf.spans[nidx as usize].reg;
                                 if nreg != 0 && nreg != reg_id {
                                     adj_map[nreg as usize] += 1;
@@ -474,12 +455,7 @@ pub(crate) fn build_regions(
     merge_regions(chf, merge_region_area);
 
     // ── 6. Count remaining regions ──────────────────────────────────────
-    let max_reg = chf
-        .spans
-        .iter()
-        .map(|s| s.reg)
-        .max()
-        .unwrap_or(0);
+    let max_reg = chf.spans.iter().map(|s| s.reg).max().unwrap_or(0);
 
     // Renumber regions to be contiguous starting from 1.
     let mut remap = vec![0u16; (max_reg as usize + 1).max(2)];

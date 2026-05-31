@@ -1,10 +1,10 @@
 use glam::{Quat, Vec3};
 
 use crate::assets::{self, JointTransform};
-use tracing;
 use crate::clip;
 use crate::pose::Pose;
 use crate::skeleton::{self, BoneIndex, BoneTransform};
+use tracing;
 
 // ---------------------------------------------------------------------------
 // JointTransform ↔ BoneTransform
@@ -47,9 +47,9 @@ pub fn skeleton_asset_to_runtime(
     for joint in &asset_skel.joints {
         // Convert parent index: asset uses u32, runtime uses u16 via BoneIndex.
         // Clamp to u16::MAX as a safe fallback if asset data is corrupted.
-        let parent = joint.parent_index.map(|p| {
-            BoneIndex(p.min(u16::MAX as u32) as u16)
-        });
+        let parent = joint
+            .parent_index
+            .map(|p| BoneIndex(p.min(u16::MAX as u32) as u16));
         let bone_idx = runtime.add_bone(
             parent,
             joint.name.clone(),
@@ -149,8 +149,7 @@ pub fn pose_from_joint_transforms(transforms: &[JointTransform]) -> Pose {
 ///
 /// The order matches the skeleton's bone ordering (index 0 → bone 0, etc.).
 pub fn joint_transforms_from_pose(pose: &Pose) -> Vec<JointTransform> {
-    pose
-        .local_transforms()
+    pose.local_transforms()
         .iter()
         .map(|bt| JointTransform::from(bt))
         .collect()

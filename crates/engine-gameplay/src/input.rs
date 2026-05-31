@@ -568,8 +568,8 @@ pub fn resolve_action(
                             match axis {
                                 GamepadAxis::LeftX | GamepadAxis::RightX => x_val = Some(rv),
                                 GamepadAxis::LeftY | GamepadAxis::RightY => y_val = Some(rv),
-                    GamepadAxis::LT => x_val = Some(rv),
-                    GamepadAxis::RT => y_val = Some(rv),
+                                GamepadAxis::LT => x_val = Some(rv),
+                                GamepadAxis::RT => y_val = Some(rv),
                             }
                         } else {
                             // Non-axis match (keyboard/gamepad-button): treated as X-axis.

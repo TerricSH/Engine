@@ -1,8 +1,8 @@
+use crate::render_graph::CompiledBarrier;
 use crate::{
     render_graph, validate_frame_input, Diagnostic, DiagnosticSeverity, FrameStats,
     RenderFrameInput,
 };
-use crate::render_graph::CompiledBarrier;
 
 /// Backend renderer trait — implemented by concrete rendering backends
 /// (Vulkan, OpenGL, DX12) to bridge scene input to GPU execution.
@@ -89,8 +89,10 @@ impl Renderer {
 
         if let Some(backend) = self.backend.as_mut() {
             // Build the render graph from the frame input (DAG-based builder)
-            let graph =
-                crate::render_graph2::RenderGraph::build_with_config(input, &input.render_options.pass_graph_config);
+            let graph = crate::render_graph2::RenderGraph::build_with_config(
+                input,
+                &input.render_options.pass_graph_config,
+            );
 
             // Phase B: compile the graph (topological sort, cull dead passes,
             // infer barriers).

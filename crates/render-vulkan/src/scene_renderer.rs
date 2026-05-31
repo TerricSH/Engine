@@ -23,8 +23,7 @@ use glam::Vec4 as GlamVec4;
 use engine_renderer::{
     render_graph, AssetId, AxisAlignedBox, BackendRenderer, Diagnostic, DiagnosticSeverity,
     FrameStats, LightItem, LightKind, MaterialBinding, MaterialPipelineContext, MaterialResolver,
-    ParamBlock, PassRegistry, RenderFrameInput, RenderableItem, SkinnedItem,
-    Transparency,
+    ParamBlock, PassRegistry, RenderFrameInput, RenderableItem, SkinnedItem, Transparency,
 };
 use render_core::{
     self, BindGroupLayoutBinding, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
@@ -1312,19 +1311,16 @@ impl SceneRenderer {
 
                         first_directional = false;
                     } else {
-                        light_ssbo_data
-                            .extend_from_slice(&pack_light_gpu_bytes(light, dir, 0.0));
+                        light_ssbo_data.extend_from_slice(&pack_light_gpu_bytes(light, dir, 0.0));
                     }
                 }
                 LightKind::Point => {
                     let dir = [0.0f32; 3];
-                    light_ssbo_data
-                        .extend_from_slice(&pack_light_gpu_bytes(light, dir, 1.0));
+                    light_ssbo_data.extend_from_slice(&pack_light_gpu_bytes(light, dir, 1.0));
                 }
                 LightKind::Spot => {
                     let dir = normalize_dir(&light.direction);
-                    light_ssbo_data
-                        .extend_from_slice(&pack_light_gpu_bytes(light, dir, 2.0));
+                    light_ssbo_data.extend_from_slice(&pack_light_gpu_bytes(light, dir, 2.0));
                 }
             }
         }
@@ -1487,13 +1483,7 @@ impl SceneRenderer {
             }
             pc_bytes.resize(128, 0u8);
             unsafe {
-                d.cmd_push_constants(
-                    cmd,
-                    hdr_pll,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    &pc_bytes,
-                );
+                d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
             }
 
             // Bind vertex/index buffers
@@ -1564,8 +1554,7 @@ impl SceneRenderer {
             }
 
             let skeleton_id = &skinned.skeleton.id;
-            let bone_buf = match self
-                .get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette)
+            let bone_buf = match self.get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette)
             {
                 Ok(b) => b,
                 Err(diags) => {
@@ -1617,13 +1606,7 @@ impl SceneRenderer {
 
             let pc_bytes = vec![0u8; 128];
             unsafe {
-                d.cmd_push_constants(
-                    cmd,
-                    hdr_pll,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    &pc_bytes,
-                );
+                d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
             }
 
             // Bind vertex/index buffers
@@ -1671,8 +1654,7 @@ impl SceneRenderer {
             }
 
             if !visible_indices.is_empty() {
-                let mut indirect_bytes: Vec<u8> =
-                    Vec::with_capacity(visible_indices.len() * 20);
+                let mut indirect_bytes: Vec<u8> = Vec::with_capacity(visible_indices.len() * 20);
 
                 for &idx in &visible_indices {
                     let drawable = &input.drawables[idx];
@@ -1705,8 +1687,7 @@ impl SceneRenderer {
 
                         let material =
                             self.material_binding_for_drawable(input, &drawable.material);
-                        let material_ubo =
-                            Self::parse_material_ubo(&material.uniforms.bytes);
+                        let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
                         let ubo_bytes: &[u8] = unsafe {
                             std::slice::from_raw_parts(
                                 &material_ubo as *const _ as *const u8,
@@ -1714,10 +1695,7 @@ impl SceneRenderer {
                             )
                         };
                         let (mat_desc_set, _mat_buf) = self
-                            .get_or_create_material_desc_set(
-                                &drawable.material.id,
-                                ubo_bytes,
-                            )
+                            .get_or_create_material_desc_set(&drawable.material.id, ubo_bytes)
                             .unwrap_or_else(|diags| {
                                 for d in &diags {
                                     tracing::warn!(
@@ -1733,9 +1711,7 @@ impl SceneRenderer {
                             for tex_slot in &material.textures {
                                 let tex_id = &tex_slot.texture.id;
                                 if self.device.textures.contains_key(tex_id) {
-                                    let _ = self
-                                        .device
-                                        .bind_material_texture(tex_id, mat_desc_set);
+                                    let _ = self.device.bind_material_texture(tex_id, mat_desc_set);
                                     break;
                                 }
                             }
@@ -1795,13 +1771,7 @@ impl SceneRenderer {
 
                             let cmd_offset = cmd_idx as u64 * 20;
                             unsafe {
-                                d.cmd_draw_indexed_indirect(
-                                    cmd,
-                                    indirect_buf,
-                                    cmd_offset,
-                                    1,
-                                    20,
-                                );
+                                d.cmd_draw_indexed_indirect(cmd, indirect_buf, cmd_offset, 1, 20);
                             }
                         }
                     }
@@ -1882,9 +1852,8 @@ impl SceneRenderer {
         let (cascade_splits, light_vps) =
             VulkanDevice::compute_cascade_data(&view_mat, &proj_mat, 0.1, 100.0);
 
-        let splits_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(&cascade_splits as *const _ as *const u8, 16)
-        };
+        let splits_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(&cascade_splits as *const _ as *const u8, 16) };
         self.device.write_ubo_current(splits_bytes, 176);
 
         for (i, lvp) in light_vps.iter().enumerate() {
@@ -1997,13 +1966,7 @@ impl SceneRenderer {
                     )
                 };
                 unsafe {
-                    d.cmd_push_constants(
-                        cmd,
-                        pll,
-                        vk::ShaderStageFlags::VERTEX,
-                        0,
-                        mvp_bytes,
-                    );
+                    d.cmd_push_constants(cmd, pll, vk::ShaderStageFlags::VERTEX, 0, mvp_bytes);
                     let vbs = [vk_vb];
                     let offsets = [0u64];
                     d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
@@ -2436,18 +2399,20 @@ impl BackendRenderer for SceneRenderer {
                 render_graph::PassKind::Present => {}
                 render_graph::PassKind::Custom(name) if name == "bloom" => {
                     if let Some(ref mut enc) = self.cur_enc {
-                        let _ = self
-                            .pass_registry
-                            .find_mut("bloom")
-                            .map(|p: &mut dyn engine_renderer::RenderPass| p.execute(input, &mut **enc, stats));
+                        let _ = self.pass_registry.find_mut("bloom").map(
+                            |p: &mut dyn engine_renderer::RenderPass| {
+                                p.execute(input, &mut **enc, stats)
+                            },
+                        );
                     }
                 }
                 render_graph::PassKind::Custom(name) if name == "ssao" => {
                     if let Some(ref mut enc) = self.cur_enc {
-                        let _ = self
-                            .pass_registry
-                            .find_mut("ssao")
-                            .map(|p: &mut dyn engine_renderer::RenderPass| p.execute(input, &mut **enc, stats));
+                        let _ = self.pass_registry.find_mut("ssao").map(
+                            |p: &mut dyn engine_renderer::RenderPass| {
+                                p.execute(input, &mut **enc, stats)
+                            },
+                        );
                     }
                 }
                 render_graph::PassKind::Custom(name) => {

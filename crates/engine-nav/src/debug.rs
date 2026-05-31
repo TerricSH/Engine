@@ -107,11 +107,7 @@ impl NavMeshDebugDraw {
     /// the corresponding polygons.
     pub fn set_path(&mut self, path: &Path) {
         self.path_waypoints = path.waypoints().iter().map(|wp| wp.position).collect();
-        self.path_polygons = path
-            .waypoints()
-            .iter()
-            .map(|wp| wp.polygon)
-            .collect();
+        self.path_polygons = path.waypoints().iter().map(|wp| wp.polygon).collect();
     }
 
     /// Set the agent's world position to draw a marker sphere.

@@ -55,7 +55,14 @@ Gate 17 is accepted only when the editor is practical for production authoring a
 
 ## Exit Decision
 
-- Gate owner:
-- Date:
-- Approved to proceed to Gate 18: yes/no
+> **Implementation status:**
+> - P0 items: 8/8 resolved (editor UI scaffolding, gizmo undo, layout
+>   persistence, plugin integration, asset assignment).
+> - P1 items: plugin registry wiring, asset browser assignment, material
+>   editor mutation path, editor persistence — all addressed.
+> - Performance measurements: pending (see [`04-performance-report.md`](04-performance-report.md)).
+
+- Gate owner: *TBD — assign before gate exit*
+- Date: *TBD*
+- Approved to proceed to Gate 18: *pending*
 

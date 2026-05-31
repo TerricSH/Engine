@@ -120,9 +120,7 @@ pub unsafe extern "C" fn animation_play_clip(
 ///
 /// `player` must be a valid pointer to `AnimationPlayer`, or null.
 #[no_mangle]
-pub unsafe extern "C" fn animation_bone_count(
-    player: *const std::ffi::c_void,
-) -> u32 {
+pub unsafe extern "C" fn animation_bone_count(player: *const std::ffi::c_void) -> u32 {
     if player.is_null() {
         return 0;
     }

@@ -18,6 +18,8 @@ pub struct World {
     // Mapping for Scene ↔ World conversion.
     pub(crate) persistent_to_entity: BTreeMap<String, Entity>,
     pub(crate) entity_to_persistent: Vec<Option<String>>,
+    // Per-entity enabled/disabled state (true = enabled, processed by systems).
+    pub(crate) enabled: Vec<bool>,
     // Stored scene-level settings (preserved through round-trips).
     pub(crate) scene_settings: SceneSettings,
     pub(crate) scene_id: String,
@@ -33,6 +35,7 @@ impl World {
             storages: BTreeMap::new(),
             persistent_to_entity: BTreeMap::new(),
             entity_to_persistent: Vec::new(),
+            enabled: Vec::new(),
             scene_settings: SceneSettings::default(),
             scene_id: "ecs-world".to_string(),
             scene_name: "ECS World".to_string(),
@@ -50,7 +53,14 @@ impl World {
 
     /// Create a new entity and return its handle.
     pub fn create_entity(&mut self) -> Entity {
-        self.entities.allocate()
+        let entity = self.entities.allocate();
+        let idx = entity.index() as usize;
+        if self.enabled.len() <= idx {
+            self.enabled.resize(idx + 1, true);
+        } else {
+            self.enabled[idx] = true;
+        }
+        entity
     }
 
     /// Destroy an entity and all of its components.
@@ -78,6 +88,29 @@ impl World {
     /// Returns `true` if the entity handle is still alive.
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entities.is_alive(entity)
+    }
+
+    /// Enable or disable an entity.
+    ///
+    /// Disabled entities are preserved in the world but are not processed by
+    /// systems (they are effectively "inactive").
+    pub fn set_enabled(&mut self, entity: Entity, enabled: bool) {
+        let idx = entity.index() as usize;
+        if idx < self.enabled.len() {
+            self.enabled[idx] = enabled;
+        }
+    }
+
+    /// Returns `true` if the entity is enabled.
+    ///
+    /// Newly created entities are enabled by default.  Returns `false` for
+    /// stale entity handles.
+    pub fn is_enabled(&self, entity: Entity) -> bool {
+        if !self.entities.is_alive(entity) {
+            return false;
+        }
+        let idx = entity.index() as usize;
+        idx < self.enabled.len() && self.enabled[idx]
     }
 
     /// Number of live entities.
@@ -288,6 +321,7 @@ impl World {
         self.storages.clear();
         self.persistent_to_entity.clear();
         self.entity_to_persistent.clear();
+        self.enabled.clear();
         self.scene_settings = SceneSettings::default();
         self.scene_id = "ecs-world".to_string();
         self.scene_name = "ECS World".to_string();

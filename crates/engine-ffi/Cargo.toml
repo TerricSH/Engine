@@ -8,11 +8,14 @@ description = "FFI bridge between Rust engine and C# scripting layer"
 
 [dependencies]
 engine-animation = { path = "../engine-animation" }
+engine-audio = { path = "../engine-audio" }
 engine-character = { path = "../engine-character" }
+engine-gameplay = { path = "../engine-gameplay" }
 engine-nav = { path = "../engine-nav" }
 engine-physics = { path = "../engine-physics" }
 engine-serialize = { path = "../engine-serialize" }
 engine-scene = { path = "../engine-scene" }
+engine-ui = { path = "../engine-ui" }
 glam.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

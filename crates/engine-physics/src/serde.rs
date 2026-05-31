@@ -30,10 +30,7 @@ pub(super) fn serialize_rigid_body(component: &dyn std::any::Any) -> BTreeMap<St
     );
     fields.insert("mass".into(), Value::Float32(rb.mass));
     fields.insert("linear_damping".into(), Value::Float32(rb.linear_damping));
-    fields.insert(
-        "angular_damping".into(),
-        Value::Float32(rb.angular_damping),
-    );
+    fields.insert("angular_damping".into(), Value::Float32(rb.angular_damping));
     fields.insert("enabled".into(), Value::Bool(rb.enabled));
     fields.insert("gravity_scale".into(), Value::Float32(rb.gravity_scale));
     fields.insert("can_sleep".into(), Value::Bool(rb.can_sleep));
@@ -41,9 +38,7 @@ pub(super) fn serialize_rigid_body(component: &dyn std::any::Any) -> BTreeMap<St
     fields
 }
 
-pub(super) fn deserialize_rigid_body(
-    fields: &BTreeMap<String, Value>,
-) -> Box<dyn std::any::Any> {
+pub(super) fn deserialize_rigid_body(fields: &BTreeMap<String, Value>) -> Box<dyn std::any::Any> {
     let body_type = match fields.get("body_type") {
         Some(Value::Enum(s)) if s == "Static" => BodyType::Static,
         Some(Value::Enum(s)) if s == "Kinematic" => BodyType::Kinematic,
@@ -141,14 +136,18 @@ pub(super) fn serialize_collider(component: &dyn std::any::Any) -> BTreeMap<Stri
     fields.insert("friction".into(), Value::Float32(c.friction));
     fields.insert("restitution".into(), Value::Float32(c.restitution));
     fields.insert("is_trigger".into(), Value::Bool(c.is_trigger));
-    fields.insert("collision_group".into(), Value::UInt(c.collision_group as u64));
-    fields.insert("collision_mask".into(), Value::UInt(c.collision_mask as u64));
+    fields.insert(
+        "collision_group".into(),
+        Value::UInt(c.collision_group as u64),
+    );
+    fields.insert(
+        "collision_mask".into(),
+        Value::UInt(c.collision_mask as u64),
+    );
     fields
 }
 
-pub(super) fn deserialize_collider(
-    fields: &BTreeMap<String, Value>,
-) -> Box<dyn std::any::Any> {
+pub(super) fn deserialize_collider(fields: &BTreeMap<String, Value>) -> Box<dyn std::any::Any> {
     // Deserialize shape.
     let shape = match fields.get("shape") {
         Some(Value::Map(shape_map)) => {
@@ -200,9 +199,7 @@ pub(super) fn deserialize_collider(
 // PhysicsMaterial
 // ══════════════════════════════════════════════════════════════════════════════
 
-pub(super) fn serialize_physics_material(
-    component: &dyn std::any::Any,
-) -> BTreeMap<String, Value> {
+pub(super) fn serialize_physics_material(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
     let m = component
         .downcast_ref::<PhysicsMaterial>()
         .expect("PhysicsMaterial expected");
@@ -217,7 +214,8 @@ pub(super) fn deserialize_physics_material(
     fields: &BTreeMap<String, Value>,
 ) -> Box<dyn std::any::Any> {
     let friction = float_field(fields, "friction").unwrap_or(PhysicsMaterial::default().friction);
-    let restitution = float_field(fields, "restitution").unwrap_or(PhysicsMaterial::default().restitution);
+    let restitution =
+        float_field(fields, "restitution").unwrap_or(PhysicsMaterial::default().restitution);
     let density = float_field(fields, "density").unwrap_or(PhysicsMaterial::default().density);
     Box::new(PhysicsMaterial {
         friction,

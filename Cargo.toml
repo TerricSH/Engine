@@ -20,6 +20,7 @@ members = [
     "crates/engine-ui",
     "crates/engine-nav",
     "crates/engine-character",
+    "crates/engine-gameplay",
     "crates/engine-ffi",
     "crates/sandbox",
 ]
@@ -32,6 +33,7 @@ rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+ab_glyph = "0.2"
 ash = "0.38"
 base64 = "0.22"
 ash-window = "0.13"

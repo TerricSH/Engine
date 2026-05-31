@@ -6,7 +6,9 @@ use rapier3d::prelude::*;
 
 use crate::components::{BodyType, Collider, ColliderShape, RigidBody};
 use crate::convert::{from_rapier_isometry, from_rapier_vec, to_rapier_isometry, to_rapier_vec};
-use crate::events::{CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind};
+use crate::events::{
+    CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind,
+};
 use crate::joints::{JointDescriptor, JointHandle, JointType};
 use crate::queries::{
     OverlapHitResult, QueryBatcher, QueryResults, RaycastHitResult, SweepHitResult,
@@ -84,14 +86,8 @@ impl EventHandler for BackendEventHandler {
 
         // Route sensor (trigger) events through the intersection channel;
         // regular collisions go through the collision channel.
-        let is_sensor = colliders
-            .get(c1)
-            .map(|c| c.is_sensor())
-            .unwrap_or(false)
-            || colliders
-                .get(c2)
-                .map(|c| c.is_sensor())
-                .unwrap_or(false);
+        let is_sensor = colliders.get(c1).map(|c| c.is_sensor()).unwrap_or(false)
+            || colliders.get(c2).map(|c| c.is_sensor()).unwrap_or(false);
 
         if is_sensor {
             let _ = self.tx_int.send(RawIntersectionEvent {
@@ -196,10 +192,7 @@ impl RapierBackend {
     pub fn step(&mut self) -> PhysicsEvents {
         let (tx_col, rx_col) = crossbeam_channel::unbounded();
         let (tx_int, rx_int) = crossbeam_channel::unbounded();
-        let handler = BackendEventHandler {
-            tx_col,
-            tx_int,
-        };
+        let handler = BackendEventHandler { tx_col, tx_int };
 
         self.pipeline.step(
             &self.gravity,
@@ -225,7 +218,10 @@ impl RapierBackend {
 
         // ── Resolve collider handle → entity helper ──────────────────────
         let resolve = |handle: ColliderHandle| -> Option<Entity> {
-            collider_to_entity.get(&handle).copied().map(|i| Entity::new(i, 0))
+            collider_to_entity
+                .get(&handle)
+                .copied()
+                .map(|i| Entity::new(i, 0))
         };
 
         // ── 1. Collect collision (non-trigger) events ─────────────────────
@@ -237,7 +233,11 @@ impl RapierBackend {
                 CollisionEventKind::ContactStopped
             };
             if let (Some(a), Some(b)) = (resolve(raw.collider1), resolve(raw.collider2)) {
-                collisions.push(CollisionEvent { kind, entity_a: a, entity_b: b });
+                collisions.push(CollisionEvent {
+                    kind,
+                    entity_a: a,
+                    entity_b: b,
+                });
             }
         }
 
@@ -274,7 +274,11 @@ impl RapierBackend {
                     TriggerEventKind::Entered
                 };
                 if let (Some(a), Some(b)) = (resolve(raw.collider1), resolve(raw.collider2)) {
-                    triggers.push(TriggerEvent { kind, entity_a: a, entity_b: b });
+                    triggers.push(TriggerEvent {
+                        kind,
+                        entity_a: a,
+                        entity_b: b,
+                    });
                 }
                 event_overlaps.insert(key);
             } else {
@@ -306,16 +310,24 @@ impl RapierBackend {
         // Read all active intersection (sensor) pairs.
         // Rapier returns (ColliderHandle, ColliderHandle, intersecting: bool).
         for (c1, c2, _intersecting) in self.narrow_phase.intersection_pairs() {
-            let Some(&e1) = collider_to_entity.get(&c1) else { continue };
-            let Some(&e2) = collider_to_entity.get(&c2) else { continue };
+            let Some(&e1) = collider_to_entity.get(&c1) else {
+                continue;
+            };
+            let Some(&e2) = collider_to_entity.get(&c2) else {
+                continue;
+            };
             let key = if e1 < e2 { (e1, e2) } else { (e2, e1) };
             full_overlaps.insert(key);
         }
 
         // Read all active contact (non-sensor) pairs.
         for pair in self.narrow_phase.contact_pairs() {
-            let Some(&e1) = collider_to_entity.get(&pair.collider1) else { continue };
-            let Some(&e2) = collider_to_entity.get(&pair.collider2) else { continue };
+            let Some(&e1) = collider_to_entity.get(&pair.collider1) else {
+                continue;
+            };
+            let Some(&e2) = collider_to_entity.get(&pair.collider2) else {
+                continue;
+            };
             let key = if e1 < e2 { (e1, e2) } else { (e2, e1) };
             collision_overlaps.insert(key);
         }
@@ -347,7 +359,10 @@ impl RapierBackend {
 
         self.active_collision_overlaps = collision_overlaps;
 
-        PhysicsEvents { collisions, triggers }
+        PhysicsEvents {
+            collisions,
+            triggers,
+        }
     }
 
     // ── Body management ─────────────────────────────────────────────────

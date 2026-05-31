@@ -14,7 +14,9 @@ pub use backend::{RapierBackend, RaycastHit};
 pub use components::{BodyType, Collider, ColliderShape, PhysicsMaterial, RigidBody};
 pub use convert::{from_rapier_vec, to_rapier_vec};
 pub use debug::{ColliderDebugInfo, PhysicsDebugDraw};
-pub use events::{CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind};
+pub use events::{
+    CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind,
+};
 pub use joints::{JointDescriptor, JointHandle, JointLimits, JointMotor, JointType};
 pub use queries::{
     OverlapHitResult, OverlapQuery, QueryBatcher, QueryResults, RaycastHitResult, RaycastQuery,

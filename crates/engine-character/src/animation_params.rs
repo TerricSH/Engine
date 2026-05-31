@@ -206,7 +206,10 @@ mod tests {
         let ctrl = make_ctrl(true, 0.0, 0.0, CharacterState::Landing);
         let p = AnimParams::from_controller(&ctrl);
         assert_eq!(p.move_state, AnimMoveState::Land);
-        assert!(!p.grounded, "Landing is not Grounded — is_grounded() is false");
+        assert!(
+            !p.grounded,
+            "Landing is not Grounded — is_grounded() is false"
+        );
         assert!(!p.is_moving);
     }
 

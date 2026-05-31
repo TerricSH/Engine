@@ -9,8 +9,8 @@ use glam::Vec3;
 
 use crate::clip::AudioClip;
 use crate::{
-    AudioCommand, AudioListener, _compute_stereo_pan, _distance_attenuation, _MAX_VOICES,
-    _VOLUME_RAMP_SECS,
+    AudioCommand, AudioListener, MixerGroup, _compute_stereo_pan, _distance_attenuation,
+    _MAX_VOICES, _VOLUME_RAMP_SECS,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,6 +46,8 @@ pub(crate) struct MixerVoice {
     emitter_rolloff: f32,
     /// Pre-clip volume for this voice (before master volume).
     voice_volume: f32,
+    /// Mixer group this voice belongs to.
+    group: MixerGroup,
 }
 
 /// Mixer state: everything the audio callback touches.
@@ -61,6 +63,8 @@ pub(crate) struct MixerState {
     listener: AudioListener,
     /// Output sample rate (from cpal config).
     sample_rate: u32,
+    /// Per-group volume multipliers, indexed by [`MixerGroup::index()`].
+    group_volumes: [f32; MixerGroup::COUNT],
 }
 
 impl MixerState {
@@ -76,6 +80,7 @@ impl MixerState {
             master_volume: 1.0,
             listener: AudioListener::default(),
             sample_rate,
+            group_volumes: [1.0; MixerGroup::COUNT],
         }
     }
 
@@ -91,6 +96,7 @@ impl MixerState {
                     loop_enabled,
                     emitter,
                     finished,
+                    group,
                 } => {
                     let sr = self.sample_rate;
                     if let Some(slot) = self.find_free_slot() {
@@ -114,6 +120,7 @@ impl MixerState {
                         } else {
                             slot.spatial = false;
                         }
+                        slot.group = group;
                     }
                 }
                 AudioCommand::Stop { id } => {
@@ -150,11 +157,23 @@ impl MixerState {
                         }
                     }
                 }
+                AudioCommand::SetEmitterPosition { id, position } => {
+                    if let Some(slot) = self.find_voice(id) {
+                        slot.spatial = true;
+                        slot.emitter_position = position;
+                    }
+                }
                 AudioCommand::SetMasterVolume(vol) => {
                     self.master_volume = vol.clamp(0.0, 1.0);
                 }
                 AudioCommand::SetListener(listener) => {
                     self.listener = listener;
+                }
+                AudioCommand::SetGroupVolume(group, vol) => {
+                    let idx = group.index();
+                    if idx < self.group_volumes.len() {
+                        self.group_volumes[idx] = vol.clamp(0.0, 1.0);
+                    }
                 }
                 AudioCommand::StopAll => {
                     for v in &mut self.voices {
@@ -183,7 +202,7 @@ impl MixerState {
                     continue;
                 };
 
-                let clip_channels = clip.channels() as usize;
+                let clip_channels = (clip.channels() as usize).max(1);
                 let clip_frames = clip.samples().len() / clip_channels;
 
                 // Check for end-of-clip.
@@ -217,9 +236,10 @@ impl MixerState {
                 // Advance read position.
                 v.read_frame += 1;
 
-                // Apply per-voice volume.
-                let left = s_left * vol;
-                let right = s_right * vol;
+                // Apply per-voice volume * group (bus) volume.
+                let g_vol = self.group_volumes[v.group.index()];
+                let left_sample = s_left * vol * g_vol;
+                let right_sample = s_right * vol * g_vol;
 
                 // Spatial audio panning.
                 if v.spatial {
@@ -232,11 +252,11 @@ impl MixerState {
                     let dist = v.emitter_position.distance(self.listener.position);
                     let atten =
                         _distance_attenuation(dist, v.emitter_max_distance, v.emitter_rolloff);
-                    left_sum += left * pan_l * atten;
-                    right_sum += right * pan_r * atten;
+                    left_sum += left_sample * pan_l * atten;
+                    right_sum += right_sample * pan_r * atten;
                 } else {
-                    left_sum += left;
-                    right_sum += right;
+                    left_sum += left_sample;
+                    right_sum += right_sample;
                 }
             }
 
@@ -247,7 +267,7 @@ impl MixerState {
             // Clamp to avoid overflow in output.
             let out_idx = frame * channels as usize;
             data[out_idx] = left_sum.clamp(-1.0, 1.0);
-            if channels as usize > out_idx + 1 {
+            if channels > 1 {
                 data[out_idx + 1] = right_sum.clamp(-1.0, 1.0);
             }
         }
@@ -282,6 +302,7 @@ impl MixerVoice {
             emitter_max_distance: 10.0,
             emitter_rolloff: 1.0,
             voice_volume: 1.0,
+            group: MixerGroup::default(),
         }
     }
 

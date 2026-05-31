@@ -51,7 +51,10 @@ impl VulkanDevice {
     ) -> Option<vk::ImageMemoryBarrier<'static>> {
         // Skip transitions FROM Undefined (no layout to preserve) and
         // PresentSrc (swapchain images managed externally).
-        if matches!(barrier.old_state, ResourceState::Undefined | ResourceState::PresentSrc) {
+        if matches!(
+            barrier.old_state,
+            ResourceState::Undefined | ResourceState::PresentSrc
+        ) {
             return None;
         }
 

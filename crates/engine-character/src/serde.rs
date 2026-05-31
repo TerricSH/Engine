@@ -11,9 +11,7 @@ use engine_serialize::Value;
 use crate::controller::CharacterController;
 
 /// Serialize a `CharacterController` component into a field map.
-pub fn serialize_character_controller(
-    component: &dyn std::any::Any,
-) -> BTreeMap<String, Value> {
+pub fn serialize_character_controller(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
     let ctrl = component
         .downcast_ref::<CharacterController>()
         .expect("CharacterController expected");
@@ -37,15 +35,9 @@ pub fn serialize_character_controller(
     );
 
     // ── Jump & gravity ───────────────────────────────────────────────────
-    fields.insert(
-        "jump_velocity".into(),
-        Value::Float32(ctrl.jump_velocity),
-    );
+    fields.insert("jump_velocity".into(), Value::Float32(ctrl.jump_velocity));
     fields.insert("gravity_scale".into(), Value::Float32(ctrl.gravity_scale));
-    fields.insert(
-        "max_fall_speed".into(),
-        Value::Float32(ctrl.max_fall_speed),
-    );
+    fields.insert("max_fall_speed".into(), Value::Float32(ctrl.max_fall_speed));
 
     // ── Collision ────────────────────────────────────────────────────────
     fields.insert("step_height".into(), Value::Float32(ctrl.step_height));
@@ -67,10 +59,7 @@ pub fn serialize_character_controller(
     fields.insert("velocity".into(), Value::Vec3(ctrl.velocity.into()));
 
     // ── Misc ─────────────────────────────────────────────────────────────
-    fields.insert(
-        "foot_ik_enabled".into(),
-        Value::Bool(ctrl.foot_ik_enabled),
-    );
+    fields.insert("foot_ik_enabled".into(), Value::Bool(ctrl.foot_ik_enabled));
 
     fields
 }

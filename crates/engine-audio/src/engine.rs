@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -5,7 +6,7 @@ use crate::clip::AudioClip;
 use crate::handle::AudioHandle;
 #[cfg(feature = "subsystem-audio-cpal")]
 use crate::mixer::MixerState;
-use crate::{AudioCommand, AudioEmitter, AudioError, AudioListener};
+use crate::{AudioCommand, AudioEmitter, AudioError, AudioListener, MixerGroup};
 
 #[cfg(feature = "subsystem-audio-cpal")]
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -40,6 +41,9 @@ pub struct AudioEngine {
     master_volume: f32,
     /// Current listener state.
     listener: AudioListener,
+    /// Active sound handles keyed by handle ID.
+    /// Used by the FFI layer to stop / set volume on individual sounds.
+    active_handles: HashMap<u64, AudioHandle>,
 }
 
 // SAFETY: AudioEngine is Send because all fields are Send.
@@ -66,6 +70,7 @@ impl AudioEngine {
             next_id: 1,
             master_volume: 1.0,
             listener: AudioListener::default(),
+            active_handles: HashMap::new(),
         })
     }
 
@@ -204,14 +209,17 @@ impl AudioEngine {
             .send(AudioCommand::Play {
                 id,
                 clip,
-                volume: self.master_volume,
+                volume: 1.0,
                 loop_enabled: false,
                 emitter: None,
                 finished: finished.clone(),
+                group: MixerGroup::Sfx,
             })
             .map_err(|_| AudioError::StreamError("command channel closed".to_string()))?;
 
-        Ok(AudioHandle::new(id, self.cmd_tx.clone(), finished))
+        let handle = AudioHandle::new(id, self.cmd_tx.clone(), finished);
+        self.active_handles.insert(id, handle.clone());
+        Ok(handle)
     }
 
     /// Play a clip with spatial audio and return a handle.
@@ -232,10 +240,37 @@ impl AudioEngine {
                 loop_enabled: false,
                 emitter: Some(emitter),
                 finished: finished.clone(),
+                group: MixerGroup::Sfx,
             })
             .map_err(|_| AudioError::StreamError("command channel closed".to_string()))?;
 
-        Ok(AudioHandle::new(id, self.cmd_tx.clone(), finished))
+        let handle = AudioHandle::new(id, self.cmd_tx.clone(), finished);
+        self.active_handles.insert(id, handle.clone());
+        Ok(handle)
+    }
+
+    /// Stop a playing sound by handle ID.
+    ///
+    /// Returns `true` if a sound with that ID was found and stopped.
+    pub fn stop(&mut self, handle_id: u64) -> bool {
+        if let Some(mut handle) = self.active_handles.remove(&handle_id) {
+            let _ = handle.stop();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the volume of a playing sound by handle ID.
+    ///
+    /// `volume` is clamped to `[0, 1]`.  Returns `true` if the handle was found.
+    pub fn set_volume(&mut self, handle_id: u64, volume: f32) -> bool {
+        if let Some(handle) = self.active_handles.get_mut(&handle_id) {
+            let _ = handle.set_volume(volume.clamp(0.0, 1.0));
+            true
+        } else {
+            false
+        }
     }
 
     /// Set the global listener.
@@ -244,14 +279,40 @@ impl AudioEngine {
         let _ = self.cmd_tx.send(AudioCommand::SetListener(listener));
     }
 
-    /// Per-frame update. Processes any pending state synchronisation.
+    /// Per-frame update.  Synchronises ECS-driven positional data with the
+    /// audio callback thread and prunes finished handles.
     ///
-    /// `dt` is the frame delta in seconds (reserved for future use such as
-    /// main-thread positional interpolation).
-    pub fn update(&mut self, _dt: f32) {
-        // Currently the command queue is drained by the audio callback itself.
-        // This method is reserved for future main-thread work such as
-        // streaming-chunk submission or statistics gathering.
+    /// Call this once per frame after the ECS world has been ticked.
+    /// `listener_transform` — when `Some`, updates the spatial listener
+    /// position/orientation.
+    /// `source_positions` — an iterator of `(source_id, position)` pairs
+    /// for active spatial sources whose position changed.
+    pub fn update(
+        &mut self,
+        _dt: f32,
+        listener_transform: Option<&engine_scene::components::Transform>,
+        source_positions: &[(u64, glam::Vec3)],
+    ) {
+        if let Some(lt) = listener_transform {
+            let mut listener = AudioListener::new();
+            listener.set_position(lt.translation);
+            // Orientation derived from the transform's rotation.
+            let fwd = lt.rotation * -glam::Vec3::Z;
+            let up = lt.rotation * glam::Vec3::Y;
+            listener.set_orientation(fwd, up);
+            let _ = self.cmd_tx.send(AudioCommand::SetListener(listener));
+        }
+
+        for &(source_id, pos) in source_positions {
+            let _ = self.cmd_tx.send(AudioCommand::SetEmitterPosition {
+                id: source_id,
+                position: pos,
+            });
+        }
+
+        // Prune finished handles to prevent unbounded growth.
+        self.active_handles
+            .retain(|_id, handle| !handle.is_finished());
     }
 
     /// Set the master volume (0.0–1.0).
@@ -270,6 +331,15 @@ impl AudioEngine {
     /// Stop all currently playing sounds.
     pub fn stop_all(&mut self) {
         let _ = self.cmd_tx.send(AudioCommand::StopAll);
+    }
+
+    /// Set the volume of an entire mixer group (Music / Sfx / Ui / Ambience).
+    ///
+    /// `volume` is clamped to `[0, 1]`.  This is multiplied with per-voice
+    /// and master volume during mixing.
+    pub fn set_group_volume(&mut self, group: MixerGroup, volume: f32) {
+        let vol = volume.clamp(0.0, 1.0);
+        let _ = self.cmd_tx.send(AudioCommand::SetGroupVolume(group, vol));
     }
 }
 

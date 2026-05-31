@@ -101,8 +101,12 @@ struct BvhNode {
 /// Internal entry used during BVH construction.
 struct BvhEntry {
     idx: u32,
-    bx: u16, by: u16, bz: u16,
-    ex: u16, ey: u16, ez: u16,
+    bx: u16,
+    by: u16,
+    bz: u16,
+    ex: u16,
+    ey: u16,
+    ez: u16,
 }
 
 impl NavMesh {
@@ -129,13 +133,20 @@ impl NavMesh {
     fn poly_aabb(&self, verts: &[VertexIndex]) -> Option<(f32, f32, f32, f32)> {
         let mut iter = verts.iter().filter_map(|vi| self.vertex(*vi).copied());
         let first = iter.next()?;
-        let (mut min_x, mut max_x, mut min_z, mut max_z) =
-            (first.x, first.x, first.z, first.z);
+        let (mut min_x, mut max_x, mut min_z, mut max_z) = (first.x, first.x, first.z, first.z);
         for v in iter {
-            if v.x < min_x { min_x = v.x; }
-            if v.x > max_x { max_x = v.x; }
-            if v.z < min_z { min_z = v.z; }
-            if v.z > max_z { max_z = v.z; }
+            if v.x < min_x {
+                min_x = v.x;
+            }
+            if v.x > max_x {
+                max_x = v.x;
+            }
+            if v.z < min_z {
+                min_z = v.z;
+            }
+            if v.z > max_z {
+                max_z = v.z;
+            }
         }
         Some((min_x, max_x, min_z, max_z))
     }
@@ -149,7 +160,9 @@ impl NavMesh {
     pub fn rebuild_bvh(&mut self) {
         self.bvh_nodes.clear();
         let n = self.polygons.len();
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
 
         // 1. Compute world AABB of entire mesh (for quantisation).
         let mut world_min = Vec3::splat(f32::MAX);
@@ -158,10 +171,18 @@ impl NavMesh {
 
         for poly in &self.polygons {
             if let Some((min_x, max_x, min_z, max_z)) = self.poly_aabb(&poly.vertices) {
-                if min_x < world_min.x { world_min.x = min_x; }
-                if min_z < world_min.z { world_min.z = min_z; }
-                if max_x > world_max.x { world_max.x = max_x; }
-                if max_z > world_max.z { world_max.z = max_z; }
+                if min_x < world_min.x {
+                    world_min.x = min_x;
+                }
+                if min_z < world_min.z {
+                    world_min.z = min_z;
+                }
+                if max_x > world_max.x {
+                    world_max.x = max_x;
+                }
+                if max_z > world_max.z {
+                    world_max.z = max_z;
+                }
                 poly_boxes.push((min_x, max_x, min_z, max_z));
             } else {
                 poly_boxes.push((0.0, 0.0, 0.0, 0.0));
@@ -183,16 +204,24 @@ impl NavMesh {
         let oz = world_min.z;
         let oy = world_min.y;
 
-        let mut entries: Vec<BvhEntry> = poly_boxes.iter().enumerate().map(|(i, &(min_x, max_x, min_z, max_z))| {
-            let qx = |v: f32| ((v - ox) * q).clamp(0.0, 65535.0) as u16;
-            let qz = |v: f32| ((v - oz) * q).clamp(0.0, 65535.0) as u16;
-            let qy = |v: f32| ((v - oy) * q).clamp(0.0, 65535.0) as u16;
-            BvhEntry {
-                idx: i as u32,
-                bx: qx(min_x), by: qy(0.0), bz: qz(min_z),
-                ex: qx(max_x), ey: qy(0.0), ez: qz(max_z),
-            }
-        }).collect();
+        let mut entries: Vec<BvhEntry> = poly_boxes
+            .iter()
+            .enumerate()
+            .map(|(i, &(min_x, max_x, min_z, max_z))| {
+                let qx = |v: f32| ((v - ox) * q).clamp(0.0, 65535.0) as u16;
+                let qz = |v: f32| ((v - oz) * q).clamp(0.0, 65535.0) as u16;
+                let qy = |v: f32| ((v - oy) * q).clamp(0.0, 65535.0) as u16;
+                BvhEntry {
+                    idx: i as u32,
+                    bx: qx(min_x),
+                    by: qy(0.0),
+                    bz: qz(min_z),
+                    ex: qx(max_x),
+                    ey: qy(0.0),
+                    ez: qz(max_z),
+                }
+            })
+            .collect();
 
         // 4. Sort by X midpoint (simple SAH-like heuristic in 2D).
         entries.sort_by_key(|e| e.bx);
@@ -209,7 +238,9 @@ impl NavMesh {
         let mut nodes = Vec::new();
         let count = hi - lo;
 
-        if count == 0 { return nodes; }
+        if count == 0 {
+            return nodes;
+        }
 
         // Compute AABB of the range.
         let mut bmin = [u16::MAX; 3];
@@ -226,7 +257,8 @@ impl NavMesh {
         if count == 1 {
             // Leaf node.
             nodes.push(BvhNode {
-                bmin, bmax,
+                bmin,
+                bmax,
                 index: entries[lo].idx as i32,
             });
             return nodes;
@@ -235,10 +267,22 @@ impl NavMesh {
         // Internal node: split at median of the longest axis.
         // Sort sub-range by the midpoint of the split axis so the median
         // produces a balanced partition.
-        let axis = if bmax[0] - bmin[0] >= bmax[2] - bmin[2] { 0usize } else { 2usize };
+        let axis = if bmax[0] - bmin[0] >= bmax[2] - bmin[2] {
+            0usize
+        } else {
+            2usize
+        };
         entries[lo..hi].sort_by(|a, b| {
-            let ca = if axis == 0 { (a.bx as u32 + a.ex as u32) / 2 } else { (a.bz as u32 + a.ez as u32) / 2 };
-            let cb = if axis == 0 { (b.bx as u32 + b.ex as u32) / 2 } else { (b.bz as u32 + b.ez as u32) / 2 };
+            let ca = if axis == 0 {
+                (a.bx as u32 + a.ex as u32) / 2
+            } else {
+                (a.bz as u32 + a.ez as u32) / 2
+            };
+            let cb = if axis == 0 {
+                (b.bx as u32 + b.ex as u32) / 2
+            } else {
+                (b.bz as u32 + b.ez as u32) / 2
+            };
             ca.cmp(&cb)
         });
         let split = lo + count / 2;
@@ -258,7 +302,8 @@ impl NavMesh {
 
         let mut result = Vec::with_capacity(1 + left_count + right_count);
         result.push(BvhNode {
-            bmin, bmax,
+            bmin,
+            bmax,
             index: escape,
         });
         result.extend(left);
@@ -290,9 +335,12 @@ impl NavMesh {
         while i < self.bvh_nodes.len() {
             let node = &self.bvh_nodes[i];
             // Overlap test (point in AABB).
-            if qpx >= node.bmin[0] && qpx <= node.bmax[0]
-                && qpz >= node.bmin[2] && qpz <= node.bmax[2]
-                && qpy >= node.bmin[1] && qpy <= node.bmax[1]
+            if qpx >= node.bmin[0]
+                && qpx <= node.bmax[0]
+                && qpz >= node.bmin[2]
+                && qpz <= node.bmax[2]
+                && qpy >= node.bmin[1]
+                && qpy <= node.bmax[1]
             {
                 if node.index >= 0 {
                     // Leaf.
@@ -408,7 +456,9 @@ impl NavMesh {
         let candidates = self.bvh_query(px, pz);
         for &pi in &candidates {
             if let Some(polygon) = self.polygons.get(pi.0 as usize) {
-                if polygon.vertices.len() < 3 { continue; }
+                if polygon.vertices.len() < 3 {
+                    continue;
+                }
                 if point_in_convex_polygon_xz(px, pz, &polygon.vertices, &self.vertices) {
                     return Some(pi);
                 }
@@ -463,6 +513,111 @@ impl NavMesh {
             .unwrap_or_default()
     }
 
+    // ── Walkability / random-point queries ──────────────────────────────────
+
+    /// Check whether a navigable path exists between `from` and `to`.
+    ///
+    /// Internally runs a full A* search; returns `true` when a path exists.
+    /// This is equivalent to `GetNearestPoint` + `FindPath` combined into a
+    /// boolean predicate.
+    pub fn is_walkable_to(&self, from: Vec3, to: Vec3) -> bool {
+        let pathfinder = crate::pathfinding::Pathfinder::new();
+        pathfinder.find_path(self, from, to).is_ok()
+    }
+
+    /// Return a uniformly-distributed random point on the navmesh.
+    ///
+    /// Uses the XZ bounds of the mesh for rejection sampling — a candidate
+    /// point is generated inside the world-space AABB and tested against the
+    /// polygon set.  This is equivalent to `GetRandomPoint` in standard
+    /// navmesh APIs.
+    ///
+    /// Returns `None` when the mesh is empty or has no navigable area.
+    pub fn random_point(&self, seed: u64) -> Option<Vec3> {
+        if self.polygons.is_empty() {
+            return None;
+        }
+
+        // Use a simple LCG (Lehmer generator) for deterministic output.
+        let mut rng_state = seed;
+        let mut next_u32 = || -> u32 {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng_state >> 32) as u32
+        };
+        let mut next_f32 = || -> f32 { (next_u32() as f32) * (1.0 / 4294967296.0) };
+
+        // Build world-space AABB from all polygon vertices.
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_z = f32::MAX;
+        let mut max_z = f32::MIN;
+        for v in &self.vertices {
+            if v.x < min_x {
+                min_x = v.x;
+            }
+            if v.x > max_x {
+                max_x = v.x;
+            }
+            if v.z < min_z {
+                min_z = v.z;
+            }
+            if v.z > max_z {
+                max_z = v.z;
+            }
+        }
+
+        if min_x > max_x || min_z > max_z {
+            return None; // no vertices
+        }
+
+        // Rejection sampling inside the AABB with a polygon-containment check.
+        let range_x = max_x - min_x;
+        let range_z = max_z - min_z;
+        for _ in 0..64 {
+            let px = min_x + next_f32() * range_x;
+            let pz = min_z + next_f32() * range_z;
+            let candidate = Vec3::new(px, 0.0, pz);
+            if self.find_polygon_containing(candidate).is_some() {
+                return Some(candidate);
+            }
+        }
+
+        // Fallback: return the centre of the first polygon.
+        self.polygon_center(PolygonIndex(0))
+    }
+
+    // ── Portal extraction (used by funnel/string-pulling) ──────────────────
+
+    /// Find the shared edge vertices between two adjacent polygons.
+    ///
+    /// Returns `Some((v0, v1))` — the two consecutive vertex indices forming
+    /// the shared edge — or `None` if the polygons are not adjacent.
+    pub fn shared_edge(
+        &self,
+        a: PolygonIndex,
+        b: PolygonIndex,
+    ) -> Option<(VertexIndex, VertexIndex)> {
+        let poly_a = self.polygons.get(a.0 as usize)?;
+        let poly_b = self.polygons.get(b.0 as usize)?;
+
+        // Build a set of vertex indices for poly-a.
+        let vert_set: std::collections::HashSet<VertexIndex> =
+            poly_a.vertices.iter().copied().collect();
+
+        // Find two consecutive vertices in poly-b that are also in poly-a.
+        let n = poly_b.vertices.len();
+        for i in 0..n {
+            let v0 = poly_b.vertices[i];
+            let v1 = poly_b.vertices[(i + 1) % n];
+            if vert_set.contains(&v0) && vert_set.contains(&v1) {
+                return Some((v0, v1));
+            }
+        }
+        None
+    }
+
     // ── Debug / FFI accessors ──────────────────────────────────────────────
 
     /// All vertices in the mesh.
@@ -477,7 +632,9 @@ impl NavMesh {
 
     /// The vertex indices of a polygon, in winding order.
     pub fn polygon_vertex_indices(&self, idx: PolygonIndex) -> Option<&[VertexIndex]> {
-        self.polygons.get(idx.0 as usize).map(|p| p.vertices.as_slice())
+        self.polygons
+            .get(idx.0 as usize)
+            .map(|p| p.vertices.as_slice())
     }
 
     /// The cost multiplier of a polygon (1.0 = normal).
@@ -499,22 +656,31 @@ impl Default for NavMesh {
 
 /// Test whether `(px, pz)` is inside a convex polygon (XZ projection).
 /// Returns `true` if point is on an edge or vertex.
-fn point_in_convex_polygon_xz(
-    px: f32, pz: f32,
-    verts: &[VertexIndex],
-    all_verts: &[Vec3],
-) -> bool {
+fn point_in_convex_polygon_xz(px: f32, pz: f32, verts: &[VertexIndex], all_verts: &[Vec3]) -> bool {
     let n = verts.len();
-    if n < 3 { return false; }
+    if n < 3 {
+        return false;
+    }
     let mut positive = false;
     let mut negative = false;
     for j in 0..n {
-        let a = match all_verts.get(verts[j].0 as usize) { Some(v) => v, None => return false };
-        let b = match all_verts.get(verts[(j + 1) % n].0 as usize) { Some(v) => v, None => return false };
+        let a = match all_verts.get(verts[j].0 as usize) {
+            Some(v) => v,
+            None => return false,
+        };
+        let b = match all_verts.get(verts[(j + 1) % n].0 as usize) {
+            Some(v) => v,
+            None => return false,
+        };
         let cross = (b.x - a.x) * (pz - a.z) - (b.z - a.z) * (px - a.x);
-        if cross > 0.0 { positive = true; }
-        else if cross < 0.0 { negative = true; }
-        if positive && negative { return false; }
+        if cross > 0.0 {
+            positive = true;
+        } else if cross < 0.0 {
+            negative = true;
+        }
+        if positive && negative {
+            return false;
+        }
     }
     true
 }

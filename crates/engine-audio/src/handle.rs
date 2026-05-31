@@ -68,6 +68,11 @@ impl AudioHandle {
             .map_err(|_| AudioError::InvalidHandle)
     }
 
+    /// Returns the unique identifier for this handle.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Whether the voice has finished playing (EOF and not looping).
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Acquire)

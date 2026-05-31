@@ -71,8 +71,16 @@ fn generate_instance_id() -> String {
 /// 3. A [`PrefabInstanceRef`] is attached.
 /// 4. Parent–child relationships are resolved via [`Transform.parent`].
 ///
+/// If `child_resolver` is provided, any entries in
+/// [`Prefab.child_prefab_refs`] are recursively expanded: the child prefab
+/// is loaded, instantiated, and attached under the designated entity.
+///
 /// Returns the root entity and the full list of created entities.
-pub fn instantiate_prefab(world: &mut World, prefab: &Prefab) -> Result<PrefabInstantiateResult, String> {
+pub fn instantiate_prefab(
+    world: &mut World,
+    prefab: &Prefab,
+    child_resolver: Option<&dyn PrefabLoad>,
+) -> Result<PrefabInstantiateResult, String> {
     if prefab.hierarchy.is_empty() {
         return Err("Cannot instantiate a prefab with an empty hierarchy".to_string());
     }
@@ -84,6 +92,18 @@ pub fn instantiate_prefab(world: &mut World, prefab: &Prefab) -> Result<PrefabIn
     for record in &prefab.hierarchy {
         let entity = world.create_entity();
         entity_map.insert(record.persistent_id.clone(), entity);
+    }
+
+    // Reserve entities for child prefabs (tracked separately).
+    let mut child_results: Vec<(String, PrefabInstantiateResult)> = Vec::new();
+
+    if let Some(resolver) = child_resolver {
+        for child_ref in &prefab.child_prefab_refs {
+            if let Some(child_prefab) = resolver.load_prefab(&child_ref.prefab_asset.id) {
+                let child_result = instantiate_prefab(world, child_prefab, Some(resolver))?;
+                child_results.push((child_ref.entity_persistent_id.clone(), child_result));
+            }
+        }
     }
 
     // ── Pass 2: populate components ────────────────────────────────────
@@ -138,6 +158,17 @@ pub fn instantiate_prefab(world: &mut World, prefab: &Prefab) -> Result<PrefabIn
         }
     }
 
+    // ── Pass 4: attach child prefab roots under their parent entities ──
+    for (parent_pid, child_result) in &child_results {
+        if let Some(&parent_entity) = entity_map.get(parent_pid) {
+            if let Some(transform) =
+                world.get_mut::<crate::components::Transform>(child_result.root_entity)
+            {
+                transform.parent = Some(parent_entity);
+            }
+        }
+    }
+
     // ── Determine root entity ──────────────────────────────────────────
     let root_pid = prefab
         .hierarchy
@@ -154,6 +185,11 @@ pub fn instantiate_prefab(world: &mut World, prefab: &Prefab) -> Result<PrefabIn
     let mut all_entities: Vec<Entity> = entity_map.into_values().collect();
     all_entities.insert(0, root_entity);
 
+    // Append child prefab entities.
+    for (_, child_result) in &child_results {
+        all_entities.extend(child_result.all_entities.iter().copied());
+    }
+
     Ok(PrefabInstantiateResult {
         root_entity,
         all_entities,
@@ -163,7 +199,9 @@ pub fn instantiate_prefab(world: &mut World, prefab: &Prefab) -> Result<PrefabIn
 /// Load a prefab from an asset registry and instantiate it.
 ///
 /// `registry` must implement [`PrefabLoad`] so that prefab assets can be
-/// resolved by their string identifier.
+/// resolved by their string identifier.  Child prefabs referenced by
+/// [`Prefab.child_prefab_refs`] are recursively expanded through the same
+/// registry.
 pub fn instantiate_prefab_from_asset(
     world: &mut World,
     registry: &dyn PrefabLoad,
@@ -172,7 +210,7 @@ pub fn instantiate_prefab_from_asset(
     let prefab = registry
         .load_prefab(asset_id)
         .ok_or_else(|| format!("Prefab asset '{asset_id}' not found in registry"))?;
-    instantiate_prefab(world, prefab)
+    instantiate_prefab(world, prefab, Some(registry))
 }
 
 // ── PrefabLoad trait ───────────────────────────────────────────────────────
@@ -263,7 +301,7 @@ mod tests {
     fn instantiate_empty_prefab_fails() {
         let mut world = World::new();
         let prefab = Prefab::new(AssetId::new("prefabs/empty.prefab"));
-        let result = instantiate_prefab(&mut world, &prefab);
+        let result = instantiate_prefab(&mut world, &prefab, None);
         assert!(result.is_err(), "expected error for empty prefab");
     }
 
@@ -283,7 +321,7 @@ mod tests {
             components,
         });
 
-        let result = instantiate_prefab(&mut world, &prefab).expect("instantiate");
+        let result = instantiate_prefab(&mut world, &prefab, None).expect("instantiate");
         assert_eq!(result.all_entities.len(), 1);
         assert_eq!(result.root_entity, result.all_entities[0]);
         assert!(world.is_alive(result.root_entity));
@@ -349,7 +387,7 @@ mod tests {
                 components: child_components,
             });
 
-        let result = instantiate_prefab(&mut world, &prefab).expect("instantiate");
+        let result = instantiate_prefab(&mut world, &prefab, None).expect("instantiate");
         assert_eq!(result.all_entities.len(), 2);
 
         // Parent has no parent link
@@ -405,13 +443,9 @@ mod tests {
         });
 
         // Set component default that overrides scale
-        prefab.set_default(
-            "engine.transform",
-            "scale",
-            Value::Vec3([5.0, 5.0, 5.0]),
-        );
+        prefab.set_default("engine.transform", "scale", Value::Vec3([5.0, 5.0, 5.0]));
 
-        let result = instantiate_prefab(&mut world, &prefab).expect("instantiate");
+        let result = instantiate_prefab(&mut world, &prefab, None).expect("instantiate");
         let transform = world
             .get::<crate::components::Transform>(result.root_entity)
             .expect("transform");
@@ -432,14 +466,18 @@ mod tests {
             components.insert("engine.transform".to_string(), make_transform_record());
             prefab.add_entity(EntityRecord {
                 persistent_id: format!("ent-{i}"),
-                parent: if i == 0 { None } else { Some("ent-0".to_string()) },
+                parent: if i == 0 {
+                    None
+                } else {
+                    Some("ent-0".to_string())
+                },
                 name: Some(format!("Entity {i}")),
                 enabled: true,
                 components,
             });
         }
 
-        let result = instantiate_prefab(&mut world, &prefab).expect("instantiate");
+        let result = instantiate_prefab(&mut world, &prefab, None).expect("instantiate");
         assert_eq!(result.all_entities.len(), 3);
 
         // All entities should have PrefabInstanceRef with same instance_id
@@ -450,7 +488,9 @@ mod tests {
             .clone();
 
         for &entity in &result.all_entities {
-            let instance_ref = world.get::<PrefabInstanceRef>(entity).expect("PrefabInstanceRef");
+            let instance_ref = world
+                .get::<PrefabInstanceRef>(entity)
+                .expect("PrefabInstanceRef");
             assert_eq!(instance_ref.instance_id, instance_id);
             assert_eq!(instance_ref.source_asset, "prefabs/inst_refs.prefab");
         }

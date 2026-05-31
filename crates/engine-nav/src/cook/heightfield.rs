@@ -12,8 +12,8 @@
 //!    headroom above are marked non-walkable (prevents agents from walking
 //!    under low ceilings).
 
-use glam::Vec3;
 use crate::cook::config::NavMeshCookConfig;
+use glam::Vec3;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -91,18 +91,30 @@ impl Heightfield {
     /// covered by a triangle.
     pub(crate) fn add_span(
         &mut self,
-        x: u32, z: u32,
-        smin: u16, smax: u16,
-        area: u8, merge_threshold: u16,
+        x: u32,
+        z: u32,
+        smin: u16,
+        smax: u16,
+        area: u8,
+        merge_threshold: u16,
     ) {
-        if x >= self.width || z >= self.height { return; }
-        if smin >= smax { return; }
+        if x >= self.width || z >= self.height {
+            return;
+        }
+        if smin >= smax {
+            return;
+        }
         let idx = self.cell_index(x, z);
 
         // If column is empty, just insert the new span.
         if self.cells[idx] == NULL_SPAN {
             let new_idx = self.spans.len() as u32;
-            self.spans.push(Span { smin, smax, next: NULL_SPAN, area });
+            self.spans.push(Span {
+                smin,
+                smax,
+                next: NULL_SPAN,
+                area,
+            });
             self.cells[idx] = new_idx;
             return;
         }
@@ -123,9 +135,15 @@ impl Heightfield {
             // Check overlap or adjacency within threshold.
             if new_smax + merge_threshold >= s_smin && new_smin <= s_smax + merge_threshold {
                 // Merge: extend bounds.
-                if s_smin < new_smin { new_smin = s_smin; }
-                if s_smax > new_smax { new_smax = s_smax; }
-                if s_area > new_area { new_area = s_area; }
+                if s_smin < new_smin {
+                    new_smin = s_smin;
+                }
+                if s_smax > new_smax {
+                    new_smax = s_smax;
+                }
+                if s_area > new_area {
+                    new_area = s_area;
+                }
 
                 // Remove current span by unlinking it.
                 if prev == NULL_SPAN {
@@ -138,7 +156,12 @@ impl Heightfield {
             } else if new_smax < s_smin {
                 // Insert before current span.
                 let new_idx = self.spans.len() as u32;
-                self.spans.push(Span { smin: new_smin, smax: new_smax, next: curr, area: new_area });
+                self.spans.push(Span {
+                    smin: new_smin,
+                    smax: new_smax,
+                    next: curr,
+                    area: new_area,
+                });
                 if prev == NULL_SPAN {
                     self.cells[idx] = new_idx;
                 } else {
@@ -153,7 +176,12 @@ impl Heightfield {
 
         // Append at end of list.
         let new_idx = self.spans.len() as u32;
-        self.spans.push(Span { smin: new_smin, smax: new_smax, next: NULL_SPAN, area: new_area });
+        self.spans.push(Span {
+            smin: new_smin,
+            smax: new_smax,
+            next: NULL_SPAN,
+            area: new_area,
+        });
         if prev == NULL_SPAN {
             self.cells[idx] = new_idx;
         } else {
@@ -167,15 +195,12 @@ impl Heightfield {
     /// Every triangle is projected onto the XZ plane, its covered grid cells
     /// are determined by scanline walk, and the vertical extent
     /// (`min_y` … `max_y`) is recorded as a span.
-    pub fn rasterize_triangles(
-        &mut self,
-        vertices: &[Vec3],
-        indices: &[u32],
-        area: u8,
-    ) {
+    pub fn rasterize_triangles(&mut self, vertices: &[Vec3], indices: &[u32], area: u8) {
         let merge_threshold = 1; // merge adjacent spans within 1 voxel
         for chunk in indices.chunks(3) {
-            if chunk.len() < 3 { break; }
+            if chunk.len() < 3 {
+                break;
+            }
             let i0 = chunk[0] as usize;
             let i1 = chunk[1] as usize;
             let i2 = chunk[2] as usize;
@@ -191,7 +216,9 @@ impl Heightfield {
             let e2 = c - a;
             let n = e1.cross(e2);
             let twice_area = n.length();
-            if twice_area < 1e-10 { continue; }
+            if twice_area < 1e-10 {
+                continue;
+            }
             // Check slope against walkable_angle.
             // Since we don't have walkable_slope here, accept all for now;
             // filtering happens later in CompactHeightfield.
@@ -212,10 +239,10 @@ impl Heightfield {
         let (ix1, iz1) = self.world_to_cell(Vec3::new(max_x, 0.0, max_z));
 
         // Clamp to grid.
-                let _ix0 = ix0.max(0).min(self.width as i32 - 1) as u32;
-                let _ix1 = ix1.max(0).min(self.width as i32 - 1) as u32;
-                let iz0 = iz0.max(0).min(self.height as i32 - 1) as u32;
-                let iz1 = iz1.max(0).min(self.height as i32 - 1) as u32;
+        let _ix0 = ix0.max(0).min(self.width as i32 - 1) as u32;
+        let _ix1 = ix1.max(0).min(self.width as i32 - 1) as u32;
+        let iz0 = iz0.max(0).min(self.height as i32 - 1) as u32;
+        let iz1 = iz1.max(0).min(self.height as i32 - 1) as u32;
 
         // For each grid row, compute the triangle's intersection with
         // that row (a scanline segment), then for each cell compute Y range.
@@ -229,7 +256,9 @@ impl Heightfield {
 
             // Compute min/max x of the triangle on this scanline (z = cell_z).
             let x_on_edge = |p: Vec3, q: Vec3, z: f32| -> f32 {
-                if (q.z - p.z).abs() < 1e-10 { return f32::NAN; } // horizontal edge
+                if (q.z - p.z).abs() < 1e-10 {
+                    return f32::NAN;
+                } // horizontal edge
                 p.x + (z - p.z) * (q.x - p.x) / (q.z - p.z)
             };
 
@@ -248,13 +277,17 @@ impl Heightfield {
                 }
             }
 
-            if xs.len() < 2 { continue; }
+            if xs.len() < 2 {
+                continue;
+            }
             xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let scan_min_x = xs[0];
             let scan_max_x = xs[xs.len() - 1];
 
             let sx0 = ((scan_min_x - self.bmin.x) / self.cs).floor().max(0.0) as u32;
-            let sx1 = ((scan_max_x - self.bmin.x) / self.cs).floor().min((self.width - 1) as f32) as u32;
+            let sx1 = ((scan_max_x - self.bmin.x) / self.cs)
+                .floor()
+                .min((self.width - 1) as f32) as u32;
 
             for ix in sx0..=sx1 {
                 let cell_x = self.bmin.x + (ix as f32 + 0.5) * self.cs;
@@ -264,21 +297,27 @@ impl Heightfield {
                 let e0 = edge(b, a, p);
                 let e1 = edge(c, b, p);
                 let e2 = edge(a, c, p);
-                let inside = (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0)
-                    || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0);
-                if !inside { continue; }
+                let inside =
+                    (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0) || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0);
+                if !inside {
+                    continue;
+                }
 
                 // Compute Y range of the triangle at this cell centre.
                 // Barycentric coordinates would be more accurate, but for
                 // voxelisation just sample the plane equation.
                 let normal = (b - a).cross(c - a);
                 let n_len = normal.length();
-                if n_len < 1e-10 { continue; }
+                if n_len < 1e-10 {
+                    continue;
+                }
                 let n = normal / n_len;
                 let d = n.dot(a);
 
                 // Plane: n · point = d  →  y = (d - n.x*x - n.z*z) / n.y
-                if n.y.abs() < 1e-10 { continue; } // vertical triangle shouldn't be walkable, skip
+                if n.y.abs() < 1e-10 {
+                    continue;
+                } // vertical triangle shouldn't be walkable, skip
                 let surface_y = (d - n.x * cell_x - n.z * cell_z) / n.y;
 
                 let smin_i = ((surface_y - self.bmin.y) / self.ch).floor() as i32;
@@ -343,7 +382,10 @@ impl Heightfield {
                     let s_smax = self.spans[curr as usize].smax;
                     let s_next = self.spans[curr as usize].next;
 
-                    if s_area == 0 { curr = s_next; continue; }
+                    if s_area == 0 {
+                        curr = s_next;
+                        continue;
+                    }
 
                     let mut is_ledge = false;
 
@@ -432,7 +474,10 @@ impl Heightfield {
                     let s_smax = self.spans[curr as usize].smax;
                     let s_next = self.spans[curr as usize].next;
 
-                    if s_area == 0 { curr = s_next; continue; }
+                    if s_area == 0 {
+                        curr = s_next;
+                        continue;
+                    }
 
                     let headroom = if s_next != NULL_SPAN {
                         let ns_smin = self.spans[s_next as usize].smin;
@@ -513,7 +558,7 @@ mod tests {
         let cfg = default_cfg();
         let mut hf = Heightfield::alloc(&cfg);
         hf.add_span(0, 0, 5, 10, 1, 1); // upper
-        hf.add_span(0, 0, 0, 3, 1, 1);  // lower — inserts before
+        hf.add_span(0, 0, 0, 3, 1, 1); // lower — inserts before
         let idx = hf.cells[0]; // should point to lower
         let s0 = &hf.spans[idx as usize];
         assert_eq!(s0.smin, 0);
@@ -569,7 +614,14 @@ mod tests {
         hf.rasterize_triangles(&verts, &idxs, 1);
 
         // Count non-empty cells — should be > 0.
-        let filled: u32 = hf.cells.iter().map(|&c| if c != NULL_SPAN { 1 } else { 0 }).sum();
-        assert!(filled > 0, "flat triangle should rasterize to at least one cell");
+        let filled: u32 = hf
+            .cells
+            .iter()
+            .map(|&c| if c != NULL_SPAN { 1 } else { 0 })
+            .sum();
+        assert!(
+            filled > 0,
+            "flat triangle should rasterize to at least one cell"
+        );
     }
 }

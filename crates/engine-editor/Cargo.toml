@@ -7,11 +7,15 @@ license.workspace = true
 
 [features]
 default = []
-tooling-editor = []
+tooling-editor = ["engine-audio"]
 
 [dependencies]
 crossbeam-channel.workspace = true
+engine-animation = { path = "../engine-animation" }
 engine-asset = { path = "../engine-asset" }
+engine-audio = { path = "../engine-audio", optional = true }
+engine-nav = { path = "../engine-nav" }
+engine-physics = { path = "../engine-physics" }
 engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
 engine-script = { path = "../engine-script" }
@@ -20,5 +24,6 @@ engine-ui = { path = "../engine-ui" }
 glam.workspace = true
 ron.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -2,12 +2,12 @@
 
 pub(crate) mod depth;
 pub(crate) mod descriptor;
-pub(crate) mod graph_barriers;
 pub(crate) mod device_trait;
 pub(crate) mod drop;
 pub(crate) mod encoder;
 pub(crate) mod env;
 pub(crate) mod frame;
+pub(crate) mod graph_barriers;
 pub(crate) mod hdr;
 pub(crate) mod pipeline;
 pub(crate) mod post_process;

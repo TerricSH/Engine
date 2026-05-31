@@ -29,7 +29,11 @@ impl BlendSpace1D {
     /// Create a new 1D blend space.
     /// `clips` will be sorted by threshold value.
     pub fn new(parameter_name: impl Into<String>, mut clips: Vec<BlendSpaceSample>) -> Self {
-        clips.sort_by(|a, b| a.threshold.partial_cmp(&b.threshold).unwrap_or(std::cmp::Ordering::Equal));
+        clips.sort_by(|a, b| {
+            a.threshold
+                .partial_cmp(&b.threshold)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         Self {
             parameter_name: parameter_name.into(),
             clips,
@@ -60,7 +64,11 @@ impl BlendSpace1D {
             }
         }
         let range = self.clips[hi].threshold - self.clips[lo].threshold;
-        let t = if range > 0.0 { ((param - self.clips[lo].threshold) / range).clamp(0.0, 1.0) } else { 0.0 };
+        let t = if range > 0.0 {
+            ((param - self.clips[lo].threshold) / range).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         (lo, t)
     }
 }

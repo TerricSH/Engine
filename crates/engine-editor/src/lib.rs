@@ -64,9 +64,15 @@ pub struct EditorDisabled {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "tooling-editor")]
+pub mod animation_preview;
+#[cfg(feature = "tooling-editor")]
+pub mod asset_browser;
+#[cfg(feature = "tooling-editor")]
 pub mod build;
 #[cfg(feature = "tooling-editor")]
 pub mod commands;
+#[cfg(feature = "tooling-editor")]
+mod debug_views;
 #[cfg(feature = "tooling-editor")]
 pub mod diagnostics;
 #[cfg(feature = "tooling-editor")]
@@ -74,15 +80,25 @@ mod editor_core;
 #[cfg(feature = "tooling-editor")]
 mod editor_ui;
 #[cfg(feature = "tooling-editor")]
+mod gizmo;
+#[cfg(feature = "tooling-editor")]
 pub mod hierarchy;
+#[cfg(feature = "tooling-editor")]
+pub mod hot_reload_ui;
 #[cfg(feature = "tooling-editor")]
 pub mod inspector;
 #[cfg(feature = "tooling-editor")]
 pub mod io;
 #[cfg(feature = "tooling-editor")]
+pub mod material_editor;
+#[cfg(feature = "tooling-editor")]
 mod panels;
 #[cfg(feature = "tooling-editor")]
+pub mod performance;
+#[cfg(feature = "tooling-editor")]
 pub mod plugin;
+#[cfg(feature = "tooling-editor")]
+pub mod prefab_editor;
 #[cfg(feature = "tooling-editor")]
 pub mod scene_view;
 #[cfg(feature = "tooling-editor")]

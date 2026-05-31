@@ -9,6 +9,7 @@ license.workspace = true
 default = []
 
 [dependencies]
+bincode.workspace = true
 engine-character = { path = "../engine-character" }
 engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }

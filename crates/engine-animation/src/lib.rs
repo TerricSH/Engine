@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod clip;
+mod convert;
 pub(crate) mod pose;
 pub mod skeleton;
-mod convert;
 
 pub mod assets;
 pub mod blend_space;
@@ -28,8 +28,8 @@ pub use assets::{AnimationChannel, AnimationClip, Joint, JointTransform, Keyfram
 pub use blend_space::*;
 pub use locomotion_clips::*;
 
-pub use convert::*;
 pub use components::{AnimationPlayer, IkTargetComponent, SkeletonComponent};
+pub use convert::*;
 pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
 pub use events::{check_event_trigger, AnimEvent, AnimEventCollector, AnimEventDef};
 pub use extract::{PendingSkinnedItem, SkinnedExtractProducer};

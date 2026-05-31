@@ -159,7 +159,12 @@ impl AnimStateMachineInstance {
     /// Force-transition to a named state immediately, bypassing conditions.
     /// This is useful for script-driven animation control (cutscenes, etc.).
     pub fn force_transition_to(&mut self, state_name: &str) -> bool {
-        if self.state_machine.states.iter().any(|s| s.name == state_name) {
+        if self
+            .state_machine
+            .states
+            .iter()
+            .any(|s| s.name == state_name)
+        {
             self.current_state = state_name.to_string();
             self.current_time = 0.0;
             self.transitioning = false;
@@ -200,7 +205,9 @@ impl AnimStateMachineInstance {
         self.state_machine
             .transitions
             .iter()
-            .filter(|t| t.from_state == self.current_state && self.evaluate_conditions(&t.conditions))
+            .filter(|t| {
+                t.from_state == self.current_state && self.evaluate_conditions(&t.conditions)
+            })
             .fold(None, |best, t| match best {
                 None => Some(t),
                 Some(b) if t.priority > b.priority => Some(t),

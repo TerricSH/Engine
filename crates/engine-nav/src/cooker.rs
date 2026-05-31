@@ -17,11 +17,11 @@
 //!   → polymesh_to_navmesh               (output conversion)
 //! ```
 
-use glam::Vec3;
-use crate::navmesh::NavMesh;
-use crate::cook::{compact, contour, convert, heightfield, polymesh, region};
-pub use crate::cook::config::NavMeshCookConfig;
 use crate::cook::config::CookError;
+pub use crate::cook::config::NavMeshCookConfig;
+use crate::cook::{compact, contour, convert, heightfield, polymesh, region};
+use crate::navmesh::NavMesh;
+use glam::Vec3;
 
 /// Cooks triangle geometry into a navigation mesh using the full Recast-style
 /// voxelisation pipeline.
@@ -42,7 +42,9 @@ use crate::cook::config::CookError;
 pub struct NavMeshCooker;
 
 impl NavMeshCooker {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     /// Bake a navigation mesh from triangle soup.
     ///
@@ -68,9 +70,8 @@ impl NavMeshCooker {
         hf.filter_walkable_low_height_spans(height_vox);
 
         // 3. Compact + distance field + erosion.
-        let mut chf = compact::CompactHeightfield::build_from_heightfield(
-            &hf, height_vox, climb_vox,
-        );
+        let mut chf =
+            compact::CompactHeightfield::build_from_heightfield(&hf, height_vox, climb_vox);
         chf.build_distance_field();
 
         let radius_cells = config.walkable_radius_cells();
@@ -80,24 +81,18 @@ impl NavMeshCooker {
 
         // 4. Region partitioning.
 
-        let _num_reg = region::build_regions(
-            &mut chf,
-            config.min_region_area,
-            config.merge_region_area,
-        ).map_err(|_| CookError::RegionGenerationFailed)?;
+        let _num_reg =
+            region::build_regions(&mut chf, config.min_region_area, config.merge_region_area)
+                .map_err(|_| CookError::RegionGenerationFailed)?;
 
         // 5. Contours.
-        let cs = contour::build_contours(
-            &chf,
-            config.max_simplification_error,
-            config.max_edge_len,
-        ).map_err(|e| CookError::ContourGenerationFailed(e.to_string()))?;
+        let cs =
+            contour::build_contours(&chf, config.max_simplification_error, config.max_edge_len)
+                .map_err(|e| CookError::ContourGenerationFailed(e.to_string()))?;
 
         // 6. Polygon mesh.
-        let pm = polymesh::build_poly_mesh(
-            &cs,
-            config.max_verts_per_poly,
-        ).map_err(|e| CookError::PolyMeshGenerationFailed(e.to_string()))?;
+        let pm = polymesh::build_poly_mesh(&cs, config.max_verts_per_poly)
+            .map_err(|e| CookError::PolyMeshGenerationFailed(e.to_string()))?;
 
         // 7. Convert to NavMesh.
         Ok(convert::polymesh_to_navmesh(&pm))
@@ -105,7 +100,9 @@ impl NavMeshCooker {
 }
 
 impl Default for NavMeshCooker {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Re-export config for convenience ──────────────────────────────────────────
@@ -145,8 +142,12 @@ mod tests {
         };
 
         let verts = vec![
-            Vec3::new(0.0, 0.0, 0.0), Vec3::new(3.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 3.0),
-            Vec3::new(3.0, 0.0, 0.0), Vec3::new(3.0, 0.0, 3.0), Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(3.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, 3.0),
         ];
         let idxs: Vec<u32> = (0..6).collect();
         let result = cooker.bake(&verts, &idxs, &cfg);

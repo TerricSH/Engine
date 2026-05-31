@@ -8,9 +8,9 @@
 //! exactly follows the region boundary.  The raw contour is then simplified
 //! with the Douglas–Peucker algorithm and long edges are split.
 
-use glam::Vec3;
 use crate::cook::compact::CompactHeightfield;
 use crate::cook::config::CookError;
+use glam::Vec3;
 
 // ── Direction helpers ─────────────────────────────────────────────────────
 
@@ -61,13 +61,7 @@ pub(crate) fn build_contours(
     let mut regions: Vec<u16> = chf
         .spans
         .iter()
-        .filter_map(|s| {
-            if s.reg != 0 {
-                Some(s.reg)
-            } else {
-                None
-            }
-        })
+        .filter_map(|s| if s.reg != 0 { Some(s.reg) } else { None })
         .collect();
     regions.sort_unstable();
     regions.dedup();
@@ -209,11 +203,7 @@ pub(crate) fn build_contours(
 ///
 /// This correctly handles concave shapes (L-shapes, U-shapes, etc.)
 /// because the edges always lie between region and non-region cells.
-fn trace_contour_corners(
-    in_region: &[bool],
-    width: usize,
-    height: usize,
-) -> Vec<(u32, u32)> {
+fn trace_contour_corners(in_region: &[bool], width: usize, height: usize) -> Vec<(u32, u32)> {
     // ── Step 1: find all contour edges ────────────────────────────────────
     //
     // A *contour edge* is a grid edge where exactly one of the two adjacent
@@ -251,12 +241,8 @@ fn trace_contour_corners(
                 false // out of bounds
             };
             if left != right {
-                adj.entry((gx, gz))
-                    .or_default()
-                    .push((gx, gz + 1));
-                adj.entry((gx, gz + 1))
-                    .or_default()
-                    .push((gx, gz));
+                adj.entry((gx, gz)).or_default().push((gx, gz + 1));
+                adj.entry((gx, gz + 1)).or_default().push((gx, gz));
             }
         }
     }
@@ -278,12 +264,8 @@ fn trace_contour_corners(
                 false // out of bounds
             };
             if up != down {
-                adj.entry((gx, gz))
-                    .or_default()
-                    .push((gx + 1, gz));
-                adj.entry((gx + 1, gz))
-                    .or_default()
-                    .push((gx, gz));
+                adj.entry((gx, gz)).or_default().push((gx + 1, gz));
+                adj.entry((gx + 1, gz)).or_default().push((gx, gz));
             }
         }
     }
@@ -351,12 +333,7 @@ fn trace_contour_corners(
 /// (operates on the XZ plane, ignoring Y).
 ///
 /// Returns the simplified vertex sequence (including both endpoints).
-fn douglas_peucker(
-    verts: &[Vec3],
-    max_error: f32,
-    start: usize,
-    end: usize,
-) -> Vec<Vec3> {
+fn douglas_peucker(verts: &[Vec3], max_error: f32, start: usize, end: usize) -> Vec<Vec3> {
     if end - start <= 1 {
         // Two points or fewer — nothing to simplify.
         return verts[start..=end].to_vec();
@@ -445,11 +422,7 @@ fn split_long_edges(verts: &[Vec3], max_len: f32) -> Vec<Vec3> {
             let segs = segments.max(2);
             for s in 1..segs {
                 let t = s as f32 / segs as f32;
-                result.push(Vec3::new(
-                    a.x + dx * t,
-                    a.y + (b.y - a.y) * t,
-                    a.z + dz * t,
-                ));
+                result.push(Vec3::new(a.x + dx * t, a.y + (b.y - a.y) * t, a.z + dz * t));
             }
         }
     }
@@ -520,7 +493,11 @@ mod tests {
     fn single_square_region_four_verts() {
         let chf = make_chf_with_region(3, 3, 1);
         let result = build_contours(&chf, 1.3, 12);
-        assert!(result.is_ok(), "build_contours should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "build_contours should succeed: {:?}",
+            result.err()
+        );
         let cs = result.unwrap();
         assert_eq!(cs.conts.len(), 1, "should produce one contour");
         let c = &cs.conts[0];
@@ -602,7 +579,11 @@ mod tests {
         ];
         // The middle vertex is 0.5 units from the line from first to last.
         let result = douglas_peucker(&verts, 0.6, 0, 2);
-        assert_eq!(result.len(), 2, "should simplify to 2 verts with error > 0.5");
+        assert_eq!(
+            result.len(),
+            2,
+            "should simplify to 2 verts with error > 0.5"
+        );
 
         let result2 = douglas_peucker(&verts, 0.4, 0, 2);
         assert_eq!(result2.len(), 3, "should keep middle vert with error < 0.5");

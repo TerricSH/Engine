@@ -9,6 +9,7 @@ license.workspace = true
 default = []
 
 [dependencies]
+bincode.workspace = true
 engine-renderer = { path = "../engine-renderer" }
 engine-serialize = { path = "../engine-serialize" }
 serde.workspace = true

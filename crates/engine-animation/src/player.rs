@@ -1,12 +1,12 @@
 use glam::Quat;
 
 use crate::assets::{AnimationClip, JointTransform, Keyframe, Skeleton};
+use crate::blend_space::BlendSpace1D;
 use crate::components::AnimationPlayer;
 use crate::components::IkTargetComponent;
 use crate::ik::solve_pose_multi;
 use crate::pose::Pose;
 use crate::skeleton;
-use crate::blend_space::BlendSpace1D;
 use crate::state_machine::{AnimParamValue, AnimStateMachineInstance};
 
 // ---------------------------------------------------------------------------
@@ -49,11 +49,7 @@ impl AnimationEvaluator {
     ///
     /// Starts from the skeleton's rest pose and overrides each animated channel.
     /// Non-animated bones retain their rest-pose transform.
-    pub fn evaluate_pose(
-        clip: &AnimationClip,
-        time: f32,
-        skeleton: &skeleton::Skeleton,
-    ) -> Pose {
+    pub fn evaluate_pose(clip: &AnimationClip, time: f32, skeleton: &skeleton::Skeleton) -> Pose {
         let mut pose = skeleton.rest_pose();
         for channel in &clip.channels {
             let joint_idx = channel.joint_index as usize;
@@ -288,9 +284,7 @@ fn evaluate_blend_space_1d(
 
     // Single sample → evaluate it directly.
     if bs.clips.len() == 1 {
-        return if let Some((_, clip)) =
-            clips.iter().find(|(id, _)| *id == bs.clips[0].clip_asset)
-        {
+        return if let Some((_, clip)) = clips.iter().find(|(id, _)| *id == bs.clips[0].clip_asset) {
             AnimationEvaluator::evaluate_pose(clip, time, skel)
         } else {
             skel.rest_pose()
@@ -302,9 +296,7 @@ fn evaluate_blend_space_1d(
 
     if param <= first.threshold {
         // Below range → sample first clip.
-        return if let Some((_, clip)) =
-            clips.iter().find(|(id, _)| *id == first.clip_asset)
-        {
+        return if let Some((_, clip)) = clips.iter().find(|(id, _)| *id == first.clip_asset) {
             AnimationEvaluator::evaluate_pose(clip, time, skel)
         } else {
             skel.rest_pose()
@@ -313,9 +305,7 @@ fn evaluate_blend_space_1d(
 
     if param >= last.threshold {
         // Above range → sample last clip.
-        return if let Some((_, clip)) =
-            clips.iter().find(|(id, _)| *id == last.clip_asset)
-        {
+        return if let Some((_, clip)) = clips.iter().find(|(id, _)| *id == last.clip_asset) {
             AnimationEvaluator::evaluate_pose(clip, time, skel)
         } else {
             skel.rest_pose()
@@ -476,10 +466,7 @@ pub fn update_animation_pipeline(
 
     // ── 4. Cache bone world positions for C# query ───────────────────────
     let global = pose.global_transforms(skel);
-    player.cached_bone_positions = global
-        .iter()
-        .map(|bt| bt.translation.to_array())
-        .collect();
+    player.cached_bone_positions = global.iter().map(|bt| bt.translation.to_array()).collect();
 
     // ── 5. Compute skin matrices ─────────────────────────────────────────
     pose.skin_matrices(skel)
@@ -541,8 +528,7 @@ pub fn update_animation(
     match (clip, skel) {
         (Some(clip), Some(skel)) => {
             let pose = AnimationEvaluator::evaluate_pose(clip, player.current_time, skel);
-            pose
-                .skin_matrices(skel)
+            pose.skin_matrices(skel)
                 .iter()
                 .map(|m| m.to_cols_array_2d())
                 .collect()

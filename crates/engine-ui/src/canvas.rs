@@ -1,8 +1,13 @@
+use std::collections::BTreeMap;
+
 use engine_renderer::{Rect, UiBatch};
 use engine_serialize::AssetId;
+use engine_serialize::Value;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::batch;
+use crate::color::Color;
 use crate::layout::{Layout, ScaleMode};
 use crate::types::{ElementId, UiElement, UiElementKind, UiRect};
 use crate::DEFAULT_UI_MATERIAL;
@@ -20,6 +25,7 @@ use crate::DEFAULT_UI_MATERIAL;
 ///
 /// Call [`Canvas::layout_all`] after mutating element layouts to recompute
 /// the pixel rectangles used by rendering and hit-testing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Canvas {
     /// Canvas logical width in pixels.
     pub width: f32,
@@ -59,6 +65,11 @@ impl Canvas {
         );
         self.width = width;
         self.height = height;
+    }
+
+    /// Set the next element ID counter (used during deserialization).
+    pub fn set_next_id(&mut self, id: u32) {
+        self.next_id = id;
     }
 
     /// Add a [`UiElement`], assigning it a new [`ElementId`].
@@ -151,12 +162,18 @@ impl Canvas {
         while changed {
             changed = false;
             for i in 0..n {
-                if resolved[i] { continue; }
+                if resolved[i] {
+                    continue;
+                }
                 let parent_rect = match parent_of[i] {
                     None => canvas_rect, // root → canvas
                     Some(pid) => {
                         if let Some(&p_idx) = id_to_idx.get(&pid) {
-                            if resolved[p_idx] { rects[p_idx] } else { continue; }
+                            if resolved[p_idx] {
+                                rects[p_idx]
+                            } else {
+                                continue;
+                            }
                         } else {
                             canvas_rect // parent missing → canvas
                         }
@@ -232,21 +249,123 @@ impl Canvas {
                         &batch::color_to_array(*color),
                     );
                 }
-                UiElementKind::Text { color, .. } => {
-                    // Placeholder: render as a semi-transparent quad
-                    let mut c = batch::color_to_array(*color);
-                    c[3] /= 2;
-                    batch::add_quad(batch, &element.rect, &[0.0, 0.0], &[1.0, 1.0], &c);
-                }
-                UiElementKind::Button {
-                    normal_color, ..
+                UiElementKind::Text {
+                    content,
+                    font_size,
+                    color,
                 } => {
+                    // Render via font atlas — each glyph becomes a quad
+                    if let Some(verts) =
+                        crate::font::render_text(content, *font_size, *color, &element.rect)
+                    {
+                        for chunk in verts.chunks(4) {
+                            if chunk.len() < 4 {
+                                continue;
+                            }
+                            let gx = chunk[0].position[0];
+                            let gy = chunk[0].position[1];
+                            let gx2 = chunk[2].position[0];
+                            let gy2 = chunk[2].position[1];
+                            if (gx2 - gx) < 1.0 || (gy2 - gy) < 1.0 {
+                                continue;
+                            }
+                            // Place each glyph quad into the batch.
+                            // The font atlas texture is handled separately;
+                            // for now glyphs are rendered as colored quads
+                            // until the batch texture pipeline is extended.
+                            batch::add_quad(
+                                batch,
+                                &UiRect::new(gx, gy, gx2 - gx, gy2 - gy),
+                                &[0.0, 0.0],
+                                &[1.0, 1.0],
+                                &batch::color_to_array(*color),
+                            );
+                        }
+                    } else {
+                        // No font loaded — fallback placeholder.
+                        let mut c = batch::color_to_array(*color);
+                        c[3] /= 2;
+                        batch::add_quad(batch, &element.rect, &[0.0, 0.0], &[1.0, 1.0], &c);
+                    }
+                }
+                UiElementKind::Button { normal_color, .. } => {
                     batch::add_quad(
                         batch,
                         &element.rect,
                         &[0.0, 0.0],
                         &[1.0, 1.0],
                         &batch::color_to_array(*normal_color),
+                    );
+                }
+                UiElementKind::Toggle {
+                    color_on, is_on, ..
+                } => {
+                    let c = if *is_on {
+                        *color_on
+                    } else {
+                        Color::new(100, 100, 100, 255)
+                    };
+                    batch::add_quad(
+                        batch,
+                        &element.rect,
+                        &[0.0, 0.0],
+                        &[1.0, 1.0],
+                        &batch::color_to_array(c),
+                    );
+                }
+                UiElementKind::Checkbox { checked, color, .. } => {
+                    let c = if *checked {
+                        *color
+                    } else {
+                        Color::new(80, 80, 80, 255)
+                    };
+                    batch::add_quad(
+                        batch,
+                        &element.rect,
+                        &[0.0, 0.0],
+                        &[1.0, 1.0],
+                        &batch::color_to_array(c),
+                    );
+                }
+                UiElementKind::Slider {
+                    value, min, max, ..
+                } => {
+                    // Draw a track and a thumb indicator.
+                    let track_color = Color::new(60, 60, 60, 255);
+                    batch::add_quad(
+                        batch,
+                        &element.rect,
+                        &[0.0, 0.0],
+                        &[1.0, 1.0],
+                        &batch::color_to_array(track_color),
+                    );
+                    // Thumb fills a fraction of the width.
+                    let t = if (*max - *min).abs() > 1e-6 {
+                        ((*value - *min) / (*max - *min)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let thumb_rect = UiRect::new(
+                        element.rect.x,
+                        element.rect.y,
+                        (element.rect.width * t).max(4.0),
+                        element.rect.height,
+                    );
+                    batch::add_quad(
+                        batch,
+                        &thumb_rect,
+                        &[0.0, 0.0],
+                        &[1.0, 1.0],
+                        &batch::color_to_array(Color::new(200, 200, 200, 255)),
+                    );
+                }
+                UiElementKind::ScrollView { color, .. } => {
+                    batch::add_quad(
+                        batch,
+                        &element.rect,
+                        &[0.0, 0.0],
+                        &[1.0, 1.0],
+                        &batch::color_to_array(*color),
                     );
                 }
             }
@@ -257,11 +376,98 @@ impl Canvas {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Serialization hooks (field-map format for ComponentRegistry)
+// ---------------------------------------------------------------------------
+
+/// Serialize a [`Canvas`] component into a field map.
+///
+/// Only metadata fields (width, height, scale_mode) are serialized;
+/// the element tree is transient and rebuilt from UI code on load.
+fn serialize_canvas(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
+    let canvas = component.downcast_ref::<Canvas>().expect("Canvas expected");
+    let mut fields = BTreeMap::new();
+
+    fields.insert("width".into(), Value::Float32(canvas.width));
+    fields.insert("height".into(), Value::Float32(canvas.height));
+    fields.insert(
+        "scale_mode".into(),
+        Value::Str(format!("{:?}", canvas.scale_mode)),
+    );
+    fields.insert("next_id".into(), Value::UInt(canvas.next_id as u64));
+    fields.insert(
+        "element_count".into(),
+        Value::UInt(canvas.elements.len() as u64),
+    );
+
+    fields
+}
+
+/// Deserialize a [`Canvas`] from a field map.
+///
+/// Elements are not restored — the UI scene is expected to re-create them
+/// via script code on load.
+fn deserialize_canvas(fields: &BTreeMap<String, Value>) -> Box<dyn std::any::Any> {
+    let width = match fields.get("width") {
+        Some(Value::Float32(v)) => *v,
+        _ => 800.0,
+    };
+    let height = match fields.get("height") {
+        Some(Value::Float32(v)) => *v,
+        _ => 600.0,
+    };
+    let mut canvas = Canvas::new(width, height);
+
+    // Restore scale_mode (serialized via Debug format).
+    if let Some(Value::Str(s)) = fields.get("scale_mode") {
+        canvas.scale_mode = match s.as_str() {
+            "FitWidth" => ScaleMode::FitWidth,
+            "FitHeight" => ScaleMode::FitHeight,
+            _ => ScaleMode::Fixed,
+        };
+    }
+
+    if let Some(Value::UInt(v)) = fields.get("next_id") {
+        canvas.set_next_id(*v as u32);
+    }
+
+    Box::new(canvas)
+}
+
 // ECS Component
 // ---------------------------------------------------------------------------
 
 impl engine_scene::Component for Canvas {
     const TYPE_ID: &'static str = "engine.canvas";
+}
+
+// ---------------------------------------------------------------------------
+// ECS registration
+// ---------------------------------------------------------------------------
+
+/// Register UI extensions (Canvas component) with the engine's component
+/// registry.
+///
+/// Call this during engine initialisation so that the Canvas component
+/// type is recognised by the ECS world.
+pub fn register_ui_extensions(component_registry: &mut engine_scene::registry::ComponentRegistry) {
+    use engine_scene::registry::{ComponentExtension, ComponentMeta};
+    use engine_scene::{Component, ComponentStorageDyn, SparseSet};
+
+    let _ = component_registry.register(ComponentExtension {
+        meta: ComponentMeta {
+            type_id: Canvas::TYPE_ID,
+            display_name: "UI Canvas",
+            schema_version: (0, 1, 0),
+            has_editor: true,
+            has_script_binding: true,
+        },
+        storage_factory: || -> Box<dyn ComponentStorageDyn> {
+            Box::new(SparseSet::<Canvas>::new())
+        },
+        serialize: Some(serialize_canvas),
+        deserialize: Some(deserialize_canvas),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -358,16 +564,19 @@ mod tests {
     #[test]
     fn build_batches_skips_disabled() {
         let mut canvas = test_canvas();
-        canvas.add_element(
-            panel_element(Layout::FILL, 0, Color::WHITE).with_enabled(false),
-        );
+        canvas.add_element(panel_element(Layout::FILL, 0, Color::WHITE).with_enabled(false));
         assert!(canvas.build_batches().is_empty());
     }
 
     #[test]
     fn build_batches_single_panel() {
         let mut canvas = test_canvas();
-        let layout = Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::new(0.0, 0.0), Vec2::new(100.0, 50.0));
+        let layout = Layout::new(
+            Vec2::ZERO,
+            Vec2::ZERO,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(100.0, 50.0),
+        );
         canvas.add_element(panel_element(layout, 0, Color::WHITE));
         canvas.layout_all();
         let batches = canvas.build_batches();
@@ -382,7 +591,12 @@ mod tests {
     fn build_batches_z_order_splits() {
         let mut canvas = test_canvas();
         let l1 = Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(10.0, 10.0));
-        let l2 = Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::new(0.0, 0.0), Vec2::new(10.0, 10.0));
+        let l2 = Layout::new(
+            Vec2::ZERO,
+            Vec2::ZERO,
+            Vec2::new(0.0, 0.0),
+            Vec2::new(10.0, 10.0),
+        );
         canvas.add_element(panel_element(l1, 0, Color::WHITE));
         canvas.add_element(panel_element(l2, 1, Color::WHITE));
         canvas.layout_all();
@@ -396,7 +610,12 @@ mod tests {
     fn build_batches_merges_same_z_and_texture() {
         let mut canvas = test_canvas();
         let l1 = Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(10.0, 10.0));
-        let l2 = Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::new(10.0, 0.0), Vec2::new(20.0, 10.0));
+        let l2 = Layout::new(
+            Vec2::ZERO,
+            Vec2::ZERO,
+            Vec2::new(10.0, 0.0),
+            Vec2::new(20.0, 10.0),
+        );
         canvas.add_element(panel_element(l1, 0, Color::WHITE));
         canvas.add_element(panel_element(l2, 0, Color::WHITE));
         canvas.layout_all();
@@ -539,13 +758,22 @@ mod tests {
         // Child: fills its parent (the left half)
         let child_layout = Layout::FILL;
         let child_id = canvas.add_element(
-            UiElement::new(UiElementKind::Panel { color: Color::WHITE }, child_layout)
-                .with_z_order(0)
-                .with_children(vec![]),
+            UiElement::new(
+                UiElementKind::Panel {
+                    color: Color::WHITE,
+                },
+                child_layout,
+            )
+            .with_z_order(0)
+            .with_children(vec![]),
         );
 
         // Register parent-child relationship
-        canvas.get_element_mut(parent_id).unwrap().children.push(child_id);
+        canvas
+            .get_element_mut(parent_id)
+            .unwrap()
+            .children
+            .push(child_id);
 
         canvas.layout_all();
 

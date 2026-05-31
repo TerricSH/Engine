@@ -5,10 +5,9 @@
 
 use engine_character::{
     character_get_ground_normal_x_ffi, character_get_ground_normal_y_ffi,
-    character_get_ground_normal_z_ffi, character_get_move_state_ffi,
-    character_get_velocity_x_ffi, character_get_velocity_y_ffi,
-    character_get_velocity_z_ffi, character_is_grounded_ffi, character_jump_ffi,
-    character_move_ffi,
+    character_get_ground_normal_z_ffi, character_get_move_state_ffi, character_get_velocity_x_ffi,
+    character_get_velocity_y_ffi, character_get_velocity_z_ffi, character_is_grounded_ffi,
+    character_jump_ffi, character_move_ffi,
 };
 
 /// Move the character in the given direction at the given speed.
@@ -37,9 +36,7 @@ pub unsafe extern "C" fn character_move(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_jump(
-    controller: *mut std::ffi::c_void,
-) -> bool {
+pub unsafe extern "C" fn character_jump(controller: *mut std::ffi::c_void) -> bool {
     character_jump_ffi(controller as *mut engine_character::CharacterController)
 }
 
@@ -47,9 +44,7 @@ pub unsafe extern "C" fn character_jump(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_is_grounded(
-    controller: *const std::ffi::c_void,
-) -> i32 {
+pub unsafe extern "C" fn character_is_grounded(controller: *const std::ffi::c_void) -> i32 {
     character_is_grounded_ffi(controller as *const engine_character::CharacterController)
 }
 
@@ -57,9 +52,7 @@ pub unsafe extern "C" fn character_is_grounded(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_get_move_state(
-    controller: *const std::ffi::c_void,
-) -> i32 {
+pub unsafe extern "C" fn character_get_move_state(controller: *const std::ffi::c_void) -> i32 {
     character_get_move_state_ffi(controller as *const engine_character::CharacterController)
 }
 
@@ -67,9 +60,7 @@ pub unsafe extern "C" fn character_get_move_state(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_get_velocity_x(
-    controller: *const std::ffi::c_void,
-) -> f32 {
+pub unsafe extern "C" fn character_get_velocity_x(controller: *const std::ffi::c_void) -> f32 {
     character_get_velocity_x_ffi(controller as *const engine_character::CharacterController)
 }
 
@@ -77,9 +68,7 @@ pub unsafe extern "C" fn character_get_velocity_x(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_get_velocity_y(
-    controller: *const std::ffi::c_void,
-) -> f32 {
+pub unsafe extern "C" fn character_get_velocity_y(controller: *const std::ffi::c_void) -> f32 {
     character_get_velocity_y_ffi(controller as *const engine_character::CharacterController)
 }
 
@@ -87,9 +76,7 @@ pub unsafe extern "C" fn character_get_velocity_y(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_get_velocity_z(
-    controller: *const std::ffi::c_void,
-) -> f32 {
+pub unsafe extern "C" fn character_get_velocity_z(controller: *const std::ffi::c_void) -> f32 {
     character_get_velocity_z_ffi(controller as *const engine_character::CharacterController)
 }
 
@@ -97,9 +84,7 @@ pub unsafe extern "C" fn character_get_velocity_z(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_get_ground_normal_x(
-    controller: *const std::ffi::c_void,
-) -> f32 {
+pub unsafe extern "C" fn character_get_ground_normal_x(controller: *const std::ffi::c_void) -> f32 {
     character_get_ground_normal_x_ffi(controller as *const engine_character::CharacterController)
 }
 
@@ -107,9 +92,7 @@ pub unsafe extern "C" fn character_get_ground_normal_x(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_get_ground_normal_y(
-    controller: *const std::ffi::c_void,
-) -> f32 {
+pub unsafe extern "C" fn character_get_ground_normal_y(controller: *const std::ffi::c_void) -> f32 {
     character_get_ground_normal_y_ffi(controller as *const engine_character::CharacterController)
 }
 
@@ -117,9 +100,7 @@ pub unsafe extern "C" fn character_get_ground_normal_y(
 /// # Safety
 /// `controller` must be a valid pointer to a CharacterController, or null.
 #[no_mangle]
-pub unsafe extern "C" fn character_get_ground_normal_z(
-    controller: *const std::ffi::c_void,
-) -> f32 {
+pub unsafe extern "C" fn character_get_ground_normal_z(controller: *const std::ffi::c_void) -> f32 {
     character_get_ground_normal_z_ffi(controller as *const engine_character::CharacterController)
 }
 

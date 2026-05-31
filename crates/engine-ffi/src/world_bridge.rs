@@ -173,12 +173,17 @@ pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
     ) -> *mut u8 {
         let engine_type_id = match crate::component::lookup_engine_type_id(type_id) {
             Some(id) => id,
-            None => { *out_len = 0; return std::ptr::null_mut(); }
+            None => {
+                *out_len = 0;
+                return std::ptr::null_mut();
+            }
         };
 
         let json = with_world(|world| {
             let e = Entity::new(entity.index, entity.generation);
-            if !world.is_alive(e) { return None; }
+            if !world.is_alive(e) {
+                return None;
+            }
             world.serialize_component(e, engine_type_id)
         });
 
@@ -212,17 +217,23 @@ pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
             Some(id) => id,
             None => return false,
         };
-        if data.is_null() || len == 0 { return false; }
+        if data.is_null() || len == 0 {
+            return false;
+        }
         // SAFETY: caller guarantees data points to valid memory of at least len bytes.
         let json = unsafe {
             let slice = std::slice::from_raw_parts(data, len as usize);
             std::str::from_utf8(slice).unwrap_or("")
         };
-        if json.is_empty() { return false; }
+        if json.is_empty() {
+            return false;
+        }
 
         with_world_mut(|world| {
             let e = Entity::new(entity.index, entity.generation);
-            if !world.is_alive(e) { return false; }
+            if !world.is_alive(e) {
+                return false;
+            }
             world.deserialize_component(e, engine_type_id, json)
         })
         .unwrap_or(false)

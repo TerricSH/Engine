@@ -17,6 +17,9 @@ pub struct AudioClip {
     sample_rate: u32,
     /// Number of interleaved channels (1 = mono, 2 = stereo).
     channels: u16,
+    /// Source format tag (e.g. `"wav"`, `"flac"`, `"mp3"`).
+    /// Set during decode; empty if unknown.
+    source_format: String,
 }
 
 impl AudioClip {
@@ -26,6 +29,7 @@ impl AudioClip {
             samples,
             sample_rate,
             channels,
+            source_format: String::new(),
         }
     }
 
@@ -42,6 +46,11 @@ impl AudioClip {
     /// Number of interleaved channels.
     pub fn channels(&self) -> u16 {
         self.channels
+    }
+
+    /// Source format tag (e.g. `"wav"`, `"flac"`, `"mp3"`, `"vorbis"`).
+    pub fn source_format(&self) -> &str {
+        &self.source_format
     }
 
     /// Total duration in seconds.
@@ -111,6 +120,21 @@ impl AudioClip {
 
         let track_id = track.id;
         let codec_params = &track.codec_params;
+
+        // Extract the source format from the codec type.
+        let source_format = match codec_params.codec {
+            symphonia::core::codecs::CODEC_TYPE_FLAC => "flac",
+            symphonia::core::codecs::CODEC_TYPE_MP3 => "mp3",
+            symphonia::core::codecs::CODEC_TYPE_VORBIS => "vorbis",
+            symphonia::core::codecs::CODEC_TYPE_PCM_S16BE
+            | symphonia::core::codecs::CODEC_TYPE_PCM_S16LE
+            | symphonia::core::codecs::CODEC_TYPE_PCM_S24BE
+            | symphonia::core::codecs::CODEC_TYPE_PCM_S24LE
+            | symphonia::core::codecs::CODEC_TYPE_PCM_S32BE
+            | symphonia::core::codecs::CODEC_TYPE_PCM_S32LE => "pcm",
+            _ => "unknown",
+        }
+        .to_string();
 
         let sample_rate = codec_params
             .sample_rate
@@ -197,6 +221,7 @@ impl AudioClip {
             samples: all_samples,
             sample_rate,
             channels: num_channels,
+            source_format,
         })
     }
 }

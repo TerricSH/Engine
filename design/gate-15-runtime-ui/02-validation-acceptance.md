@@ -55,7 +55,13 @@ Gate 15 is accepted only when runtime UI can render, receive input, serialize, a
 
 ## Exit Decision
 
-- Gate owner:
-- Date:
-- Approved to proceed to Gate 16: yes/no
+> **Implementation status:**
+> - P0 items: 6/6 resolved (core controls, text rendering, Canvas
+>   serialization/registration).
+> - P1 items: keyboard focus, capture ownership, touch tracking — addressed.
+> - Performance measurements: pending (see [`04-performance-report.md`](04-performance-report.md)).
+
+- Gate owner: *TBD — assign before gate exit*
+- Date: *TBD*
+- Approved to proceed to Gate 16: *pending*
 

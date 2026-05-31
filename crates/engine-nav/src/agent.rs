@@ -259,6 +259,21 @@ impl NavAgent {
         self.path = None;
         self.next_waypoint = 0;
     }
+
+    /// Number of waypoints remaining on the current path (including already
+    /// passed ones, for a total count).
+    pub fn waypoint_count(&self) -> usize {
+        self.path.as_ref().map(|p| p.len()).unwrap_or(0)
+    }
+
+    /// Get the world-space position of a waypoint by index.
+    /// Returns `None` if the index is out of range or no path is set.
+    pub fn waypoint_at(&self, index: usize) -> Option<Vec3> {
+        self.path
+            .as_ref()
+            .and_then(|p| p.waypoints().get(index))
+            .map(|wp| wp.position)
+    }
 }
 
 impl Default for NavAgent {

@@ -387,4 +387,3 @@ pub struct SpecConstant {
     pub id: u32,
     pub value: SpecValue,
 }
-

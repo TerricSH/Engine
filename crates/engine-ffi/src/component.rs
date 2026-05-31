@@ -91,7 +91,10 @@ pub fn lookup_component_name(type_id: FfiComponentTypeId) -> Option<String> {
 /// This variant should be preferred over [`register_component_type`] because
 /// it enables C# to read and write component data through
 /// `component_get_ptr` / `component_set_ptr`.
-pub fn register_component_type_with_id(name: &str, engine_type_id: &'static str) -> FfiComponentTypeId {
+pub fn register_component_type_with_id(
+    name: &str,
+    engine_type_id: &'static str,
+) -> FfiComponentTypeId {
     let mut reg = COMPONENT_REGISTRY.write().unwrap();
     if let Some(&id) = reg.name_to_id.get(name) {
         reg.id_to_engine_type_id.insert(id, engine_type_id);

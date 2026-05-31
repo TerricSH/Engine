@@ -7,9 +7,9 @@
 //! 2. `ear_clip_triangulate`   → list of index-triplets.
 //! 3. `merge_convex_polys`     → list of convex `PolyPolygon`s.
 
-use glam::Vec3;
 use crate::cook::config::CookError;
 use crate::cook::contour::ContourSet;
+use glam::Vec3;
 
 // ── Data structures ───────────────────────────────────────────────────────
 
@@ -322,20 +322,13 @@ fn point_in_triangle_xz(a: Vec3, b: Vec3, c: Vec3, q: Vec3, ccw: bool) -> bool {
 /// Each input triangle is `(v0, v1, v2)` where the indices refer to `verts`.
 /// The function starts with each triangle as its own polygon and iteratively
 /// merges any pair that shares a full edge and whose union remains convex.
-fn merge_convex_polys(
-    tris: &[(u32, u32, u32)],
-    verts: &[Vec3],
-    nvp: u32,
-) -> Vec<Vec<u32>> {
+fn merge_convex_polys(tris: &[(u32, u32, u32)], verts: &[Vec3], nvp: u32) -> Vec<Vec<u32>> {
     if tris.is_empty() {
         return Vec::new();
     }
 
     // Seed with triangles.
-    let mut polys: Vec<Vec<u32>> = tris
-        .iter()
-        .map(|&(a, b, c)| vec![a, b, c])
-        .collect();
+    let mut polys: Vec<Vec<u32>> = tris.iter().map(|&(a, b, c)| vec![a, b, c]).collect();
 
     // Greedy merge loop.
     loop {
@@ -385,7 +378,8 @@ fn merge_convex_polys(
 /// Build a map from edge (sorted vertex-index pair) to the list of polygon
 /// indices that contain that edge.
 fn build_edge_owner_map(polys: &[Vec<u32>]) -> std::collections::HashMap<(u32, u32), Vec<usize>> {
-    let mut map: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<(u32, u32), Vec<usize>> =
+        std::collections::HashMap::new();
 
     for (pi, poly) in polys.iter().enumerate() {
         let n = poly.len();
@@ -404,12 +398,7 @@ fn build_edge_owner_map(polys: &[Vec<u32>]) -> std::collections::HashMap<(u32, u
 ///
 /// Returns `Some(merged)` if the merge is valid (result is convex and
 /// does not exceed `nvp` vertices).
-fn try_merge(
-    p1: &[u32],
-    p2: &[u32],
-    verts: &[Vec3],
-    nvp: u32,
-) -> Option<Vec<u32>> {
+fn try_merge(p1: &[u32], p2: &[u32], verts: &[Vec3], nvp: u32) -> Option<Vec<u32>> {
     // Check vertex count limit.
     let total_verts = p1.len() + p2.len() - 2; // shared edge counted twice
     if total_verts > nvp as usize {
@@ -612,10 +601,7 @@ mod tests {
         assert!(result.is_ok());
         let pm = result.unwrap();
         // The ear-clip produces 2 triangles → merged into 1 quad.
-        assert!(
-            pm.polys.len() >= 1,
-            "should produce at least 1 polygon"
-        );
+        assert!(pm.polys.len() >= 1, "should produce at least 1 polygon");
         // The quad should have 4 vertices.
         assert!(
             pm.polys[0].verts.len() == 4,

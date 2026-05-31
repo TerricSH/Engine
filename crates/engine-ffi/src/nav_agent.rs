@@ -69,9 +69,7 @@ pub unsafe extern "C" fn nav_agent_get_position(
 ///
 /// `agent` must be a valid pointer to a `NavAgent`, or null.
 #[no_mangle]
-pub unsafe extern "C" fn nav_agent_is_path_finished(
-    agent: *const std::ffi::c_void,
-) -> bool {
+pub unsafe extern "C" fn nav_agent_is_path_finished(agent: *const std::ffi::c_void) -> bool {
     if agent.is_null() {
         return true;
     }
@@ -88,13 +86,58 @@ pub unsafe extern "C" fn nav_agent_is_path_finished(
 ///
 /// `agent` must be a valid pointer to a `NavAgent`, or null.
 #[no_mangle]
-pub unsafe extern "C" fn nav_agent_get_remaining_distance(
-    agent: *const std::ffi::c_void,
-) -> f32 {
+pub unsafe extern "C" fn nav_agent_get_remaining_distance(agent: *const std::ffi::c_void) -> f32 {
     if agent.is_null() {
         return 0.0;
     }
     // SAFETY: Null-checked above; caller guarantees a valid `NavAgent`.
     let agent = &*(agent as *const engine_nav::NavAgent);
     agent.remaining_distance()
+}
+
+/// Returns the number of waypoints on the agent's current path.
+///
+/// Returns `0` for null agents or when no path is set.
+///
+/// # Safety
+///
+/// `agent` must be a valid pointer to a `NavAgent`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn nav_agent_waypoint_count(agent: *const std::ffi::c_void) -> i32 {
+    if agent.is_null() {
+        return 0;
+    }
+    let agent = &*(agent as *const engine_nav::NavAgent);
+    agent.waypoint_count() as i32
+}
+
+/// Get a waypoint position by index.
+///
+/// Returns `true` on success and fills `out_x/y/z`; returns `false` if
+/// the agent is null or the index is out of range.
+///
+/// # Safety
+///
+/// * `agent` must be a valid pointer to a `NavAgent`, or null.
+/// * `out_x`, `out_y`, `out_z` must be valid, non-null writeable pointers.
+#[no_mangle]
+pub unsafe extern "C" fn nav_agent_waypoint_at(
+    agent: *const std::ffi::c_void,
+    index: i32,
+    out_x: *mut f32,
+    out_y: *mut f32,
+    out_z: *mut f32,
+) -> bool {
+    if agent.is_null() || out_x.is_null() || out_y.is_null() || out_z.is_null() {
+        return false;
+    }
+    let agent = &*(agent as *const engine_nav::NavAgent);
+    if let Some(pos) = agent.waypoint_at(index as usize) {
+        *out_x = pos.x;
+        *out_y = pos.y;
+        *out_z = pos.z;
+        true
+    } else {
+        false
+    }
 }

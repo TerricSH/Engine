@@ -157,6 +157,13 @@ internal static class EngineAPI
     [DllImport("engine_ffi")]
     internal static extern float nav_agent_get_remaining_distance(IntPtr agent);
 
+    [DllImport("engine_ffi")]
+    internal static extern int nav_agent_waypoint_count(IntPtr agent);
+
+    [DllImport("engine_ffi")]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool nav_agent_waypoint_at(IntPtr agent, int index, out float x, out float y, out float z);
+
     // ── IK Target Component ────────────────────────────────────────────
 
     [DllImport("engine_ffi")]
@@ -166,6 +173,20 @@ internal static class EngineAPI
     [DllImport("engine_ffi")]
     [return: MarshalAs(UnmanagedType.I1)]
     internal static extern bool ik_get_effector_target(IntPtr ik, string name, out float x, out float y, out float z);
+
+    // ── Audio ──────────────────────────────────────────────────────────
+
+    [DllImport("engine_ffi")]
+    internal static extern ulong audio_play_sound(IntPtr engine, string clipAsset, float volume, [MarshalAs(UnmanagedType.I1)] bool looping);
+
+    [DllImport("engine_ffi")]
+    internal static extern void audio_stop_sound(IntPtr engine, ulong handleId);
+
+    [DllImport("engine_ffi")]
+    internal static extern void audio_set_volume(IntPtr engine, ulong handleId, float volume);
+
+    [DllImport("engine_ffi")]
+    internal static extern void audio_set_master_volume(IntPtr engine, float volume);
 }
 
 /// <summary>

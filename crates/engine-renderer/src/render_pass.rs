@@ -86,7 +86,10 @@ impl PassRegistry {
 
     /// Find a registered pass by its [`kind`](RenderPass::kind).
     pub fn find(&self, kind: &str) -> Option<&dyn RenderPass> {
-        self.passes.iter().find(|p| p.kind() == kind).map(|p| p.as_ref())
+        self.passes
+            .iter()
+            .find(|p| p.kind() == kind)
+            .map(|p| p.as_ref())
     }
 
     /// Find a registered pass by its [`kind`](RenderPass::kind) (mutable).

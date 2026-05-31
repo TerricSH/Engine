@@ -282,7 +282,10 @@ mod tests {
 
     #[test]
     fn get_move_state_null_controller() {
-        assert_eq!(character_get_move_state_ffi(std::ptr::null()), STATE_FALLING);
+        assert_eq!(
+            character_get_move_state_ffi(std::ptr::null()),
+            STATE_FALLING
+        );
     }
 
     #[test]

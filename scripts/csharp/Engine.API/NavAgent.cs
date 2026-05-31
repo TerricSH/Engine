@@ -43,4 +43,18 @@ public class NavAgent
     /// Total remaining distance along the agent's path.
     /// </summary>
     public float RemainingDistance => EngineAPI.nav_agent_get_remaining_distance(_nativePtr);
+
+    /// <summary>
+    /// Number of waypoints on the current path (0 if no path).
+    /// </summary>
+    public int WaypointCount => EngineAPI.nav_agent_waypoint_count(_nativePtr);
+
+    /// <summary>
+    /// Get a waypoint position by index.
+    /// Returns true on success, false if out of range.
+    /// </summary>
+    public bool GetWaypoint(int index, out float x, out float y, out float z)
+    {
+        return EngineAPI.nav_agent_waypoint_at(_nativePtr, index, out x, out y, out z);
+    }
 }
