@@ -7,419 +7,34 @@
 use std::collections::HashMap;
 
 use render_core::{
-    AdapterInfo, Backend, BackendCapabilities, BackendKind, BufferDescriptor, BufferHandle,
-    BufferUsage, CommandEncoder, Device, DeviceDescriptor, FramebufferDescriptor,
-    FramebufferHandle, IndexFormat, MemoryHint, PipelineDescriptor, PipelineHandle,
-    PipelineLayoutDescriptor, PipelineLayoutHandle, RenderPassDescriptor, RenderPassHandle,
-    RendererStatistics, ResourceLimits, RhiError, ShaderFormat, ShaderModuleDescriptor,
-    ShaderModuleHandle, SurfaceDescriptor, SurfaceHandle, SwapchainDescriptor, SwapchainHandle,
-    TextureDescriptor, TextureFormat, TextureHandle, TextureUsage,
+    AdapterInfo, BackendCapabilities, BackendKind, BufferDescriptor, BufferHandle, BufferUsage,
+    CommandEncoder, Device, DeviceDescriptor, FramebufferDescriptor, FramebufferHandle,
+    MemoryHint, PipelineDescriptor, PipelineHandle, PipelineLayoutDescriptor,
+    PipelineLayoutHandle, RenderPassDescriptor, RenderPassHandle, RendererStatistics,
+    ResourceLimits, RhiError, ShaderFormat, ShaderModuleDescriptor, ShaderModuleHandle,
+    SurfaceDescriptor, SurfaceHandle, SwapchainDescriptor, SwapchainHandle, TextureDescriptor,
+    TextureFormat, TextureHandle, TextureUsage,
 };
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use windows::{
     core::Interface,
-    Win32::Foundation::{BOOL, FALSE, HANDLE, HWND, RECT, TRUE},
+    Win32::Foundation::{BOOL, FALSE, HANDLE, HWND, TRUE},
+    Win32::Graphics::Direct3D::*,
     Win32::Graphics::Direct3D12::*,
     Win32::Graphics::Dxgi::Common::*,
     Win32::Graphics::Dxgi::*,
-    Win32::Graphics::Direct3D::*,
     Win32::System::Threading::{CreateEventA, WaitForSingleObject},
 };
 
-// ============================================================================
-// Adapter metadata
-// ============================================================================
-
-#[derive(Clone, Debug)]
-pub struct Dx12Adapter {
-    pub name: String,
-    pub vendor_id: u32,
-    pub device_id: u32,
-    pub dedicated_memory: u64,
-}
-
-// ============================================================================
-// Backend
-// ============================================================================
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DirectX12Backend;
-
-impl DirectX12Backend {
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl Backend for DirectX12Backend {
-    fn kind(&self) -> BackendKind {
-        BackendKind::DirectX12
-    }
-
-    #[cfg(not(all(target_os = "windows", feature = "backend-dx12")))]
-    fn enumerate_adapters(&self) -> Result<Vec<AdapterInfo>, RhiError> {
-        Ok(vec![AdapterInfo {
-            backend: BackendKind::DirectX12,
-            name: "DirectX 12 (disabled — not on Windows)".to_string(),
-            vendor_id: None,
-            device_id: None,
-            driver_version: None,
-            capabilities: BackendCapabilities {
-                max_texture_dimension_2d: 16384,
-                max_color_attachments: 8,
-                supports_swapchain: false,
-                supports_timestamps: false,
-                supports_debug_markers: false,
-                supported_shader_formats: vec![ShaderFormat::Dxil, ShaderFormat::Hlsl],
-                supported_surface_formats: vec![TextureFormat::Rgba8Unorm, TextureFormat::Bgra8Unorm],
-                limits: ResourceLimits {
-                    max_buffer_bytes: 256 * 1024 * 1024,
-                    max_texture_array_layers: 256,
-                    max_bind_groups: 4,
-                    max_vertex_attributes: 16,
-                    max_color_attachments: 8,
-                    max_sample_count: 4,
-                },
-            },
-        }])
-    }
-
-    #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-    fn enumerate_adapters(&self) -> Result<Vec<AdapterInfo>, RhiError> {
-        enumerate_adapters_impl()
-    }
-
-    #[cfg(not(all(target_os = "windows", feature = "backend-dx12")))]
-    fn create_device(&self, _: &DeviceDescriptor) -> Result<Box<dyn Device>, RhiError> {
-        Err(RhiError::Backend {
-            detail: "DirectX 12 backend requires Windows and the `backend-dx12` feature".to_string(),
-        })
-    }
-
-    #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-    fn create_device(&self, descriptor: &DeviceDescriptor) -> Result<Box<dyn Device>, RhiError> {
-        Dx12Device::create(descriptor).map(|d| Box::new(d) as Box<dyn Device>)
-    }
-}
-
-// ============================================================================
-// Platform-specific adapter enumeration
-// ============================================================================
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-fn enumerate_adapters_impl() -> Result<Vec<AdapterInfo>, RhiError> {
-    unsafe {
-        let flags = DXGI_CREATE_FACTORY_FLAGS(0);
-        let factory: IDXGIFactory2 =
-            CreateDXGIFactory2(flags).map_err(|e| RhiError::Backend {
-                detail: format!("DXGI: failed to create factory: {e}"),
-            })?;
-
-        let mut adapters = Vec::new();
-
-        for i in 0.. {
-            let result = factory.EnumAdapters1(i);
-            let adapter = match result {
-                Ok(a) => a,
-                Err(_) => break,
-            };
-
-            let desc = match adapter.GetDesc1() {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-
-            let name = String::from_utf16_lossy(&desc.Description)
-                .trim_end_matches('\0')
-                .to_string();
-
-            adapters.push(AdapterInfo {
-                backend: BackendKind::DirectX12,
-                name,
-                vendor_id: Some(desc.VendorId),
-                device_id: Some(desc.DeviceId),
-                driver_version: None,
-                capabilities: BackendCapabilities {
-                    max_texture_dimension_2d: 16384,
-                    max_color_attachments: 8,
-                    supports_swapchain: true,
-                    supports_timestamps: true,
-                    supports_debug_markers: true,
-                    supported_shader_formats: vec![ShaderFormat::Dxil, ShaderFormat::Hlsl],
-                    supported_surface_formats: vec![
-                        TextureFormat::Rgba8Unorm,
-                        TextureFormat::Bgra8Unorm,
-                        TextureFormat::Rgba16Float,
-                    ],
-                    limits: ResourceLimits {
-                        max_buffer_bytes: 256 * 1024 * 1024,
-                        max_texture_array_layers: 256,
-                        max_bind_groups: 4,
-                        max_vertex_attributes: 16,
-                        max_color_attachments: 8,
-                        max_sample_count: 4,
-                    },
-                },
-            });
-        }
-
-        Ok(adapters)
-    }
-}
-
-// ============================================================================
-// Handle table
-// ============================================================================
-
-struct HandleTable<T> {
-    entries: Vec<Option<(u32, T)>>,
-}
-
-impl<T> HandleTable<T> {
-    fn new() -> Self {
-        Self { entries: Vec::new() }
-    }
-
-    fn insert(&mut self, value: T) -> u32 {
-        for (idx, slot) in self.entries.iter_mut().enumerate() {
-            if slot.is_none() {
-                let gen = match slot {
-                    Some((g, _)) => *g + 1,
-                    None => 1,
-                };
-                *slot = Some((gen, value));
-                return idx as u32;
-            }
-        }
-        self.entries.push(Some((1, value)));
-        (self.entries.len() - 1) as u32
-    }
-
-    fn get(&self, index: u32) -> Option<&T> {
-        self.entries
-            .get(index as usize)
-            .and_then(|s| s.as_ref().map(|(_, v)| v))
-    }
-
-    fn get_mut(&mut self, index: u32) -> Option<&mut T> {
-        self.entries
-            .get_mut(index as usize)
-            .and_then(|s| s.as_mut().map(|(_, v)| v))
-    }
-
-    fn remove(&mut self, index: u32) -> Option<T> {
-        self.entries
-            .get_mut(index as usize)
-            .and_then(|s| s.take().map(|(_, v)| v))
-    }
-}
-
-// ============================================================================
-// Internal resource types
-// ============================================================================
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-#[allow(dead_code)]
-struct Dx12BufferInner {
-    resource: ID3D12Resource,
-    upload_resource: Option<ID3D12Resource>,
-    size: u64,
-    state: D3D12_RESOURCE_STATES,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-#[allow(dead_code)]
-struct Dx12TextureInner {
-    resource: ID3D12Resource,
-    format: TextureFormat,
-    width: u32,
-    height: u32,
-    state: D3D12_RESOURCE_STATES,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-#[allow(dead_code)]
-struct Dx12ShaderModuleInner {
-    format: ShaderFormat,
-    entry_points: Vec<String>,
-    source_hash: [u8; 32],
-    bytecode: Vec<u8>,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-#[allow(dead_code)]
-struct Dx12RenderPassInner {
-    color_formats: Vec<DXGI_FORMAT>,
-    depth_format: Option<DXGI_FORMAT>,
-    sample_count: u8,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-#[allow(dead_code)]
-struct Dx12FramebufferInner {
-    rtv_descriptors: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
-    dsv_descriptor: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
-    width: u32,
-    height: u32,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-#[allow(dead_code)]
-struct Dx12PipelineLayoutInner {
-    root_signature: ID3D12RootSignature,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-#[allow(dead_code)]
-struct Dx12PipelineInner {
-    pso: ID3D12PipelineState,
-    topology: u32,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-struct Dx12SwapchainInner {
-    swapchain: IDXGISwapChain3,
-    back_buffers: Vec<ID3D12Resource>,
-    rtv_heap: ID3D12DescriptorHeap,
-    rtv_size: u32,
-    width: u32,
-    height: u32,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-struct Dx12SurfaceInner {
-    #[allow(dead_code)]
-    hwnd: HWND,
-    format: TextureFormat,
-}
-
-// ============================================================================
-// Command encoder
-// ============================================================================
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-struct Dx12CommandEncoder {
-    cmd_list: ID3D12GraphicsCommandList,
-    draws: u32,
-    triangles: u64,
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-impl Dx12CommandEncoder {
-    fn new(cmd_list: ID3D12GraphicsCommandList) -> Self {
-        Self {
-            cmd_list,
-            draws: 0,
-            triangles: 0,
-        }
-    }
-}
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-impl CommandEncoder for Dx12CommandEncoder {
-    fn begin_render_pass(
-        &mut self,
-        _render_pass: RenderPassHandle,
-        _framebuffer: FramebufferHandle,
-        _area: (u32, u32, u32, u32),
-        _clear_color: [f32; 4],
-        _clear_depth: Option<f32>,
-    ) {
-        // Render pass begin is handled by the caller setting RTV/DSV and clearing.
-        // D3D12 doesn't have explicit render pass begin like Vulkan.
-    }
-
-    fn bind_pipeline(&mut self, _pipeline: PipelineHandle) {
-        // Pipeline binding requires access to the device's handle table.
-        // This is resolved by the device's command recording method.
-    }
-
-    fn bind_vertex_buffers(&mut self, _buffers: &[BufferHandle], _offsets: &[u64]) {
-        // Resolved by the device when recording commands.
-    }
-
-    fn bind_index_buffer(&mut self, _buffer: BufferHandle, _offset: u64, _index_format: IndexFormat) {
-    }
-
-    fn bind_descriptor_sets(
-        &mut self,
-        _pipeline_layout: PipelineLayoutHandle,
-        _first_set: u32,
-        _sets: &[render_core::DescriptorSetHandle],
-        _dynamic_offsets: &[u32],
-    ) {
-    }
-
-    fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min_depth: f32, max_depth: f32) {
-        unsafe {
-            let viewport = D3D12_VIEWPORT {
-                TopLeftX: x,
-                TopLeftY: y,
-                Width: w,
-                Height: h,
-                MinDepth: min_depth,
-                MaxDepth: max_depth,
-            };
-            self.cmd_list.RSSetViewports(&[viewport]);
-        }
-    }
-
-    fn set_scissor(&mut self, x: i32, y: i32, w: u32, h: u32) {
-        unsafe {
-            let rect: RECT = RECT {
-                left: x,
-                top: y,
-                right: (x + w as i32),
-                bottom: (y + h as i32),
-            };
-            self.cmd_list.RSSetScissorRects(&[rect]);
-        }
-    }
-
-    fn draw(
-        &mut self,
-        vertex_count: u32,
-        instance_count: u32,
-        _first_vertex: u32,
-        _first_instance: u32,
-    ) {
-        unsafe {
-            self.cmd_list.DrawInstanced(vertex_count, instance_count, 0, 0);
-        }
-        self.draws += 1;
-        self.triangles += vertex_count as u64 / 3 * instance_count as u64;
-    }
-
-    fn draw_indexed(
-        &mut self,
-        index_count: u32,
-        instance_count: u32,
-        first_index: u32,
-        vertex_offset: i32,
-        _first_instance: u32,
-    ) {
-        unsafe {
-            self.cmd_list
-                .DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, 0);
-        }
-        self.draws += 1;
-        self.triangles += index_count as u64 / 3 * instance_count as u64;
-    }
-
-    fn end_render_pass(&mut self) {}
-
-    fn push_constants(
-        &mut self,
-        _pipeline_layout: PipelineLayoutHandle,
-        _stage_flags: u32,
-        _offset: u32,
-        _data: &[u8],
-    ) {
-        // D3D12 push constants are handled via root constants in the root signature.
-        // The actual data is set via SetGraphicsRoot32BitConstants or similar.
-    }
-}
+use crate::encoder::Dx12CommandEncoder;
+use crate::handle::HandleTable;
+use crate::pipeline::{Dx12PipelineInner, Dx12PipelineLayoutInner};
+use crate::resources::{
+    Dx12BufferInner, Dx12FramebufferInner, Dx12RenderPassInner, Dx12ShaderModuleInner,
+    Dx12TextureInner,
+};
+use crate::swapchain::{Dx12SurfaceInner, Dx12SwapchainInner};
 
 // ============================================================================
 // Dx12Device — full implementation
@@ -427,37 +42,37 @@ impl CommandEncoder for Dx12CommandEncoder {
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 pub struct Dx12Device {
-    info: AdapterInfo,
-    device: ID3D12Device,
-    queue: ID3D12CommandQueue,
-    allocators: Vec<ID3D12CommandAllocator>,
-    cmd_lists: Vec<ID3D12GraphicsCommandList>,
-    fence: ID3D12Fence,
-    fence_event: HANDLE,
-    fence_value: u64,
-    frame_index: usize,
+    pub(crate) info: AdapterInfo,
+    pub(crate) device: ID3D12Device,
+    pub(crate) queue: ID3D12CommandQueue,
+    pub(crate) allocators: Vec<ID3D12CommandAllocator>,
+    pub(crate) cmd_lists: Vec<ID3D12GraphicsCommandList>,
+    pub(crate) fence: ID3D12Fence,
+    pub(crate) fence_event: HANDLE,
+    pub(crate) fence_value: u64,
+    pub(crate) frame_index: usize,
     // Handle tables
-    buffers: HandleTable<Dx12BufferInner>,
-    textures: HandleTable<Dx12TextureInner>,
-    shader_modules: HandleTable<Dx12ShaderModuleInner>,
-    render_passes: HandleTable<Dx12RenderPassInner>,
-    framebuffers: HandleTable<Dx12FramebufferInner>,
-    pipeline_layouts: HandleTable<Dx12PipelineLayoutInner>,
-    pipelines: HandleTable<Dx12PipelineInner>,
-    swapchains: HandleTable<Dx12SwapchainInner>,
-    surfaces: HandleTable<Dx12SurfaceInner>,
+    pub(crate) buffers: HandleTable<Dx12BufferInner>,
+    pub(crate) textures: HandleTable<Dx12TextureInner>,
+    pub(crate) shader_modules: HandleTable<Dx12ShaderModuleInner>,
+    pub(crate) render_passes: HandleTable<Dx12RenderPassInner>,
+    pub(crate) framebuffers: HandleTable<Dx12FramebufferInner>,
+    pub(crate) pipeline_layouts: HandleTable<Dx12PipelineLayoutInner>,
+    pub(crate) pipelines: HandleTable<Dx12PipelineInner>,
+    pub(crate) swapchains: HandleTable<Dx12SwapchainInner>,
+    pub(crate) surfaces: HandleTable<Dx12SurfaceInner>,
     // Generation counters for handles
-    gen_buffer: u32,
-    gen_texture: u32,
-    gen_shader: u32,
-    gen_pass: u32,
-    gen_fb: u32,
-    gen_layout: u32,
-    gen_pipeline: u32,
-    gen_swapchain: u32,
-    gen_surface: u32,
+    pub(crate) gen_buffer: u32,
+    pub(crate) gen_texture: u32,
+    pub(crate) gen_shader: u32,
+    pub(crate) gen_pass: u32,
+    pub(crate) gen_fb: u32,
+    pub(crate) gen_layout: u32,
+    pub(crate) gen_pipeline: u32,
+    pub(crate) gen_swapchain: u32,
+    pub(crate) gen_surface: u32,
     // Shader bytecode cache: [source_hash; 32] -> Vec<u8>
-    shader_cache: HashMap<[u8; 32], Vec<u8>>,
+    pub(crate) shader_cache: HashMap<[u8; 32], Vec<u8>>,
 }
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
@@ -649,13 +264,13 @@ impl Dx12Device {
         }
     }
 
-    fn make_handle(gen: &mut u32, index: u32) -> u32 {
+    pub(crate) fn make_handle(gen: &mut u32, index: u32) -> u32 {
         let g = *gen;
         *gen = gen.wrapping_add(1);
         (g << 16) | (index & 0xFFFF)
     }
 
-    fn decode_handle(h: u32) -> (u32, u32) {
+    pub(crate) fn decode_handle(h: u32) -> (u32, u32) {
         (h >> 16, h & 0xFFFF)
     }
 
@@ -688,7 +303,7 @@ impl Dx12Device {
         }
     }
 
-    fn texture_format_to_dxgi(format: TextureFormat) -> DXGI_FORMAT {
+    pub(crate) fn texture_format_to_dxgi(format: TextureFormat) -> DXGI_FORMAT {
         match format {
             TextureFormat::Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
             TextureFormat::Bgra8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -699,7 +314,7 @@ impl Dx12Device {
     }
 
     #[allow(dead_code)]
-    fn fill_hex(buf: &mut [u8; 32], bytes: &[u8]) {
+    pub(crate) fn fill_hex(buf: &mut [u8; 32], bytes: &[u8]) {
         for (i, b) in bytes.iter().enumerate() {
             if i < 32 {
                 buf[i] = *b;
@@ -1642,7 +1257,7 @@ impl Device for Dx12Device {
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 impl Dx12Device {
-    fn attribute_format_to_dxgi(format: &str) -> DXGI_FORMAT {
+    pub(crate) fn attribute_format_to_dxgi(format: &str) -> DXGI_FORMAT {
         match format {
             "float3" | "float32x3" => DXGI_FORMAT_R32G32B32_FLOAT,
             "float2" | "float32x2" => DXGI_FORMAT_R32G32_FLOAT,
@@ -1652,22 +1267,4 @@ impl Dx12Device {
             _ => DXGI_FORMAT_R32G32B32_FLOAT,
         }
     }
-}
-
-// ============================================================================
-// is_available helper
-// ============================================================================
-
-#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-pub fn is_available() -> bool {
-    true
-}
-
-#[cfg(not(all(target_os = "windows", feature = "backend-dx12")))]
-pub fn is_available() -> bool {
-    false
-}
-
-pub fn backend() -> DirectX12Backend {
-    DirectX12Backend::new()
 }

@@ -24,10 +24,17 @@
 //! ] }
 //! ```
 
-mod device;
-mod error;
+pub mod backend;
+pub mod device;
+mod encoder;
+pub mod error;
+mod handle;
+mod pipeline;
+mod resources;
+mod swapchain;
 
-pub use device::{backend, is_available, DirectX12Backend, Dx12Adapter, Dx12Device};
+pub use backend::{backend, is_available, DirectX12Backend, Dx12Adapter};
+pub use device::Dx12Device;
 pub use error::Dx12Error;
 
 #[cfg(test)]
