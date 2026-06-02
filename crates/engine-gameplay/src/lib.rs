@@ -5,11 +5,16 @@
 //! * **Game State Manager** — Finite state machine for the game lifecycle
 //!   (`Boot → Menu → Loading → Playing → Paused → GameOver`) with
 //!   transition validation rules and C#-compatible callbacks.
+//! * **Input Action Maps** — Platform-agnostic input system with action
+//!   definitions, bindings, resolution, rebinding, and serialization.
 //! * **Gameplay Event Bus** — Lightweight pub/sub event system for
 //!   gameplay events such as score, health, ammo, dialogue, quests,
 //!   and custom string-keyed events.
+//! * **Platform Facade** — Capability-driven platform adaptation with
+//!   desktop and mock implementations.
+//! * **Telemetry** — Local event logging and export (stub submission).
 //!
-//! Both systems are designed to be used from Rust gameplay code and
+//! All systems are designed to be used from Rust gameplay code and
 //! from the C# scripting layer via `engine-ffi`.
 
 pub mod event_bus;

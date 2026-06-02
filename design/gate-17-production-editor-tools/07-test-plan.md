@@ -30,11 +30,15 @@ Gate 17 tests prove the editor can support production authoring through plugin s
 
 ## Test Fixtures
 
-- `scenes/gate17_editor_workflow.scene`: mixed scene with renderables, prefab, animation, material, physics object.
-- `assets/gate17/`: material, texture, animation, prefab fixtures.
-- Deterministic editor action script for create/edit/undo/save/reload operations.
+> **Fixture implementation status: Pending.** The fixtures below are referenced by integration and manual test cases. As of the current gate review, the following items do not yet exist on disk and must be created during the integration test implementation phase.
+
+- `scenes/gate17_editor_workflow.scene`: mixed scene with renderables, prefab, animation, material, physics object. *(not yet created)*
+- `assets/gate17/`: material, texture, animation, prefab fixtures. *(not yet created)*
+- Deterministic editor action script for create/edit/undo/save/reload operations. *(not yet created)*
 
 ## Executable Integration Cases
+
+> **Implementation status: Pending.** The integration tests IT-G17-01/02/03 are not yet implemented. They are described below as the target specification; the runtime automation and fixtures must be created before gate exit.
 
 ### IT-G17-01 Command And Undo Workflow
 

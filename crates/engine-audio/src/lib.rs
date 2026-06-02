@@ -166,6 +166,7 @@ pub enum MixerGroup {
     Ambience,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for MixerGroup {
     fn default() -> Self {
         Self::Sfx

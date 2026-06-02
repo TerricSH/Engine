@@ -89,8 +89,8 @@ pub struct NavMesh {
 /// Layout mirrors Detour's `dtBVNode`:
 /// - `bmin`/`bmax`: quantised AABB (each axis 0..65535).
 /// - `index`: if ≥ 0 → leaf, this is the polygon index.
-///           if < 0  → internal node, `-index` is the *escape offset*
-///             to skip this node's subtree during linear traversal.
+///   if < 0  → internal node, `-index` is the *escape offset*
+///   to skip this node's subtree during linear traversal.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct BvhNode {
     bmin: [u16; 3],

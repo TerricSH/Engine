@@ -202,10 +202,7 @@ fn evaluate_sm_to_pose(
     let (_state_name, blend_weight) = sm.update(dt);
 
     // Resolve the current state.
-    let state = match sm.state_machine.find_state(&sm.current_state) {
-        Some(s) => s,
-        None => return None,
-    };
+    let state = sm.state_machine.find_state(&sm.current_state)?;
 
     // Evaluate the current pose: either via blend space or single clip.
     let current_pose = if let Some(ref bs) = state.blend_space_1d {

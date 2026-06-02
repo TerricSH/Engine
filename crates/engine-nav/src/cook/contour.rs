@@ -24,11 +24,14 @@ const DIRS4: [(i32, i32); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
 /// The set of all contours extracted from a compact heightfield.
 pub(crate) struct ContourSet {
     pub conts: Vec<Contour>,
+    #[allow(dead_code)]
     pub width: u32,
+    #[allow(dead_code)]
     pub height: u32,
     pub bmin: Vec3,
     pub cs: f32,
     pub ch: f32,
+    #[allow(dead_code)]
     pub border_size: u32,
 }
 
@@ -37,6 +40,7 @@ pub(crate) struct Contour {
     /// World-space vertices of the simplified contour (CCW winding).
     pub verts: Vec<Vec3>,
     /// Region ID this contour belongs to.
+    #[allow(dead_code)]
     pub reg: u16,
     /// Area type of this region.
     pub area: u8,
@@ -373,6 +377,7 @@ fn find_farthest_xz(verts: &[Vec3], start: usize, end: usize) -> (usize, f32) {
     let mut max_dist: f32 = -1.0;
     let mut max_idx = start;
 
+    #[allow(clippy::needless_range_loop)]
     for i in (start + 1)..end {
         let px = verts[i].x - ax;
         let pz = verts[i].z - az;
@@ -471,6 +476,7 @@ mod tests {
     use crate::cook::heightfield::Heightfield;
 
     /// Build a compact heightfield with a single flat region.
+    #[allow(clippy::field_reassign_with_default)]
     fn make_chf_with_region(width: u32, height: u32, reg: u16) -> CompactHeightfield {
         let mut cfg = NavMeshCookConfig::default();
         cfg.bounds_min = Vec3::ZERO;

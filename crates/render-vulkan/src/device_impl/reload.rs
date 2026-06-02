@@ -12,6 +12,17 @@ use crate::error::{VkResult, VulkanError};
 
 use super::VulkanDevice;
 
+/// Returned by [`VulkanDevice::replace_shadow_map`] — the old shadow-map
+/// resources that should be queued for deferred destruction.
+#[allow(clippy::type_complexity)]
+type ShadowMapSwapSet = (
+    vk::Image,
+    vk::ImageView,
+    Vec<vk::ImageView>,
+    Option<Allocation>,
+    Vec<vk::Framebuffer>,
+);
+
 impl VulkanDevice {
     // ------------------------------------------------------------------
     // Texture helpers
@@ -288,24 +299,16 @@ impl VulkanDevice {
 
     /// Atomically replace the CSM shadow-map texture (3-layer array).
     ///
-    /// Takes the new 3-layer image, layered view (for descriptor), per-layer views
-    /// (for framebuffers), and allocation. Recreates cascade framebuffers internally.
-    ///
-    /// Returns the **old** resources `(image, layered_view, [layer_views], allocation,
-    /// [framebuffers])` so the caller can queue them for deferred destruction.
+    /// Returns the **old** resources so the caller can queue them for deferred
+    /// destruction.
+    #[allow(dead_code)]
     pub(crate) fn replace_shadow_map(
         &mut self,
         new_image: vk::Image,
         new_layered_view: vk::ImageView,
         new_layer_views: Vec<vk::ImageView>,
         new_allocation: Allocation,
-    ) -> Option<(
-        vk::Image,
-        vk::ImageView,
-        Vec<vk::ImageView>,
-        Option<Allocation>,
-        Vec<vk::Framebuffer>,
-    )> {
+    ) -> Option<ShadowMapSwapSet> {
         let old_image = self.shadow_map.take();
         let old_layered_view = self.shadow_map_view.take();
         let old_layer_views = std::mem::take(&mut self.shadow_layer_views);

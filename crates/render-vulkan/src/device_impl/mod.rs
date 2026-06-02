@@ -207,18 +207,25 @@ pub struct VulkanDevice {
     /// Maximum sample count supported by the device.
     pub(crate) max_msaa_samples: vk::SampleCountFlags,
     /// Multisampled color image for HDR forward pass (MSAA > 1 only).
+    #[allow(dead_code)]
     pub(crate) msaa_color_image: Option<vk::Image>,
+    #[allow(dead_code)]
     pub(crate) msaa_color_view: Option<vk::ImageView>,
+    #[allow(dead_code)]
     pub(crate) msaa_color_allocation: Option<crate::allocator::Allocation>,
     /// Multisampled depth image for HDR forward pass (MSAA > 1 only).
+    #[allow(dead_code)]
     pub(crate) msaa_depth_image: Option<vk::Image>,
+    #[allow(dead_code)]
     pub(crate) msaa_depth_view: Option<vk::ImageView>,
+    #[allow(dead_code)]
     pub(crate) msaa_depth_allocation: Option<crate::allocator::Allocation>,
 
     // Material texture cache (Phase 3.1)
     /// Uploaded GPU textures indexed by asset ID string.
     pub(crate) textures: HashMap<String, GpuTexture>,
     /// Cached descriptor sets per material ID (allocated from material_desc_pool).
+    #[allow(dead_code)]
     pub(crate) material_desc_sets: HashMap<String, vk::DescriptorSet>,
 
     // Post-processing (Phase 4.5)

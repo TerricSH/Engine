@@ -160,8 +160,8 @@ pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
         crate::r#async::dispatch_main_thread_callbacks();
     }
 
-    /// Thread-local buffer for FFI component data transfer.
-    /// Reused across calls. Only one FFI call executes per thread at a time.
+    // Thread-local buffer for FFI component data transfer.
+    // Reused across calls. Only one FFI call executes per thread at a time.
     std::thread_local! {
         static FFI_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }

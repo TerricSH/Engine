@@ -130,12 +130,14 @@ mod tests {
         assert!((cfg.cell_size - 0.3).abs() < 1e-6);
     }
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn config_validate_ok() {
         let mut cfg = NavMeshCookConfig::default();
         cfg.bounds_max = Vec3::new(10.0, 5.0, 10.0);
         assert!(cfg.validate().is_ok());
     }
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn config_grid_size() {
         let mut cfg = NavMeshCookConfig::default();
         cfg.bounds_min = Vec3::ZERO;

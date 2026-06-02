@@ -33,12 +33,16 @@ Gate 19 tests prove release artifacts are reproducible, tested, profiled, packag
 
 ## Test Fixtures
 
-- `release/gate19_test_project/`: minimal game project with scene, assets, script, UI, audio.
-- Tagged test version such as `v0.0.0-gate19-test`.
-- Known broken scene, asset, and script fixtures for negative QA.
-- Mock crash dump or deliberate crash mode for diagnostics.
+> **Fixture implementation status: Pending.** The fixtures below are referenced by integration tests and manual validation. As of the current gate review, the following items do not yet exist on disk and must be created during the build/QA infrastructure implementation phase.
+
+- `release/gate19_test_project/`: minimal game project with scene, assets, script, UI, audio. *(not yet created)*
+- Tagged test version such as `v0.0.0-gate19-test`. *(not yet created)*
+- Known broken scene, asset, and script fixtures for negative QA. *(not yet created)*
+- Mock crash dump or deliberate crash mode for diagnostics. *(not yet created)*
 
 ## Executable Integration Cases
+
+> **Implementation status: Pending.** The integration tests IT-G19-01/02/03 are not yet implemented. They are described below as the target specification; the CI infrastructure, test project, and fixtures must be created before gate exit.
 
 ### IT-G19-01 Release Candidate Dry Run
 

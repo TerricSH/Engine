@@ -117,24 +117,32 @@ impl CallbackId {
 }
 
 // ---------------------------------------------------------------------------
+// StateChangeCallback type alias
+// ---------------------------------------------------------------------------
+
+type StateChangeCallback = (
+    CallbackId,
+    Box<dyn FnMut(&GameState, &GameState) + Send>,
+);
+
+// ---------------------------------------------------------------------------
 // GameStateManager
 // ---------------------------------------------------------------------------
 
-/// Manages the game's lifecycle state machine.
+/// The game state machine.
+///
+/// Managed states: `Boot`, `Menu`, `Loading`, `Playing`, `Paused`, `GameOver`.
+/// Transitions are validated against registered `StateTransitionRule`s;
+/// `force_transition` bypasses validation.  Callbacks fire on every state
+/// change and are designed to be used from C# via `engine-ffi`.
 ///
 /// # Example
 ///
 /// ```
-/// use engine_gameplay::{GameState, GameStateManager};
+/// use engine_gameplay::state::{GameState, GameStateManager};
 ///
 /// let mut mgr = GameStateManager::new(GameState::Boot);
 /// mgr.add_transition(GameState::Boot, GameState::Menu);
-/// mgr.add_transition(GameState::Menu, GameState::Loading);
-/// mgr.add_transition(GameState::Loading, GameState::Playing);
-/// mgr.add_transition(GameState::Playing, GameState::Paused);
-/// mgr.add_transition(GameState::Paused, GameState::Playing);
-/// mgr.add_transition(GameState::Playing, GameState::GameOver);
-/// mgr.add_transition(GameState::GameOver, GameState::Menu);
 ///
 /// assert!(mgr.request_transition(GameState::Menu).is_ok());
 /// assert!(mgr.request_transition(GameState::Paused).is_err()); // no rule Menu→Paused
@@ -143,7 +151,7 @@ pub struct GameStateManager {
     current: GameState,
     previous: Vec<GameState>,
     transitions: Vec<StateTransitionRule>,
-    callbacks: Vec<(CallbackId, Box<dyn FnMut(&GameState, &GameState) + Send>)>,
+    callbacks: Vec<StateChangeCallback>,
 }
 
 impl GameStateManager {

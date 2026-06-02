@@ -221,8 +221,8 @@ impl VulkanDevice {
 
         // ---- Shader modules ----
         // SAFETY: `d` is a valid AshDevice; `vert`/`frag` are valid SPIR-V.
-        let vm = unsafe { mk_sm(&d, &vert)? };
-        let fm = unsafe { mk_sm(&d, &frag)? };
+        let vm = unsafe { mk_sm(d, &vert)? };
+        let fm = unsafe { mk_sm(d, &frag)? };
 
         // ---- Graphics pipeline ----
         let stride = 32u32;

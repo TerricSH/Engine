@@ -193,7 +193,7 @@ impl CompactHeightfield {
                             if overlap_top > overlap_bot + walkable_height {
                                 // Copy address to avoid borrow conflict.
                                 let con_span = &mut spans[span_idx];
-                                con_span.set_con(dir, n_local as u32);
+                                con_span.set_con(dir, n_local);
                                 break;
                             } // if overlap
                         } // for n_local
@@ -356,6 +356,7 @@ impl CompactHeightfield {
     }
 
     /// Count total walkable spans.
+    #[allow(dead_code)]
     pub fn walkable_count(&self) -> usize {
         self.areas.iter().filter(|&&a| a > 0).count()
     }
@@ -366,6 +367,7 @@ mod tests {
     use super::*;
     use crate::cook::config::NavMeshCookConfig;
 
+    #[allow(clippy::field_reassign_with_default)]
     fn small_hf() -> Heightfield {
         let mut cfg = NavMeshCookConfig::default();
         cfg.bounds_min = Vec3::ZERO;
@@ -381,6 +383,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::len_zero)]
     fn build_compact_from_flat() {
         let hf = small_hf();
         let chf = CompactHeightfield::build_from_heightfield(&hf, 5, 2);
@@ -410,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)]
     fn neighbor_connectivity() {
         let hf = small_hf();
         let chf = CompactHeightfield::build_from_heightfield(&hf, 5, 2);

@@ -17,8 +17,11 @@ use glam::Vec3;
 pub(crate) struct PolyMesh {
     pub verts: Vec<Vec3>,
     pub polys: Vec<PolyPolygon>,
+    #[allow(dead_code)]
     pub bmin: Vec3,
+    #[allow(dead_code)]
     pub cs: f32,
+    #[allow(dead_code)]
     pub ch: f32,
 }
 
@@ -31,6 +34,7 @@ pub(crate) struct PolyMesh {
 pub(crate) struct PolyPolygon {
     pub verts: Vec<u16>,
     pub neighbors: Vec<u16>,
+    #[allow(dead_code)]
     pub area: u8,
 }
 
@@ -278,6 +282,7 @@ fn is_ear(
     }
 
     // 2. No other vertex inside triangle (a, b, c).
+    #[allow(clippy::needless_range_loop)]
     for j in 0..verts.len() {
         if j == p as usize || j == i as usize || j == n as usize {
             continue;
@@ -584,6 +589,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::len_zero)]
     fn quad_becomes_four_verts() {
         // A square region → should produce 1 quad after merge.
         let c = make_contour(
@@ -611,6 +617,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::len_zero)]
     fn l_shape_triangulates() {
         // A simple L-shaped contour.
         let c = make_contour(

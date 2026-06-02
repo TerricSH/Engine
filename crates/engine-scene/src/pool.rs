@@ -106,8 +106,7 @@ impl ObjectPool {
             info
         } else {
             // Pool exhausted — create a new instance on demand.
-            let info = self.instantiate_new(world);
-            info
+            self.instantiate_new(world)
         };
 
         // Fire the on_spawn callback (e.g. to reset script / physics state).

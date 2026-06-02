@@ -38,6 +38,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use engine_gameplay::event_bus::{EventBus, GameplayEvent};
+use engine_gameplay::input::{query_current_value, InputActionMap, InputValue};
 use engine_gameplay::state::GameState;
 use engine_gameplay::GameStateManager;
 
@@ -91,6 +92,94 @@ pub unsafe extern "C" fn gameplay_current_state(manager: *const std::ffi::c_void
     // SAFETY: Caller guarantees a valid GameStateManager or null.
     let mgr = &*(manager as *const GameStateManager);
     mgr.current().to_u32() as i32
+}
+
+// ---------------------------------------------------------------------------
+// Input Action Query FFI (G18-F02)
+// ---------------------------------------------------------------------------
+
+/// Query the current (last-resolved) value of an input action by name.
+///
+/// Returns `true` if the action was found, `false` otherwise.
+///
+/// Output parameters:
+/// * `value_type_out` — 0=Digital, 1=Analog1D, 2=Analog2D, -1=not found.
+/// * `bool_out` — 1.0 if the action value is `Bool(true)`, 0.0 otherwise.
+/// * `float_out` — the float value for Analog1D actions.
+/// * `vec2_x_out` / `vec2_y_out` — X and Y components for Analog2D.
+///
+/// Null output pointers are silently skipped (no crash).
+///
+/// # Safety
+/// `map` must be a valid pointer to an `InputActionMap`, or null.
+/// `action_name` must be a valid null-terminated UTF-8 string, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gameplay_query_input_action(
+    map: *const std::ffi::c_void,
+    action_name: *const c_char,
+    value_type_out: *mut i32,
+    bool_out: *mut i32,
+    float_out: *mut f32,
+    vec2_x_out: *mut f32,
+    vec2_y_out: *mut f32,
+) -> bool {
+    if map.is_null() || action_name.is_null() {
+        if let Some(p) = value_type_out.as_mut() {
+            *p = -1;
+        }
+        return false;
+    }
+
+    let map_ref = &*(map as *const InputActionMap);
+    let name = CStr::from_ptr(action_name).to_string_lossy();
+
+    match query_current_value(map_ref, &name) {
+        Some(InputValue::Bool(v)) => {
+            if let Some(p) = value_type_out.as_mut() {
+                *p = 0;
+            }
+            if let Some(p) = bool_out.as_mut() {
+                *p = if *v { 1 } else { 0 };
+            }
+            if let Some(p) = float_out.as_mut() {
+                *p = if *v { 1.0 } else { 0.0 };
+            }
+            true
+        }
+        Some(InputValue::Float(v)) => {
+            if let Some(p) = value_type_out.as_mut() {
+                *p = 1;
+            }
+            if let Some(p) = float_out.as_mut() {
+                *p = *v;
+            }
+            if let Some(p) = bool_out.as_mut() {
+                *p = if *v > 0.5 { 1 } else { 0 };
+            }
+            true
+        }
+        Some(InputValue::Vec2(v)) => {
+            if let Some(p) = value_type_out.as_mut() {
+                *p = 2;
+            }
+            if let Some(p) = vec2_x_out.as_mut() {
+                *p = v.x;
+            }
+            if let Some(p) = vec2_y_out.as_mut() {
+                *p = v.y;
+            }
+            if let Some(p) = float_out.as_mut() {
+                *p = v.length();
+            }
+            true
+        }
+        None => {
+            if let Some(p) = value_type_out.as_mut() {
+                *p = -1;
+            }
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

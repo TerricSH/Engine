@@ -1,16 +1,174 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  ci:
+  # ── Lint ────────────────────────────────────────────────────────────────
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: cargo fmt --check
         run: cargo fmt --check --all
-      - name: cargo check
-        run: cargo check --workspace --all-targets
-      - name: cargo clippy
+
+  # ── Clippy + check ─────────────────────────────────────────────────────
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test
-        run: cargo test --workspace
+
+  # ── FD-011 compliance: ensure no tooling-editor leaks into runtime crates
+  #    when building with target-mobile.
+  fd011-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo check --workspace (target-mobile, no tooling)
+        run: cargo check --workspace --features backend-vulkan,subsystem-scripting-csharp,target-mobile
+
+  # ── Feature matrix builds (per FD-010) ─────────────────────────────────
+  #    Cross target-* with backend-*; tooling-editor only on desktop.
+  check-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [target-desktop, target-mobile]
+        backend: [backend-vulkan]
+        include:
+          # Desktop: editor + scripting allowed
+          - target: target-desktop
+            tooling: tooling-editor,subsystem-scripting-csharp,tooling-hot-reload
+          # Mobile: editor stripped, subsystems only
+          - target: target-mobile
+            tooling: subsystem-scripting-csharp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo check (features)
+        run: cargo check --workspace --features ${{ matrix.backend }},${{ matrix.target }},${{ matrix.tooling }}
+
+  # ── Unit + integration tests (feature-aware) ───────────────────────────
+  test-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature-set:
+          - backend-vulkan,tooling-editor,subsystem-scripting-csharp
+          - backend-vulkan,subsystem-scripting-csharp,target-mobile
+          - backend-opengl,target-desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo test --workspace (features)
+        run: cargo test --workspace --features ${{ matrix.feature-set }}
+
+  # ── Multi-platform check (Ubuntu / Windows) ───────────────────────────
+  check-platform:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            features: backend-vulkan,tooling-editor,subsystem-scripting-csharp
+          - os: windows-latest
+            features: backend-dx12,backend-vulkan,tooling-editor,subsystem-scripting-csharp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo check (platform)
+        run: cargo check --workspace --features ${{ matrix.features }}
+
+  # ── Platform test (Ubuntu / Windows) ───────────────────────────────────
+  test-platform:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            features: backend-vulkan,tooling-editor,subsystem-scripting-csharp
+          - os: windows-latest
+            features: backend-dx12,backend-vulkan,tooling-editor,subsystem-scripting-csharp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo test --workspace (platform)
+        run: cargo test --workspace --features ${{ matrix.features }}
+
+  # ── macOS check ────────────────────────────────────────────────────────
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo check --workspace (macOS, vulkan via MoltenVK per FD-003)
+        run: cargo check --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp
+
+  # ── macOS test ─────────────────────────────────────────────────────────
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo test --workspace (macOS)
+        run: cargo test --workspace --features backend-vulkan,tooling-editor,subsystem-scripting-csharp
+
+  # ── Asset cook smoke (G19-F03, G19-F05 stub) ──────────────────────────
+  #    Placeholder.  Will validate: release build does not require source
+  #    assets, cooked outputs are reproducible.  Currently a compile-only
+  #    gate; full cook pipeline to be implemented in Gate 19.
+  asset-cook-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo check (release build, all features)
+        run: cargo check --workspace --release --features backend-vulkan,tooling-editor,subsystem-scripting-csharp,tooling-hot-reload
+
+  # ── Release build (G19-F01 reproducible build stub) ───────────────────
+  #    Performs an --offline-unfrozen release check to verify lockfile
+  #    reproducibility.  Full multi-platform packaging, signing, and
+  #    archiving to be implemented in Gate 19.
+  release-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: cargo check --release (locked, frozen)
+        run: cargo check --workspace --release --frozen --features backend-vulkan,subsystem-scripting-csharp
+
+  # ── Platform packaging stubs (G19-F02) ────────────────────────────────
+  #    TODO: Replace with real packaging jobs per platform.
+  #    - package-windows: MSIX/ZIP packaging
+  #    - package-linux: AppImage/tar packaging
+  #    - package-macos: .app bundle + DMG
+  #    - package-android: APK/AAB via cargo-apk + Gradle
+  #    - package-ios: .ipa via xcodebuild + NativeAOT
+  #    Each job must: cook assets (G19-F03), include NOTICES.txt (FD-025),
+  #    archive symbols, generate checksums/signatures (G19-F06), and
+  #    produce ReleaseMetadata-v0 manifests.
+
+  # ── QA automation stub (G19-F05) ──────────────────────────────────────
+  #    TODO: Automated scene runner, asset cook validation, script error
+  #    recovery tests, hot reload stress tests, performance regression
+  #    threshold checks.  Must fail on known broken scenes/assets/scripts.
+
+  # ── Crash diagnostics stub (G19-F07) ──────────────────────────────────
+  #    TODO: Archive symbols per release ID, generate diagnostic bundle,
+  #    verify symbol resolution against release artifacts.

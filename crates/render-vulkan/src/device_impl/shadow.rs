@@ -466,11 +466,11 @@ impl VulkanDevice {
     pub(crate) fn compute_cascade_splits(near: f32, far: f32) -> [f32; 3] {
         let lambda = 0.95f32; // bias toward logarithmic
         let mut splits = [0.0f32; 3];
-        for i in 0..3 {
+        for (i, split) in splits.iter_mut().enumerate() {
             let t = (i + 1) as f32 / 3.0;
             let log_split = near * (far / near).powf(t);
             let uniform_split = near + (far - near) * t;
-            splits[i] = lambda * log_split + (1.0 - lambda) * uniform_split;
+            *split = lambda * log_split + (1.0 - lambda) * uniform_split;
         }
         splits
     }
@@ -480,7 +480,7 @@ impl VulkanDevice {
     /// Given the camera's view and projection matrices, and the near/far
     /// plane distances, returns:
     /// - `cascade_splits`: `[split0, split1, split2, far]` — split distances
-    ///    in view-space z
+    ///   in view-space z
     /// - `light_vps`: 3 light view-projection matrices, one per cascade
     ///
     /// Each cascade's light VP is an orthographic projection that tightly

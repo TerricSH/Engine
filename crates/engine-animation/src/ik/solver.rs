@@ -375,7 +375,7 @@ fn apply_constraint(
 ) {
     let rest = constraint
         .rest_angle
-        .map(|a| Quat::from_array(a))
+        .map(Quat::from_array)
         .unwrap_or(rest_rotation);
 
     let rest_inv = rest.inverse();

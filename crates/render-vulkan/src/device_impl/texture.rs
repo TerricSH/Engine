@@ -24,6 +24,7 @@ impl VulkanDevice {
     ///
     /// If a texture with the same `id` already exists, it is replaced (old
     /// resources are freed immediately).
+    #[allow(dead_code)]
     pub(crate) fn upload_texture(
         &mut self,
         id: &str,

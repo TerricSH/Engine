@@ -2,7 +2,6 @@
 
 use engine_asset::ReloadCoordinator;
 use engine_core::{EngineConfig, EngineRuntime};
-use render_core::Device;
 
 mod diagnostics;
 

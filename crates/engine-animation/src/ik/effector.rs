@@ -16,18 +16,13 @@ use serde::{Deserialize, Serialize};
 use crate::BoneIndex;
 
 /// Coordinate space for an IK effector's target transform.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum IkEffectorSpace {
     /// Target is in world space (absolute position in the scene).
+    #[default]
     World,
     /// Target is in the local space of the effector's parent bone.
     Local,
-}
-
-impl Default for IkEffectorSpace {
-    fn default() -> Self {
-        Self::World
-    }
 }
 
 /// An IK effector — a **control point** that drives a bone toward a target.

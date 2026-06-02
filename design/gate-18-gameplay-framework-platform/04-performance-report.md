@@ -15,6 +15,8 @@ Not measured yet. Gate exit is blocked if measured results exceed the target bud
 
 ## Benchmarks
 
+### Desktop Baseline
+
 | Test | Target | Result | Notes |
 |---|---:|---:|---|
 | Gameplay loop startup | <= 7.0 s | TBD | Menu -> load -> play -> pause -> save -> game-over |
@@ -23,6 +25,19 @@ Not measured yet. Gate exit is blocked if measured results exceed the target bud
 | Memory usage | <= 2.0 GiB | TBD | After warm-up |
 | State transition | <= 100 ms | TBD | Menu/pause/game-over transitions |
 | Checkpoint save | <= 250 ms | TBD | Local save fixture |
+
+### Mobile Simulator
+
+Per `FD-005`, mobile simulator numbers are mandatory from Gate 5 onward. The simulator runs the same release build with the `target-mobile` feature combination (per `FD-010`) and a reduced loop fixture.
+
+| Test | Target | Result | Notes |
+|---|---:|---:|---|
+| Gameplay loop startup | <= 9.0 s | TBD | Reduced loop fixture, mobile profile |
+| Steady frame CPU p95 | <= 16.0 ms | TBD | Mobile simulator profile |
+| Steady frame GPU p95 | <= 16.0 ms | TBD | Mobile simulator profile |
+| Memory usage | <= 1.3 GiB | TBD | After warm-up, mobile profile |
+| State transition | <= 150 ms | TBD | Mobile profile Menu/pause/game-over transitions |
+| Checkpoint save | <= 400 ms | TBD | Local save fixture, mobile profile |
 
 ## Findings
 

@@ -266,6 +266,7 @@ pub fn render_text(
 }
 
 /// Access the global atlas pixel data (for texture upload).
+#[allow(dead_code)]
 pub fn atlas_pixels() -> Option<(Vec<u8>, u32, u32)> {
     let atlas = FONT_ATLAS.lock().ok()?;
     if !atlas.is_ready {

@@ -1375,7 +1375,7 @@ impl SceneRenderer {
                     height: self.height,
                 },
             })
-            .clear_values(&clear_values);
+            .clear_values(clear_values);
         // SAFETY: command buffer is in recording state; RP, FB valid.
         unsafe {
             d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
@@ -1876,6 +1876,7 @@ impl SceneRenderer {
         };
         let clear_values = [clear_value];
 
+        #[allow(clippy::needless_range_loop)]
         for cascade in 0..CASCADE_COUNT {
             let fb = match self.device.shadow_fbs.get(cascade).copied() {
                 Some(fb) => fb,
@@ -1892,7 +1893,7 @@ impl SceneRenderer {
                         height: SHADOW_SIZE,
                     },
                 })
-                .clear_values(&clear_values);
+            .clear_values(&clear_values);
             unsafe {
                 d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
             }
@@ -2375,6 +2376,7 @@ impl BackendRenderer for SceneRenderer {
         Ok(())
     }
 
+    #[allow(unexpected_cfgs, clippy::redundant_guards)]
     fn execute_pass(
         &mut self,
         input: &RenderFrameInput,

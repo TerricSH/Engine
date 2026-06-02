@@ -30,12 +30,16 @@ Gate 18 tests prove the high-level gameplay loop, input abstraction, event bus, 
 
 ## Test Fixtures
 
-- `scenes/gate18_game_loop.scene`: menu, loading, gameplay, pause, game-over states.
-- `input/gate18_bindings_default.ron`: keyboard/gamepad/touch action mappings.
-- `scripts/csharp/Gate18GameplayLoopSample`.
-- `platform/gate18_mock_mobile.profile`: mock mobile platform capabilities.
+> **Fixture implementation status: Pending.** The fixtures below are referenced by integration tests. As of the current gate review, the following items do not yet exist on disk and must be created during the integration test implementation phase.
+
+- `scenes/gate18_game_loop.scene`: menu, loading, gameplay, pause, game-over states. *(not yet created)*
+- `input/gate18_bindings_default.ron`: keyboard/gamepad/touch action mappings. *(not yet created)*
+- `scripts/csharp/Gate18GameplayLoopSample`. *(not yet created)*
+- `platform/gate18_mock_mobile.profile`: mock mobile platform capabilities. *(not yet created)*
 
 ## Executable Integration Cases
+
+> **Implementation status: Pending.** The integration tests IT-G18-01/02/03 are not yet implemented. They are described below as the target specification; the test automation and fixtures must be created before gate exit.
 
 ### IT-G18-01 Full Gameplay Loop
 

@@ -7,3 +7,4 @@
 .opencode/
 scripts/csharp/**/bin/
 scripts/csharp/**/obj/
+tests/fixtures/**/.gitkeep

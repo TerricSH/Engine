@@ -15,12 +15,13 @@ use serde::{Deserialize, Serialize};
 use crate::BoneIndex;
 
 /// IK solver algorithm selection.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum IkSolverType {
     /// Forward And Backward Reaching Inverse Kinematics.
     ///
     /// Fast, stable, and handles arbitrary chain lengths well. Does not
     /// natively respect joint angle limits (use constraints separately).
+    #[default]
     Fabrik,
 
     /// Cyclic Coordinate Descent.
@@ -28,12 +29,6 @@ pub enum IkSolverType {
     /// Iteratively rotates each joint in the chain to minimise the distance
     /// to the target. Naturally supports joint angle limits per-bone.
     Ccd,
-}
-
-impl Default for IkSolverType {
-    fn default() -> Self {
-        Self::Fabrik
-    }
 }
 
 /// An IK chain — a sequence of bones forming one kinematic chain.
@@ -141,6 +136,11 @@ impl IkChain {
     /// Returns the number of bones in this chain.
     pub fn len(&self) -> usize {
         self.bones.len()
+    }
+
+    /// Returns `true` if the chain contains no bones.
+    pub fn is_empty(&self) -> bool {
+        self.bones.is_empty()
     }
 
     /// Returns `true` if the chain has fewer than 2 bones (unsolvable).

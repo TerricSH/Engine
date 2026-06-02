@@ -526,9 +526,8 @@ impl Pathfinder {
             poly: corridor[0],
         });
 
-        // Current apex position and its polygon.
+        // Current apex position.
         let mut apex = start_pt;
-        let mut apex_poly = corridor[0];
 
         // Funnel state: left and right boundaries, tracked by portal index.
         let mut left_idx: usize = 0;
@@ -575,7 +574,6 @@ impl Pathfinder {
                     poly: corridor[right_idx],
                 });
                 apex = portal_right;
-                apex_poly = corridor[right_idx];
                 // Restart from right_idx.
                 left_idx = right_idx;
                 portal_left = apex;
@@ -592,7 +590,6 @@ impl Pathfinder {
                     poly: corridor[left_idx],
                 });
                 apex = portal_left;
-                apex_poly = corridor[left_idx];
                 right_idx = left_idx;
                 portal_left = apex;
                 portal_right = apex;

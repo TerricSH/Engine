@@ -3,6 +3,12 @@
 //! Phase 4.5 adds two compute-sahder-based effects as custom render-graph
 //! passes:
 //!
+//! **Feature status:** Bloom and SSAO are half-implemented. Their resources,
+//! pipelines, and dispatch functions are defined but not yet integrated into
+//! the render loop. Dead-code warnings are allowed while integration is in
+//! progress.
+#![allow(dead_code)]
+//!
 //! * **Bloom** — a 2×2 downsample chain (4 iterations) followed by an
 //!   upsample composite that accumulates the result back onto the HDR
 //!   colour image before tone-mapping.
@@ -268,7 +274,7 @@ impl VulkanDevice {
     /// Called before and after the bloom pass to prepare/clean up the
     /// image layouts.  Requires a valid frame index `fi` whose command
     /// buffer is in the recording state.
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn barrier_bloom_images(
         &self,
         fi: usize,

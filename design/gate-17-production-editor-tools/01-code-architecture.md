@@ -51,7 +51,7 @@ flowchart TB
 |---|---|
 | `FD-011` Editor vs runtime crate split | All production tooling extends `engine-editor` (gated by `tooling-editor`). Runtime crates remain editor-free; mobile/release builds drop the editor entirely. |
 | `FD-014` Logging and tracing | Editor performance inspector consumes `tracing` spans/events; no parallel ad-hoc instrumentation. |
-| `FD-005` Mobile budget reporting timing | Gate 17 mobile column is intentionally N/A in `performance-budgets.md` because the editor is desktop-only (`FD-011`). The Gate 17 `04-performance-report.md` records `N/A` for the mobile row and explains why. |
+| `FD-005` Mobile budget reporting timing | Gate 17 mobile column is intentionally N/A in `performance-budgets.md` because the editor is desktop-only (`FD-011`). The Gate 17 `04-performance-report.md` must include a mobile simulator section with `N/A` entries and explain why the editor is desktop-only. |
 
 ## Architectural Notes
 

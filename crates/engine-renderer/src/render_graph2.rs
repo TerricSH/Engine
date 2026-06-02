@@ -715,10 +715,11 @@ impl RenderGraph {
 
         // Also respect explicit GraphEdges.
         for edge in &self.edges {
-            if edge.from_pass < n && edge.to_pass < n {
-                if !needed_by[edge.to_pass].contains(&edge.from_pass) {
-                    needed_by[edge.to_pass].push(edge.from_pass);
-                }
+            if edge.from_pass < n
+                && edge.to_pass < n
+                && !needed_by[edge.to_pass].contains(&edge.from_pass)
+            {
+                needed_by[edge.to_pass].push(edge.from_pass);
             }
         }
 
@@ -1215,7 +1216,7 @@ mod tests {
         let graph = make_graph();
         let compiled = graph.compile_v2().expect("compile_v2 should succeed");
         assert_eq!(compiled.pass_order.len(), 4);
-        let positions: Vec<usize> = compiled.pass_order.iter().copied().collect();
+        let positions: Vec<usize> = compiled.pass_order.to_vec();
         for w in positions.windows(2) {
             assert!(w[0] < w[1], "pass_order should be ascending");
         }

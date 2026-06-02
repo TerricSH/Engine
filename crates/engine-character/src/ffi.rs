@@ -13,7 +13,7 @@
 //! dereferencing inherently requires unsafe code.
 //! Every `unsafe` block has a `// SAFETY:` comment explaining its invariants.
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
 
 use glam::Vec3;
 

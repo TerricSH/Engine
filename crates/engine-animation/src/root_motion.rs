@@ -110,21 +110,21 @@ pub fn extract_root_motion(
     delta
 }
 
-/// Gate 11 Root Motion Policy:
-///
-/// - Root motion is extracted from the animation by comparing the root bone
-///   transform between consecutive frames.
-/// - When `RootMotionApplyTo::None` (default), root motion is ignored and
-///   the character controller or physics system fully controls movement.
-/// - When `RootMotionApplyTo::Controller`, the extracted delta is exposed
-///   for the Gate 12 character controller to optionally consume.
-/// - When `RootMotionApplyTo::DirectTransform`, the delta is applied
-///   directly to the entity's world transform. This mode is intended for
-///   non-character objects (props, cinematics) and MUST NOT be used when
-///   a character controller or physics body is present.
-/// - Horizontal-only mode (default) zeroes the Y component of the
-///   translation delta to prevent animation from overriding vertical
-///   physics (gravity, jumping).
+// Gate 11 Root Motion Policy:
+//
+// - Root motion is extracted from the animation by comparing the root bone
+//   transform between consecutive frames.
+// - When `RootMotionApplyTo::None` (default), root motion is ignored and
+//   the character controller or physics system fully controls movement.
+// - When `RootMotionApplyTo::Controller`, the extracted delta is exposed
+//   for the Gate 12 character controller to optionally consume.
+// - When `RootMotionApplyTo::DirectTransform`, the delta is applied
+//   directly to the entity's world transform. This mode is intended for
+//   non-character objects (props, cinematics) and MUST NOT be used when
+//   a character controller or physics body is present.
+// - Horizontal-only mode (default) zeroes the Y component of the
+//   translation delta to prevent animation from overriding vertical
+//   physics (gravity, jumping).
 
 #[cfg(test)]
 mod tests {

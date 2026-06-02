@@ -16,7 +16,7 @@ use std::os::raw::c_char;
 ///
 /// `msg` must be a valid, null-terminated C string pointer or null.
 #[no_mangle]
-pub extern "C" fn ffi_log_info(msg: *const c_char) {
+pub unsafe extern "C" fn ffi_log_info(msg: *const c_char) {
     if msg.is_null() {
         return;
     }

@@ -21,6 +21,7 @@ use glam::Vec3;
 pub(crate) const NULL_SPAN: u32 = u32::MAX;
 
 /// Maximum number of vertices per polygon during clipping.
+#[allow(dead_code)]
 const MAX_CLIP_VERTS: usize = 12;
 
 // ── Span ─────────────────────────────────────────────────────────────────────
@@ -46,6 +47,7 @@ pub(crate) struct Heightfield {
     pub width: u32,
     pub height: u32,
     pub bmin: Vec3,
+    #[allow(dead_code)]
     pub bmax: Vec3,
     pub cs: f32,
     pub ch: f32,
@@ -378,7 +380,7 @@ impl Heightfield {
                 while curr != NULL_SPAN {
                     // Copy data BEFORE any mutable borrow.
                     let s_area = self.spans[curr as usize].area;
-                    let s_smin = self.spans[curr as usize].smin;
+                    let _s_smin = self.spans[curr as usize].smin;
                     let s_smax = self.spans[curr as usize].smax;
                     let s_next = self.spans[curr as usize].next;
 

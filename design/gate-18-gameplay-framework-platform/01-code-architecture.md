@@ -41,8 +41,8 @@ flowchart TB
 Gate 18 freezes high-level gameplay framework APIs and behavior. No new serialized `-v0` data contract is introduced here; gameplay frameworks coordinate through existing contracts (`ECSScene-v0`, `Prefab-v0`, `RuntimeUI-v0`, `Audio-v0`, `ScriptAPI-v0`) plus the API-level freezes below.
 
 - Game state transition API.
-- Input action query API and rebinding persistence format.
-- Gameplay event bus semantics.
+- Input action query API (definitions, bindings, resolution, serialization; rebinding *persistence format* remains open).
+- Gameplay event bus publish/subscribe API (event dispatch semantics are frozen; lifetime, ordering, and replay rules remain open).
 - Platform capability facade.
 
 ## Cross-Cutting Decisions Applied

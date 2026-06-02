@@ -183,6 +183,16 @@ impl EventHistory {
 }
 
 // ---------------------------------------------------------------------------
+// EventSubscription type alias
+// ---------------------------------------------------------------------------
+
+type EventSubscription = (
+    String,
+    SubscriptionId,
+    Box<dyn FnMut(&GameplayEvent) + Send>,
+);
+
+// ---------------------------------------------------------------------------
 // EventBus
 // ---------------------------------------------------------------------------
 
@@ -191,11 +201,7 @@ impl EventHistory {
 /// Subscribers register with a string event-type key and receive a
 /// [`SubscriptionId`] that can be used to unsubscribe.
 pub struct EventBus {
-    subscriptions: Vec<(
-        String,
-        SubscriptionId,
-        Box<dyn FnMut(&GameplayEvent) + Send>,
-    )>,
+    subscriptions: Vec<EventSubscription>,
     history: EventHistory,
 }
 

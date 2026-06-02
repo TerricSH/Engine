@@ -122,7 +122,7 @@ pub fn apply_foot_ik(
                     .with_weight(config.blend_weight);
 
                     let constraints = IkConstraintSet::new();
-                    solve_pose_multi(pose, skel, &[chain.clone()], &[effector], &constraints);
+                    solve_pose_multi(pose, skel, std::slice::from_ref(chain), &[effector], &constraints);
                     any_corrected = true;
                 }
             }

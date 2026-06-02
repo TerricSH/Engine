@@ -96,9 +96,10 @@ impl Layout {
 // ---------------------------------------------------------------------------
 
 /// Controls how a canvas is scaled when the viewport size changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ScaleMode {
     /// No automatic scaling — canvas is always `width × height` pixels.
+    #[default]
     Fixed,
     /// Scale to fit the viewport width while preserving aspect ratio.
     FitWidth,
@@ -106,22 +107,18 @@ pub enum ScaleMode {
     FitHeight,
 }
 
-impl Default for ScaleMode {
-    fn default() -> Self {
-        Self::Fixed
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Legacy alignment helpers (unchanged from original)
 // ---------------------------------------------------------------------------
 
 /// Align `rect` to the left edge of `container` with `padding`.
+#[allow(dead_code)]
 pub fn align_left(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
     UiRect::new(container.x + padding, rect.y, rect.width, rect.height)
 }
 
 /// Align `rect` to the right edge of `container` with `padding`.
+#[allow(dead_code)]
 pub fn align_right(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
     UiRect::new(
         container.x + container.width - rect.width - padding,
@@ -132,11 +129,13 @@ pub fn align_right(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
 }
 
 /// Align `rect` to the top edge of `container` with `padding`.
+#[allow(dead_code)]
 pub fn align_top(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
     UiRect::new(rect.x, container.y + padding, rect.width, rect.height)
 }
 
 /// Align `rect` to the bottom edge of `container` with `padding`.
+#[allow(dead_code)]
 pub fn align_bottom(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
     UiRect::new(
         rect.x,
@@ -147,6 +146,7 @@ pub fn align_bottom(rect: &UiRect, container: &UiRect, padding: f32) -> UiRect {
 }
 
 /// Center `rect` horizontally within `container`.
+#[allow(dead_code)]
 pub fn center_horizontal(rect: &UiRect, container: &UiRect) -> UiRect {
     UiRect::new(
         container.x + (container.width - rect.width) * 0.5,
@@ -157,6 +157,7 @@ pub fn center_horizontal(rect: &UiRect, container: &UiRect) -> UiRect {
 }
 
 /// Center `rect` vertically within `container`.
+#[allow(dead_code)]
 pub fn center_vertical(rect: &UiRect, container: &UiRect) -> UiRect {
     UiRect::new(
         rect.x,
@@ -167,6 +168,7 @@ pub fn center_vertical(rect: &UiRect, container: &UiRect) -> UiRect {
 }
 
 /// Place `rect` above `target` with `spacing` pixels between them.
+#[allow(dead_code)]
 pub fn place_above(rect: &UiRect, target: &UiRect, spacing: f32) -> UiRect {
     UiRect::new(
         rect.x,
@@ -177,6 +179,7 @@ pub fn place_above(rect: &UiRect, target: &UiRect, spacing: f32) -> UiRect {
 }
 
 /// Place `rect` below `target` with `spacing` pixels between them.
+#[allow(dead_code)]
 pub fn place_below(rect: &UiRect, target: &UiRect, spacing: f32) -> UiRect {
     UiRect::new(
         rect.x,
@@ -187,6 +190,7 @@ pub fn place_below(rect: &UiRect, target: &UiRect, spacing: f32) -> UiRect {
 }
 
 /// Place `rect` to the right of `target` with `spacing` pixels between them.
+#[allow(dead_code)]
 pub fn place_right_of(rect: &UiRect, target: &UiRect, spacing: f32) -> UiRect {
     UiRect::new(
         target.x + target.width + spacing,
@@ -197,6 +201,7 @@ pub fn place_right_of(rect: &UiRect, target: &UiRect, spacing: f32) -> UiRect {
 }
 
 /// Place `rect` to the left of `target` with `spacing` pixels between them.
+#[allow(dead_code)]
 pub fn place_left_of(rect: &UiRect, target: &UiRect, spacing: f32) -> UiRect {
     UiRect::new(
         target.x - rect.width - spacing,

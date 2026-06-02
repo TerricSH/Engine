@@ -231,6 +231,12 @@ impl InputBinding {
             modifier: InputModifier::None,
         }
     }
+
+    /// Set the modifier on this binding (builder pattern).
+    pub fn with_modifier(mut self, modifier: InputModifier) -> Self {
+        self.modifier = modifier;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +540,32 @@ fn apply_modifier(value: InputValue, modifier: &InputModifier) -> InputValue {
             InputValue::Float(f) => InputValue::Float(f * *factor),
             InputValue::Vec2(v) => InputValue::Vec2(v * *factor),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API — query current value
+// ---------------------------------------------------------------------------
+
+/// Query the current (last-resolved) value of an action without re-resolving
+/// against raw events.  Returns `None` if the action does not exist in the map.
+pub fn query_current_value<'a>(
+    map: &'a InputActionMap,
+    action_name: &str,
+) -> Option<&'a InputValue> {
+    map.action(action_name).map(|a| &a.current_value)
+}
+
+/// Mutable access to the current value of the named action.
+///
+/// Returns `None` if the action does not exist.
+pub fn set_current_value(map: &mut InputActionMap, action_name: &str, value: InputValue) -> bool {
+    match map.action_mut(action_name) {
+        Some(a) => {
+            a.current_value = value;
+            true
+        }
+        None => false,
     }
 }
 
@@ -1189,17 +1221,5 @@ mod tests {
             map.resolve_binding("jump", &events),
             Some(InputValue::Bool(true))
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// InputBinding convenience: with_modifier (used in tests)
-// ---------------------------------------------------------------------------
-
-impl InputBinding {
-    /// Set the modifier on this binding (builder pattern).
-    pub fn with_modifier(mut self, modifier: InputModifier) -> Self {
-        self.modifier = modifier;
-        self
     }
 }

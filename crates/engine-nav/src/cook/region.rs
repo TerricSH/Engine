@@ -1,3 +1,4 @@
+#![allow(clippy::doc_overindented_list_items)]
 //! Watershed region generation for navmesh baking.
 //!
 //! This module implements Recast's watershed algorithm to partition the
@@ -12,9 +13,9 @@
 //! 2. **Watershed flooding** — distance levels are processed from highest
 //!    (deepest interior) down to 1:
 //!    a. **Expand** — existing regions grow outward into the current level
-//!       via iterative neighbour-propagation.
+//!      via iterative neighbour-propagation.
 //!    b. **Seed** — any unassigned span at this level starts a new region
-//!       via flood-fill through same-level connected spans.
+//!      via flood-fill through same-level connected spans.
 //! 3. **Grow** — regions expand into any remaining unassigned spans
 //!    (distance 0 borders).
 //! 4. **Filter** — regions smaller than `min_region_area` are discarded.
@@ -488,6 +489,7 @@ mod tests {
 
     /// Build a compact heightfield from a flat 10×10 walkable platform
     /// and compute its distance field.
+    #[allow(clippy::field_reassign_with_default)]
     fn flat_10x10() -> CompactHeightfield {
         let mut cfg = NavMeshCookConfig::default();
         cfg.bounds_min = Vec3::ZERO;
@@ -504,6 +506,7 @@ mod tests {
     }
 
     /// Build two disconnected 4×4 platforms separated by a 2-cell gap.
+    #[allow(clippy::field_reassign_with_default)]
     fn two_platforms() -> CompactHeightfield {
         let mut cfg = NavMeshCookConfig::default();
         cfg.bounds_min = Vec3::ZERO;
@@ -528,6 +531,7 @@ mod tests {
 
     /// Build a platform that has one large area and a small 2×2 bump
     /// connected by a narrow 1-cell corridor.
+    #[allow(clippy::field_reassign_with_default)]
     fn platform_with_appendage() -> CompactHeightfield {
         let mut cfg = NavMeshCookConfig::default();
         cfg.bounds_min = Vec3::ZERO;
@@ -572,6 +576,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn two_disconnected_regions() {
         let mut chf = two_platforms();
         let n = build_regions(&mut chf, 4, 20).unwrap();
@@ -614,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn empty_returns_error() {
         let mut cfg = NavMeshCookConfig::default();
         cfg.bounds_min = Vec3::ZERO;
@@ -643,6 +649,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn region_ids_contiguous() {
         let mut chf = two_platforms();
         let n = build_regions(&mut chf, 4, 20).unwrap();

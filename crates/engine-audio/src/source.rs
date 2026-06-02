@@ -40,7 +40,6 @@ impl AudioSource {
     /// AudioSource instances are created by [`AudioEngine`]; there is no
     /// public constructor — the engine allocates voice IDs and command
     /// channels internally.
-
     /// Start or resume playback.
     pub fn play(&mut self) {
         if self.paused {

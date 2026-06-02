@@ -213,8 +213,8 @@ mod tests {
         };
 
         let mock = MockPlatform::new(caps.clone());
-        assert_eq!(mock.capabilities().has_touch, true);
-        assert_eq!(mock.capabilities().is_mobile, true);
+        assert!(mock.capabilities().has_touch);
+        assert!(mock.capabilities().is_mobile);
         assert_eq!(
             mock.capabilities().performance_mode,
             PerformanceMode::PowerSave

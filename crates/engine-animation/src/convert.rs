@@ -4,7 +4,6 @@ use crate::assets::{self, JointTransform};
 use crate::clip;
 use crate::pose::Pose;
 use crate::skeleton::{self, BoneIndex, BoneTransform};
-use tracing;
 
 // ---------------------------------------------------------------------------
 // JointTransform ↔ BoneTransform
@@ -151,6 +150,6 @@ pub fn pose_from_joint_transforms(transforms: &[JointTransform]) -> Pose {
 pub fn joint_transforms_from_pose(pose: &Pose) -> Vec<JointTransform> {
     pose.local_transforms()
         .iter()
-        .map(|bt| JointTransform::from(bt))
+        .map(JointTransform::from)
         .collect()
 }

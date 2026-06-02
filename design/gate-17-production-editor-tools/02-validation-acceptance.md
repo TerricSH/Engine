@@ -21,7 +21,7 @@ Gate 17 is accepted only when the editor is practical for production authoring a
 - [ ] Material changes preview in editor.
 - [ ] Animation preview can scrub/play clips.
 - [ ] Prefab override diff/apply/revert UI works.
-- [ ] Performance inspector shows frame stats, draw calls, memory summary, asset count, physics body count, animation count, and AI agent count.
+- [ ] Performance inspector shows frame stats, draw calls, memory summary, asset count, physics body count, animation count, AI agent count, and hot reload errors.
 - [ ] Editor tools consume subsystem plugin surfaces.
 
 ## Automated Checks
@@ -55,14 +55,7 @@ Gate 17 is accepted only when the editor is practical for production authoring a
 
 ## Exit Decision
 
-> **Implementation status:**
-> - P0 items: 8/8 resolved (editor UI scaffolding, gizmo undo, layout
->   persistence, plugin integration, asset assignment).
-> - P1 items: plugin registry wiring, asset browser assignment, material
->   editor mutation path, editor persistence — all addressed.
-> - Performance measurements: pending (see [`04-performance-report.md`](04-performance-report.md)).
-
-- Gate owner: *TBD — assign before gate exit*
-- Date: *TBD*
-- Approved to proceed to Gate 18: *pending*
+- Gate owner:
+- Date:
+- Approved to proceed to Gate 18: yes/no
 
