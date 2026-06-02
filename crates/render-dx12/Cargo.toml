@@ -6,9 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["backend-dx12"]
+backend-dx12 = ["dep:windows"]
 
 [dependencies]
 render-core = { path = "../render-core" }
 thiserror.workspace = true
 tracing.workspace = true
+windows = { workspace = true, optional = true }
