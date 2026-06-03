@@ -97,6 +97,7 @@ impl EngineRuntime {
         let world = World::from_scene(&scene);
         self.world = Some(world);
         self.scene = Some(scene);
+        self.update_ffi_world_ptr();
     }
 
     /// Directly set an existing ECS World as the runtime's active world.
@@ -119,6 +120,18 @@ impl EngineRuntime {
 
         self.world = Some(world);
         self.scene = Some(scene);
+        self.update_ffi_world_ptr();
+    }
+
+    /// Update the FFI callback registry's world pointer to point to the
+    /// current ECS World so C# scripts can access entity/component data.
+    fn update_ffi_world_ptr(&self) {
+        let ptr = self
+            .world
+            .as_ref()
+            .map(|w| w as *const World as *mut std::ffi::c_void)
+            .unwrap_or(std::ptr::null_mut());
+        ffi_init::initialise(ptr);
     }
 
     /// Access the ECS world (immutable).

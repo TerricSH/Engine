@@ -99,7 +99,7 @@ impl GameLoop {
 
         // Tick scripts (OnUpdate)
         #[cfg(feature = "subsystem-scripting-csharp")]
-        self.runtime.tick_scripts(dt);
+        self.runtime.tick_scripts(_dt);
     }
 
     /// Produce a single rendered frame.

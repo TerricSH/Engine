@@ -1112,11 +1112,11 @@ fn run_engine_character_demo() {
     // ── Map winit PhysicalKey scancodes → engine-gameplay KeyCodes ──
     fn scancode_to_keycode(scancode: u32) -> Option<KeyCode> {
         match scancode {
-            41 => Some(KeyCode::W),
-            19 => Some(KeyCode::A),
-            37 => Some(KeyCode::S),
-            22 => Some(KeyCode::D),
-            62 => Some(KeyCode::Space),
+            26 => Some(KeyCode::W), // HID Keyboard W
+            4  => Some(KeyCode::A), // HID Keyboard A
+            22 => Some(KeyCode::S), // HID Keyboard S
+            7  => Some(KeyCode::D), // HID Keyboard D
+            44 => Some(KeyCode::Space), // HID Keyboard Space
             _ => None,
         }
     }

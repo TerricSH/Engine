@@ -91,42 +91,26 @@ impl Dx12SceneRenderer {
             return;
         }
 
-        // ── HLSL source for the minimal forward vertex shader ────────
-        const VS_SOURCE: &[u8] = b"
-            struct VSIn { float3 pos : POSITION; float4 col : COLOR; };
-            struct VSOut { float4 pos : SV_POSITION; float4 col : COLOR; };
-            cbuffer MVP : register(b0) { float4x4 mvp; };
-            VSOut main(VSIn i) {
-                VSOut o;
-                o.pos = mul(float4(i.pos, 1.0), mvp);
-                o.col = i.col;
-                return o;
-            }
-        ";
-        const PS_SOURCE: &[u8] = b"
-            struct PSIn { float4 pos : SV_POSITION; float4 col : COLOR; };
-            float4 main(PSIn i) : SV_TARGET { return i.col; }
-        ";
+        // ── Pre-compiled DXIL shaders (embedded via build script) ───────
+        // The build.rs compiles shaders.hlsl to DXIL via dxc.exe.
+        // If compilation failed, these include_bytes! will produce empty
+        // slices and the pipeline creation will fall through gracefully.
+        let vs_bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scene_vs.dxil"));
+        let ps_bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scene_ps.dxil"));
 
-        // ── Try to compile shaders via D3DCompile ────────────────────
-        let vs_dxil = compile_hlsl(VS_SOURCE, "main", "vs_5_0", &self.device);
-        let ps_dxil = compile_hlsl(PS_SOURCE, "main", "ps_5_0", &self.device);
-
-        let (vs_bytes, ps_bytes) = match (vs_dxil, ps_dxil) {
-            (Ok(vs), Ok(ps)) => (vs, ps),
-            _ => {
-                tracing::warn!(
-                    target: "scene_renderer",
-                    "HLSL shader compilation failed — draw calls will be no-ops"
-                );
-                return;
-            }
-        };
+        if vs_bytes.is_empty() || ps_bytes.is_empty() {
+            tracing::warn!(
+                target: "scene_renderer",
+                "DXIL shaders not available — run build.rs with dxc.exe, or install the Windows SDK. \
+                 Draw calls will be recorded but produce no visible output until a PSO is available."
+            );
+            return;
+        }
 
         // ── Pipeline layout (root signature with MVP root constant) ──
         let pll_desc = PipelineLayoutDescriptor {
             push_constant_ranges: vec![PushConstantRange {
-                stage_flags: 0x10, // VERTEX
+                stage_flags: 1, // D3D12_SHADER_VISIBILITY_VERTEX
                 offset: 0,
                 size: 64,          // 4×4 matrix × 4 bytes
             }],
@@ -145,11 +129,11 @@ impl Dx12SceneRenderer {
         // ── Vertex shader module ─────────────────────────────────────
         // Populate the device's shader bytecode cache so create_shader_module
         // can find the DXIL.
-        self.device.shader_cache.insert([0; 32], vs_bytes.clone());
+        self.device.shader_cache.insert([0; 32], vs_bytes.to_vec());
         let vs_mod = match self.device.create_shader_module(&ShaderModuleDescriptor {
             format: ShaderFormat::Dxil,
             source_hash: [0; 32],
-            entry_points: vec!["main".into()],
+            entry_points: vec!["VSMain".into()],
             debug_label: Some("scene_renderer_vs".into()),
         }) {
             Ok(h) => h,
@@ -160,11 +144,11 @@ impl Dx12SceneRenderer {
         };
 
         // ── Pixel shader module ──────────────────────────────────────
-        self.device.shader_cache.insert([1; 32], ps_bytes.clone());
+        self.device.shader_cache.insert([1; 32], ps_bytes.to_vec());
         let ps_mod = match self.device.create_shader_module(&ShaderModuleDescriptor {
             format: ShaderFormat::Dxil,
             source_hash: [1; 32],
-            entry_points: vec!["main".into()],
+            entry_points: vec!["PSMain".into()],
             debug_label: Some("scene_renderer_ps".into()),
         }) {
             Ok(h) => h,
@@ -222,40 +206,6 @@ impl Dx12SceneRenderer {
 }
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-fn compile_hlsl(
-    _source: &[u8],
-    entry: &str,
-    _target: &str,
-    _device: &Dx12Device,
-) -> Result<Vec<u8>, Vec<Diagnostic>> {
-    // Load pre-compiled DXIL from build script output (OUT_DIR).
-    // See build.rs for shader compilation via dxc.exe.
-    let out_dir = std::env::var("OUT_DIR").ok();
-    let dxil_name = if entry == "VSMain" {
-        "scene_vs.dxil"
-    } else {
-        "scene_ps.dxil"
-    };
-
-    if let Some(dir) = out_dir {
-        let path = std::path::Path::new(&dir).join(dxil_name);
-        if let Ok(bytes) = std::fs::read(&path) {
-            if !bytes.is_empty() {
-                return Ok(bytes);
-            }
-        }
-    }
-
-    Err(vec![Diagnostic::new(
-        "DX1270",
-        DiagnosticSeverity::Warning,
-        "scene_renderer",
-        format!(
-            "DXIL shader '{dxil_name}' not found — run build.rs with dxc.exe, or install the Windows SDK. \
-             Draw calls will be recorded but produce no visible output until a PSO is available."
-        ),
-    )])
-}
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 impl BackendRenderer for Dx12SceneRenderer {
@@ -447,7 +397,7 @@ pub struct Dx12SceneRenderer;
 
 #[cfg(not(all(target_os = "windows", feature = "backend-dx12")))]
 impl Dx12SceneRenderer {
-    pub fn new(_device: crate::device::Dx12Device, _width: u32, _height: u32) -> Self {
+    pub fn new(_device: crate::device::Dx12Device, _swapchain: render_core::SwapchainHandle, _width: u32, _height: u32) -> Self {
         Self
     }
 }
@@ -475,6 +425,4 @@ impl BackendRenderer for Dx12SceneRenderer {
 
 // Import FrameStats and Diagnostic for the stub
 #[cfg(not(all(target_os = "windows", feature = "backend-dx12")))]
-use engine_renderer::{Diagnostic, FrameStats, RenderFrameInput};
-#[cfg(not(all(target_os = "windows", feature = "backend-dx12")))]
-use render_core::BackendRenderer;
+use engine_renderer::{BackendRenderer, Diagnostic, FrameStats, RenderFrameInput};
