@@ -31,6 +31,7 @@ pub mod error;
 mod handle;
 mod pipeline;
 mod resources;
+pub mod scene_renderer;
 mod swapchain;
 
 pub use backend::{backend, is_available, DirectX12Backend, Dx12Adapter};

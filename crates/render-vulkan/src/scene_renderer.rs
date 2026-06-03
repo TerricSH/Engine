@@ -2454,6 +2454,99 @@ impl BackendRenderer for SceneRenderer {
         }
         Ok(())
     }
+
+    fn upload_mesh(
+        &mut self,
+        mesh_id: &str,
+        vertex_bytes: &[u8],
+        index_bytes: &[u8],
+        index_count: u32,
+        index_format_u16: bool,
+    ) -> Result<(), Vec<Diagnostic>> {
+        // Destroy old GPU buffers if re-uploading the same mesh ID.
+        if let Some(old) = self.meshes.remove(mesh_id) {
+            self.device.destroy_buffer(old.vertex_buffer);
+            self.device.destroy_buffer(old.index_buffer);
+        }
+
+        // Combined vertex + transfer-dst usage for the vertex buffer.
+        let vb_usage = render_core::BufferUsage(
+            render_core::BufferUsage::VERTEX.0
+                | render_core::BufferUsage::COPY_DST.0,
+        );
+        let vb_desc = render_core::BufferDescriptor {
+            size_bytes: vertex_bytes.len() as u64,
+            usage_flags: vb_usage,
+            memory_hint: render_core::MemoryHint::CpuToGpu,
+            debug_label: Some(format!("mesh-{mesh_id}-vertices")),
+        };
+        let vb = self.device.create_buffer(&vb_desc).map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0203",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("upload_mesh create_buffer(vertices): {e:?}"),
+            )]
+        })?;
+        self.device
+            .write_buffer(vb, vertex_bytes, 0)
+            .map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0204",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("upload_mesh write_buffer(vertices): {e:?}"),
+                )]
+            })?;
+
+        // Index buffer with INDEX usage.
+        let ib_usage = render_core::BufferUsage(
+            render_core::BufferUsage::INDEX.0 | render_core::BufferUsage::COPY_DST.0,
+        );
+        let ib_desc = render_core::BufferDescriptor {
+            size_bytes: index_bytes.len() as u64,
+            usage_flags: ib_usage,
+            memory_hint: render_core::MemoryHint::CpuToGpu,
+            debug_label: Some(format!("mesh-{mesh_id}-indices")),
+        };
+        let ib = self.device.create_buffer(&ib_desc).map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0205",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("upload_mesh create_buffer(indices): {e:?}"),
+            )]
+        })?;
+        self.device.write_buffer(ib, index_bytes, 0).map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0206",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("upload_mesh write_buffer(indices): {e:?}"),
+            )]
+        })?;
+
+        let index_format = if index_format_u16 {
+            IndexFormat::U16
+        } else {
+            IndexFormat::U32
+        };
+        let mesh = GpuMesh {
+            vertex_buffer: vb,
+            index_buffer: ib,
+            index_count,
+            index_format,
+        };
+        self.meshes.insert(mesh_id.to_string(), mesh);
+        Ok(())
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), Vec<Diagnostic>> {
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.device.resize(width.max(1), height.max(1));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

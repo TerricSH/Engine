@@ -46,6 +46,38 @@ pub trait BackendRenderer: Send {
         let _ = frame_stats;
         self.render_frame(input).map(|_| ())
     }
+
+    /// Upload mesh vertex+index data to the backend's internal mesh cache.
+    ///
+    /// After calling this, drawables that reference `mesh_id` in their
+    /// [`RenderableItem::mesh`](crate::RenderableItem::mesh) field will be
+    /// rendered with this geometry instead of a fallback quad.
+    ///
+    /// `vertex_bytes` and `index_bytes` are raw packed GPU-ready data.
+    /// `index_count` is the number of indices (not bytes).
+    /// `index_format` uses u16 when true and u32 when false.
+    ///
+    /// Default: no-op (backends that don't support mesh uploads).
+    fn upload_mesh(
+        &mut self,
+        _mesh_id: &str,
+        _vertex_bytes: &[u8],
+        _index_bytes: &[u8],
+        _index_count: u32,
+        _index_format_u16: bool,
+    ) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+
+    /// Resize the underlying swapchain and viewport.
+    ///
+    /// Called when the application window is resized. The backend should
+    /// recreate its swapchain and update any cached dimensions.
+    ///
+    /// Default: no-op.
+    fn resize(&mut self, _width: u32, _height: u32) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
 }
 
 pub struct Renderer {
@@ -73,6 +105,33 @@ impl Default for Renderer {
 impl Renderer {
     pub fn set_backend(&mut self, backend: Box<dyn BackendRenderer>) {
         self.backend = Some(backend);
+    }
+
+    /// Resize the active backend's swapchain and viewport.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), Vec<Diagnostic>> {
+        if let Some(backend) = self.backend.as_mut() {
+            backend.resize(width, height)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Upload mesh vertex+index data to the active backend's mesh cache.
+    ///
+    /// See [`BackendRenderer::upload_mesh`] for details.
+    pub fn upload_mesh(
+        &mut self,
+        mesh_id: &str,
+        vertex_bytes: &[u8],
+        index_bytes: &[u8],
+        index_count: u32,
+        index_format_u16: bool,
+    ) -> Result<(), Vec<Diagnostic>> {
+        if let Some(backend) = self.backend.as_mut() {
+            backend.upload_mesh(mesh_id, vertex_bytes, index_bytes, index_count, index_format_u16)
+        } else {
+            Ok(())
+        }
     }
 
     /// Render a frame by building the render graph and executing each pass.

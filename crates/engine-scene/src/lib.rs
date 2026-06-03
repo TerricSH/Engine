@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archetype;
+pub mod camera_utils;
 mod component;
 pub mod components;
 mod entity;

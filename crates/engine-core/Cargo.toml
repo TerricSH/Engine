@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 subsystem-scripting-csharp = ["dep:engine-script"]
+gameplay = ["dep:engine-physics", "dep:engine-gameplay"]
 
 [dependencies]
 engine-renderer = { path = "../engine-renderer" }
@@ -15,4 +16,7 @@ engine-scene = { path = "../engine-scene" }
 engine-script = { path = "../engine-script", optional = true }
 engine-serialize = { path = "../engine-serialize" }
 engine-ffi = { path = "../engine-ffi" }
+engine-physics = { path = "../engine-physics", optional = true }
+engine-gameplay = { path = "../engine-gameplay", optional = true }
 tracing.workspace = true
+glam.workspace = true

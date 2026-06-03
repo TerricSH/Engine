@@ -4,11 +4,12 @@ pub mod diagnostics;
 pub use diagnostics::*;
 
 use engine_renderer::{FrameStats, Renderer};
-use engine_scene::{extract_renderer_input, Scene};
+use engine_scene::{extract_renderer_input_from_world, Scene, World};
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
 
 pub mod coroutine;
 pub mod ffi_init;
+pub mod game_loop;
 
 // ── Optional script subsystem ─────────────────────────────────────────────
 
@@ -40,6 +41,7 @@ pub struct EngineRuntime {
     config: EngineConfig,
     renderer: Renderer,
     scene: Option<Scene>,
+    world: Option<World>,
     collector: DiagnosticsCollector,
     pub coroutines: coroutine::CoroutineSystem,
     #[cfg(feature = "subsystem-scripting-csharp")]
@@ -60,6 +62,7 @@ impl EngineRuntime {
             config,
             renderer: Renderer::new(),
             scene: None,
+            world: None,
             collector: DiagnosticsCollector::new(),
             coroutines: coroutine::CoroutineSystem::new(),
             #[cfg(feature = "subsystem-scripting-csharp")]
@@ -80,6 +83,62 @@ impl EngineRuntime {
         self.attach_scene_scripts(&scene);
 
         self.scene = Some(scene);
+    }
+
+    /// Load a scene and also build the ECS World from it.
+    ///
+    /// This is the recommended entry point for runtime games that need
+    /// transforms, physics, and gameplay logic in addition to rendering.
+    pub fn load_scene_to_world(&mut self, scene: Scene) {
+        // Attach scene scripts (if the script subsystem is enabled)
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        self.attach_scene_scripts(&scene);
+
+        let world = World::from_scene(&scene);
+        self.world = Some(world);
+        self.scene = Some(scene);
+    }
+
+    /// Directly set an existing ECS World as the runtime's active world.
+    ///
+    /// This is the preferred entry point when building a World manually
+    /// via `World::new()` + `create_entity()` + `add_component()`.
+    /// Unlike `load_scene_to_world` it avoids the `to_scene()/from_scene()`
+    /// serialisation round-trip.
+    ///
+    /// The world must contain at least one enabled [`Camera`] component
+    /// and at least one enabled [`Renderable`] component for extraction
+    /// to produce a valid frame.
+    pub fn set_world(&mut self, world: World) {
+        // Derive a Scene snapshot from the world for the legacy fallback
+        // path and for script attachment.
+        let scene = world.to_scene();
+
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        self.attach_scene_scripts(&scene);
+
+        self.world = Some(world);
+        self.scene = Some(scene);
+    }
+
+    /// Access the ECS world (immutable).
+    pub fn world(&self) -> Option<&World> {
+        self.world.as_ref()
+    }
+
+    /// Access the ECS world (mutable).
+    pub fn world_mut(&mut self) -> Option<&mut World> {
+        self.world.as_mut()
+    }
+
+    /// Mutable access to the renderer for backend configuration and mesh uploads.
+    pub fn renderer_mut(&mut self) -> &mut Renderer {
+        &mut self.renderer
+    }
+
+    /// Immutable access to the loaded scene (if any).
+    pub fn scene_ref(&self) -> Option<&Scene> {
+        self.scene.as_ref()
     }
 
     /// Access the diagnostics collector (immutable).
@@ -109,16 +168,23 @@ impl EngineRuntime {
     }
 
     /// Render one frame and record GPU statistics into the diagnostics collector.
+    ///
+    /// When a World is loaded (via `load_scene_to_world`), extraction reads
+    /// transforms from ECS components so objects render at their correct
+    /// position. Falls back to Scene-based extraction when no World is present.
     pub fn render_frame(&mut self, frame_index: u64) -> Result<FrameStats, Vec<Diagnostic>> {
-        let scene = self.scene.as_ref().ok_or_else(|| {
-            vec![Diagnostic::new(
+        let input = if let Some(ref world) = self.world {
+            extract_renderer_input_from_world(world, frame_index)?
+        } else if let Some(ref scene) = self.scene {
+            engine_scene::extract_renderer_input(scene, frame_index)?
+        } else {
+            return Err(vec![Diagnostic::new(
                 "SC0018",
                 DiagnosticSeverity::Error,
                 "engine-core",
                 "no scene is loaded",
-            )]
-        })?;
-        let input = extract_renderer_input(scene, frame_index)?;
+            )]);
+        };
         let result = self.renderer.draw_scene(&input);
         if let Ok(stats) = &result {
             self.collector.record_frame(frame_index, stats);

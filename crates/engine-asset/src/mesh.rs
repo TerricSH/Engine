@@ -222,3 +222,87 @@ fn compute_bounds(positions: &[Vec3]) -> (Vec3, Vec3) {
     }
     (min, max)
 }
+
+/// Convert [`MeshData`] into interleaved vertex/index bytes suitable for
+/// [`engine_renderer::BackendRenderer::upload_mesh`].
+///
+/// Vertex layout (32-byte stride):
+/// - position:  `float32x3`  (offset 0)
+/// - normal:    `float32x3`  (offset 12)
+/// - texcoords: `float32x2`  (offset 24)
+///
+/// Index format: `u32` (can be converted to `u16` externally if index count
+/// is ≤ 65535).
+pub fn mesh_data_to_upload_bytes(mesh: &MeshData) -> (Vec<u8>, Vec<u8>, u32, bool) {
+    let vertex_count = mesh.positions.len();
+    let stride = 32u64; // 8 floats × 4 bytes
+
+    let mut vertex_bytes = Vec::with_capacity(vertex_count * stride as usize);
+    for i in 0..vertex_count {
+        let pos = mesh.positions.get(i).copied().unwrap_or(Vec3::ZERO);
+        let nrm = mesh.normals.get(i).copied().unwrap_or(Vec3::Y);
+        let uv = mesh.uvs.get(i).copied().unwrap_or(Vec2::ZERO);
+
+        vertex_bytes.extend_from_slice(&pos.x.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&pos.y.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&pos.z.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&nrm.x.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&nrm.y.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&nrm.z.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&uv.x.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&uv.y.to_ne_bytes());
+    }
+
+    let index_count = mesh.indices.len() as u32;
+    let index_format_u16 = false; // MeshData uses u32 indices
+    let mut index_bytes = Vec::with_capacity(mesh.indices.len() * 4);
+    for idx in &mesh.indices {
+        index_bytes.extend_from_slice(&idx.to_ne_bytes());
+    }
+
+    (vertex_bytes, index_bytes, index_count, index_format_u16)
+}
+
+/// Convert [`MeshData`] into vertex/index bytes matching the SceneRenderer's
+/// `scene_forward_vertex_layout` (position + color, 32-byte stride).
+///
+/// Vertex layout:
+/// - position: `float32x3` (offset 0)
+/// - color:    `float32x4` (offset 12)
+/// - pad:      `float32`   (offset 28, set to 0.0)
+///
+/// The color is derived from the normal vector (`nrm * 0.5 + 0.5`), mapping
+/// each normal component into `[0, 1]` range. Alpha is always 1.0.
+///
+/// This format matches the SceneRenderer's fallback forward pipeline so
+/// glTF meshes render immediately without modifying the pipeline setup.
+pub fn mesh_data_to_color_bytes(mesh: &MeshData) -> (Vec<u8>, Vec<u8>, u32, bool) {
+    let vertex_count = mesh.positions.len();
+    let stride = 32u64; // 8 floats × 4 bytes
+
+    let mut vertex_bytes = Vec::with_capacity(vertex_count * stride as usize);
+    for i in 0..vertex_count {
+        let pos = mesh.positions.get(i).copied().unwrap_or(Vec3::ZERO);
+        let nrm = mesh.normals.get(i).copied().unwrap_or(Vec3::Y);
+        // Map normal [-1,1] to color [0,1] as a visual debug aid.
+        let color = nrm * 0.5 + 0.5;
+
+        vertex_bytes.extend_from_slice(&pos.x.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&pos.y.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&pos.z.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&color.x.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&color.y.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&color.z.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&1.0f32.to_ne_bytes()); // alpha
+        vertex_bytes.extend_from_slice(&0.0f32.to_ne_bytes()); // pad
+    }
+
+    let index_count = mesh.indices.len() as u32;
+    let mut index_bytes = Vec::with_capacity(mesh.indices.len() * 4);
+    for idx in &mesh.indices {
+        index_bytes.extend_from_slice(&idx.to_ne_bytes());
+    }
+
+    (vertex_bytes, index_bytes, index_count, false)
+}
+

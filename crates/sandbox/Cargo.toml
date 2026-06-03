@@ -21,6 +21,7 @@ engine-animation = { path = "../engine-animation" }
 engine-asset = { path = "../engine-asset" }
 engine-character = { path = "../engine-character" }
 engine-core = { path = "../engine-core" }
+engine-gameplay = { path = "../engine-gameplay" }
 engine-physics = { path = "../engine-physics" }
 engine-editor = { path = "../engine-editor", optional = true }
 engine-renderer = { path = "../engine-renderer" }

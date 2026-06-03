@@ -10,6 +10,9 @@ default = ["backend-dx12"]
 backend-dx12 = ["dep:windows"]
 
 [dependencies]
+engine-renderer = { path = "../engine-renderer" }
+engine-serialize = { path = "../engine-serialize" }
+glam.workspace = true
 render-core = { path = "../render-core" }
 thiserror.workspace = true
 tracing.workspace = true

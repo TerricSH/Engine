@@ -14,6 +14,7 @@ fn main() {
         "workspace" => tracing::info!("engine workspace initialized"),
         "gate04-scene" => run_gate04_scene(),
         "character-demo" => run_character_demo(),
+        "engine-character-demo" => run_engine_character_demo(),
         "contract-triangle" => run_contract_triangle(),
         "static-lit-scene" => run_static_lit_scene(),
         "triangle" => run_triangle(),
@@ -741,7 +742,7 @@ fn run_character_demo() {
     use platform::winit::window::Window;
     use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-    use render_core::{BufferDescriptor, BufferHandle, MemoryHint};
+    use render_core::{BufferDescriptor, BufferHandle, Device, MemoryHint};
     use render_vulkan::device_impl::VulkanDevice;
     use render_vulkan::shaders_embedded;
 
@@ -1062,6 +1063,452 @@ fn run_character_demo() {
 #[cfg(not(feature = "backend-vulkan"))]
 fn run_character_demo() {
     tracing::error!("character-demo requires `backend-vulkan` feature");
+    std::process::exit(2);
+}
+
+// ============================================================================
+// engine-character-demo: character-demo rewritten to use the engine pipeline
+// (GameLoop → EngineRuntime → SceneRenderer → VulkanDevice).
+// ============================================================================
+
+#[cfg(feature = "backend-vulkan")]
+fn run_engine_character_demo() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use engine_character::{CharacterController, CharacterMovement};
+    use engine_core::game_loop::GameLoop;
+    use engine_core::EngineConfig;
+    use engine_gameplay::input::{
+        self as gameplay_input, InputAction, InputActionMap, InputValue, InputValueType, KeyCode,
+    };
+    use engine_physics::{
+        BodyType, Collider, ColliderShape, PhysicsWorld, RigidBody,
+    };
+    use engine_scene::components::Transform;
+    use engine_scene::Entity;
+    use glam::Quat;
+    use glam::Vec3;
+    use platform::winit::window::Window;
+    use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+    use render_vulkan::device_impl::VulkanDevice;
+    use render_vulkan::scene_renderer::SceneRenderer;
+
+    struct EngineCharacterApp {
+        game_loop: Option<GameLoop>,
+        controller: Option<CharacterController>,
+        physics: Option<PhysicsWorld>,
+        held_keys: HashSet<u32>,
+        input_map: InputActionMap,
+        frames: u64,
+        max_frames: Option<u64>,
+        last_frame_time: Instant,
+        player_entity: Entity,
+        camera_entity: Entity,
+    }
+
+    // ── Map winit PhysicalKey scancodes → engine-gameplay KeyCodes ──
+    fn scancode_to_keycode(scancode: u32) -> Option<KeyCode> {
+        match scancode {
+            41 => Some(KeyCode::W),
+            19 => Some(KeyCode::A),
+            37 => Some(KeyCode::S),
+            22 => Some(KeyCode::D),
+            62 => Some(KeyCode::Space),
+            _ => None,
+        }
+    }
+
+    // ── Build the InputActionMap for WASD + Space ──────────────────
+    fn build_player_input_map() -> InputActionMap {
+        let mut map = InputActionMap::new("player", "gameplay");
+        map.add_action(InputAction::new("move_forward", InputValueType::Digital));
+        map.add_action(InputAction::new("move_back", InputValueType::Digital));
+        map.add_action(InputAction::new("move_left", InputValueType::Digital));
+        map.add_action(InputAction::new("move_right", InputValueType::Digital));
+        map.add_action(InputAction::new("jump", InputValueType::Digital));
+        map
+    }
+
+    fn action_name_for(key: KeyCode) -> &'static str {
+        match key {
+            KeyCode::W => "move_forward",
+            KeyCode::S => "move_back",
+            KeyCode::A => "move_left",
+            KeyCode::D => "move_right",
+            KeyCode::Space => "jump",
+            _ => "unknown",
+        }
+    }
+
+    fn current_bool(map: &InputActionMap, name: &str) -> bool {
+        matches!(
+            gameplay_input::query_current_value(map, name),
+            Some(InputValue::Bool(true))
+        )
+    }
+
+    // ── Mesh builders (inline in function scope) ──────────────────────
+
+    fn build_colored_quad_32byte() -> (Vec<u8>, Vec<u8>, u32) {
+        let s = 10.0f32;
+        let y = -0.5f32;
+        let verts: [f32; 32] = [
+            -s, y, -s, 0.2, 0.3, 0.4, 1.0, 0.0,
+             s, y, -s, 0.2, 0.3, 0.4, 1.0, 0.0,
+             s, y,  s, 0.2, 0.3, 0.4, 1.0, 0.0,
+            -s, y,  s, 0.2, 0.3, 0.4, 1.0, 0.0,
+        ];
+        let mut vb = Vec::with_capacity(32 * 4);
+        for v in &verts {
+            vb.extend_from_slice(&v.to_ne_bytes());
+        }
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let mut ib = Vec::with_capacity(12);
+        for i in &indices {
+            ib.extend_from_slice(&i.to_ne_bytes());
+        }
+        (vb, ib, 6)
+    }
+
+    fn build_colored_cube_32byte() -> (Vec<u8>, Vec<u8>, u32) {
+        let s = 0.5f32;
+        let verts: [f32; 192] = [
+            -s, -s,  s,  1.0, 0.2, 0.2, 1.0, 0.0,
+             s, -s,  s,  1.0, 0.2, 0.2, 1.0, 0.0,
+             s,  s,  s,  1.0, 0.2, 0.2, 1.0, 0.0,
+            -s,  s,  s,  1.0, 0.2, 0.2, 1.0, 0.0,
+             s, -s, -s,  0.2, 0.2, 1.0, 1.0, 0.0,
+            -s, -s, -s,  0.2, 0.2, 1.0, 1.0, 0.0,
+            -s,  s, -s,  0.2, 0.2, 1.0, 1.0, 0.0,
+             s,  s, -s,  0.2, 0.2, 1.0, 1.0, 0.0,
+             s, -s, -s,  0.2, 1.0, 0.2, 1.0, 0.0,
+             s, -s,  s,  0.2, 1.0, 0.2, 1.0, 0.0,
+             s,  s,  s,  0.2, 1.0, 0.2, 1.0, 0.0,
+             s,  s, -s,  0.2, 1.0, 0.2, 1.0, 0.0,
+            -s, -s,  s,  1.0, 1.0, 0.2, 1.0, 0.0,
+            -s, -s, -s,  1.0, 1.0, 0.2, 1.0, 0.0,
+            -s,  s, -s,  1.0, 1.0, 0.2, 1.0, 0.0,
+            -s,  s,  s,  1.0, 1.0, 0.2, 1.0, 0.0,
+            -s,  s,  s,  1.0, 1.0, 1.0, 1.0, 0.0,
+             s,  s,  s,  1.0, 1.0, 1.0, 1.0, 0.0,
+             s,  s, -s,  1.0, 1.0, 1.0, 1.0, 0.0,
+            -s,  s, -s,  1.0, 1.0, 1.0, 1.0, 0.0,
+            -s, -s, -s,  0.4, 0.4, 0.4, 1.0, 0.0,
+             s, -s, -s,  0.4, 0.4, 0.4, 1.0, 0.0,
+             s, -s,  s,  0.4, 0.4, 0.4, 1.0, 0.0,
+            -s, -s,  s,  0.4, 0.4, 0.4, 1.0, 0.0,
+        ];
+        let mut vb = Vec::with_capacity(192 * 4);
+        for v in &verts {
+            vb.extend_from_slice(&v.to_ne_bytes());
+        }
+        let indices: [u16; 36] = [
+             0,  1,  2,  0,  2,  3,
+             4,  5,  6,  4,  6,  7,
+             8,  9, 10,  8, 10, 11,
+            12, 13, 14, 12, 14, 15,
+            16, 17, 18, 16, 18, 19,
+            20, 21, 22, 20, 22, 23,
+        ];
+        let mut ib = Vec::with_capacity(72);
+        for i in &indices {
+            ib.extend_from_slice(&i.to_ne_bytes());
+        }
+        (vb, ib, 36)
+    }
+
+    impl WindowApp for EngineCharacterApp {
+        fn on_create(&mut self, window: Arc<Window>) {
+            let size = window.inner_size();
+            let w = size.width;
+            let h = size.height;
+
+            // ── Create Vulkan device and SceneRenderer ─────────────────
+            let device = match VulkanDevice::new(
+                window.display_handle().unwrap().as_raw(),
+                window.window_handle().unwrap().as_raw(),
+                w,
+                h,
+                cfg!(debug_assertions),
+                None,
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("VulkanDevice creation failed: {e}");
+                    return;
+                }
+            };
+
+            let scene_renderer = SceneRenderer::new(device, w, h);
+
+            // ── Build engine runtime with backend ──────────────────────
+            let mut game_loop = GameLoop::new(EngineConfig {
+                application_name: "engine-character-demo".into(),
+            });
+            game_loop
+                .runtime
+                .renderer_mut()
+                .set_backend(Box::new(scene_renderer));
+
+            // ── Build the ECS world ────────────────────────────────────
+            use engine_scene::World;
+            let mut world = World::new();
+
+            let ground = world.create_entity();
+            world.add_component(
+                ground,
+                RigidBody {
+                    body_type: BodyType::Static,
+                    ..RigidBody::default()
+                },
+            );
+            world.add_component(
+                ground,
+                Collider {
+                    shape: ColliderShape::Cuboid {
+                        hx: 10.0,
+                        hy: 0.5,
+                        hz: 10.0,
+                    },
+                    ..Collider::default()
+                },
+            );
+            world.add_component(
+                ground,
+                Transform {
+                    translation: Vec3::new(0.0, -0.5, 0.0),
+                    ..Transform::default()
+                },
+            );
+
+            let player = world.create_entity();
+            world.add_component(
+                player,
+                Transform {
+                    translation: Vec3::new(0.0, 3.0, 0.0),
+                    ..Transform::default()
+                },
+            );
+
+            // ── Camera entity (third-person, behind+above player) ─────
+            let camera = world.create_entity();
+            world.add_component(
+                camera,
+                Transform {
+                    translation: Vec3::new(0.0, 5.0, 8.0),
+                    rotation: glam::Quat::from_rotation_x(-0.45),
+                    ..Transform::default()
+                },
+            );
+            world.add_component(camera, engine_scene::components::Camera::default());
+
+            // ── Renderable components ──────────────────────────────────
+            world.add_component(
+                ground,
+                engine_scene::components::Renderable {
+                    mesh_asset: "mesh-ground".into(),
+                    material_asset: "default".into(),
+                    visible: true,
+                    cast_shadows: false,
+                    render_layer: "default".into(),
+                },
+            );
+            world.add_component(
+                player,
+                engine_scene::components::Renderable {
+                    mesh_asset: "mesh-hero".into(),
+                    material_asset: "default".into(),
+                    visible: true,
+                    cast_shadows: true,
+                    render_layer: "default".into(),
+                },
+            );
+
+            // ── Upload meshes to the vulkan backend ────────────────────
+            let (ground_vb, ground_ib, ground_ic) = build_colored_quad_32byte();
+            let (cube_vb, cube_ib, cube_ic) = build_colored_cube_32byte();
+
+            let _ = game_loop.runtime.renderer_mut().upload_mesh(
+                "mesh-ground",
+                &ground_vb,
+                &ground_ib,
+                ground_ic,
+                true,
+            );
+            let _ = game_loop.runtime.renderer_mut().upload_mesh(
+                "mesh-hero",
+                &cube_vb,
+                &cube_ib,
+                cube_ic,
+                true,
+            );
+
+            // ── Place the World in EngineRuntime ───────────────────────
+            // After this, use game_loop.runtime.world_mut() exclusively.
+            game_loop.runtime.set_world(world);
+
+            // ── Init physics ───────────────────────────────────────────
+            let mut physics = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0));
+            if let Some(w) = game_loop.runtime.world() {
+                physics.sync_from_ecs(w);
+            }
+
+            // ── Character controller ───────────────────────────────────
+            let mut controller = CharacterController::new();
+            controller.set_position(Vec3::new(0.0, 3.0, 0.0));
+
+            self.game_loop = Some(game_loop);
+            self.physics = Some(physics);
+            self.controller = Some(controller);
+            self.input_map = build_player_input_map();
+            self.player_entity = Entity::new(1, 0);
+            self.camera_entity = Entity::new(2, 0);
+        }
+
+        fn on_event(&mut self, window: &Window, event: PlatformEvent) -> EventFlow {
+            match event {
+                PlatformEvent::KeyPressed { key, .. } => {
+                    self.held_keys.insert(key);
+                    if let Some(gk) = scancode_to_keycode(key) {
+                        gameplay_input::set_current_value(
+                            &mut self.input_map,
+                            &action_name_for(gk),
+                            InputValue::Bool(true),
+                        );
+                    }
+                }
+                PlatformEvent::KeyReleased { key, .. } => {
+                    self.held_keys.remove(&key);
+                    if let Some(gk) = scancode_to_keycode(key) {
+                        gameplay_input::set_current_value(
+                            &mut self.input_map,
+                            &action_name_for(gk),
+                            InputValue::Bool(false),
+                        );
+                    }
+                }
+                PlatformEvent::Resized { width, height } => {
+                    if let Some(ref mut gl) = self.game_loop {
+                        let _ = gl.runtime.renderer_mut().resize(width, height);
+                    }
+                }
+                PlatformEvent::Redraw => {
+                    let dt = self.last_frame_time.elapsed().as_secs_f32();
+                    self.last_frame_time = Instant::now();
+
+                        // ── Read movement from InputActionMap ──────────
+                        let fwd = current_bool(&self.input_map, "move_forward");
+                        let back = current_bool(&self.input_map, "move_back");
+                        let left = current_bool(&self.input_map, "move_left");
+                        let right = current_bool(&self.input_map, "move_right");
+                        let jump = current_bool(&self.input_map, "jump");
+
+                        let (dx, dz) = (
+                            (right as i8 - left as i8) as f32,
+                            (fwd as i8 - back as i8) as f32,
+                        );
+                    let dir = Vec3::new(dx, 0.0, dz);
+                    let dir = if dir.length_squared() > 0.001 {
+                        dir.normalize()
+                    } else {
+                        dir
+                    };
+
+                    // ── Character + physics + render in one borrow ─────
+                    if let (Some(ref mut gl), Some(ref mut ctrl), Some(ref mut physics)) =
+                        (&mut self.game_loop, &mut self.controller, &mut self.physics)
+                    {
+                        // Character movement
+                        let input = CharacterMovement {
+                            direction: dir,
+                            wish_jump: jump,
+                            delta_time: dt.min(0.1),
+                        };
+                        ctrl.update(&input, Some(physics));
+
+                        // Write character position to runtime's world
+                        if let Some(rw) = gl.runtime.world_mut() {
+                            let pos = ctrl.position();
+                            if let Some(t) = rw.get_mut::<Transform>(self.player_entity) {
+                                t.translation = pos;
+                            }
+                        }
+
+                        // ── Orbit camera follows the player ────────────
+                        if let Some(rw) = gl.runtime.world_mut() {
+                            let pos = ctrl.position();
+                            if let Some(t) = rw.get_mut::<Transform>(self.camera_entity) {
+                                let eye = pos + Vec3::new(0.0, 5.0, 8.0);
+                                let dir = (pos - eye).normalize();
+                                t.translation = eye;
+                                t.rotation = Quat::from_rotation_arc(-Vec3::Z, dir);
+                            }
+                        }
+
+                        // Step physics on runtime's world
+                        if let Some(rw) = gl.runtime.world_mut() {
+                            physics.step(dt.min(0.1), rw);
+                        }
+
+                        // Render
+                        if let Err(errs) = gl.render(self.frames) {
+                            for e in &errs {
+                                tracing::warn!(code = e.code, "render error: {}", e.message);
+                            }
+                        }
+                    }
+                    window.request_redraw();
+                    self.frames += 1;
+                    if self.max_frames.is_some_and(|l| self.frames >= l) {
+                        return EventFlow::Exit;
+                    }
+                }
+                PlatformEvent::CloseRequested => return EventFlow::Exit,
+                _ => {}
+            }
+            EventFlow::Continue
+        }
+    }
+
+    fn parse_frame_limit() -> Option<u64> {
+        std::env::args()
+            .skip(1)
+            .find(|a| a.starts_with("--frames="))
+            .and_then(|s| s.split('=').nth(1).and_then(|v| v.parse().ok()))
+    }
+
+    let max_frames = parse_frame_limit();
+    let app = EngineCharacterApp {
+        game_loop: None,
+        controller: None,
+        physics: None,
+        held_keys: HashSet::new(),
+        input_map: build_player_input_map(),
+        frames: 0,
+        max_frames,
+        last_frame_time: Instant::now(),
+        player_entity: Entity::new(0, 0),
+        camera_entity: Entity::new(0, 0),
+    };
+
+    if let Err(e) = platform::run(
+        WindowDescriptor {
+            title: "Engine Character Demo".into(),
+            width: 1280,
+            height: 720,
+        },
+        app,
+    ) {
+        tracing::error!("{e}");
+    }
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn run_engine_character_demo() {
+    tracing::error!("engine-character-demo requires `backend-vulkan` feature");
     std::process::exit(2);
 }
 

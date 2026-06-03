@@ -49,6 +49,11 @@ impl World {
         self.component_registry = Some(registry);
     }
 
+    /// Access the scene-level settings (ambient, gravity, camera defaults etc.).
+    pub fn scene_settings(&self) -> &SceneSettings {
+        &self.scene_settings
+    }
+
     // ── Entity management ─────────────────────────────────────────────
 
     /// Create a new entity and return its handle.

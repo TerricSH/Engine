@@ -879,10 +879,13 @@ name = "engine-core"
 version = "0.1.0"
 dependencies = [
  "engine-ffi",
+ "engine-gameplay",
+ "engine-physics",
  "engine-renderer",
  "engine-scene",
  "engine-script",
  "engine-serialize",
+ "glam",
  "tracing",
 ]
 
@@ -2900,6 +2903,9 @@ dependencies = [
 name = "render-dx12"
 version = "0.1.0"
 dependencies = [
+ "engine-renderer",
+ "engine-serialize",
+ "glam",
  "render-core",
  "thiserror 1.0.69",
  "tracing",
@@ -3094,6 +3100,7 @@ dependencies = [
  "engine-character",
  "engine-core",
  "engine-editor",
+ "engine-gameplay",
  "engine-physics",
  "engine-renderer",
  "engine-scene",

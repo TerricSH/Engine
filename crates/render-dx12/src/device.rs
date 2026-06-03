@@ -1132,7 +1132,11 @@ impl Device for Dx12Device {
             let clear_color: [f32; 4] = [0.02, 0.02, 0.06, 1.0];
             self.cmd_lists[fi].ClearRenderTargetView(rtv_handle, &clear_color, None);
 
-            let encoder = Dx12CommandEncoder::new(self.cmd_lists[fi].clone());
+            // Set the render target on the command list.
+            self.cmd_lists[fi]
+                .OMSetRenderTargets(1, Some(&rtv_handle as *const _ as *const _), false, None);
+
+            let encoder = Dx12CommandEncoder::new(self.cmd_lists[fi].clone(), self as *const _);
             Ok((image_index, Box::new(encoder)))
         }
     }
