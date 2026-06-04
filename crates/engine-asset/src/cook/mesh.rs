@@ -23,6 +23,9 @@ pub fn cook_mesh(source: &Path, output: &Path) -> Result<CookResult, CookError> 
         crate::mesh::MeshError::NoPositions => {
             CookError::InvalidAsset("mesh has no positions".into())
         }
+        crate::mesh::MeshError::JointsWeightsMismatch => {
+            CookError::InvalidAsset("joints and weights count mismatch".into())
+        }
     })?;
 
     // 2. Serialize with bincode.
@@ -51,6 +54,9 @@ pub fn cook_meshes(source: &Path, output_base: &Path) -> Result<Vec<CookResult>,
         crate::mesh::MeshError::UnsupportedFormat(msg) => CookError::UnsupportedFormat(msg),
         crate::mesh::MeshError::NoPositions => {
             CookError::InvalidAsset("mesh has no positions".into())
+        }
+        crate::mesh::MeshError::JointsWeightsMismatch => {
+            CookError::InvalidAsset("joints and weights count mismatch".into())
         }
     })?;
 
@@ -101,6 +107,8 @@ mod tests {
             uvs: vec![],
             indices: vec![0, 1, 2],
             bounds: (Vec3::ZERO, Vec3::ONE),
+            joints: vec![],
+            weights: vec![],
         }
     }
 

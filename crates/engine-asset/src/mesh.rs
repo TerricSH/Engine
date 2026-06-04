@@ -17,6 +17,10 @@ pub struct MeshData {
     pub indices: Vec<u32>,
     /// Bounding box.
     pub bounds: (Vec3, Vec3), // min, max
+    /// Skinning joint indices (4 per vertex), empty if not skinned.
+    pub joints: Vec<[u32; 4]>,
+    /// Skinning blend weights (4 per vertex), empty if not skinned.
+    pub weights: Vec<[f32; 4]>,
 }
 
 /// Errors from mesh loading.
@@ -28,6 +32,8 @@ pub enum MeshError {
     UnsupportedFormat(String),
     #[error("mesh has no positions")]
     NoPositions,
+    #[error("joints and weights count mismatch")]
+    JointsWeightsMismatch,
 }
 
 /// Load a mesh from a glTF 2.0 file.
@@ -70,6 +76,22 @@ pub fn load_mesh_from_gltf(path: &std::path::Path) -> Result<MeshData, MeshError
             let normals: Vec<Vec3> = normals.into_iter().map(Vec3::from_array).collect();
             let uvs: Vec<Vec2> = uvs.into_iter().map(Vec2::from_array).collect();
 
+            let joints: Vec<[u16; 4]> = reader
+                .read_joints(0)
+                .map(|iter| iter.into_u16().collect())
+                .unwrap_or_default();
+            let weights: Vec<[f32; 4]> = reader
+                .read_weights(0)
+                .map(|iter| iter.into_f32().collect())
+                .unwrap_or_default();
+            let joints_u32: Vec<[u32; 4]> = joints
+                .iter()
+                .map(|&j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
+                .collect();
+            if !joints_u32.is_empty() && joints_u32.len() != weights.len() {
+                return Err(MeshError::JointsWeightsMismatch);
+            }
+
             let (min, max) = compute_bounds(&positions);
 
             return Ok(MeshData {
@@ -78,6 +100,8 @@ pub fn load_mesh_from_gltf(path: &std::path::Path) -> Result<MeshData, MeshError
                 uvs,
                 indices,
                 bounds: (min, max),
+                joints: joints_u32,
+                weights,
             });
         }
     }
@@ -118,6 +142,19 @@ pub fn load_meshes_from_gltf(path: &std::path::Path) -> Result<Vec<(String, Mesh
                 continue;
             }
 
+            let joints: Vec<[u16; 4]> = reader
+                .read_joints(0)
+                .map(|iter| iter.into_u16().collect())
+                .unwrap_or_default();
+            let weights: Vec<[f32; 4]> = reader
+                .read_weights(0)
+                .map(|iter| iter.into_f32().collect())
+                .unwrap_or_default();
+            let joints_u32: Vec<[u32; 4]> = joints
+                .iter()
+                .map(|&j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
+                .collect();
+
             let name = format!("{}_{}", mesh.name().unwrap_or("mesh"), pi);
             let pos_glam: Vec<Vec3> = positions.iter().map(|&p| Vec3::from_array(p)).collect();
             let data = MeshData {
@@ -126,6 +163,8 @@ pub fn load_meshes_from_gltf(path: &std::path::Path) -> Result<Vec<(String, Mesh
                 uvs: uvs.iter().map(|&u| Vec2::from_array(u)).collect(),
                 indices,
                 bounds: compute_bounds(&pos_glam),
+                joints: joints_u32,
+                weights,
             };
             out.push((name, data));
         }
@@ -210,7 +249,63 @@ pub fn create_test_cube() -> MeshData {
         uvs: vec![],
         indices,
         bounds: (Vec3::splat(-0.5), Vec3::splat(0.5)),
+        joints: vec![],
+        weights: vec![],
     }
+}
+
+/// Convert [`MeshData`] with skinning data into the 64-byte stride skinned
+/// vertex format used by the skinned forward pipeline:
+///
+/// - position:  `float32x3`  (offset 0)
+/// - normal:    `float32x3`  (offset 12)
+/// - texcoords: `float32x2`  (offset 24)
+/// - joints:    `uint32x4`   (offset 32)
+/// - weights:   `float32x4`  (offset 48)
+///
+/// Total stride: 64 bytes.
+///
+/// Returns `None` if the mesh has no joint/weight data.
+pub fn mesh_data_to_skinned_bytes(mesh: &MeshData) -> Option<(Vec<u8>, Vec<u8>, u32, bool)> {
+    if mesh.joints.is_empty() || mesh.weights.is_empty() {
+        return None;
+    }
+    let vertex_count = mesh.positions.len();
+    let stride = 64u64;
+
+    let mut vertex_bytes = Vec::with_capacity(vertex_count * stride as usize);
+    for i in 0..vertex_count {
+        let pos = mesh.positions.get(i).copied().unwrap_or(Vec3::ZERO);
+        let nrm = mesh.normals.get(i).copied().unwrap_or(Vec3::Y);
+        let uv = mesh.uvs.get(i).copied().unwrap_or(Vec2::ZERO);
+        let joint = mesh.joints.get(i).copied().unwrap_or([0; 4]);
+        let weight = mesh.weights.get(i).copied().unwrap_or([0.0; 4]);
+
+        vertex_bytes.extend_from_slice(&pos.x.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&pos.y.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&pos.z.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&nrm.x.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&nrm.y.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&nrm.z.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&uv.x.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&uv.y.to_ne_bytes());
+        vertex_bytes.extend_from_slice(&joint[0].to_ne_bytes());
+        vertex_bytes.extend_from_slice(&joint[1].to_ne_bytes());
+        vertex_bytes.extend_from_slice(&joint[2].to_ne_bytes());
+        vertex_bytes.extend_from_slice(&joint[3].to_ne_bytes());
+        vertex_bytes.extend_from_slice(&weight[0].to_ne_bytes());
+        vertex_bytes.extend_from_slice(&weight[1].to_ne_bytes());
+        vertex_bytes.extend_from_slice(&weight[2].to_ne_bytes());
+        vertex_bytes.extend_from_slice(&weight[3].to_ne_bytes());
+    }
+
+    let index_count = mesh.indices.len() as u32;
+    let mut index_bytes = Vec::with_capacity(mesh.indices.len() * 4);
+    for idx in &mesh.indices {
+        index_bytes.extend_from_slice(&idx.to_ne_bytes());
+    }
+
+    Some((vertex_bytes, index_bytes, index_count, false))
 }
 
 fn compute_bounds(positions: &[Vec3]) -> (Vec3, Vec3) {

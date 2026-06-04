@@ -126,6 +126,8 @@ pub fn load_gltf_scene(path: &std::path::Path) -> Result<GltfScene, MeshError> {
                 uvs,
                 indices,
                 bounds: (min, max),
+                joints: vec![],
+                weights: vec![],
             });
             mesh_prim_to_our.push((doc_mesh_idx, prim_counter, our_idx));
         }

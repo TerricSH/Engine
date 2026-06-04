@@ -1,8 +1,10 @@
 use std::sync::Mutex;
 
+use glam::Vec3;
 use engine_renderer::{
     AxisAlignedBox, BonePaletteLayout, RenderExtensionProducer, RenderFrameInput, SkinnedItem,
 };
+use engine_scene::{components::Renderable, components::Transform, Entity, World};
 
 /// Helper: convert a column-major `[[f32;4];4]` to flat `[f32;16]`.
 #[inline]
@@ -117,5 +119,116 @@ impl RenderExtensionProducer for SkinnedExtractProducer {
                 sort_key: 0,
             });
         }
+    }
+}
+
+/// Bridge: iterate ECS entities with skinning components and queue
+/// [`PendingSkinnedItem`]s into the [`SkinnedExtractProducer`].
+///
+/// Called once per frame during the update phase, after animations advance.
+///
+/// # Parameters
+/// * `world` — ECS world with `Renderable` + `Transform` + `SkeletonComponent` + `AnimationPlayer`
+/// * `skeletons` — map of skeleton asset ID to loaded `Skeleton`
+/// * `clips` — map of clip asset ID to loaded `AnimationClip`
+/// * `producer` — the shared `SkinnedExtractProducer` to push items into
+/// * `dt` — delta time in seconds
+/// Bridge: iterate ECS entities with skinning components and queue
+/// [`PendingSkinnedItem`]s into the [`SkinnedExtractProducer`].
+///
+/// Called once per frame during the update phase, after animations advance.
+///
+/// # Parameters
+/// * `world` — ECS world with `Renderable` + `Transform` + `SkeletonComponent` + `AnimationPlayer`
+/// * `asset_skeletons` — map of skeleton asset ID to loaded asset `Skeleton`
+/// * `clips` — map of clip asset ID to loaded `AnimationClip`
+/// * `producer` — the shared `SkinnedExtractProducer` to push items into
+/// * `dt` — delta time in seconds
+pub fn bridge_skinned_items(
+    world: &mut World,
+    asset_skeletons: &std::collections::HashMap<String, crate::assets::Skeleton>,
+    clips: &std::collections::HashMap<String, crate::AnimationClip>,
+    producer: &SkinnedExtractProducer,
+    dt: f32,
+) {
+    use crate::SkeletonComponent;
+
+    // Collect entities first to avoid borrow conflicts with get_mut
+    let entities: Vec<Entity> = world
+        .query::<Renderable>()
+        .filter(|(_, r)| r.visible && !r.mesh_asset.is_empty())
+        .map(|(e, _)| e)
+        .collect();
+
+    for entity in entities {
+        // Clone all needed data before mutable borrow on world
+        let Some(renderable) = world.get::<Renderable>(entity).cloned() else {
+            continue;
+        };
+        let skel_asset_id = world
+            .get::<SkeletonComponent>(entity)
+            .and_then(|s| s.skeleton_asset.clone());
+        let Some(skel_asset_id) = skel_asset_id else {
+            continue;
+        };
+        let Some(asset_skel) = asset_skeletons.get(&skel_asset_id) else {
+            continue;
+        };
+        let transform = world
+            .get::<Transform>(entity)
+            .cloned()
+            .unwrap_or_default();
+
+        // Convert to runtime skeleton for animation evaluation
+        let runtime_skel = crate::skeleton::Skeleton::from_asset(asset_skel);
+
+        // Advance animation player (mutable borrow) and compute bone palette
+        let bone_palette = if let Some(player) = world.get_mut::<crate::AnimationPlayer>(entity) {
+            let clip = player
+                .clip_asset
+                .as_ref()
+                .and_then(|id| clips.get(id));
+            crate::player::update_animation(player, clip, Some(&runtime_skel), dt)
+        } else {
+            runtime_skel
+                .rest_pose()
+                .skin_matrices(&runtime_skel)
+                .iter()
+                .map(|m| m.to_cols_array_2d())
+                .collect()
+        };
+
+        let world_mat = glam::Mat4::from_translation(transform.translation)
+            * glam::Mat4::from_quat(transform.rotation)
+            * glam::Mat4::from_scale(transform.scale);
+
+        // Compute AABB from bone palette positions
+        let (bounds_min, bounds_max) = {
+            let mut min = Vec3::splat(f32::MAX);
+            let mut max = Vec3::splat(f32::MIN);
+            for m in &bone_palette {
+                let t = Vec3::new(m[0][3], m[1][3], m[2][3]);
+                min = min.min(t);
+                max = max.max(t);
+            }
+            if min.x == f32::MAX {
+                ([-0.5; 3], [0.5; 3])
+            } else {
+                (min.to_array(), max.to_array())
+            }
+        };
+
+        producer.push(PendingSkinnedItem {
+            entity: world.persistent_id(entity).map(|s| s.to_string()),
+            mesh: renderable.mesh_asset.clone(),
+            material: renderable.material_asset.clone(),
+            skeleton: skel_asset_id.clone(),
+            bone_palette,
+            world_transform: world_mat.to_cols_array_2d(),
+            bounds_min,
+            bounds_max,
+            render_layer: renderable.render_layer.clone(),
+            cast_shadows: renderable.cast_shadows,
+        });
     }
 }

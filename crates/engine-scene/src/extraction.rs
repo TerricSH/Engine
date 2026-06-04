@@ -1,8 +1,10 @@
+use std::hash::{Hash, Hasher};
+
 use engine_renderer::{
     AxisAlignedBox, ClearFlags, LightItem, LightKind, Rect, RenderFrameInput, RenderView,
     RenderableItem, ShadowMode, ViewCompose, IDENTITY_MAT4,
 };
-use engine_serialize::{Diagnostic, DiagnosticSeverity, PersistentId};
+use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, PersistentId};
 
 use crate::components;
 use crate::scene::{Scene, ECS_SCENE_CONTRACT};
@@ -70,6 +72,7 @@ pub fn extract_renderer_input(
                     asset_field(renderable, "mesh"),
                     asset_field(renderable, "material"),
                 ) {
+                    let sk = batch_sort_key(&material, &mesh);
                     input.drawables.push(RenderableItem {
                         entity: Some(entity.persistent_id.clone()),
                         mesh,
@@ -79,7 +82,7 @@ pub fn extract_renderer_input(
                         render_layer: string_field(renderable, "render_layer")
                             .unwrap_or_else(|| scene.scene_settings.default_render_layer.clone()),
                         cast_shadows: bool_field(renderable, "cast_shadows").unwrap_or(true),
-                        sort_key: input.drawables.len() as u64,
+                        sort_key: sk,
                     });
                 }
             }
@@ -99,6 +102,9 @@ pub fn extract_renderer_input(
             });
         }
     }
+
+    // Sort drawables by (material, mesh) for efficient batching.
+    input.drawables.sort_by_key(|d| d.sort_key);
 
     Ok(input)
 }
@@ -294,6 +300,7 @@ pub fn extract_renderer_input_from_world(
 
         let mesh = engine_serialize::AssetId::new(&renderable.mesh_asset);
         let material = engine_serialize::AssetId::new(&renderable.material_asset);
+        let sk = batch_sort_key(&material, &mesh);
 
         input.drawables.push(RenderableItem {
             entity: pid,
@@ -317,9 +324,12 @@ pub fn extract_renderer_input_from_world(
             },
             render_layer: renderable.render_layer.clone(),
             cast_shadows: renderable.cast_shadows,
-            sort_key: input.drawables.len() as u64,
+            sort_key: sk,
         });
     }
+
+    // Sort drawables by (material, mesh) for efficient batching.
+    input.drawables.sort_by_key(|d| d.sort_key);
 
     // ── Light pass: build LightItems ────────────────────────────────────
 
@@ -522,6 +532,14 @@ fn compute_projection_matrix(camera: &components::Camera) -> glam::Mat4 {
             )
         }
     }
+}
+
+/// Compute a sort key that groups drawables by material then mesh.
+fn batch_sort_key(material: &AssetId, mesh: &AssetId) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    material.hash(&mut hasher);
+    mesh.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Compute a world matrix from a transform component.

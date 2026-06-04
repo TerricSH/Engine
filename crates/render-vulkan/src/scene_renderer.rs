@@ -1422,117 +1422,194 @@ impl SceneRenderer {
             }
         }
 
-        // Draw calls
+        // Draw calls with dynamic batching (drawables pre-sorted by (material, mesh))
+        let mut last_material_id: Option<&str> = None;
+        let mut last_mesh_id: Option<&str> = None;
+        #[allow(unused_assignments)]
+        let mut cached_vb = vk::Buffer::null();
+        #[allow(unused_assignments)]
+        let mut cached_ib = vk::Buffer::null();
+        #[allow(unused_assignments)]
+        let mut cached_idx_ty = vk::IndexType::UINT32;
+        let mut cached_index_count = 0u32;
         for drawable in &input.drawables {
             let mesh_id = &drawable.mesh.id;
-            let mesh = match self.meshes.get(mesh_id).cloned() {
-                Some(m) => m,
-                None => {
+            let material_id = &drawable.material.id;
+
+            // Look up mesh buffers; cache across consecutive same-mesh drawables
+            if Some(mesh_id.as_str()) != last_mesh_id {
+                if let Some(m) = self.meshes.get(mesh_id).cloned() {
+                    let vk_vb = self
+                        .device
+                        .buffers
+                        .get(m.vertex_buffer.index, m.vertex_buffer.generation)
+                        .map(|e| e.buffer)
+                        .unwrap_or(vk::Buffer::null());
+                    let vk_ib = self
+                        .device
+                        .buffers
+                        .get(m.index_buffer.index, m.index_buffer.generation)
+                        .map(|e| e.buffer)
+                        .unwrap_or(vk::Buffer::null());
+                    if vk_vb == vk::Buffer::null() {
+                        last_material_id = None;
+                        last_mesh_id = None;
+                        cached_index_count = 0;
+                        continue;
+                    }
+                    cached_vb = vk_vb;
+                    cached_ib = vk_ib;
+                    cached_idx_ty = match m.index_format {
+                        IndexFormat::U16 => vk::IndexType::UINT16,
+                        IndexFormat::U32 => vk::IndexType::UINT32,
+                    };
+                    cached_index_count = m.index_count;
+                    last_mesh_id = Some(mesh_id.as_str());
+                    // Bind VB/IB
+                    let vbs = [cached_vb];
+                    let offsets = [0u64];
+                    unsafe {
+                        d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
+                        d.cmd_bind_index_buffer(cmd, cached_ib, 0, cached_idx_ty);
+                    }
+                } else {
                     tracing::trace!(
                         target: "scene_renderer",
                         mesh = mesh_id,
                         "skipping un-cached mesh in HDR forward pass"
                     );
+                    last_material_id = None;
+                    last_mesh_id = None;
                     continue;
                 }
-            };
+            }
+            // (when same mesh, VB/IB are still bound — skip rebind)
 
-            let material_id = &drawable.material.id;
-            let material = self.material_binding_for_drawable(input, &drawable.material);
-            let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
-            let ubo_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &material_ubo as *const _ as *const u8,
-                    std::mem::size_of::<MaterialUBO>(),
-                )
-            };
-            let (mat_desc_set, _mat_buf) = self
-                .get_or_create_material_desc_set(material_id, ubo_bytes)
-                .unwrap_or_else(|diags| {
-                    for d in &diags {
-                        tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
+            // Skip material descriptor rebind when same as last drawable
+            if Some(material_id.as_str()) != last_material_id {
+                let material = self.material_binding_for_drawable(input, &drawable.material);
+                let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+                let ubo_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        &material_ubo as *const _ as *const u8,
+                        std::mem::size_of::<MaterialUBO>(),
+                    )
+                };
+                let (mat_desc_set, _mat_buf) = self
+                    .get_or_create_material_desc_set(material_id, ubo_bytes)
+                    .unwrap_or_else(|diags| {
+                        for d in &diags {
+                            tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
+                        }
+                        (vk::DescriptorSet::null(), vk::Buffer::null())
+                    });
+                if mat_desc_set != vk::DescriptorSet::null() {
+                    for tex_slot in &material.textures {
+                        let tex_id = &tex_slot.texture.id;
+                        if self.device.textures.contains_key(tex_id) {
+                            let _ = self.device.bind_material_texture(tex_id, mat_desc_set);
+                            break;
+                        }
                     }
-                    (vk::DescriptorSet::null(), vk::Buffer::null())
-                });
-            if mat_desc_set != vk::DescriptorSet::null() {
-                for tex_slot in &material.textures {
-                    let tex_id = &tex_slot.texture.id;
-                    if self.device.textures.contains_key(tex_id) {
-                        let _ = self.device.bind_material_texture(tex_id, mat_desc_set);
-                        break;
+                    let sets = [mat_desc_set];
+                    unsafe {
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            hdr_pll,
+                            2,
+                            &sets,
+                            &[],
+                        );
                     }
                 }
-                let sets = [mat_desc_set];
-                unsafe {
-                    d.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        hdr_pll,
-                        2,
-                        &sets,
-                        &[],
-                    );
-                }
+                last_material_id = Some(material_id.as_str());
             }
 
             // Push constants: world transform (128 B)
             let world = &drawable.world_transform;
-            let mut pc_bytes = Vec::with_capacity(128);
-            for v in world {
-                pc_bytes.extend_from_slice(&v.to_ne_bytes());
+            let mut pc_bytes = [0u8; 128];
+            for (i, v) in world.iter().enumerate() {
+                let bytes = v.to_ne_bytes();
+                let offset = i * 4;
+                if offset + 4 <= 128 {
+                    pc_bytes[offset..offset + 4].copy_from_slice(&bytes);
+                }
             }
-            pc_bytes.resize(128, 0u8);
             unsafe {
                 d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
             }
 
-            // Bind vertex/index buffers
-            let vk_vb = self
-                .device
-                .buffers
-                .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
-                .map(|e| e.buffer)
-                .unwrap_or(vk::Buffer::null());
-            let vk_ib = self
-                .device
-                .buffers
-                .get(mesh.index_buffer.index, mesh.index_buffer.generation)
-                .map(|e| e.buffer)
-                .unwrap_or(vk::Buffer::null());
-            if vk_vb != vk::Buffer::null() {
-                let vbs = [vk_vb];
-                let offsets = [0u64];
-                let idx_ty = match mesh.index_format {
-                    IndexFormat::U16 => vk::IndexType::UINT16,
-                    IndexFormat::U32 => vk::IndexType::UINT32,
-                };
-                unsafe {
-                    d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
-                    d.cmd_bind_index_buffer(cmd, vk_ib, 0, idx_ty);
-                    d.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
-                }
+            // Draw indexed
+            unsafe {
+                d.cmd_draw_indexed(cmd, cached_index_count, 1, 0, 0, 0);
             }
 
             stats.draw_calls += 1;
-            stats.triangles += mesh.index_count as u64 / 3;
+            stats.triangles += cached_index_count as u64 / 3;
         }
 
-        // Skinned items
+        // Skinned items (less batching opportunity due to unique per-item bone data)
+        let mut last_skinned_mesh: Option<&str> = None;
+        #[allow(unused_assignments)]
+        let mut skinned_cached_vb = vk::Buffer::null();
+        #[allow(unused_assignments)]
+        let mut skinned_cached_ib = vk::Buffer::null();
+        #[allow(unused_assignments)]
+        let mut skinned_cached_idx_ty = vk::IndexType::UINT32;
+        let mut skinned_cached_index_count = 0u32;
         for skinned in &input.skinned_items {
             let mesh_id = &skinned.mesh.id;
-            let mesh = match self.meshes.get(mesh_id).cloned() {
-                Some(m) => m,
-                None => {
-                    tracing::trace!(
-                        target: "scene_renderer",
-                        mesh = mesh_id,
-                        "skipping un-cached skinned mesh in HDR forward pass"
-                    );
-                    continue;
-                }
-            };
-
             let material_id = &skinned.material.id;
+
+            // Cache VB/IB, skip on missing mesh
+            if Some(mesh_id.as_str()) != last_skinned_mesh {
+                match self.meshes.get(mesh_id).cloned() {
+                    Some(m) => {
+                        let vk_vb = self
+                            .device
+                            .buffers
+                            .get(m.vertex_buffer.index, m.vertex_buffer.generation)
+                            .map(|e| e.buffer)
+                            .unwrap_or(vk::Buffer::null());
+                        let vk_ib = self
+                            .device
+                            .buffers
+                            .get(m.index_buffer.index, m.index_buffer.generation)
+                            .map(|e| e.buffer)
+                            .unwrap_or(vk::Buffer::null());
+                        if vk_vb == vk::Buffer::null() {
+                            last_skinned_mesh = None;
+                            continue;
+                        }
+                        skinned_cached_vb = vk_vb;
+                        skinned_cached_ib = vk_ib;
+                        skinned_cached_index_count = m.index_count;
+                        skinned_cached_idx_ty = match m.index_format {
+                            IndexFormat::U16 => vk::IndexType::UINT16,
+                            IndexFormat::U32 => vk::IndexType::UINT32,
+                        };
+                        last_skinned_mesh = Some(mesh_id.as_str());
+                        let vbs = [skinned_cached_vb];
+                        let offsets = [0u64];
+                        unsafe {
+                            d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
+                            d.cmd_bind_index_buffer(cmd, skinned_cached_ib, 0, skinned_cached_idx_ty);
+                        }
+                    }
+                    None => {
+                        tracing::trace!(
+                            target: "scene_renderer",
+                            mesh = mesh_id,
+                            "skipping un-cached skinned mesh in HDR forward pass"
+                        );
+                        last_skinned_mesh = None;
+                        continue;
+                    }
+                }
+            }
+
+            // Per-item: material descriptor, bone buffer, skinned descriptor set
             let material = self.material_binding_for_drawable(input, &skinned.material);
             let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
             let ubo_bytes: &[u8] = unsafe {
@@ -1583,61 +1660,33 @@ impl SceneRenderer {
                 continue;
             }
 
-            if skinned_desc_set != vk::DescriptorSet::null() {
-                for tex_slot in &material.textures {
-                    let tex_id = &tex_slot.texture.id;
-                    if self.device.textures.contains_key(tex_id) {
-                        let _ = self.device.bind_material_texture(tex_id, skinned_desc_set);
-                        break;
-                    }
-                }
-                let sets = [skinned_desc_set];
-                unsafe {
-                    d.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        hdr_pll,
-                        2,
-                        &sets,
-                        &[],
-                    );
+            for tex_slot in &material.textures {
+                let tex_id = &tex_slot.texture.id;
+                if self.device.textures.contains_key(tex_id) {
+                    let _ = self.device.bind_material_texture(tex_id, skinned_desc_set);
+                    break;
                 }
             }
-
-            let pc_bytes = vec![0u8; 128];
+            let sets = [skinned_desc_set];
             unsafe {
-                d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    hdr_pll,
+                    2,
+                    &sets,
+                    &[],
+                );
             }
 
-            // Bind vertex/index buffers
-            let vk_vb = self
-                .device
-                .buffers
-                .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
-                .map(|e| e.buffer)
-                .unwrap_or(vk::Buffer::null());
-            let vk_ib = self
-                .device
-                .buffers
-                .get(mesh.index_buffer.index, mesh.index_buffer.generation)
-                .map(|e| e.buffer)
-                .unwrap_or(vk::Buffer::null());
-            if vk_vb != vk::Buffer::null() {
-                let vbs = [vk_vb];
-                let offsets = [0u64];
-                let idx_ty = match mesh.index_format {
-                    IndexFormat::U16 => vk::IndexType::UINT16,
-                    IndexFormat::U32 => vk::IndexType::UINT32,
-                };
-                unsafe {
-                    d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
-                    d.cmd_bind_index_buffer(cmd, vk_ib, 0, idx_ty);
-                    d.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
-                }
+            unsafe {
+                let pc_bytes = [0u8; 128];
+                d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
+                d.cmd_draw_indexed(cmd, skinned_cached_index_count, 1, 0, 0, 0);
             }
 
             stats.draw_calls += 1;
-            stats.triangles += mesh.index_count as u64 / 3;
+            stats.triangles += skinned_cached_index_count as u64 / 3;
         }
 
         // Frustum cull + indirect draw (Phase 5.1)
@@ -1924,59 +1973,77 @@ impl SceneRenderer {
 
             let light_vp = light_vps[cascade];
 
+            // Shadow draws with batching (drawables pre-sorted by mesh)
+            let mut last_shadow_mesh: Option<&str> = None;
+            #[allow(unused_assignments)]
+            let mut shadow_cached_vb = vk::Buffer::null();
+            #[allow(unused_assignments)]
+            let mut shadow_cached_ib = vk::Buffer::null();
+            let mut shadow_cached_index_count = 0u32;
             for drawable in &input.drawables {
                 if !drawable.cast_shadows {
+                    last_shadow_mesh = None;
                     continue;
                 }
 
                 let mesh_id = &drawable.mesh.id;
-                let mesh = match self.meshes.get(mesh_id).cloned() {
-                    Some(m) => m,
-                    None => {
-                        tracing::trace!(
-                            target: "scene_renderer",
-                            mesh = mesh_id,
-                            "skipping un-cached mesh in shadow pass"
-                        );
-                        continue;
-                    }
-                };
 
-                let vk_vb = self
-                    .device
-                    .buffers
-                    .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
-                    .map(|e| e.buffer)
-                    .unwrap_or(vk::Buffer::null());
-                let vk_ib = self
-                    .device
-                    .buffers
-                    .get(mesh.index_buffer.index, mesh.index_buffer.generation)
-                    .map(|e| e.buffer)
-                    .unwrap_or(vk::Buffer::null());
-                if vk_vb == vk::Buffer::null() || vk_ib == vk::Buffer::null() {
-                    continue;
+                if Some(mesh_id.as_str()) != last_shadow_mesh {
+                    match self.meshes.get(mesh_id).cloned() {
+                        Some(m) => {
+                            let vk_vb = self
+                                .device
+                                .buffers
+                                .get(m.vertex_buffer.index, m.vertex_buffer.generation)
+                                .map(|e| e.buffer)
+                                .unwrap_or(vk::Buffer::null());
+                            let vk_ib = self
+                                .device
+                                .buffers
+                                .get(m.index_buffer.index, m.index_buffer.generation)
+                                .map(|e| e.buffer)
+                                .unwrap_or(vk::Buffer::null());
+                            if vk_vb == vk::Buffer::null() || vk_ib == vk::Buffer::null() {
+                                last_shadow_mesh = None;
+                                continue;
+                            }
+                            shadow_cached_vb = vk_vb;
+                            shadow_cached_ib = vk_ib;
+                            shadow_cached_index_count = m.index_count;
+                            last_shadow_mesh = Some(mesh_id.as_str());
+                            // Bind VB/IB
+                            let vbs = [shadow_cached_vb];
+                            let offsets = [0u64];
+                            unsafe {
+                                d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
+                                d.cmd_bind_index_buffer(cmd, shadow_cached_ib, 0, vk::IndexType::UINT32);
+                            }
+                        }
+                        None => {
+                            tracing::trace!(
+                                target: "scene_renderer",
+                                mesh = mesh_id,
+                                "skipping un-cached mesh in shadow pass"
+                            );
+                            last_shadow_mesh = None;
+                            continue;
+                        }
+                    }
                 }
 
                 let world = Mat4::from_cols_array(&drawable.world_transform);
                 let mvp = light_vp * world;
-                let mvp_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
+                unsafe {
+                    let mvp_bytes: &[u8] = std::slice::from_raw_parts(
                         &mvp as *const _ as *const u8,
                         std::mem::size_of::<Mat4>(),
-                    )
-                };
-                unsafe {
+                    );
                     d.cmd_push_constants(cmd, pll, vk::ShaderStageFlags::VERTEX, 0, mvp_bytes);
-                    let vbs = [vk_vb];
-                    let offsets = [0u64];
-                    d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
-                    d.cmd_bind_index_buffer(cmd, vk_ib, 0, vk::IndexType::UINT32);
-                    d.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+                    d.cmd_draw_indexed(cmd, shadow_cached_index_count, 1, 0, 0, 0);
                 }
 
                 stats.draw_calls += 1;
-                stats.triangles += mesh.index_count as u64 / 3;
+                stats.triangles += shadow_cached_index_count as u64 / 3;
             }
 
             unsafe {

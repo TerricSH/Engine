@@ -822,6 +822,8 @@ fn run_engine_character_demo() {
             uvs: vec![],
             indices: vec![0, 1, 2, 0, 2, 3],
             bounds: (Vec3::new(-10.0, -0.5, -10.0), Vec3::new(10.0, -0.5, 10.0)),
+            joints: vec![],
+            weights: vec![],
         };
         mesh_data_to_color_bytes(&mesh)
     }
