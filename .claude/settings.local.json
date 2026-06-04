@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(ls -d \"e:\\\\project\\\\engine\"\\\\*/)",
-      "Read(//e/project/**)",
-      "Bash(cargo check *)"
-    ]
-  }
-}
