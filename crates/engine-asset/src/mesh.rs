@@ -308,6 +308,59 @@ pub fn mesh_data_to_skinned_bytes(mesh: &MeshData) -> Option<(Vec<u8>, Vec<u8>, 
     Some((vertex_bytes, index_bytes, index_count, false))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skinned_bytes_returns_none_for_non_skinned_mesh() {
+        let mesh = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z, Vec3::Z, Vec3::Z],
+            uvs: vec![],
+            indices: vec![0, 1, 2],
+            bounds: (Vec3::ZERO, Vec3::ONE),
+            joints: vec![],
+            weights: vec![],
+        };
+        assert!(mesh_data_to_skinned_bytes(&mesh).is_none());
+    }
+
+    #[test]
+    fn skinned_bytes_produces_correct_stride() {
+        let mesh = MeshData {
+            positions: vec![Vec3::ZERO; 2],
+            normals: vec![Vec3::Z; 2],
+            uvs: vec![Vec2::ZERO; 2],
+            indices: vec![0, 1],
+            bounds: (Vec3::ZERO, Vec3::ONE),
+            joints: vec![[0, 1, 2, 3]; 2],
+            weights: vec![[1.0, 0.0, 0.0, 0.0]; 2],
+        };
+        let (vb, ib, ic, u16_fmt) = mesh_data_to_skinned_bytes(&mesh).unwrap();
+        // 2 vertices × 64 bytes = 128 bytes
+        assert_eq!(vb.len(), 128);
+        // 2 indices × 4 bytes = 8 bytes
+        assert_eq!(ib.len(), 8);
+        assert_eq!(ic, 2);
+        assert!(!u16_fmt);
+    }
+
+    #[test]
+    fn skinned_bytes_joints_weights_must_match() {
+        let mesh = MeshData {
+            positions: vec![Vec3::ZERO; 3],
+            normals: vec![Vec3::Z; 3],
+            uvs: vec![Vec2::ZERO; 3],
+            indices: vec![0, 1, 2],
+            bounds: (Vec3::ZERO, Vec3::ONE),
+            joints: vec![[0; 4]; 3],
+            weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
+        };
+        assert!(mesh_data_to_skinned_bytes(&mesh).is_some());
+    }
+}
+
 fn compute_bounds(positions: &[Vec3]) -> (Vec3, Vec3) {
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);

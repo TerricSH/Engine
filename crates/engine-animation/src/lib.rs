@@ -32,7 +32,7 @@ pub use components::{AnimationPlayer, IkTargetComponent, SkeletonComponent};
 pub use convert::*;
 pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
 pub use events::{check_event_trigger, AnimEvent, AnimEventCollector, AnimEventDef};
-pub use extract::{PendingSkinnedItem, SkinnedExtractProducer};
+pub use extract::{bridge_skinned_items, PendingSkinnedItem, SkinnedExtractProducer};
 pub use foot_ik::*;
 pub use ik::{
     solve_pose, solve_pose_multi, IkChain, IkConstraint, IkConstraintSet, IkDebugDraw, IkDebugInfo,
