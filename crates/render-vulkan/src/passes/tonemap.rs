@@ -46,14 +46,6 @@ impl RenderPass for TonemapPass {
                     size_source: SizeSource::Swapchain,
                     access: ResourceAccess::Read,
                 },
-                PassAttachment {
-                    name: "ssao_output".into(),
-                    format: Some("R8".into()),
-                    clear: false,
-                    load_op: "load".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Read,
-                },
             ],
             outputs: vec![PassAttachment {
                 name: "ldr_color".into(),

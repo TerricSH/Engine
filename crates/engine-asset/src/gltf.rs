@@ -1,12 +1,13 @@
 //! Full glTF 2.0 importer — meshes, materials, node hierarchy.
 //!
-//! Builds on the low-level vertex extraction in [`crate::mesh`] and adds
-//! PBR material properties, texture references, and a transform hierarchy
-//! that maps onto the engine's ECS World.
+//! Builds on a single [`gltf::import`] call and produces a [`GltfScene`]
+//! with correctly-indexed meshes, materials, textures, and nodes.
 
 use glam::Mat4;
+use glam::Vec2;
+use glam::Vec3;
 
-use crate::mesh::{load_meshes_from_gltf, MeshData, MeshError};
+use crate::mesh::{MeshData, MeshError};
 
 // ============================================================================
 // Exported types
@@ -15,23 +16,15 @@ use crate::mesh::{load_meshes_from_gltf, MeshData, MeshError};
 /// PBR material properties extracted from a glTF material.
 #[derive(Clone, Debug)]
 pub struct GltfMaterial {
-    /// Linear-space base colour (RGBA).
     pub base_color: [f32; 4],
     /// Index into the owning scene's `textures` list, or `None`.
     pub base_color_texture: Option<usize>,
-    /// Metallic factor in [0,1].
     pub metallic: f32,
-    /// Roughness factor in [0,1].
     pub roughness: f32,
-    /// Index into the owning scene's `textures` list (ORM texture), or `None`.
     pub metallic_roughness_texture: Option<usize>,
-    /// Emissive colour (linear RGB).
     pub emissive: [f32; 3],
-    /// Index into `textures`, or `None`.
     pub emissive_texture: Option<usize>,
-    /// Index into `textures` (normal map), or `None`.
     pub normal_texture: Option<usize>,
-    /// Whether the material uses double-sided rendering.
     pub double_sided: bool,
 }
 
@@ -47,7 +40,7 @@ pub struct GltfTexture {
 #[derive(Clone, Debug)]
 pub struct GltfNode {
     pub name: String,
-    /// Local transform relative to the parent node.
+    /// World-space transform (accumulated from parent chain).
     pub transform: Mat4,
     /// Index into the owning scene's `meshes` vec, or `None`.
     pub mesh_index: Option<usize>,
@@ -64,37 +57,94 @@ pub struct GltfScene {
     pub materials: Vec<GltfMaterial>,
     pub textures: Vec<GltfTexture>,
     pub nodes: Vec<GltfNode>,
-    /// Root node indices (nodes without a parent).
     pub roots: Vec<usize>,
 }
 
 // ============================================================================
-// Import
+// Import — single-pass, correctly indexed
 // ============================================================================
 
 /// Load a full scene from a glTF 2.0 file.
 pub fn load_gltf_scene(path: &std::path::Path) -> Result<GltfScene, MeshError> {
-    let (doc, _buffers, images) = gltf::import(path).map_err(|e| MeshError::GltfLoad(e.to_string()))?;
+    let (doc, buffers, images_raw) =
+        gltf::import(path).map_err(|e| MeshError::GltfLoad(e.to_string()))?;
 
-    // ── Meshes ─────────────────────────────────────────────────────────
-    let mesh_pairs = load_meshes_from_gltf(path)?;
-    let meshes: Vec<MeshData> = mesh_pairs.into_iter().map(|(_, m)| m).collect();
-
-    // ── Materials ──────────────────────────────────────────────────────
+    // ── Materials (document order) ─────────────────────────────────────
     let materials: Vec<GltfMaterial> = doc.materials().map(|mat| extract_material(&mat)).collect();
 
-    // ── Textures ───────────────────────────────────────────────────────
-    let textures: Vec<GltfTexture> = images
-        .into_iter()
-        .filter_map(|img| decode_gltf_image(img).ok())
+    // ── Textures (document order — index matches doc.textures()) ───────
+    // Build a mapping of glTF image index → texture index list overlap.
+    let textures: Vec<GltfTexture> = doc
+        .textures()
+        .filter_map(|tex| {
+            let img_idx = tex.source().index();
+            images_raw.get(img_idx).and_then(|img| {
+                decode_gltf_image(img.clone())
+                    .map_err(|e| tracing::warn!(target: "gltf", index = img_idx, "texture decode: {e}"))
+                    .ok()
+            })
+        })
         .collect();
+
+    // ── Meshes — expand all primitives into a flat vec ────────────────
+    // mesh_doc_to_our[(doc_mesh_idx, prim_idx)] = index in our meshes[]
+    let mut meshes: Vec<MeshData> = Vec::new();
+    let mut mesh_prim_to_our: Vec<(usize, usize, usize)> = Vec::new(); // (doc_mesh, prim_counter, our_idx)
+
+    for doc_mesh in doc.meshes() {
+        let doc_mesh_idx = doc_mesh.index();
+        for (prim_counter, prim) in doc_mesh.primitives().enumerate() {
+            let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
+            let our_idx = meshes.len();
+
+            let positions: Vec<Vec3> = reader
+                .read_positions()
+                .ok_or(MeshError::NoPositions)?
+                .map(Vec3::from_array)
+                .collect();
+            let normals: Vec<Vec3> = reader
+                .read_normals()
+                .map(|iter| iter.map(Vec3::from_array).collect())
+                .unwrap_or_else(|| vec![Vec3::Y; positions.len()]);
+            let uvs: Vec<Vec2> = reader
+                .read_tex_coords(0)
+                .map(|iter| iter.into_f32().map(Vec2::from_array).collect())
+                .unwrap_or_default();
+            let indices: Vec<u32> = reader
+                .read_indices()
+                .map(|iter| iter.into_u32().collect())
+                .unwrap_or_else(|| (0..positions.len() as u32).collect());
+
+            if positions.is_empty() {
+                continue;
+            }
+
+            let (min, max) = compute_bounds(&positions);
+            meshes.push(MeshData {
+                positions,
+                normals,
+                uvs,
+                indices,
+                bounds: (min, max),
+            });
+            mesh_prim_to_our.push((doc_mesh_idx, prim_counter, our_idx));
+        }
+    }
 
     // ── Nodes ──────────────────────────────────────────────────────────
     let mut nodes: Vec<GltfNode> = Vec::new();
     let mut roots: Vec<usize> = Vec::new();
     if let Some(scene) = doc.scenes().next() {
         for node in scene.nodes() {
-            flatten_node(&node, &Mat4::IDENTITY, &mut nodes, &mut roots, &materials, true);
+            flatten_node(
+                &node,
+                &Mat4::IDENTITY,
+                &mut nodes,
+                &mut roots,
+                &materials,
+                &mesh_prim_to_our,
+                true,
+            );
         }
     }
 
@@ -111,7 +161,6 @@ pub fn load_gltf_scene(path: &std::path::Path) -> Result<GltfScene, MeshError> {
 // Internal helpers
 // ============================================================================
 
-/// Extract PBR material properties from a glTF material.
 fn extract_material(mat: &gltf::Material<'_>) -> GltfMaterial {
     let pbr = mat.pbr_metallic_roughness();
     let base_color: [f32; 4] = {
@@ -122,7 +171,6 @@ fn extract_material(mat: &gltf::Material<'_>) -> GltfMaterial {
         let f = mat.emissive_factor();
         [f[0], f[1], f[2]]
     };
-
     GltfMaterial {
         base_color,
         base_color_texture: pbr.base_color_texture().map(|t| t.texture().index()),
@@ -131,49 +179,45 @@ fn extract_material(mat: &gltf::Material<'_>) -> GltfMaterial {
         metallic_roughness_texture: pbr.metallic_roughness_texture().map(|t| t.texture().index()),
         emissive,
         emissive_texture: mat.emissive_texture().map(|t| t.texture().index()),
-        normal_texture: mat
-            .normal_texture()
-            .map(|t| t.texture().index()),
+        normal_texture: mat.normal_texture().map(|t| t.texture().index()),
         double_sided: mat.double_sided(),
     }
 }
 
-/// Recursively flatten a glTF node tree into the `nodes` vec.
-/// `parent_transform` is the accumulated world transform of the parent.
 fn flatten_node(
     node: &gltf::Node<'_>,
     parent_transform: &Mat4,
     nodes: &mut Vec<GltfNode>,
     roots: &mut Vec<usize>,
-    materials: &[GltfMaterial],
+    _materials: &[GltfMaterial],
+    mesh_prim_to_our: &[(usize, usize, usize)],
     is_root: bool,
 ) -> usize {
-    // Compute local transform.
     let local_mat = {
         let mat = node.transform().matrix();
         Mat4::from_cols_array_2d(&mat)
     };
-
     let world = *parent_transform * local_mat;
 
-    // Determine mesh and material indices.
-    let (mesh_idx, mat_idx) = node.mesh().map(|m| {
-        let mesh_idx = m.index();
-        let prim_mat = m.primitives().next().and_then(|p| {
-            let gltf_mat = p.material();
-            materials.iter().position(|em| {
-                em.base_color == extract_material(&gltf_mat).base_color
-            })
-        });
-        (Some(mesh_idx), prim_mat)
-    }).unwrap_or((None, None));
+    // Look up the correct mesh index in our flat vec.
+    let our_mesh = node.mesh().and_then(|m| {
+        let doc_mesh_idx = m.index();
+        mesh_prim_to_our
+            .iter()
+            .find(|(doc, _, _)| *doc == doc_mesh_idx)
+            .map(|(_, _, our)| *our)
+    });
+    let mat_idx: Option<usize> = node
+        .mesh()
+        .and_then(|m| m.primitives().next())
+        .and_then(|p| p.material().index());
 
     let idx = nodes.len();
     let name = node.name().unwrap_or("node").to_string();
     nodes.push(GltfNode {
         name,
         transform: world,
-        mesh_index: mesh_idx,
+        mesh_index: our_mesh,
         material_index: mat_idx,
         children: Vec::new(),
     });
@@ -182,16 +226,24 @@ fn flatten_node(
         roots.push(idx);
     }
 
-    // Recurse into children.
     for child in node.children() {
-        let child_idx = flatten_node(&child, &world, nodes, roots, materials, false);
+        let child_idx = flatten_node(&child, &world, nodes, roots, _materials, mesh_prim_to_our, false);
         nodes[idx].children.push(child_idx);
     }
 
     idx
 }
 
-/// Decode a glTF image into RGBA pixel data.
+fn compute_bounds(positions: &[Vec3]) -> (Vec3, Vec3) {
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    for p in positions {
+        min = min.min(*p);
+        max = max.max(*p);
+    }
+    (min, max)
+}
+
 fn decode_gltf_image(img: gltf::image::Data) -> Result<GltfTexture, MeshError> {
     let (data, width, height) = match img.format {
         gltf::image::Format::R8 => {
@@ -245,7 +297,6 @@ fn decode_gltf_image(img: gltf::image::Data) -> Result<GltfTexture, MeshError> {
                 }).collect();
             (rgba, img.width, img.height)
         }
-        // Float formats: cast f32 → u8 (tone-map via clamp).
         gltf::image::Format::R32G32B32FLOAT => {
             let rgba: Vec<u8> = img.pixels.chunks_exact(12)
                 .flat_map(|c| {
@@ -268,6 +319,40 @@ fn decode_gltf_image(img: gltf::image::Data) -> Result<GltfTexture, MeshError> {
             (rgba, img.width, img.height)
         }
     };
-
     Ok(GltfTexture { data, width, height })
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_triangle_gltf() {
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/models/triangle.gltf"
+        ));
+        let scene = load_gltf_scene(path).expect("triangle.gltf should load");
+        assert_eq!(scene.meshes.len(), 1, "one mesh (1 primitive)");
+        assert_eq!(scene.materials.len(), 0, "no materials in triangle.gltf");
+        assert_eq!(scene.nodes.len(), 1, "one node");
+        assert_eq!(scene.roots.len(), 1, "one root node");
+
+        let mesh = &scene.meshes[0];
+        assert_eq!(mesh.positions.len(), 3, "triangle has 3 vertices");
+        assert_eq!(mesh.indices.len(), 3, "triangle has 3 indices");
+        assert!(mesh.normals.len() == 3, "triangle has normals");
+
+        let node = &scene.nodes[0];
+        assert_eq!(node.mesh_index, Some(0), "node points to first mesh");
+        assert!(node.material_index.is_none(), "no material");
+
+        // Verify a known vertex position (from the glTF data: [-1,-1,0])
+        assert!((mesh.positions[0].x - (-1.0)).abs() < 0.001);
+        assert!((mesh.positions[0].y - (-1.0)).abs() < 0.001);
+    }
 }

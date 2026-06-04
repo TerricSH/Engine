@@ -19,8 +19,6 @@ use std::path::Path;
 use render_core::{Device, RhiError};
 use thiserror::Error;
 
-const _CHANNELS: usize = 4; // RGBA
-
 /// Read the current framebuffer region and save it as a PNG file.
 ///
 /// `device` is the rendering device with a completed frame.

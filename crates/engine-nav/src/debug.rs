@@ -32,9 +32,7 @@ const COLOR_AGENT: [f32; 4] = [1.0, 0.2, 0.2, 1.0];
 struct PolyDraw {
     /// Indices into the debug draw's vertex list.
     vertex_indices: Vec<usize>,
-    /// Movement-cost multiplier (1.0 = normal).
-    #[allow(dead_code)]
-    cost: f32,
+
 }
 
 // ---------------------------------------------------------------------------
@@ -87,10 +85,8 @@ impl NavMeshDebugDraw {
         for i in 0..navmesh.polygon_count() {
             let idx = PolygonIndex(i as u32);
             if let Some(indices) = navmesh.polygon_vertex_indices(idx) {
-                let cost = navmesh.polygon_cost(idx);
                 self.polygons.push(PolyDraw {
                     vertex_indices: indices.iter().map(|vi| vi.0 as usize).collect(),
-                    cost,
                 });
             }
         }

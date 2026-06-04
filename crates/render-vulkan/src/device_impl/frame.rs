@@ -48,11 +48,6 @@ impl VulkanDevice {
                     self.ensure_shadow()?;
                     // Create HDR offscreen + tone-mapping resources
                     self.ensure_hdr_resources()?;
-                    // Create post-processing resources (bloom + SSAO).
-                    // These are idempotent and gracefully no-op when
-                    // the required SPIR-V is unavailable.
-                    let _ = self.create_bloom_resources();
-                    let _ = self.create_ssao_resources();
                 }
                 Err(VulkanError::SurfaceMinimized) => {
                     self.minimized = true;

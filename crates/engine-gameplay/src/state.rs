@@ -166,7 +166,7 @@ impl GameStateManager {
     }
 
     // -----------------------------------------------------------------------
-    // Accessors
+    // State queries
     // -----------------------------------------------------------------------
 
     /// The current state.
@@ -224,16 +224,13 @@ impl GameStateManager {
             return Err("already in requested state".into());
         }
 
-        // Find a matching rule where `self.current` is in `from` and `target` is `to`.
         for rule in &mut self.transitions {
             if rule.to == target && rule.from.contains(&self.current) {
-                // Evaluate condition if one exists.
                 if let Some(ref mut cond) = rule.condition {
                     if !cond() {
                         return Err("transition condition not met".into());
                     }
                 }
-                // Transition is valid.
                 self.previous.push(self.current);
                 self.current = target;
                 self._fire_callbacks();
@@ -248,9 +245,6 @@ impl GameStateManager {
     }
 
     /// Force a transition without validation.
-    ///
-    /// This bypasses all transition rules and conditions.  Use it for
-    /// loading screens, emergency resets, or initialisation sequences.
     pub fn force_transition(&mut self, target: GameState) {
         if target == self.current {
             return;
@@ -261,9 +255,6 @@ impl GameStateManager {
     }
 
     /// Attempt to transition back to the most recent previous state.
-    ///
-    /// Returns `Err` if there is no previous state or if the transition
-    /// is not valid.
     pub fn pop_state(&mut self) -> Result<(), String> {
         let prev = self
             .previous
@@ -278,9 +269,6 @@ impl GameStateManager {
     // -----------------------------------------------------------------------
 
     /// Register a callback that fires on every state change.
-    ///
-    /// The callback receives `(old_state, new_state)`.
-    /// Returns a `CallbackId` that can be used with [`unregister_callback`].
     pub fn on_state_change<F>(&mut self, callback: F) -> CallbackId
     where
         F: FnMut(&GameState, &GameState) + Send + 'static,
@@ -302,13 +290,6 @@ impl GameStateManager {
     // -----------------------------------------------------------------------
 
     fn _fire_callbacks(&mut self) {
-        // We can't expose the *previous* current after the swap, so we
-        // fire with (prev, new).  Callbacks receive mutable references
-        // to themselves but read-only references to the states.
-        //
-        // Because we need to iterate over the callbacks while passing
-        // `&self.current`, we take the previous value from the stack
-        // (it was pushed just before the transition).
         let prev = self
             .previous
             .last()

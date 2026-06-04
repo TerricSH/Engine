@@ -11,11 +11,8 @@
 //! | [`hdr_forward`]               | `"opaque_pbr_forward_pass"`   | Main forward shading   |
 //! | [`shadow`]                    | `"directional_shadow_pass"`   | CSM directional shadow |
 //! | [`tonemap`]                   | `"tone_map_pass"`             | HDR→LDR tone-mapping   |
-//! | [`bloom`]                     | `"bloom"`                     | HDR bloom post-process |
-//! | [`ssao`]                      | `"ssao"`                      | SSAO post-process      |
 
-pub mod bloom;
+
 pub mod hdr_forward;
 pub mod shadow;
-pub mod ssao;
 pub mod tonemap;

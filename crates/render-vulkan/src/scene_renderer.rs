@@ -2399,24 +2399,7 @@ impl BackendRenderer for SceneRenderer {
                     self.execute_tonemap_pass(input, stats)?;
                 }
                 render_graph::PassKind::Present => {}
-                render_graph::PassKind::Custom(name) if name == "bloom" => {
-                    if let Some(ref mut enc) = self.cur_enc {
-                        let _ = self.pass_registry.find_mut("bloom").map(
-                            |p: &mut dyn engine_renderer::RenderPass| {
-                                p.execute(input, &mut **enc, stats)
-                            },
-                        );
-                    }
-                }
-                render_graph::PassKind::Custom(name) if name == "ssao" => {
-                    if let Some(ref mut enc) = self.cur_enc {
-                        let _ = self.pass_registry.find_mut("ssao").map(
-                            |p: &mut dyn engine_renderer::RenderPass| {
-                                p.execute(input, &mut **enc, stats)
-                            },
-                        );
-                    }
-                }
+
                 render_graph::PassKind::Custom(name) => {
                     tracing::warn!(target: "scene_renderer", pass = name, "unknown custom render pass");
                 }

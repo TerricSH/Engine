@@ -7,7 +7,7 @@
 
 use ash::vk;
 
-use crate::error::{VkResult, VulkanError};
+use crate::error::VkResult;
 
 use super::VulkanDevice;
 
@@ -15,61 +15,6 @@ impl VulkanDevice {
     // ------------------------------------------------------------------
     // Texture upload
     // ------------------------------------------------------------------
-
-    /// Upload a 2D texture to the GPU and cache it under `id`.
-    ///
-    /// `data` must be `width × height × 4` bytes (R8G8B8A8_UNORM).
-    /// Creates the image, image view, and a sampler with linear filtering and
-    /// repeat addressing mode.
-    ///
-    /// If a texture with the same `id` already exists, it is replaced (old
-    /// resources are freed immediately).
-    #[allow(dead_code)]
-    pub(crate) fn upload_texture(
-        &mut self,
-        id: &str,
-        width: u32,
-        height: u32,
-        data: &[u8],
-    ) -> VkResult<()> {
-        // Remove existing entry if present (drop old resources).
-        if let Some(old) = self.textures.remove(id) {
-            self.destroy_gpu_texture(old);
-        }
-
-        let d = &self.logical_device.device;
-        let _allocator = self.logical_device.allocator();
-
-        // ---- 1. Create image + upload via staging ----
-        let (image, image_view, allocation) =
-            self.create_sampled_texture(width, height, 1, data)?;
-
-        // ---- 2. Create sampler (linear filtering, repeat) ----
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT)
-            .min_lod(0.0)
-            .max_lod(1.0)
-            .mip_lod_bias(0.0)
-            .anisotropy_enable(false);
-        // SAFETY: `d` is a valid AshDevice; `sampler_info` describes a valid
-        // sampler; `None` means no custom allocator.
-        let sampler = unsafe { d.create_sampler(&sampler_info, None) }
-            .map_err(|r| VulkanError::vk("create_material_sampler", r))?;
-
-        let gpu_tex = super::GpuTexture {
-            image,
-            view: image_view,
-            allocation,
-            sampler,
-        };
-        self.textures.insert(id.to_string(), gpu_tex);
-        Ok(())
-    }
 
     // ------------------------------------------------------------------
     // Descriptor binding

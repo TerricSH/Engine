@@ -10,7 +10,6 @@ pub(crate) mod frame;
 pub(crate) mod graph_barriers;
 pub(crate) mod hdr;
 pub(crate) mod pipeline;
-pub(crate) mod post_process;
 pub(crate) mod reload;
 pub(crate) mod rendering;
 pub(crate) mod shadow;
@@ -117,10 +116,6 @@ pub struct VulkanDevice {
 
     // Render pass metadata
     pub(crate) rp_has_depth: HashMap<u32, bool>,
-    /// Render-pass index → depth-only (no color attachments).
-    /// TODO(Gate 3): populate when registering shadow RP in the encoder slab.
-    #[allow(dead_code)]
-    pub(crate) rp_is_depth_only: HashMap<u32, bool>,
 
     // Per-frame descriptor infrastructure (set=0 per FD-041)
     pub(crate) desc_set_layout_0: Option<vk::DescriptorSetLayout>,
@@ -206,66 +201,11 @@ pub struct VulkanDevice {
     // MSAA resources (Phase 4.2)
     /// Maximum sample count supported by the device.
     pub(crate) max_msaa_samples: vk::SampleCountFlags,
-    /// Multisampled color image for HDR forward pass (MSAA > 1 only).
-    #[allow(dead_code)]
-    pub(crate) msaa_color_image: Option<vk::Image>,
-    #[allow(dead_code)]
-    pub(crate) msaa_color_view: Option<vk::ImageView>,
-    #[allow(dead_code)]
-    pub(crate) msaa_color_allocation: Option<crate::allocator::Allocation>,
-    /// Multisampled depth image for HDR forward pass (MSAA > 1 only).
-    #[allow(dead_code)]
-    pub(crate) msaa_depth_image: Option<vk::Image>,
-    #[allow(dead_code)]
-    pub(crate) msaa_depth_view: Option<vk::ImageView>,
-    #[allow(dead_code)]
-    pub(crate) msaa_depth_allocation: Option<crate::allocator::Allocation>,
 
     // Material texture cache (Phase 3.1)
     /// Uploaded GPU textures indexed by asset ID string.
     pub(crate) textures: HashMap<String, GpuTexture>,
-    /// Cached descriptor sets per material ID (allocated from material_desc_pool).
-    #[allow(dead_code)]
-    pub(crate) material_desc_sets: HashMap<String, vk::DescriptorSet>,
 
-    // Post-processing (Phase 4.5)
-    // -- Bloom resources --
-    /// Downsample compute pipelines (one per mip level).
-    pub(crate) bloom_downsample_pipelines: Vec<vk::Pipeline>,
-    /// Upsample compute pipelines (one per mip level).
-    pub(crate) bloom_upsample_pipelines: Vec<vk::Pipeline>,
-    /// Pipeline layout shared by all bloom compute shaders.
-    pub(crate) bloom_pipeline_layout: Option<vk::PipelineLayout>,
-    /// Bloom mip-chain images (RGBA16F, halves per level).
-    pub(crate) bloom_images: Vec<vk::Image>,
-    pub(crate) bloom_image_views: Vec<vk::ImageView>,
-    pub(crate) bloom_allocations: Vec<crate::allocator::Allocation>,
-    /// Bloom mip descriptor sets (storage image access per level).
-    pub(crate) bloom_desc_sets: Vec<vk::DescriptorSet>,
-    pub(crate) bloom_desc_pool: Option<vk::DescriptorPool>,
-    pub(crate) bloom_desc_layout: Option<vk::DescriptorSetLayout>,
-    /// Sampler for bloom texture reads (linear clamp).
-    pub(crate) bloom_sampler: Option<vk::Sampler>,
-
-    // -- SSAO resources --
-    /// SSAO compute pipeline.
-    pub(crate) ssao_pipeline: Option<vk::Pipeline>,
-    /// SSAO pipeline layout.
-    pub(crate) ssao_pipeline_layout: Option<vk::PipelineLayout>,
-    /// SSAO noise texture (4x4 random rotations, RGBA8).
-    pub(crate) ssao_noise_image: Option<vk::Image>,
-    pub(crate) ssao_noise_view: Option<vk::ImageView>,
-    pub(crate) ssao_noise_allocation: Option<crate::allocator::Allocation>,
-    /// SSAO output texture (R8_UNORM occlusion factor).
-    pub(crate) ssao_output_image: Option<vk::Image>,
-    pub(crate) ssao_output_view: Option<vk::ImageView>,
-    pub(crate) ssao_output_allocation: Option<crate::allocator::Allocation>,
-    /// Descriptor set for SSAO (depth + noise + output).
-    pub(crate) ssao_desc_set: Option<vk::DescriptorSet>,
-    pub(crate) ssao_desc_pool: Option<vk::DescriptorPool>,
-    pub(crate) ssao_desc_layout: Option<vk::DescriptorSetLayout>,
-    /// Sampler for SSAO depth reads (nearest clamp).
-    pub(crate) ssao_depth_sampler: Option<vk::Sampler>,
 }
 
 impl VulkanDevice {
@@ -388,7 +328,6 @@ impl VulkanDevice {
             pipeline_cache: vk::PipelineCache::null(),
             pso_cache_path: None,
             rp_has_depth: HashMap::new(),
-            rp_is_depth_only: HashMap::new(),
             desc_set_layout_0: None,
             desc_pool: None,
             frame_desc_sets: Vec::new(),
@@ -445,16 +384,9 @@ impl VulkanDevice {
 
             // MSAA resources (Phase 4.2)
             max_msaa_samples: max_msaa,
-            msaa_color_image: None,
-            msaa_color_view: None,
-            msaa_color_allocation: None,
-            msaa_depth_image: None,
-            msaa_depth_view: None,
-            msaa_depth_allocation: None,
 
             // Material texture cache (Phase 3.1)
             textures: HashMap::new(),
-            material_desc_sets: HashMap::new(),
 
             // Light SSBO (Phase 4.3)
             light_ssbo: None,
@@ -468,29 +400,6 @@ impl VulkanDevice {
             cull_args_buffer: None,
             cull_args_alloc: None,
 
-            // Post-processing (Phase 4.5)
-            bloom_downsample_pipelines: Vec::new(),
-            bloom_upsample_pipelines: Vec::new(),
-            bloom_pipeline_layout: None,
-            bloom_images: Vec::new(),
-            bloom_image_views: Vec::new(),
-            bloom_allocations: Vec::new(),
-            bloom_desc_sets: Vec::new(),
-            bloom_desc_pool: None,
-            bloom_desc_layout: None,
-            bloom_sampler: None,
-            ssao_pipeline: None,
-            ssao_pipeline_layout: None,
-            ssao_noise_image: None,
-            ssao_noise_view: None,
-            ssao_noise_allocation: None,
-            ssao_output_image: None,
-            ssao_output_view: None,
-            ssao_output_allocation: None,
-            ssao_desc_set: None,
-            ssao_desc_pool: None,
-            ssao_desc_layout: None,
-            ssao_depth_sampler: None,
         };
 
         // Phase 3.3: Initialize PSO cache (load from disk if cache_dir provided).

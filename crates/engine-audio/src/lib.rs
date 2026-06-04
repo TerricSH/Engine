@@ -37,8 +37,62 @@ pub(crate) mod mixer;
 pub mod source;
 
 // ---------------------------------------------------------------------------
-// Re-exports (all public types)
+// Constants
 // ---------------------------------------------------------------------------
+
+/// Maximum number of simultaneous voices (pre-allocated pool, never exceeded).
+pub(crate) const _MAX_VOICES: usize = 32;
+
+/// Volume ramp duration in seconds (linear, avoids clicks on parameter changes).
+pub(crate) const _VOLUME_RAMP_SECS: f32 = 0.005;
+
+/// Number of output channels (always stereo).
+pub(crate) const _OUTPUT_CHANNELS: u16 = 2;
+
+// ---------------------------------------------------------------------------
+// Spatial audio helpers
+// ---------------------------------------------------------------------------
+
+/// Constant-power stereo pan from emitter position relative to listener.
+///
+/// Returns `(left_gain, right_gain)` where both sum in power to 1.0 at centre.
+pub(crate) fn _compute_stereo_pan(
+    emitter: Vec3,
+    listener_pos: Vec3,
+    listener_forward: Vec3,
+    listener_up: Vec3,
+) -> (f32, f32) {
+    let to_emitter = (emitter - listener_pos).normalize_or_zero();
+    if to_emitter == Vec3::ZERO {
+        return (
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        );
+    }
+
+    let forward = listener_forward.normalize_or_zero();
+    let up = listener_up.normalize_or_zero();
+    let right = forward.cross(up).normalize_or_zero();
+
+    // Dot with right vector: -1 = full left, +1 = full right.
+    let pan = to_emitter.dot(right).clamp(-1.0, 1.0);
+
+    // Constant-power pan law.
+    let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4; // 0 … π/2
+    let left_gain = theta.cos();
+    let right_gain = theta.sin();
+
+    (left_gain, right_gain)
+}
+
+/// Inverse-distance attenuation with rolloff factor.
+pub(crate) fn _distance_attenuation(distance: f32, max_distance: f32, rolloff: f32) -> f32 {
+    if distance <= 0.0 {
+        return 1.0;
+    }
+    let d = distance.min(max_distance);
+    1.0 / (1.0 + rolloff * d)
+}
 
 pub use clip::AudioClip;
 pub use components::{register_audio_extensions, AudioListenerComponent, AudioSourceComponent};
@@ -47,19 +101,6 @@ pub use handle::AudioHandle;
 pub use source::AudioSource;
 
 pub use MixerGroup::*;
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Maximum number of simultaneous voices (pre-allocated pool, never exceeded).
-const _MAX_VOICES: usize = 32;
-
-/// Volume ramp duration in seconds (linear, avoids clicks on parameter changes).
-const _VOLUME_RAMP_SECS: f32 = 0.005;
-
-/// Number of output channels (always stereo).
-const _OUTPUT_CHANNELS: u16 = 2;
 
 // ---------------------------------------------------------------------------
 // AudioError
@@ -101,11 +142,10 @@ pub enum AudioError {
 // ---------------------------------------------------------------------------
 
 /// Commands sent from the main thread to the audio callback thread.
-#[allow(dead_code)]
 pub(crate) enum AudioCommand {
     Play {
         id: u64,
-        clip: Arc<clip::AudioClip>,
+        clip: Arc<AudioClip>,
         volume: f32,
         loop_enabled: bool,
         emitter: Option<AudioEmitter>,
@@ -277,46 +317,4 @@ impl AudioListener {
 }
 
 // ---------------------------------------------------------------------------
-// Spatial audio helpers
-// ---------------------------------------------------------------------------
 
-/// Constant-power stereo pan from emitter position relative to listener.
-///
-/// Returns `(left_gain, right_gain)` where both sum in power to 1.0 at centre.
-pub(crate) fn _compute_stereo_pan(
-    emitter: Vec3,
-    listener_pos: Vec3,
-    listener_forward: Vec3,
-    listener_up: Vec3,
-) -> (f32, f32) {
-    let to_emitter = (emitter - listener_pos).normalize_or_zero();
-    if to_emitter == Vec3::ZERO {
-        return (
-            std::f32::consts::FRAC_1_SQRT_2,
-            std::f32::consts::FRAC_1_SQRT_2,
-        );
-    }
-
-    let forward = listener_forward.normalize_or_zero();
-    let up = listener_up.normalize_or_zero();
-    let right = forward.cross(up).normalize_or_zero();
-
-    // Dot with right vector: -1 = full left, +1 = full right.
-    let pan = to_emitter.dot(right).clamp(-1.0, 1.0);
-
-    // Constant-power pan law.
-    let theta = (pan + 1.0) * std::f32::consts::FRAC_PI_4; // 0 … π/2
-    let left_gain = theta.cos();
-    let right_gain = theta.sin();
-
-    (left_gain, right_gain)
-}
-
-/// Inverse-distance attenuation with rolloff factor.
-pub(crate) fn _distance_attenuation(distance: f32, max_distance: f32, rolloff: f32) -> f32 {
-    if distance <= 0.0 {
-        return 1.0;
-    }
-    let d = distance.min(max_distance);
-    1.0 / (1.0 + rolloff * d)
-}

@@ -25,18 +25,12 @@ use crate::editor_ui::EditorUi;
 /// let cmds = inspector.ui(&mut ui, "entity-001", &scripts);
 /// for cmd in cmds { scene.execute(cmd)?; }
 /// ```
-pub struct ScriptInspector {
-    /// Tracks which script headers are expanded in the UI.
-    #[allow(dead_code)]
-    expanded_scripts: Vec<String>,
-}
+pub struct ScriptInspector;
 
 impl ScriptInspector {
     /// Create a new script inspector.
     pub fn new() -> Self {
-        Self {
-            expanded_scripts: Vec::new(),
-        }
+        Self
     }
 
     /// Render the script component editor for the given scripts.

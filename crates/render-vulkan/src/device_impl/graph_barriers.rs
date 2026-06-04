@@ -84,7 +84,7 @@ impl VulkanDevice {
         let (image, aspect_mask, layer_count) = match resource_name {
             "hdr_color" => (self.hdr_color_image?, vk::ImageAspectFlags::COLOR, 1),
             "depth_stencil" => (self.depth_image?, vk::ImageAspectFlags::DEPTH, 1),
-            "ssao_output" => (self.ssao_output_image?, vk::ImageAspectFlags::COLOR, 1),
+
             _ => return None,
         };
 
