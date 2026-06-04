@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-backend-vulkan = ["dep:render-vulkan"]
+backend-vulkan = ["dep:render-vulkan", "engine-core/backend-vulkan"]
 backend-opengl = ["dep:render-opengl"]
 backend-dx12 = ["dep:render-dx12"]
 tooling-editor = ["engine-editor/tooling-editor", "dep:engine-editor"]

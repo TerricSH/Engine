@@ -9,6 +9,7 @@ license.workspace = true
 default = []
 subsystem-scripting-csharp = ["dep:engine-script"]
 gameplay = ["dep:engine-physics", "dep:engine-gameplay"]
+backend-vulkan = ["dep:render-vulkan", "dep:raw-window-handle"]
 
 [dependencies]
 engine-renderer = { path = "../engine-renderer" }
@@ -18,5 +19,7 @@ engine-serialize = { path = "../engine-serialize" }
 engine-ffi = { path = "../engine-ffi" }
 engine-physics = { path = "../engine-physics", optional = true }
 engine-gameplay = { path = "../engine-gameplay", optional = true }
+render-vulkan = { path = "../render-vulkan", optional = true }
+raw-window-handle = { workspace = true, optional = true }
 tracing.workspace = true
 glam.workspace = true

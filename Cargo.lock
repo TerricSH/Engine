@@ -886,6 +886,8 @@ dependencies = [
  "engine-script",
  "engine-serialize",
  "glam",
+ "raw-window-handle",
+ "render-vulkan",
  "tracing",
 ]
 

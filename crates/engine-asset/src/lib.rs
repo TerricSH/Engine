@@ -17,6 +17,7 @@
 //!   a [`crossbeam_channel`] receiver.
 
 pub mod cook;
+pub mod gltf;
 pub mod hot_reload;
 mod loader;
 pub mod mesh;

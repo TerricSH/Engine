@@ -292,6 +292,37 @@ impl EngineRuntime {
     }
 }
 
+// ── Backend factory (feature-gated) ─────────────────────────────────────
+
+/// Create a Vulkan backend renderer from raw window handles.
+///
+/// This is the engine-level entry point for Vulkan initialisation.
+/// Callers in the sandbox / application layer call this function once
+/// during startup and pass the returned [`BackendRenderer`] to
+/// [`Renderer::set_backend`](engine_renderer::Renderer::set_backend).
+#[cfg(feature = "backend-vulkan")]
+pub fn create_vulkan_backend_renderer(
+    display_handle: raw_window_handle::RawDisplayHandle,
+    window_handle: raw_window_handle::RawWindowHandle,
+    width: u32,
+    height: u32,
+    enable_validation: bool,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<Box<dyn engine_renderer::BackendRenderer>, String> {
+    let device = render_vulkan::device_impl::VulkanDevice::new(
+        display_handle,
+        window_handle,
+        width,
+        height,
+        enable_validation,
+        cache_dir,
+    )
+    .map_err(|e| format!("VulkanDevice creation failed: {e}"))?;
+    Ok(Box::new(
+        render_vulkan::scene_renderer::SceneRenderer::new(device, width, height),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

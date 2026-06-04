@@ -40,6 +40,7 @@ mod controller;
 mod ffi;
 pub use ffi::*;
 mod movement;
+mod pawn;
 mod serde;
 
 pub use animation_bridge::update_character_animation;
@@ -47,6 +48,7 @@ pub use animation_params::{anim_params, AnimMoveState, AnimParams};
 pub use collision::{ground_check, resolve_collision};
 pub use controller::{CharacterCommand, CharacterController, CharacterError, CharacterState};
 pub use movement::{process_movement, CharacterMovement, CharacterOutput};
+pub use pawn::{create_player_pawn, PlayerPawn};
 
 // ── Gate 9 extension registration ──────────────────────────────────────────
 

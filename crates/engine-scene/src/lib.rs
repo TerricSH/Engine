@@ -2,6 +2,7 @@
 
 pub mod archetype;
 pub mod camera_utils;
+pub mod third_person_camera;
 mod component;
 pub mod components;
 mod entity;
