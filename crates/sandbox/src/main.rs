@@ -913,6 +913,20 @@ fn run_engine_character_demo() {
             );
             world.add_component(camera, engine_scene::components::Camera::default());
 
+            // ── Directional light ──
+            world.add_component(
+                world.create_entity(),
+                engine_scene::components::Light {
+                    kind: engine_scene::components::LightKind::Directional,
+                    color: [1.0, 1.0, 1.0],
+                    intensity: 100000.0,
+                    range: 100.0,
+                    spot_angles: None,
+                    shadow_mode: 1,
+                    direction: [0.5, -0.8, 0.3],
+                },
+            );
+
             // ── Renderable components ──────────────────────────────────
             world.add_component(
                 ground,

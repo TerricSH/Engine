@@ -3,6 +3,7 @@
 //! [`create_player_pawn`] creates a complete third-person walking pawn in the
 //! ECS world: a ground plane, a player capsule, and a follow camera.
 
+use engine_physics::{BodyType, Collider, ColliderShape, RigidBody};
 use engine_scene::components::{Camera, Renderable, Transform};
 use engine_scene::third_person_camera::ThirdPersonCamera;
 use engine_scene::{Entity, World};
@@ -59,6 +60,23 @@ pub fn create_player_pawn(world: &mut World) -> PlayerPawn {
         Transform {
             translation: Vec3::new(0.0, 3.0, 0.0),
             ..Transform::default()
+        },
+    );
+    world.add_component(
+        player,
+        RigidBody {
+            body_type: BodyType::Dynamic,
+            ..RigidBody::default()
+        },
+    );
+    world.add_component(
+        player,
+        Collider {
+            shape: ColliderShape::Capsule {
+                half_height: 0.75,
+                radius: 0.3,
+            },
+            ..Collider::default()
         },
     );
     world.add_component(
