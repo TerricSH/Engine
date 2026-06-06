@@ -21,11 +21,23 @@ fn main() {
         "engine-model-viewer" => run_engine_model_viewer(),
         "textured-object" => run_textured_object(),
         "resize-smoke" => run_resize_smoke(),
+        "editor" => run_editor(),
         other => {
             tracing::error!(command = other, "unknown sandbox command");
             std::process::exit(2);
         }
     }
+}
+
+#[cfg(all(feature = "tooling-editor", feature = "backend-vulkan"))]
+mod editor_app;
+#[cfg(all(feature = "tooling-editor", feature = "backend-vulkan"))]
+use editor_app::run_editor;
+
+#[cfg(not(all(feature = "tooling-editor", feature = "backend-vulkan")))]
+fn run_editor() {
+    tracing::error!("editor requires `tooling-editor` and `backend-vulkan` features");
+    std::process::exit(2);
 }
 
 fn run_gate04_scene() {
@@ -828,9 +840,66 @@ fn run_engine_character_demo() {
         mesh_data_to_color_bytes(&mesh)
     }
 
-    fn build_cube_mesh() -> (Vec<u8>, Vec<u8>, u32, bool) {
-        use engine_asset::mesh::{mesh_data_to_color_bytes, create_test_cube};
-        mesh_data_to_color_bytes(&create_test_cube())
+    fn build_capsule_mesh() -> (Vec<u8>, Vec<u8>, u32, bool) {
+        use engine_asset::mesh::{mesh_data_to_color_bytes, MeshData};
+        use glam::Vec3;
+        let segs: u32 = 12;
+        let rings_top: u32 = 3;
+        let rings_mid: u32 = 2;
+        let rings_bot: u32 = 3;
+        let total_rings = rings_top + rings_mid + rings_bot;
+        let half_h = 0.75;
+        let radius = 0.3;
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut indices = Vec::new();
+        for ring in 0..=total_rings {
+            let ring_f = ring as f32;
+            let (cy, cr, ny, nr) = if ring <= rings_top {
+                // Top hemisphere: θ=0 (top pole) → θ=π/2 (equator)
+                let theta = ring_f / rings_top as f32 * std::f32::consts::FRAC_PI_2;
+                let y = half_h + radius * theta.cos();
+                let r = radius * theta.sin().max(0.001);
+                (y, r, theta.cos(), theta.sin().max(0.001))
+            } else if ring <= rings_top + rings_mid {
+                // Cylinder body: y = half_h → -half_h, r = radius
+                let t = (ring_f - rings_top as f32) / rings_mid as f32;
+                let y = half_h - t * 2.0 * half_h;
+                (y, radius, 0.0, 1.0)
+            } else {
+                // Bottom hemisphere: θ=0 (equator) → θ=π/2 (bottom pole)
+                let t = (ring_f - rings_top as f32 - rings_mid as f32) / rings_bot as f32;
+                let theta = t * std::f32::consts::FRAC_PI_2;
+                let y = -half_h - radius * (1.0 - theta.cos());
+                let r = radius * theta.cos().max(0.001);
+                (y, r, -theta.sin(), theta.cos().max(0.001))
+            };
+            for seg in 0..segs {
+                let a = seg as f32 / segs as f32 * std::f32::consts::TAU;
+                let nx = a.cos();
+                let nz = a.sin();
+                positions.push(Vec3::new(nx * cr, cy, nz * cr));
+                normals.push(Vec3::new(nx * nr, ny, nz * nr));
+            }
+        }
+        for ring in 0..total_rings {
+            for seg in 0..segs {
+                let ns = (seg + 1) % segs;
+                let a = ring * segs + seg;
+                let b = ring * segs + ns;
+                let c = (ring + 1) * segs + seg;
+                let d = (ring + 1) * segs + ns;
+                indices.push(a); indices.push(b); indices.push(c);
+                indices.push(b); indices.push(d); indices.push(c);
+            }
+        }
+        let mesh = MeshData {
+            positions, normals,
+            uvs: vec![], indices,
+            bounds: (Vec3::new(-radius, -half_h - radius, -radius), Vec3::new(radius, half_h + radius, radius)),
+            joints: vec![], weights: vec![],
+        };
+        mesh_data_to_color_bytes(&mesh)
     }
 
     impl WindowApp for EngineCharacterApp {
@@ -914,8 +983,9 @@ fn run_engine_character_demo() {
             world.add_component(camera, engine_scene::components::Camera::default());
 
             // ── Directional light ──
+            let light_entity = world.create_entity();
             world.add_component(
-                world.create_entity(),
+                light_entity,
                 engine_scene::components::Light {
                     kind: engine_scene::components::LightKind::Directional,
                     color: [1.0, 1.0, 1.0],
@@ -951,7 +1021,7 @@ fn run_engine_character_demo() {
 
             // ── Upload meshes through engine renderer API ──────────────
             let (ground_vb, ground_ib, ground_ic, ground_u16) = build_ground_mesh();
-            let (cube_vb, cube_ib, cube_ic, cube_u16) = build_cube_mesh();
+            let (cube_vb, cube_ib, cube_ic, cube_u16) = build_capsule_mesh();
 
             let _ = game_loop.runtime.renderer_mut().upload_mesh(
                 "mesh-ground",
@@ -986,8 +1056,8 @@ fn run_engine_character_demo() {
             self.physics = Some(physics);
             self.controller = Some(controller);
             self.input_map = build_player_input_map();
-            self.player_entity = Entity::new(1, 0);
-            self.camera_entity = Entity::new(2, 0);
+            self.player_entity = player;
+            self.camera_entity = camera;
         }
 
         fn on_event(&mut self, window: &Window, event: PlatformEvent) -> EventFlow {

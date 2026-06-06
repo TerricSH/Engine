@@ -23,7 +23,8 @@ use glam::Vec4 as GlamVec4;
 use engine_renderer::{
     render_graph, AssetId, AxisAlignedBox, BackendRenderer, Diagnostic, DiagnosticSeverity,
     FrameStats, LightItem, LightKind, MaterialBinding, MaterialPipelineContext, MaterialResolver,
-    ParamBlock, PassRegistry, RenderFrameInput, RenderableItem, SkinnedItem, Transparency,
+    ParamBlock, PassRegistry, RenderFrameInput, RenderableItem, SkinnedItem, Transparency, UiBatch,
+    UiVertex,
 };
 use render_core::{
     self, BindGroupLayoutBinding, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
@@ -37,7 +38,9 @@ use render_core::{
 use render_core::PipelineDescriptor;
 
 use crate::device_impl::VulkanDevice;
-use crate::shaders_embedded::{FORWARD_FRAG_SPV, FORWARD_VERT_SPV, SKINNED_VERT_SPV};
+use crate::shaders_embedded::{
+    FORWARD_FRAG_SPV, FORWARD_VERT_SPV, SKINNED_VERT_SPV, UI_OVERLAY_FRAG_SPV, UI_OVERLAY_VERT_SPV,
+};
 
 // ============================================================================
 // GpuMesh
@@ -511,6 +514,10 @@ pub struct SceneRenderer {
     rp: Option<RenderPassHandle>,
     pll: Option<PipelineLayoutHandle>,
 
+    /// UI overlay pipeline (no depth, alpha blend, 2D positions).
+    ui_pl: Option<PipelineHandle>,
+    ui_pll: Option<PipelineLayoutHandle>,
+
     /// Per-swapchain-image framebuffer handles (color + depth).
     framebuffers: Vec<FramebufferHandle>,
     /// Index into `framebuffers` for the current swapchain image.
@@ -527,6 +534,12 @@ pub struct SceneRenderer {
 
     /// Registry of pluggable render passes.
     pub(crate) pass_registry: PassRegistry,
+
+    /// UI overlay vertex/index buffer cache.
+    ui_vb: Option<BufferHandle>,
+    ui_ib: Option<BufferHandle>,
+    ui_vb_capacity: u64,
+    ui_ib_capacity: u64,
 }
 
 impl SceneRenderer {
@@ -548,6 +561,12 @@ impl SceneRenderer {
             skinned_desc_cache_order: Vec::new(),
             rp: None,
             pll: None,
+            ui_pl: None,
+            ui_pll: None,
+            ui_vb: None,
+            ui_ib: None,
+            ui_vb_capacity: 0,
+            ui_ib_capacity: 0,
             framebuffers: Vec::new(),
             cur_fb_index: 0,
             cur_sc: None,
@@ -721,6 +740,103 @@ impl SceneRenderer {
                 )]
             })?;
             self.framebuffers = fbs;
+        }
+
+        // ── UI overlay pipeline ────────────────────────────────────
+        let ui_vert_spv = UI_OVERLAY_VERT_SPV;
+        let ui_frag_spv = UI_OVERLAY_FRAG_SPV;
+        if !ui_vert_spv.is_empty() && !ui_frag_spv.is_empty() {
+            // Temporarily set UI shaders to create the pipeline
+            let old_vert = self.device.mvp_vert_spv.clone();
+            let old_frag = self.device.mvp_frag_spv.clone();
+            self.device.set_mvp_shaders(ui_vert_spv, ui_frag_spv);
+
+            // Create UI pipeline layout: push constants for screen_size (vec2 = 8 bytes)
+            let ui_pll_desc = PipelineLayoutDescriptor {
+                bind_group_layouts: vec![],
+                push_constant_ranges: vec![PushConstantRange {
+                    stage_flags: 0x01, // VERTEX
+                    offset: 0,
+                    size: 8, // vec2 screen_size
+                }],
+                debug_label: Some("ui-overlay-pll".into()),
+            };
+            let ui_pll = self
+                .device
+                .create_pipeline_layout(&ui_pll_desc)
+                .map_err(|e| {
+                    vec![Diagnostic::new(
+                        "RV0214",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("create_ui_pipeline_layout: {e:?}"),
+                    )]
+                })?;
+
+            // Create UI pipeline: no depth, alpha blending, 2D vertex format
+            let ui_desc = render_core::PipelineDescriptor {
+                shader_modules: vec![],
+                vertex_layout: VertexLayout {
+                    stride_bytes: 32,
+                    attributes: vec![
+                        VertexAttribute {
+                            semantic: "position".into(),
+                            format: "float32x2".into(),
+                            offset_bytes: 0,
+                        },
+                        VertexAttribute {
+                            semantic: "uv".into(),
+                            format: "float32x2".into(),
+                            offset_bytes: 8,
+                        },
+                        VertexAttribute {
+                            semantic: "color".into(),
+                            format: "float32x4".into(),
+                            offset_bytes: 16,
+                        },
+                    ],
+                },
+                bind_layouts: vec![],
+                pipeline_layout: Some(ui_pll),
+                raster_state: render_core::RasterState {
+                    cull_mode: Some("none".into()),
+                    front_face: None,
+                },
+                depth_state: render_core::DepthState {
+                    format: None,
+                    write_enabled: false,
+                    compare: None,
+                },
+                blend_state: render_core::BlendState {
+                    mode: Some("Alpha".into()),
+                },
+                render_targets: vec![TextureFormat::Bgra8Unorm],
+                debug_label: Some("ui-overlay-pl".into()),
+                topology: Some("triangle_list".into()),
+                polygon_mode: Some("fill".into()),
+                sample_count: Some(1),
+                render_pass: Some(rp),
+                specialization: Vec::new(),
+            };
+            let ui_pl = self
+                .device
+                .create_pipeline(&ui_desc)
+                .map_err(|e| {
+                    vec![Diagnostic::new(
+                        "RV0215",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("create_ui_pipeline: {e:?}"),
+                    )]
+                })?;
+
+            self.ui_pll = Some(ui_pll);
+            self.ui_pl = Some(ui_pl);
+
+            // Restore forward shaders
+            if let (Some(v), Some(f)) = (old_vert, old_frag) {
+                self.device.set_mvp_shaders(&v, &f);
+            }
         }
 
         self.initialized = true;
@@ -2169,6 +2285,106 @@ impl SceneRenderer {
         let _ = stats;
         Ok(())
     }
+
+    // ── UI overlay rendering ─────────────────────────────────────────────
+
+    /// Render UI batches after the main 3D scene, within the same render pass.
+    fn render_ui_overlay(
+        &mut self,
+        encoder: &mut dyn CommandEncoder,
+        ui_pl: PipelineHandle,
+        ui_pll: PipelineLayoutHandle,
+        batches: &[UiBatch],
+        draw_calls: &mut u32,
+    ) -> Result<(), Vec<Diagnostic>> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        // Count total vertices (non-indexed: 6 vertices per quad)
+        let mut total_verts = 0usize;
+        for batch in batches {
+            total_verts += (batch.indices.len() / 6) * 6;
+        }
+        if total_verts == 0 {
+            return Ok(());
+        }
+
+        // Build interleaved vertex data: [pos2, uv2, color4] = 32 bytes per vertex
+        let stride: u64 = 32;
+        let vb_size = total_verts as u64 * stride;
+
+        // Expand indexed quads to non-indexed triangles
+        let mut vert_bytes: Vec<u8> = Vec::with_capacity(total_verts * stride as usize);
+        for batch in batches {
+            let verts = &batch.vertices;
+            for chunk in batch.indices.chunks(6) {
+                for &idx in chunk {
+                    let v = &verts[idx as usize];
+                    vert_bytes.extend_from_slice(&v.position[0].to_ne_bytes());
+                    vert_bytes.extend_from_slice(&v.position[1].to_ne_bytes());
+                    vert_bytes.extend_from_slice(&v.uv[0].to_ne_bytes());
+                    vert_bytes.extend_from_slice(&v.uv[1].to_ne_bytes());
+                    let r = v.color[0] as f32 / 255.0;
+                    let g = v.color[1] as f32 / 255.0;
+                    let b = v.color[2] as f32 / 255.0;
+                    let a = v.color[3] as f32 / 255.0;
+                    vert_bytes.extend_from_slice(&r.to_ne_bytes());
+                    vert_bytes.extend_from_slice(&g.to_ne_bytes());
+                    vert_bytes.extend_from_slice(&b.to_ne_bytes());
+                    vert_bytes.extend_from_slice(&a.to_ne_bytes());
+                }
+            }
+        }
+
+        // Ensure vertex buffer is large enough
+        if self.ui_vb_capacity < vb_size {
+            if let Some(old) = self.ui_vb.take() {
+                self.device.destroy_buffer(old);
+            }
+            let vb_desc = BufferDescriptor {
+                size_bytes: vb_size,
+                usage_flags: render_core::BufferUsage(0),
+                memory_hint: MemoryHint::CpuToGpu,
+                debug_label: Some("ui-overlay-vb".into()),
+            };
+            let vb = self.device.create_buffer(&vb_desc).map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0216",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_ui_vb: {e:?}"),
+                )]
+            })?;
+            self.ui_vb = Some(vb);
+            self.ui_vb_capacity = vb_size;
+        }
+
+        // Write vertex data
+        if let Some(vb) = self.ui_vb {
+            self.device.write_buffer(vb, &vert_bytes, 0).map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0217",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("write_ui_vb: {e:?}"),
+                )]
+            })?;
+
+            encoder.bind_pipeline(ui_pl);
+
+            let mut pc = Vec::with_capacity(8);
+            pc.extend_from_slice(&(self.width as f32).to_ne_bytes());
+            pc.extend_from_slice(&(self.height as f32).to_ne_bytes());
+            encoder.push_constants(ui_pll, 0x01, 0, &pc);
+
+            encoder.bind_vertex_buffers(&[vb], &[0]);
+            encoder.draw(total_verts as u32, 1, 0, 0);
+            *draw_calls += 1;
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -2395,6 +2611,19 @@ impl BackendRenderer for SceneRenderer {
 
             draw_calls += 1;
             triangles += mesh.index_count as u64 / 3;
+        }
+
+        // ── UI overlay ────────────────────────────────────────────────
+        if let (Some(ui_pl), Some(ui_pll)) = (self.ui_pl, self.ui_pll) {
+            if !input.ui_batches.is_empty() {
+                self.render_ui_overlay(
+                    &mut *encoder,
+                    ui_pl,
+                    ui_pll,
+                    &input.ui_batches,
+                    &mut draw_calls,
+                )?;
+            }
         }
 
         encoder.end_render_pass();

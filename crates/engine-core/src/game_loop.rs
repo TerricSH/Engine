@@ -1,7 +1,9 @@
 use crate::{EngineConfig, EngineRuntime};
+use engine_character::{CharacterController, CharacterMovement};
 use engine_renderer::FrameStats;
 use engine_scene::Scene;
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
+use glam::Vec3;
 
 #[cfg(feature = "gameplay")]
 use engine_gameplay::{GameStateManager, InputActionMap};
@@ -29,6 +31,12 @@ pub struct GameLoop {
 
     #[cfg(feature = "gameplay")]
     pub input_map: InputActionMap,
+
+    /// Kinematic character controller driven by `update_character`.
+    pub character: Option<CharacterController>,
+
+    /// Entity whose Transform is synced from the character controller's position.
+    pub character_entity: Option<engine_scene::Entity>,
 }
 
 impl GameLoop {
@@ -43,6 +51,8 @@ impl GameLoop {
             ),
             #[cfg(feature = "gameplay")]
             input_map: InputActionMap::new("player".to_string(), "gameplay".to_string()),
+            character: None,
+            character_entity: None,
         }
     }
 
@@ -78,10 +88,46 @@ impl GameLoop {
         }
     }
 
+    /// Drive the kinematic character controller and sync its position back to
+    /// the ECS world.  Call this each frame after processing player input.
+    ///
+    /// `direction` is a normalised horizontal movement vector.
+    /// `wish_jump` is true when the player wants to jump this frame.
+    /// `dt` is the frame delta time in seconds.
+    pub fn update_character(&mut self, direction: Vec3, wish_jump: bool, dt: f32) {
+        let Some(ref mut ctrl) = self.character else { return };
+
+        let input = CharacterMovement {
+            direction,
+            wish_jump,
+            delta_time: dt.min(0.1),
+        };
+
+        // Drive the controller.  Physics world is optional — without it the
+        // controller still moves but won't do ground collision.
+        #[cfg(feature = "gameplay")]
+        {
+            let physics: Option<&PhysicsWorld> = self.physics.as_ref();
+            ctrl.update(&input, physics);
+        }
+        #[cfg(not(feature = "gameplay"))]
+        ctrl.update(&input, None);
+
+        // Write controller position back to the ECS entity's Transform.
+        if let Some(entity) = self.character_entity {
+            if let Some(world) = self.runtime.world_mut() {
+                use engine_scene::components::Transform;
+                if let Some(t) = world.get_mut::<Transform>(entity) {
+                    t.translation = ctrl.position();
+                }
+            }
+        }
+    }
+
     /// Advance the simulation by `dt` seconds.
     ///
     /// Handles physics stepping and ECS ↔ physics sync when the `gameplay`
-    /// feature is enabled. Script ticking runs when the
+    /// feature is enabled.  Script ticking runs when the
     /// `subsystem-scripting-csharp` feature is active.
     ///
     /// Typical per-frame orchestration:

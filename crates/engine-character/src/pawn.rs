@@ -9,6 +9,8 @@ use engine_scene::third_person_camera::ThirdPersonCamera;
 use engine_scene::{Entity, World};
 use glam::Vec3;
 
+use crate::CharacterController;
+
 /// Result of assembling a player pawn into a [`World`].
 pub struct PlayerPawn {
     /// Ground plane entity (static rigid-body + collider).
@@ -19,6 +21,8 @@ pub struct PlayerPawn {
     pub camera: Entity,
     /// Camera controller config (call `.apply(world, camera)` each frame).
     pub camera_controller: ThirdPersonCamera,
+    /// Kinematic character controller (call `.update()` each frame).
+    pub controller: CharacterController,
     /// Mesh ID used for the ground plane (for upload_mesh).
     pub ground_mesh_id: String,
     /// Mesh ID used for the player (for upload_mesh).
@@ -29,17 +33,37 @@ pub struct PlayerPawn {
 ///
 /// After calling this:
 /// * Upload a coloured-quad mesh for `result.ground_mesh_id`
-///   and a coloured-cube mesh for `result.player_mesh_id`.
+///   and a coloured-capsule mesh for `result.player_mesh_id`.
 /// * Each frame, call `result.camera_controller.apply(world, result.camera)`
 ///   before `render_frame()`.
+/// * Each frame, call `result.controller.update(&input, Some(physics))`
+///   and write `result.controller.position()` back to the player's Transform.
 pub fn create_player_pawn(world: &mut World) -> PlayerPawn {
-    // ── Ground ────────────────────────────────────────────────────────
+    // ── Ground (static rigid-body + collider) ─────────────────────────
     let ground = world.create_entity();
     world.add_component(
         ground,
         Transform {
             translation: Vec3::new(0.0, -0.5, 0.0),
             ..Transform::default()
+        },
+    );
+    world.add_component(
+        ground,
+        RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+    );
+    world.add_component(
+        ground,
+        Collider {
+            shape: ColliderShape::Cuboid {
+                hx: 10.0,
+                hy: 0.5,
+                hz: 10.0,
+            },
+            ..Collider::default()
         },
     );
     world.add_component(
@@ -53,7 +77,7 @@ pub fn create_player_pawn(world: &mut World) -> PlayerPawn {
         },
     );
 
-    // ── Player capsule ────────────────────────────────────────────────
+    // ── Player capsule (kinematic character, no rigid-body) ───────────
     let player = world.create_entity();
     world.add_component(
         player,
@@ -62,13 +86,7 @@ pub fn create_player_pawn(world: &mut World) -> PlayerPawn {
             ..Transform::default()
         },
     );
-    world.add_component(
-        player,
-        RigidBody {
-            body_type: BodyType::Dynamic,
-            ..RigidBody::default()
-        },
-    );
+    // Keep the collider for ray-cast queries by the character controller.
     world.add_component(
         player,
         Collider {
@@ -102,12 +120,14 @@ pub fn create_player_pawn(world: &mut World) -> PlayerPawn {
     world.add_component(camera, Camera::default());
 
     let camera_controller = ThirdPersonCamera::new(player);
+    let controller = CharacterController::new();
 
     PlayerPawn {
         ground,
         player,
         camera,
         camera_controller,
+        controller,
         ground_mesh_id: "mesh-ground".to_string(),
         player_mesh_id: "mesh-hero".to_string(),
     }

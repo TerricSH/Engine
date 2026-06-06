@@ -878,6 +878,7 @@ dependencies = [
 name = "engine-core"
 version = "0.1.0"
 dependencies = [
+ "engine-character",
  "engine-ffi",
  "engine-gameplay",
  "engine-physics",

@@ -17,6 +17,7 @@ engine-scene = { path = "../engine-scene" }
 engine-script = { path = "../engine-script", optional = true }
 engine-serialize = { path = "../engine-serialize" }
 engine-ffi = { path = "../engine-ffi" }
+engine-character = { path = "../engine-character" }
 engine-physics = { path = "../engine-physics", optional = true }
 engine-gameplay = { path = "../engine-gameplay", optional = true }
 render-vulkan = { path = "../render-vulkan", optional = true }
