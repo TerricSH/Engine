@@ -1,0 +1,162 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "engine-asset resource-chain fixture"
+  },
+  "scene": 1,
+  "scenes": [
+    {
+      "name": "SceneZeroNotDefault",
+      "nodes": [2]
+    },
+    {
+      "name": "SelectedDefaultScene",
+      "nodes": [0]
+    }
+  ],
+  "nodes": [
+    {
+      "name": "RootInstance",
+      "mesh": 0,
+      "children": [1],
+      "translation": [1.0, 2.0, 3.0],
+      "rotation": [0.0, 0.0, 0.70710678, 0.70710678],
+      "scale": [2.0, 1.0, 1.0]
+    },
+    {
+      "name": "ChildInstance",
+      "mesh": 0,
+      "translation": [1.0, 1.0, 0.0],
+      "rotation": [0.70710678, 0.0, 0.0, 0.70710678],
+      "scale": [0.5, 2.0, 1.0]
+    },
+    {
+      "name": "SceneZeroDecoy",
+      "translation": [99.0, 0.0, 0.0]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "SharedMesh",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "TEXCOORD_0": 1
+          },
+          "material": 0,
+          "mode": 4
+        },
+        {
+          "attributes": {
+            "POSITION": 0,
+            "TEXCOORD_0": 1
+          },
+          "material": 1,
+          "mode": 4
+        }
+      ]
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "byteOffset": 0,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3",
+      "min": [0.6882353, 0.6882353, 0.6882353],
+      "max": [0.8137255, 0.8137255, 0.6882353]
+    },
+    {
+      "bufferView": 1,
+      "byteOffset": 0,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC2"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 36,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 36,
+      "byteLength": 24,
+      "target": 34962
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "resource-chain.bin",
+      "byteLength": 60
+    }
+  ],
+  "images": [
+    {
+      "name": "RedGreenImage",
+      "uri": "resource-chain.png"
+    }
+  ],
+  "samplers": [
+    {
+      "name": "NearestClampedMirrored",
+      "magFilter": 9728,
+      "minFilter": 9984,
+      "wrapS": 33071,
+      "wrapT": 33648
+    },
+    {
+      "name": "LinearRepeated",
+      "magFilter": 9729,
+      "minFilter": 9987,
+      "wrapS": 10497,
+      "wrapT": 10497
+    }
+  ],
+  "textures": [
+    {
+      "name": "RedGreenNearest",
+      "sampler": 0,
+      "source": 0
+    },
+    {
+      "name": "RedGreenLinear",
+      "sampler": 1,
+      "source": 0
+    }
+  ],
+  "materials": [
+    {
+      "name": "RedMask",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [1.0, 0.5, 0.25, 0.8],
+        "baseColorTexture": {
+          "index": 0
+        },
+        "metallicFactor": 0.25,
+        "roughnessFactor": 0.75
+      },
+      "alphaMode": "MASK",
+      "alphaCutoff": 0.4,
+      "doubleSided": true
+    },
+    {
+      "name": "GreenBlend",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [0.25, 1.0, 0.5, 0.6],
+        "baseColorTexture": {
+          "index": 1
+        },
+        "metallicFactor": 0.6,
+        "roughnessFactor": 0.2
+      },
+      "alphaMode": "BLEND",
+      "doubleSided": false
+    }
+  ]
+}

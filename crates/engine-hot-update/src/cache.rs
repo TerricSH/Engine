@@ -3,8 +3,13 @@ use std::path::{Path, PathBuf};
 use engine_serialize::HotUpdateManifest;
 use tracing::{debug, info, warn};
 
+use crate::atomic_fs::atomic_write;
 use crate::error::UpdateError;
 use crate::package::{Package, PackageState};
+use crate::path_safety::{
+    is_link_or_reparse, remove_dir_all_safe, safe_join, safe_package_path,
+    validate_manifest_paths_once, validate_package_id,
+};
 
 // ---------------------------------------------------------------------------
 // PackageCache
@@ -17,10 +22,12 @@ use crate::package::{Package, PackageState};
 /// packages/<id>/manifest.json   — serialised manifest
 /// packages/<id>/state.json      — serialised state
 /// staged/<id>/                  — verified, ready-to-activate payloads
-/// active/<id>/                  — currently active payloads
-/// previous/<id>/                — previous active (for rollback)
-/// active_pointer.txt            — package_id of the active package
-/// boot_marker                   — created on activation, deleted on success
+/// active/<id>/                  — immutable activated payloads (old versions retained)
+/// previous/<id>/                — legacy rollback payloads (migration only)
+/// active_pointer.txt            — atomically replaced package_id commit point
+/// activation_record.json        — deterministic rollback metadata
+/// activation_transaction.json   — interrupted-operation recovery journal
+/// boot_marker                   — pending-boot activation record
 /// ```
 pub struct PackageCache {
     /// Root directory for all cache data.
@@ -44,39 +51,40 @@ impl PackageCache {
     /// subdirectories if they do not exist.
     pub fn initialize(&self) -> Result<(), UpdateError> {
         for subdir in &["packages", "staged", "active", "previous"] {
-            let path = self.base_dir.join(subdir);
+            let path = safe_join(&self.base_dir, subdir, "cache directory")?;
             if !path.exists() {
                 info!(dir = %path.display(), "creating cache directory");
                 std::fs::create_dir_all(&path)?;
             }
         }
+        self.recover_interrupted_transaction()?;
         debug!("cache initialised at {:?}", self.base_dir);
         Ok(())
     }
 
     /// Return the `packages/` metadata directory for a given package ID.
-    fn meta_dir(&self, pkg_id: &str) -> PathBuf {
-        self.base_dir.join("packages").join(pkg_id)
+    pub(crate) fn meta_dir(&self, pkg_id: &str) -> Result<PathBuf, UpdateError> {
+        safe_package_path(&self.base_dir, "packages", pkg_id)
     }
 
     /// Return the staged directory for a given package ID.
-    fn staged_dir(&self, pkg_id: &str) -> PathBuf {
-        self.base_dir.join("staged").join(pkg_id)
+    pub(crate) fn staged_dir(&self, pkg_id: &str) -> Result<PathBuf, UpdateError> {
+        safe_package_path(&self.base_dir, "staged", pkg_id)
     }
 
     /// Return the active directory for a given package ID.
-    fn active_dir(&self, pkg_id: &str) -> PathBuf {
-        self.base_dir.join("active").join(pkg_id)
+    pub(crate) fn active_dir(&self, pkg_id: &str) -> Result<PathBuf, UpdateError> {
+        safe_package_path(&self.base_dir, "active", pkg_id)
     }
 
     /// Return the previous directory for a given package ID.
-    fn previous_dir(&self, pkg_id: &str) -> PathBuf {
-        self.base_dir.join("previous").join(pkg_id)
+    pub(crate) fn previous_dir(&self, pkg_id: &str) -> Result<PathBuf, UpdateError> {
+        safe_package_path(&self.base_dir, "previous", pkg_id)
     }
 
     /// Path to the active pointer file.
-    fn active_pointer_path(&self) -> PathBuf {
-        self.base_dir.join("active_pointer.txt")
+    pub(crate) fn active_pointer_path(&self) -> Result<PathBuf, UpdateError> {
+        safe_join(&self.base_dir, "active_pointer.txt", "active pointer")
     }
 
     /// Path to the boot marker.
@@ -84,20 +92,26 @@ impl PackageCache {
         self.base_dir.join("boot_marker")
     }
 
+    pub(crate) fn checked_boot_marker_path(&self) -> Result<PathBuf, UpdateError> {
+        safe_join(&self.base_dir, "boot_marker", "boot marker")
+    }
+
     /// Persist the package's manifest and state to disk.
     pub fn write_state(&self, package: &Package) -> Result<(), UpdateError> {
-        let meta_dir = self.meta_dir(package.package_id());
+        validate_package_id(package.package_id())?;
+        validate_manifest_paths_once(&package.manifest)?;
+        let meta_dir = self.meta_dir(package.package_id())?;
         std::fs::create_dir_all(&meta_dir)?;
 
         // Write manifest.
-        let manifest_path = meta_dir.join("manifest.json");
+        let manifest_path = safe_join(&meta_dir, "manifest.json", "cached manifest")?;
         let manifest_json = serde_json::to_string_pretty(&package.manifest)?;
-        std::fs::write(&manifest_path, &manifest_json)?;
+        atomic_write(&manifest_path, manifest_json.as_bytes())?;
 
         // Write state.
-        let state_path = meta_dir.join("state.json");
+        let state_path = safe_join(&meta_dir, "state.json", "cached package state")?;
         let state_json = serde_json::to_string_pretty(&package.state)?;
-        std::fs::write(&state_path, &state_json)?;
+        atomic_write(&state_path, state_json.as_bytes())?;
 
         Ok(())
     }
@@ -107,18 +121,23 @@ impl PackageCache {
     /// Returns `Err(UpdateError::CacheCorrupt(...))` if the metadata is
     /// missing or unparseable.
     pub fn read_state(&self, package_id: &str) -> Result<Package, UpdateError> {
-        let meta_dir = self.meta_dir(package_id);
+        validate_package_id(package_id)?;
+        let meta_dir = self.meta_dir(package_id)?;
 
-        let manifest_path = meta_dir.join("manifest.json");
+        let manifest_path = safe_join(&meta_dir, "manifest.json", "cached manifest")?;
         if !manifest_path.exists() {
             return Err(UpdateError::CacheCorrupt(format!(
                 "manifest not found for package {package_id}"
             )));
         }
         let manifest_json = std::fs::read_to_string(&manifest_path)?;
-        let manifest: HotUpdateManifest = serde_json::from_str(&manifest_json)?;
+        let manifest: HotUpdateManifest =
+            serde_json::from_str(&manifest_json).map_err(|error| {
+                UpdateError::CacheCorrupt(format!("invalid manifest for {package_id}: {error}"))
+            })?;
+        validate_manifest_paths_once(&manifest)?;
 
-        let state_path = meta_dir.join("state.json");
+        let state_path = safe_join(&meta_dir, "state.json", "cached package state")?;
         let state = if state_path.exists() {
             let state_json = std::fs::read_to_string(&state_path)?;
             serde_json::from_str(&state_json).map_err(|e| {
@@ -135,28 +154,41 @@ impl PackageCache {
 
     /// List all known packages by scanning the `packages/` directory.
     pub fn list_packages(&self) -> Vec<Package> {
-        let packages_dir = self.base_dir.join("packages");
+        self.try_list_packages().unwrap_or_else(|error| {
+            warn!("cannot list package cache: {error}");
+            Vec::new()
+        })
+    }
+
+    /// Strict package listing that does not hide cache or I/O errors.
+    pub fn try_list_packages(&self) -> Result<Vec<Package>, UpdateError> {
+        let packages_dir = safe_join(&self.base_dir, "packages", "package metadata root")?;
         let mut packages = Vec::new();
 
-        let entries = match std::fs::read_dir(&packages_dir) {
-            Ok(e) => e,
-            Err(_) => return packages,
-        };
+        let entries = std::fs::read_dir(&packages_dir)?;
 
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry?;
             let dir_name = entry.file_name();
-            let pkg_id = dir_name.to_string_lossy().to_string();
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                match self.read_state(&pkg_id) {
-                    Ok(pkg) => packages.push(pkg),
-                    Err(e) => {
-                        warn!("failed to read package {pkg_id}: {e}");
-                    }
-                }
+            let pkg_id = dir_name.into_string().map_err(|_| {
+                UpdateError::CacheCorrupt("non-UTF-8 package cache directory".into())
+            })?;
+            validate_package_id(&pkg_id).map_err(|error| {
+                UpdateError::CacheCorrupt(format!(
+                    "invalid package cache directory {pkg_id:?}: {error}"
+                ))
+            })?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if !metadata.is_dir() || is_link_or_reparse(&metadata) {
+                return Err(UpdateError::CacheCorrupt(format!(
+                    "package cache entry is not a regular directory: {}",
+                    entry.path().display()
+                )));
             }
+            packages.push(self.read_state(&pkg_id)?);
         }
 
-        packages
+        Ok(packages)
     }
 
     /// Get the currently active package.
@@ -164,22 +196,47 @@ impl PackageCache {
     /// Reads the `active_pointer.txt` file to determine which package is
     /// active, then loads its state.
     pub fn active_package(&self) -> Option<Package> {
-        let pointer_path = self.active_pointer_path();
-        if !pointer_path.exists() {
-            return None;
-        }
+        self.try_active_package().ok().flatten()
+    }
 
-        let pkg_id = std::fs::read_to_string(&pointer_path).ok()?;
-        let pkg_id = pkg_id.trim();
-        if pkg_id.is_empty() {
-            return None;
-        }
+    /// Strict active-package lookup that preserves recovery and cache errors.
+    pub fn try_active_package(&self) -> Result<Option<Package>, UpdateError> {
+        let Some(pkg_id) = self.active_package_id()? else {
+            return Ok(None);
+        };
 
-        let mut pkg = self.read_state(pkg_id).ok()?;
+        let mut pkg = self.read_state(&pkg_id)?;
         pkg.state = PackageState::Active;
-        pkg.active_path = self.active_dir(pkg_id);
-        pkg.staged_path = self.staged_dir(pkg_id);
-        Some(pkg)
+        pkg.active_path = self.active_dir(&pkg_id)?;
+        pkg.staged_path = self.staged_dir(&pkg_id)?;
+        if !pkg.active_path.is_dir() {
+            return Err(UpdateError::CacheCorrupt(format!(
+                "active pointer {pkg_id} has no immutable payload directory"
+            )));
+        }
+        Ok(Some(pkg))
+    }
+
+    /// Read the durable record that determines the exact rollback target.
+    pub fn activation_record(&self) -> Result<Option<crate::ActivationRecord>, UpdateError> {
+        self.read_activation_record()
+    }
+
+    /// Strictly read and validate the active pointer.
+    pub(crate) fn active_package_id(&self) -> Result<Option<String>, UpdateError> {
+        let pointer_path = self.active_pointer_path()?;
+        if !pointer_path.exists() {
+            return Ok(None);
+        }
+        let package_id = std::fs::read_to_string(&pointer_path)?;
+        let package_id = package_id.trim();
+        if package_id.is_empty() {
+            return Err(UpdateError::CacheCorrupt("active pointer is empty".into()));
+        }
+        validate_package_id(package_id).map_err(|error| {
+            UpdateError::CacheCorrupt(format!("active pointer contains an invalid id: {error}"))
+        })?;
+        Ok(Some(package_id.to_string()))
     }
 
     /// Get a specific package by ID.
@@ -188,9 +245,15 @@ impl PackageCache {
     }
 
     /// Set the active pointer to a given package ID.
-    pub fn set_active_pointer(&self, package_id: &str) -> Result<(), UpdateError> {
-        std::fs::write(self.active_pointer_path(), package_id)?;
-        Ok(())
+    pub(crate) fn set_active_pointer(&self, package_id: &str) -> Result<(), UpdateError> {
+        validate_package_id(package_id)?;
+        if !self.active_dir(package_id)?.is_dir() {
+            return Err(UpdateError::CacheCorrupt(format!(
+                "cannot point at package without an active payload directory: {package_id}"
+            )));
+        }
+        self.read_state(package_id)?;
+        atomic_write(&self.active_pointer_path()?, package_id.as_bytes())
     }
 
     /// Clean up old packages beyond the retention limit.
@@ -199,7 +262,10 @@ impl PackageCache {
     /// creation date).  Also removes associated staged and active
     /// directories.
     pub fn gc(&self, keep_count: usize) -> Result<(), UpdateError> {
-        let mut packages = self.list_packages();
+        self.recover_interrupted_transaction()?;
+        let mut packages = self.try_list_packages()?;
+        let active_id = self.active_package_id()?;
+        let activation_record = self.read_activation_record()?;
 
         // Sort by creation date (newest first).
         packages.sort_by(|a, b| b.manifest.created_at.cmp(&a.manifest.created_at));
@@ -210,39 +276,37 @@ impl PackageCache {
 
         for pkg in &packages[keep_count..] {
             let id = pkg.package_id().to_string();
+            let is_protected = active_id.as_deref() == Some(id.as_str())
+                || activation_record.as_ref().is_some_and(|record| {
+                    record.activated_id == id || record.previous_id.as_deref() == Some(id.as_str())
+                });
+            if is_protected {
+                debug!("GC: retaining active or rollback package {id}");
+                continue;
+            }
             info!("GC: removing package {id}");
 
             // Remove metadata.
-            let meta_dir = self.meta_dir(&id);
+            let meta_dir = self.meta_dir(&id)?;
             if meta_dir.exists() {
-                std::fs::remove_dir_all(&meta_dir)?;
+                remove_dir_all_safe(&meta_dir, "package metadata GC")?;
             }
 
             // Remove staged.
-            let staged = self.staged_dir(&id);
+            let staged = self.staged_dir(&id)?;
             if staged.exists() {
-                std::fs::remove_dir_all(&staged)?;
+                remove_dir_all_safe(&staged, "staged package GC")?;
             }
 
-            // Remove active (but not if it's the current active).
-            if let Some(active) = self.active_package() {
-                if active.package_id() != id {
-                    let active_dir = self.active_dir(&id);
-                    if active_dir.exists() {
-                        std::fs::remove_dir_all(&active_dir)?;
-                    }
-                }
-            } else {
-                let active_dir = self.active_dir(&id);
-                if active_dir.exists() {
-                    std::fs::remove_dir_all(&active_dir)?;
-                }
+            let active_dir = self.active_dir(&id)?;
+            if active_dir.exists() {
+                remove_dir_all_safe(&active_dir, "inactive immutable package GC")?;
             }
 
             // Remove previous.
-            let previous = self.previous_dir(&id);
+            let previous = self.previous_dir(&id)?;
             if previous.exists() {
-                std::fs::remove_dir_all(&previous)?;
+                remove_dir_all_safe(&previous, "previous package GC")?;
             }
         }
 
@@ -357,6 +421,7 @@ mod tests {
     fn cache_active_package_returns_active() {
         let (cache, pkg, _tmp) = setup_cache();
         cache.write_state(&pkg).unwrap();
+        std::fs::create_dir_all(cache.active_dir(pkg.package_id()).unwrap()).unwrap();
         cache.set_active_pointer(pkg.package_id()).unwrap();
 
         let active = cache.active_package().unwrap();
@@ -453,5 +518,26 @@ mod tests {
         let cache = PackageCache::new(tmp.path());
         let marker = cache.boot_marker_path();
         assert!(marker.to_string_lossy().contains("boot_marker"));
+    }
+
+    #[test]
+    fn cache_public_package_id_apis_reject_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = PackageCache::new(tmp.path());
+        cache.initialize().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+
+        assert!(matches!(
+            cache.read_state("../victim.txt"),
+            Err(UpdateError::UnsafePath { .. })
+        ));
+        assert!(cache.get_package("..\\victim.txt").is_none());
+        assert!(matches!(
+            cache.set_active_pointer("../victim.txt"),
+            Err(UpdateError::UnsafePath { .. })
+        ));
+        assert_eq!(std::fs::read(victim).unwrap(), b"keep");
+        assert!(!tmp.path().join("active_pointer.txt").exists());
     }
 }

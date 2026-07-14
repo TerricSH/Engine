@@ -10,6 +10,81 @@ use crate::error::{VkResult, VulkanError};
 use super::{slab::FrameSync, VulkanDevice};
 
 impl VulkanDevice {
+    /// Wait for all submitted device work and surface a Vulkan error instead
+    /// of discarding it. Resource replacement and frame cancellation use this
+    /// before destroying objects shared by both in-flight frame slots.
+    pub(crate) fn wait_idle_checked(&self) -> VkResult<()> {
+        // SAFETY: the logical device remains alive for `self`.
+        unsafe { self.logical_device.device.device_wait_idle() }
+            .map_err(|result| VulkanError::vk("device_wait_idle", result))
+    }
+
+    /// Cancel the currently recording, unsubmitted frame and repair its sync
+    /// objects. `acquire` resets the frame fence and signals the image-available
+    /// semaphore, so merely dropping the encoder would deadlock or reuse a
+    /// signalled binary semaphore on the next frame.
+    pub(crate) fn abort_current_frame_recording(&mut self) -> VkResult<()> {
+        if self.frame_sync.is_empty() {
+            return Ok(());
+        }
+
+        self.wait_idle_checked()?;
+        let frame_index = self.current_frame;
+        let frame = &self.frame_sync[frame_index];
+        let device = &self.logical_device.device;
+
+        // The command buffer was never submitted and the device is idle, so it
+        // can return to the initial state regardless of where recording failed.
+        unsafe {
+            device
+                .reset_command_buffer(
+                    frame.command_buffer,
+                    vk::CommandBufferResetFlags::RELEASE_RESOURCES,
+                )
+                .map_err(|result| VulkanError::vk("abort_reset_command_buffer", result))?;
+        }
+
+        let replacement_fence = unsafe {
+            device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+        }
+        .map_err(|result| VulkanError::vk("abort_create_fence", result))?;
+        let replacement_image_available =
+            match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
+                Ok(semaphore) => semaphore,
+                Err(result) => {
+                    unsafe { device.destroy_fence(replacement_fence, None) };
+                    return Err(VulkanError::vk("abort_create_image_semaphore", result));
+                }
+            };
+        let replacement_render_finished =
+            match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
+                Ok(semaphore) => semaphore,
+                Err(result) => {
+                    unsafe {
+                        device.destroy_semaphore(replacement_image_available, None);
+                        device.destroy_fence(replacement_fence, None);
+                    }
+                    return Err(VulkanError::vk("abort_create_render_semaphore", result));
+                }
+            };
+
+        let frame = &mut self.frame_sync[frame_index];
+        let old_fence = std::mem::replace(&mut frame.in_flight_fence, replacement_fence);
+        let old_image_available =
+            std::mem::replace(&mut frame.image_available, replacement_image_available);
+        let old_render_finished =
+            std::mem::replace(&mut frame.render_finished, replacement_render_finished);
+        unsafe {
+            device.destroy_fence(old_fence, None);
+            device.destroy_semaphore(old_image_available, None);
+            device.destroy_semaphore(old_render_finished, None);
+        }
+        Ok(())
+    }
+
     /// Ensure a swapchain exists (lazily create one if absent).
     pub(crate) fn ensure_sc(&mut self) -> VkResult<()> {
         if self.swapchain.is_none() {
@@ -76,17 +151,12 @@ impl VulkanDevice {
             .as_ref()
             .ok_or(VulkanError::Loader("swapchain not initialized".into()))?;
         // SAFETY: `sc.loader` is a valid swapchain loader; `sc.swapchain` is a
-        // valid VkSwapchainKHR; `self.frame_sync[fi].timeline_semaphore` is a
-        // valid timeline semaphore (acquire_next_image increments its value by
-        // 1 on signal); timeout parameters are standard Vulkan.
-        let timeline_semaphore = self.frame_sync[fi].timeline_semaphore;
+        // valid VkSwapchainKHR; `image_available` is a binary semaphore as
+        // required by `vkAcquireNextImageKHR`; timeout parameters are standard.
+        let image_available = self.frame_sync[fi].image_available;
         let (ii, sub) = unsafe {
-            sc.loader.acquire_next_image(
-                sc.swapchain,
-                u64::MAX,
-                timeline_semaphore,
-                vk::Fence::null(),
-            )
+            sc.loader
+                .acquire_next_image(sc.swapchain, u64::MAX, image_available, vk::Fence::null())
         }
         .map_err(|r| {
             if r == vk::Result::ERROR_OUT_OF_DATE_KHR {
@@ -131,7 +201,6 @@ impl VulkanDevice {
     }
 
     /// End the command buffer, submit to the graphics queue, and present.
-    /// Updates `timeline_value` after a successful submit.
     pub(crate) fn submit_and_present(&mut self, fi: usize, ii: u32) -> VkResult<bool> {
         let d = &self.logical_device.device;
         let f = &self.frame_sync[fi];
@@ -146,44 +215,28 @@ impl VulkanDevice {
                 .map_err(|r| VulkanError::vk("ecb", r))?;
         }
 
-        // ── Timeline semaphore values ───────────────────────────────────
-        // acquire_next_image has already signalled the timeline semaphore
-        // to (timeline_value + 1).  We wait for that value in the submit
-        // (ensuring the image is available) and then signal value+2 for
-        // the next frame's CPU wait / acquire.
-        let wait_value = f.timeline_value + 1; // image available
-        let signal_value = f.timeline_value + 2; // render finished
-
-        let ws = [f.timeline_semaphore];
+        // ── Binary semaphore synchronization ──────────────────────────
+        // Wait for image acquisition and signal a separate binary semaphore
+        // when rendering is ready for presentation.
+        let ws = [f.image_available];
         let wst = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let cbs = [f.command_buffer];
-        let ss = [f.timeline_semaphore];
-
-        // Build submit info with timeline extension chained.
-        // (Bind array temporaries to locals to satisfy ash's borrow checker.)
-        let wait_vals = [wait_value];
-        let signal_vals = [signal_value];
-        let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
-            .wait_semaphore_values(&wait_vals)
-            .signal_semaphore_values(&signal_vals);
+        let ss = [f.render_finished];
         let si = vk::SubmitInfo::default()
             .wait_semaphores(&ws)
             .wait_dst_stage_mask(&wst)
             .command_buffers(&cbs)
-            .signal_semaphores(&ss)
-            .push_next(&mut timeline_info);
+            .signal_semaphores(&ss);
         // SAFETY: `queue` is a valid VkQueue; command buffer is in completed
         // state; semaphores and fence are valid; submit info is correctly
-        // structured with timeline values.
+        // structured with binary synchronization primitives.
         unsafe {
             d.queue_submit(self.logical_device.queue, &[si], f.in_flight_fence)
                 .map_err(|r| VulkanError::vk("qs", r))?;
         }
 
         // ── Present ─────────────────────────────────────────────────────
-        // NOTE: timeline semaphores work in VkPresentInfoKHR without a
-        // TimelineSemaphoreSubmitInfo pNext — the driver waits for the last
-        // signalled value (which is `signal_value` from our submit above).
+        // Present waits for the binary semaphore signalled by queue submission.
         let sca = [sc.swapchain];
         let ia = [ii];
         let pi = vk::PresentInfoKHR::default()
@@ -192,28 +245,17 @@ impl VulkanDevice {
             .image_indices(&ia);
         // SAFETY: `queue` is valid; swapchain, semaphores, image indices,
         // and pNext chain are valid; `PresentInfoKHR` is correctly structured.
-        let result = match unsafe { sc.loader.queue_present(self.logical_device.queue, &pi) } {
+        match unsafe { sc.loader.queue_present(self.logical_device.queue, &pi) } {
             Ok(false) => Ok(false),
             Ok(true) => Ok(true),
             Err(r) if r == vk::Result::ERROR_OUT_OF_DATE_KHR || r == vk::Result::SUBOPTIMAL_KHR => {
                 Ok(true)
             }
             Err(r) => Err(VulkanError::vk("qp", r)),
-        };
-
-        // On success, bump the timeline value so the next begin_frame on this
-        // slot waits for the render-finished signal.
-        if result.is_ok() {
-            // SAFETY: `fi` was validated at the top of this function; we write
-            // through a &mut self reborrow.
-            let fs = &mut self.frame_sync[fi];
-            fs.timeline_value = signal_value;
         }
-
-        result
     }
 
-    /// Create frame-sync objects (fences, timeline semaphores, command
+    /// Create frame-sync objects (fences, binary semaphores, command
     /// pools/buffers) for double-buffering.
     pub(crate) fn build_frames(&mut self) -> VkResult<()> {
         let d = &self.logical_device.device;
@@ -231,38 +273,67 @@ impl VulkanDevice {
             .map_err(|r| VulkanError::vk("ccp", r))?;
             // SAFETY: `cp` was just created and is valid; allocation info
             // correctly references the pool with PRIMARY level.
-            let cbs = unsafe {
+            let cbs = match unsafe {
                 d.allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(cp)
                         .level(vk::CommandBufferLevel::PRIMARY)
                         .command_buffer_count(1),
                 )
-            }
-            .map_err(|r| VulkanError::vk("acb", r))?;
+            } {
+                Ok(cbs) => cbs,
+                Err(r) => {
+                    // SAFETY: `cp` was created above and owns no submitted work.
+                    unsafe { d.destroy_command_pool(cp, None) };
+                    return Err(VulkanError::vk("acb", r));
+                }
+            };
 
-            // Create timeline semaphore with initial value 0.
-            let mut type_info = vk::SemaphoreTypeCreateInfo::default()
-                .semaphore_type(vk::SemaphoreType::TIMELINE)
-                .initial_value(0);
-            let si = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
-            // SAFETY: `d` is a valid AshDevice; `si` describes a valid timeline
-            // semaphore; `None` means no custom allocator.
-            let ts =
-                unsafe { d.create_semaphore(&si, None) }.map_err(|r| VulkanError::vk("cts", r))?;
+            let si = vk::SemaphoreCreateInfo::default();
+            // SAFETY: `d` is a valid AshDevice; a default create-info produces
+            // the binary semaphores required by acquire and present.
+            let image_available = match unsafe { d.create_semaphore(&si, None) } {
+                Ok(semaphore) => semaphore,
+                Err(r) => {
+                    // SAFETY: `cp` was created above and owns no submitted work.
+                    unsafe { d.destroy_command_pool(cp, None) };
+                    return Err(VulkanError::vk("create_image_available", r));
+                }
+            };
+            let render_finished = match unsafe { d.create_semaphore(&si, None) } {
+                Ok(semaphore) => semaphore,
+                Err(r) => {
+                    // SAFETY: both handles were created above and are idle.
+                    unsafe {
+                        d.destroy_semaphore(image_available, None);
+                        d.destroy_command_pool(cp, None);
+                    }
+                    return Err(VulkanError::vk("create_render_finished", r));
+                }
+            };
 
             // SAFETY: `d` is a valid AshDevice; fence is created in SIGNALED
             // state; `None` means no custom allocator.
-            let fl = unsafe {
+            let fl = match unsafe {
                 d.create_fence(
                     &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                     None,
                 )
-            }
-            .map_err(|r| VulkanError::vk("cf", r))?;
+            } {
+                Ok(fence) => fence,
+                Err(r) => {
+                    // SAFETY: all handles were created above and are idle.
+                    unsafe {
+                        d.destroy_semaphore(render_finished, None);
+                        d.destroy_semaphore(image_available, None);
+                        d.destroy_command_pool(cp, None);
+                    }
+                    return Err(VulkanError::vk("cf", r));
+                }
+            };
             self.frame_sync.push(FrameSync {
-                timeline_semaphore: ts,
-                timeline_value: 0,
+                image_available,
+                render_finished,
                 in_flight_fence: fl,
                 command_pool: cp,
                 command_buffer: cbs[0],

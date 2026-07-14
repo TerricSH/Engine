@@ -1,10 +1,10 @@
 use std::sync::Mutex;
 
-use glam::Vec3;
 use engine_renderer::{
     AxisAlignedBox, BonePaletteLayout, RenderExtensionProducer, RenderFrameInput, SkinnedItem,
 };
 use engine_scene::{components::Renderable, components::Transform, Entity, World};
+use glam::Vec3;
 
 /// Helper: convert a column-major `[[f32;4];4]` to flat `[f32;16]`.
 #[inline]
@@ -129,17 +129,6 @@ impl RenderExtensionProducer for SkinnedExtractProducer {
 ///
 /// # Parameters
 /// * `world` — ECS world with `Renderable` + `Transform` + `SkeletonComponent` + `AnimationPlayer`
-/// * `skeletons` — map of skeleton asset ID to loaded `Skeleton`
-/// * `clips` — map of clip asset ID to loaded `AnimationClip`
-/// * `producer` — the shared `SkinnedExtractProducer` to push items into
-/// * `dt` — delta time in seconds
-/// Bridge: iterate ECS entities with skinning components and queue
-/// [`PendingSkinnedItem`]s into the [`SkinnedExtractProducer`].
-///
-/// Called once per frame during the update phase, after animations advance.
-///
-/// # Parameters
-/// * `world` — ECS world with `Renderable` + `Transform` + `SkeletonComponent` + `AnimationPlayer`
 /// * `asset_skeletons` — map of skeleton asset ID to loaded asset `Skeleton`
 /// * `clips` — map of clip asset ID to loaded `AnimationClip`
 /// * `producer` — the shared `SkinnedExtractProducer` to push items into
@@ -174,20 +163,14 @@ pub fn bridge_skinned_items(
         let Some(asset_skel) = asset_skeletons.get(&skel_asset_id) else {
             continue;
         };
-        let transform = world
-            .get::<Transform>(entity)
-            .cloned()
-            .unwrap_or_default();
+        let transform = world.get::<Transform>(entity).cloned().unwrap_or_default();
 
         // Convert to runtime skeleton for animation evaluation
         let runtime_skel = crate::skeleton::Skeleton::from_asset(asset_skel);
 
         // Advance animation player (mutable borrow) and compute bone palette
         let bone_palette = if let Some(player) = world.get_mut::<crate::AnimationPlayer>(entity) {
-            let clip = player
-                .clip_asset
-                .as_ref()
-                .and_then(|id| clips.get(id));
+            let clip = player.clip_asset.as_ref().and_then(|id| clips.get(id));
             crate::player::update_animation(player, clip, Some(&runtime_skel), dt)
         } else {
             runtime_skel

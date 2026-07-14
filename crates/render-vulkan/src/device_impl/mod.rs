@@ -205,7 +205,6 @@ pub struct VulkanDevice {
     // Material texture cache (Phase 3.1)
     /// Uploaded GPU textures indexed by asset ID string.
     pub(crate) textures: HashMap<String, GpuTexture>,
-
 }
 
 impl VulkanDevice {
@@ -399,7 +398,6 @@ impl VulkanDevice {
             indirect_draw_alloc: None,
             cull_args_buffer: None,
             cull_args_alloc: None,
-
         };
 
         // Phase 3.3: Initialize PSO cache (load from disk if cache_dir provided).
@@ -712,18 +710,6 @@ impl VulkanDevice {
         self.cull_args_alloc = Some(cull_alloc);
 
         Ok(())
-    }
-
-    /// Write draw-command data into the indirect draw buffer at the given
-    /// byte offset.  Silently returns if the buffer has not been created.
-    pub(crate) fn write_indirect_draw_buffer(&mut self, data: &[u8], offset: u64) {
-        if let Some(ref mut alloc) = self.indirect_draw_alloc {
-            if let Some(slice) = alloc.mapped_slice_mut() {
-                let start = offset as usize;
-                let end = (start + data.len()).min(slice.len());
-                slice[start..end].copy_from_slice(&data[..end - start]);
-            }
-        }
     }
 
     /// Destroy the indirect draw and cull-args buffers.

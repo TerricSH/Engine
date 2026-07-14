@@ -305,6 +305,7 @@ impl ScriptHost for ProcessHost {
     fn instantiate(
         &mut self,
         handle: &ScriptHandle,
+        class_name: &str,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
         let instance_id = format!("inst-{:04x}", self.next_instance_id);
         self.next_instance_id += 1;
@@ -314,11 +315,25 @@ impl ScriptHost for ProcessHost {
         let mut io_lock = io
             .lock()
             .map_err(|e| ScriptError::HostError(format!("Script IO lock poisoned: {e}")))?;
-        let _response = io_lock.roundtrip(&ScriptMessage::Instantiate {
+        let response = io_lock.roundtrip(&ScriptMessage::Instantiate {
             assembly_id: handle.id().to_string(),
-            class_name: "ScriptType".to_string(), // will be refined when ScriptComponent is used
+            class_name: class_name.to_string(),
             instance_id: instance_id.clone(),
         })?;
+        match response {
+            ScriptMessage::MethodResult {
+                instance_id: response_id,
+                ..
+            } if response_id == instance_id => {}
+            ScriptMessage::Error { message } => {
+                return Err(ScriptError::ExecutionError(message));
+            }
+            other => {
+                return Err(ScriptError::ExecutionError(format!(
+                    "Unexpected response to Instantiate: {other:?}"
+                )));
+            }
+        }
         // Drop the lock before moving `io` into the instance
         drop(io_lock);
 

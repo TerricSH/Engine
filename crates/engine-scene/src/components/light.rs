@@ -22,7 +22,8 @@ pub struct Light {
     pub spot_angles: Option<[f32; 2]>,
     /// Shadow mode: 0 = off, 1 = hard, 2 = soft.
     pub shadow_mode: u8,
-    /// Light direction in world space.
+    /// Light direction in entity-local space. Extraction transforms and
+    /// normalizes it through the entity's complete parent hierarchy.
     pub direction: [f32; 3],
 }
 

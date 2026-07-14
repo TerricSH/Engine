@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "FFI bridge between Rust engine and C# scripting layer"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 engine-animation = { path = "../engine-animation" }
 engine-audio = { path = "../engine-audio" }
@@ -17,5 +20,8 @@ engine-serialize = { path = "../engine-serialize" }
 engine-scene = { path = "../engine-scene" }
 engine-ui = { path = "../engine-ui" }
 glam.workspace = true
+image.workspace = true
+libloading = "0.8"
 serde_json.workspace = true
 tracing.workspace = true
+ureq = "2.9"

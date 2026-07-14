@@ -279,8 +279,8 @@ mod tests {
     #[test]
     fn serialize_value_to_script_float() {
         assert_eq!(
-            serialize_value_to_script(&Value::Float64(3.14)),
-            ScriptValue::Float(3.14)
+            serialize_value_to_script(&Value::Float64(1.25)),
+            ScriptValue::Float(1.25)
         );
     }
 
@@ -315,7 +315,7 @@ mod tests {
         let cases = vec![
             ScriptValue::Bool(true),
             ScriptValue::Int(42),
-            ScriptValue::Float(3.14),
+            ScriptValue::Float(1.25),
             ScriptValue::String("hello".into()),
             ScriptValue::Vec3([1.0, 0.0, 0.0]),
             ScriptValue::EntityId("ent-001".into()),

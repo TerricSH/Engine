@@ -4,7 +4,7 @@ use ash::vk;
 
 use crate::error::{VkResult, VulkanError};
 
-use super::VulkanDevice;
+use super::{texture::FALLBACK_MATERIAL_TEXTURE_ID, VulkanDevice};
 
 impl VulkanDevice {
     pub(crate) fn create_descriptor_infra(&mut self) -> VkResult<()> {
@@ -191,12 +191,12 @@ impl VulkanDevice {
     ///   binding=0: UNIFORM_BUFFER  (MaterialUBO — base_color, metallic, etc.)
     ///   binding=1: COMBINED_IMAGE_SAMPLER (base color texture)
     ///
-    /// Pool: up to 256 descriptor sets, each with 1 UBO + 1 sampler descriptor.
+    /// Pool: 256 static-material sets plus 64 skinned-material sets.
     ///
     /// Idempotent: returns `Ok(())` if already created.
     pub(crate) fn create_material_descriptor_infra(&mut self) -> VkResult<()> {
         if self.material_desc_set_layout.is_some() {
-            return Ok(());
+            return self.create_fallback_material_texture();
         }
         let d = &self.logical_device.device;
 
@@ -223,19 +223,20 @@ impl VulkanDevice {
         let ds_layout = unsafe { d.create_descriptor_set_layout(&layout_info, None) }
             .map_err(|r| VulkanError::vk("create_material_ds_layout", r))?;
 
-        // Pool: up to 256 material descriptor sets, each with UBO + sampler + bone UBO
+        // Pool: 256 material sets plus 64 skinned sets. Every set owns a
+        // sampler descriptor; skinned sets consume a second UBO descriptor.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 512,
+                descriptor_count: 384,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 256,
+                descriptor_count: 320,
             },
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(256)
+            .max_sets(320)
             .pool_sizes(&pool_sizes)
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
         let pool = unsafe { d.create_descriptor_pool(&pool_info, None) }
@@ -243,7 +244,7 @@ impl VulkanDevice {
 
         self.material_desc_set_layout = Some(ds_layout);
         self.material_desc_pool = Some(pool);
-        Ok(())
+        self.create_fallback_material_texture()
     }
 
     /// Allocate a new material descriptor set for the given buffer.
@@ -259,10 +260,10 @@ impl VulkanDevice {
         let d = &self.logical_device.device;
         let layout = self
             .material_desc_set_layout
-            .expect("material_desc_set_layout not created");
+            .ok_or_else(|| VulkanError::Loader("material descriptor layout not created".into()))?;
         let pool = self
             .material_desc_pool
-            .expect("material_desc_pool not created");
+            .ok_or_else(|| VulkanError::Loader("material descriptor pool not created".into()))?;
 
         let layouts = [layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -270,24 +271,65 @@ impl VulkanDevice {
             .set_layouts(&layouts);
         let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
             .map_err(|r| VulkanError::vk("alloc_material_ds", r))?;
-        let desc_set = desc_sets[0];
+        let desc_set = desc_sets.first().copied().ok_or_else(|| {
+            VulkanError::Loader("material descriptor allocation returned no set".into())
+        })?;
 
         // Write the descriptor: binding 0 → uniform buffer
         let buf_info = [vk::DescriptorBufferInfo::default()
             .buffer(buffer)
             .offset(0)
             .range(ubo_size)];
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(desc_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(&buf_info)];
+        let fallback = self
+            .textures
+            .get(FALLBACK_MATERIAL_TEXTURE_ID)
+            .ok_or_else(|| {
+                VulkanError::Loader("fallback material texture not initialized".into())
+            })?;
+        let image_info = [vk::DescriptorImageInfo::default()
+            .sampler(fallback.sampler)
+            .image_view(fallback.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&buf_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
+        ];
         // SAFETY: `d` is a valid AshDevice; descriptor set, buffer are valid.
         unsafe {
             d.update_descriptor_sets(&writes, &[]);
         }
 
         Ok(desc_set)
+    }
+
+    /// Return one material/skinned descriptor set to the pool. Callers must
+    /// ensure no submitted command buffer can still reference the set.
+    pub(crate) fn free_material_descriptor_set(
+        &self,
+        descriptor_set: vk::DescriptorSet,
+    ) -> VkResult<()> {
+        if descriptor_set == vk::DescriptorSet::null() {
+            return Ok(());
+        }
+        let pool = self
+            .material_desc_pool
+            .ok_or_else(|| VulkanError::Loader("material descriptor pool not created".into()))?;
+        // SAFETY: the pool was created with FREE_DESCRIPTOR_SET and the set was
+        // allocated from this exact pool.
+        unsafe {
+            self.logical_device
+                .device
+                .free_descriptor_sets(pool, &[descriptor_set])
+        }
+        .map_err(|result| VulkanError::vk("free_material_descriptor_set", result))
     }
 
     /// Allocate a material descriptor set with an additional bone UBO at binding=2.
@@ -306,10 +348,10 @@ impl VulkanDevice {
         let d = &self.logical_device.device;
         let layout = self
             .material_desc_set_layout
-            .expect("material_desc_set_layout not created");
+            .ok_or_else(|| VulkanError::Loader("material descriptor layout not created".into()))?;
         let pool = self
             .material_desc_pool
-            .expect("material_desc_pool not created");
+            .ok_or_else(|| VulkanError::Loader("material descriptor pool not created".into()))?;
 
         let layouts = [layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -317,7 +359,9 @@ impl VulkanDevice {
             .set_layouts(&layouts);
         let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
             .map_err(|r| VulkanError::vk("alloc_skinned_material_ds", r))?;
-        let desc_set = desc_sets[0];
+        let desc_set = desc_sets.first().copied().ok_or_else(|| {
+            VulkanError::Loader("skinned descriptor allocation returned no set".into())
+        })?;
 
         // Write binding 0 → material UBO, binding 2 → bone palette UBO
         let buf_info = [
@@ -330,12 +374,27 @@ impl VulkanDevice {
                 .offset(0)
                 .range(bone_ubo_size),
         ];
+        let fallback = self
+            .textures
+            .get(FALLBACK_MATERIAL_TEXTURE_ID)
+            .ok_or_else(|| {
+                VulkanError::Loader("fallback material texture not initialized".into())
+            })?;
+        let image_info = [vk::DescriptorImageInfo::default()
+            .sampler(fallback.sampler)
+            .image_view(fallback.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(desc_set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&buf_info[0..1]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
             vk::WriteDescriptorSet::default()
                 .dst_set(desc_set)
                 .dst_binding(2)

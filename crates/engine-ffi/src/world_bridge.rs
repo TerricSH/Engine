@@ -1,52 +1,131 @@
 //! Bridge between FFI entity/component callbacks and the engine's `World`.
 //!
-//! Stores a raw pointer to the engine's [`World`] so that the
+//! Stores a weak reference to the engine's shared world slot so that the
 //! `extern "C"` registry callbacks can operate on it without requiring
 //! `engine-core` or `engine-scene` to be directly coupled to `engine-ffi`.
-//!
-//! # Safety
-//!
-//! The world pointer is set once during engine initialisation and MUST
-//! remain valid for the lifetime of the process.  Access is serialised
-//! through a `Mutex`.
 
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, Once};
 
 use crate::types::FfiEntityId;
+use engine_scene::{ComponentRegistry, Entity, WeakWorldSlot, WorldSlot};
 
 // ---------------------------------------------------------------------------
-// Global world pointer
+// Global active world slot
 // ---------------------------------------------------------------------------
 
-/// Wrapper to make `*mut c_void` `Send + Sync` for static storage.
-/// The pointer is set once during engine init and read-only thereafter,
-/// so concurrent access through `Mutex` is safe.
-struct RawWorldPtr(*mut std::ffi::c_void);
+/// Non-owning reference to the most recently activated runtime world.
+///
+/// FFI calls temporarily upgrade this weak reference, keeping the slot alive
+/// for the complete callback without extending a runtime's normal lifetime.
+static ACTIVE_WORLD: LazyLock<Mutex<Option<WeakWorldSlot>>> = LazyLock::new(|| Mutex::new(None));
+static ACTIVE_COROUTINE_RUNTIME: LazyLock<Mutex<Option<WeakWorldSlot>>> =
+    LazyLock::new(|| Mutex::new(None));
 
-// SAFETY: the pointer is set once during engine init and only read
-// (through Mutex locking) afterwards.
-unsafe impl Send for RawWorldPtr {}
-unsafe impl Sync for RawWorldPtr {}
+fn lock_active_world() -> std::sync::MutexGuard<'static, Option<WeakWorldSlot>> {
+    ACTIVE_WORLD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
-impl std::fmt::Debug for RawWorldPtr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawWorldPtr").finish()
+fn active_world_slot() -> Option<WorldSlot> {
+    let weak = lock_active_world().as_ref()?.clone();
+    weak.upgrade()
+}
+
+fn lock_coroutine_runtime() -> std::sync::MutexGuard<'static, Option<WeakWorldSlot>> {
+    ACTIVE_COROUTINE_RUNTIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Select the runtime whose main-thread tick owns managed coroutines.
+/// Switching runtimes releases every coroutine belonging to the old owner.
+pub fn activate_coroutine_runtime(slot: &WorldSlot) {
+    let changed = {
+        let mut active = lock_coroutine_runtime();
+        if active.as_ref().is_some_and(|weak| weak.ptr_eq_slot(slot)) {
+            false
+        } else {
+            *active = Some(slot.downgrade());
+            true
+        }
+    };
+    if changed {
+        crate::coroutine::clear_managed_coroutines();
     }
 }
 
-/// Erased pointer to the engine's `World` instance.
-static WORLD_PTR: std::sync::OnceLock<Mutex<RawWorldPtr>> = std::sync::OnceLock::new();
+/// Release the managed coroutines owned by `slot` without affecting a newer
+/// runtime that has since become active.
+pub fn deactivate_coroutine_runtime(slot: &WorldSlot) -> bool {
+    let deactivated = {
+        let mut active = lock_coroutine_runtime();
+        if active.as_ref().is_some_and(|weak| weak.ptr_eq_slot(slot)) {
+            *active = None;
+            true
+        } else {
+            false
+        }
+    };
+    if deactivated {
+        crate::coroutine::clear_managed_coroutines();
+    }
+    deactivated
+}
 
-/// Set the engine world pointer (called from the engine runtime).
+/// Select `slot` and release its previous scene's managed coroutines.
+pub fn reset_coroutine_runtime(slot: &WorldSlot) {
+    {
+        let mut active = lock_coroutine_runtime();
+        *active = Some(slot.downgrade());
+    }
+    crate::coroutine::clear_managed_coroutines();
+}
+
+/// Make `slot` and its runtime component registry the process-wide FFI
+/// binding.
 ///
-/// # Safety
+/// Repeated activation is supported. The most recently activated live slot
+/// wins, matching the existing single-active-runtime FFI contract. The active
+/// type table is replaced while holding the same activation lock, so callers
+/// observe the old world/type pair or the new pair, never a mixture.
+pub fn activate_world(slot: &WorldSlot, component_registry: &ComponentRegistry) {
+    // Coroutines hold managed objects associated with the previously active
+    // scene/runtime. Release them before switching the process-wide binding.
+    reset_coroutine_runtime(slot);
+    let entries = component_registry
+        .iter()
+        .filter(|extension| {
+            extension.meta.has_script_binding
+                && extension.serialize.is_some()
+                && extension.deserialize.is_some()
+        })
+        .map(|extension| (extension.meta.display_name, extension.meta.type_id))
+        .collect::<Vec<_>>();
+
+    let mut active = lock_active_world();
+    crate::component::replace_component_types(&entries);
+    *active = Some(slot.downgrade());
+}
+
+/// Stop routing FFI calls to `slot` when it is still the active world.
 ///
-/// `ptr` must point to a valid, fully-initialised `World` that outlives
-/// any FFI callback invocation.  Call exactly once during engine startup.
-pub unsafe fn set_world_ptr(ptr: *mut std::ffi::c_void) {
-    WORLD_PTR
-        .set(Mutex::new(RawWorldPtr(ptr)))
-        .expect("WORLD_PTR already set");
+/// Returns `false` when another runtime has become active in the meantime.
+pub fn deactivate_world(slot: &WorldSlot) -> bool {
+    let deactivated = {
+        let mut active = lock_active_world();
+        if active.as_ref().is_some_and(|weak| weak.ptr_eq_slot(slot)) {
+            crate::component::clear_component_types();
+            *active = None;
+            true
+        } else {
+            false
+        }
+    };
+    if deactivated {
+        deactivate_coroutine_runtime(slot);
+    }
+    deactivated
 }
 
 /// Execute a closure with a mutable `&mut World` reference.
@@ -56,15 +135,7 @@ pub fn with_world_mut<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut engine_scene::World) -> R,
 {
-    let lock = WORLD_PTR.get()?;
-    let guard = lock.lock().ok()?;
-    let ptr = guard.0;
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: the caller guarantees `ptr` is valid and uniquely accessible.
-    let world = unsafe { &mut *ptr.cast::<engine_scene::World>() };
-    Some(f(world))
+    active_world_slot()?.with_world_mut(f)
 }
 
 /// Execute a closure with a shared `&World` reference.
@@ -72,15 +143,19 @@ pub fn with_world<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&engine_scene::World) -> R,
 {
-    let lock = WORLD_PTR.get()?;
-    let guard = lock.lock().ok()?;
-    let ptr = guard.0;
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: the caller guarantees `ptr` is valid.
-    let world = unsafe { &*ptr.cast::<engine_scene::World>() };
-    Some(f(world))
+    active_world_slot()?.with_world(f)
+}
+
+/// Snapshot an active world slot and one component type mapping under the
+/// activation lock. The returned strong slot keeps that exact world binding
+/// alive even if another runtime activates immediately afterwards.
+fn active_world_component(
+    type_id: crate::types::FfiComponentTypeId,
+) -> Option<(WorldSlot, &'static str)> {
+    let active = lock_active_world();
+    let weak = active.as_ref()?.clone();
+    let engine_type_id = crate::component::lookup_engine_type_id(type_id)?;
+    Some((weak.upgrade()?, engine_type_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -89,10 +164,9 @@ where
 
 use crate::registry;
 use crate::types::{
-    FfiAsyncCallback, FfiAsyncHandle, FfiComponentTypeId, FfiCoroutineHandle, FfiYieldInstruction,
+    FfiAsyncCallback, FfiAsyncHandle, FfiComponentTypeId, FfiCoroutineHandle,
+    FfiManagedCoroutineDescriptor,
 };
-use engine_scene::Entity;
-
 pub extern "C" fn entity_spawn() -> FfiEntityId {
     with_world_mut(|w| {
         let e = w.create_entity();
@@ -117,7 +191,7 @@ pub extern "C" fn entity_is_alive(entity: FfiEntityId) -> bool {
         let e = Entity::new(entity.index, entity.generation);
         w.is_alive(e)
     })
-    .unwrap_or(entity.index != u32::MAX)
+    .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -126,35 +200,25 @@ pub extern "C" fn entity_is_alive(entity: FfiEntityId) -> bool {
 
 /// Populate the global [`FfiRegistry`] with callbacks that talk to a `World`.
 ///
-/// Called once from `EngineRuntime::new()`.  `world_ptr` can be null;
-/// entity/component operations will return sentinel values until the
-/// world is set via [`set_world_ptr`].
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
-    if !world_ptr.is_null() {
-        // SAFETY: world_ptr is non-null; the caller guarantees it points to a
-        // valid World that outlives all FFI callbacks.
-        unsafe { set_world_ptr(world_ptr) };
-    }
+/// Called from `EngineRuntime::new()`. Repeated calls are idempotent; entity
+/// and component operations return sentinel values until a world is activated.
+pub fn populate_registry() {
+    static POPULATE: Once = Once::new();
+    POPULATE.call_once(populate_registry_once);
+}
 
-    // Stub coroutine/async callbacks — these need the ILRuntime bridge
-    // to be fully wired.  For now they return sentinel values.
-    extern "C" fn coroutine_start(_p: *mut std::ffi::c_void) -> FfiCoroutineHandle {
-        tracing::debug!("ffi coroutine_start: ILRuntime wiring pending");
-        FfiCoroutineHandle::INVALID
+fn populate_registry_once() {
+    unsafe extern "C" fn coroutine_start(
+        descriptor: *const FfiManagedCoroutineDescriptor,
+    ) -> FfiCoroutineHandle {
+        // SAFETY: Ownership and pointer validity follow the exported start ABI.
+        unsafe { crate::coroutine::schedule_managed_coroutine(descriptor) }
     }
-    extern "C" fn coroutine_cancel(_h: FfiCoroutineHandle) {}
-    extern "C" fn coroutine_move_next(
-        _p: *mut std::ffi::c_void,
-        _o: &mut FfiYieldInstruction,
-    ) -> bool {
-        false
+    extern "C" fn coroutine_cancel(handle: FfiCoroutineHandle) {
+        crate::coroutine::cancel_managed_coroutine(handle);
     }
-    extern "C" fn async_is_complete(_h: FfiAsyncHandle) -> bool {
-        false
-    }
-    extern "C" fn condition_check(_id: u64) -> bool {
-        false
+    extern "C" fn async_is_complete(handle: FfiAsyncHandle) -> bool {
+        crate::r#async::host_async_is_complete(handle)
     }
     extern "C" fn dispatch_callbacks() {
         crate::r#async::dispatch_main_thread_callbacks();
@@ -166,20 +230,31 @@ pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
         static FFI_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    extern "C" fn component_type_id(name: *const std::ffi::c_char) -> FfiComponentTypeId {
+        // SAFETY: This callback has the same C-string contract as the exported
+        // lookup function. It deliberately bypasses registry routing to avoid
+        // recursively calling itself in the host process.
+        unsafe { crate::component::lookup_component_type_ptr(name) }
+    }
+
+    extern "C" fn component_type_count() -> u32 {
+        crate::component::component_type_count()
+    }
+
     extern "C" fn component_get_ptr(
         entity: FfiEntityId,
         type_id: FfiComponentTypeId,
         out_len: &mut u32,
     ) -> *mut u8 {
-        let engine_type_id = match crate::component::lookup_engine_type_id(type_id) {
-            Some(id) => id,
+        let (world_slot, engine_type_id) = match active_world_component(type_id) {
+            Some(binding) => binding,
             None => {
                 *out_len = 0;
                 return std::ptr::null_mut();
             }
         };
 
-        let json = with_world(|world| {
+        let json = world_slot.with_world(|world| {
             let e = Entity::new(entity.index, entity.generation);
             if !world.is_alive(e) {
                 return None;
@@ -213,8 +288,8 @@ pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
         data: *const u8,
         len: u32,
     ) -> bool {
-        let engine_type_id = match crate::component::lookup_engine_type_id(type_id) {
-            Some(id) => id,
+        let (world_slot, engine_type_id) = match active_world_component(type_id) {
+            Some(binding) => binding,
             None => return false,
         };
         if data.is_null() || len == 0 {
@@ -229,47 +304,132 @@ pub fn populate_registry(world_ptr: *mut std::ffi::c_void) {
             return false;
         }
 
-        with_world_mut(|world| {
-            let e = Entity::new(entity.index, entity.generation);
-            if !world.is_alive(e) {
-                return false;
-            }
-            world.deserialize_component(e, engine_type_id, json)
-        })
-        .unwrap_or(false)
+        world_slot
+            .with_world_mut(|world| {
+                let e = Entity::new(entity.index, entity.generation);
+                if !world.is_alive(e) {
+                    return false;
+                }
+                world.deserialize_component(e, engine_type_id, json)
+            })
+            .unwrap_or(false)
     }
 
     extern "C" fn async_load_image(
-        _url: *const std::ffi::c_char,
-        _cb: FfiAsyncCallback,
-        _ud: u64,
+        url: *const std::ffi::c_char,
+        callback: FfiAsyncCallback,
+        user_data: u64,
     ) -> FfiAsyncHandle {
-        FfiAsyncHandle(0)
+        crate::r#async::host_async_load_image(url, callback, user_data)
     }
     extern "C" fn async_http_get(
-        _url: *const std::ffi::c_char,
-        _cb: FfiAsyncCallback,
-        _ud: u64,
+        url: *const std::ffi::c_char,
+        callback: FfiAsyncCallback,
+        user_data: u64,
     ) -> FfiAsyncHandle {
-        FfiAsyncHandle(0)
+        crate::r#async::host_async_http_get(url, callback, user_data)
     }
 
     let reg = registry::FfiRegistry {
         entity_spawn,
         entity_destroy,
         entity_is_alive,
+        component_type_id,
+        component_type_count,
         component_get_ptr,
         component_set_ptr,
         coroutine_start,
         coroutine_cancel,
-        coroutine_move_next,
         async_is_complete,
         async_load_image,
         async_http_get,
-        condition_check,
         dispatch_main_thread_callbacks: dispatch_callbacks,
     };
 
     registry::register(reg).ok();
     tracing::info!("FFI world bridge initialised");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serial_test() -> std::sync::MutexGuard<'static, ()> {
+        crate::component::lock_component_registry_for_test()
+    }
+
+    #[test]
+    fn activated_world_receives_ffi_entity_operations() {
+        let _guard = serial_test();
+        let slot = WorldSlot::new();
+        slot.replace(engine_scene::World::new());
+        activate_world(&slot, &ComponentRegistry::new());
+
+        let entity = entity_spawn();
+        assert_ne!(entity, FfiEntityId::INVALID);
+        assert_eq!(slot.with_world(engine_scene::World::alive_count), Some(1));
+
+        assert!(deactivate_world(&slot));
+    }
+
+    #[test]
+    fn replacing_world_in_active_slot_routes_to_new_world() {
+        let _guard = serial_test();
+        let slot = WorldSlot::new();
+        let mut first = engine_scene::World::new();
+        first.create_entity();
+        slot.replace(first);
+        activate_world(&slot, &ComponentRegistry::new());
+
+        slot.replace(engine_scene::World::new());
+        let entity = entity_spawn();
+        assert_ne!(entity, FfiEntityId::INVALID);
+        assert_eq!(slot.with_world(engine_scene::World::alive_count), Some(1));
+
+        assert!(deactivate_world(&slot));
+    }
+
+    #[test]
+    fn deactivating_an_old_runtime_does_not_clear_the_new_one() {
+        let _guard = serial_test();
+        let old = WorldSlot::new();
+        old.replace(engine_scene::World::new());
+        let current = WorldSlot::new();
+        current.replace(engine_scene::World::new());
+
+        activate_world(&old, &ComponentRegistry::new());
+        activate_world(&current, &ComponentRegistry::new());
+        assert!(!deactivate_world(&old));
+
+        assert_ne!(entity_spawn(), FfiEntityId::INVALID);
+        assert_eq!(
+            current.with_world(engine_scene::World::alive_count),
+            Some(1)
+        );
+        assert!(deactivate_world(&current));
+    }
+
+    #[test]
+    fn coroutine_owner_cleanup_does_not_affect_a_newer_runtime() {
+        let _guard = serial_test();
+        let old = WorldSlot::new();
+        let current = WorldSlot::new();
+
+        activate_coroutine_runtime(&old);
+        activate_coroutine_runtime(&current);
+        assert!(!deactivate_coroutine_runtime(&old));
+        assert!(deactivate_coroutine_runtime(&current));
+    }
+
+    #[test]
+    fn dropping_active_slot_makes_ffi_world_unavailable() {
+        let _guard = serial_test();
+        let slot = WorldSlot::new();
+        slot.replace(engine_scene::World::new());
+        activate_world(&slot, &ComponentRegistry::new());
+        drop(slot);
+
+        assert_eq!(entity_spawn(), FfiEntityId::INVALID);
+        *lock_active_world() = None;
+    }
 }

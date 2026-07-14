@@ -1,6 +1,8 @@
 //! Vulkan entry, instance, validation layers, and debug messenger.
 
 use std::ffi::{c_void, CStr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ash::ext::debug_utils;
 use ash::vk;
@@ -16,6 +18,7 @@ pub struct Instance {
     pub instance: AshInstance,
     debug_utils_loader: Option<debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+    validation_error_count: Arc<AtomicUsize>,
 }
 
 impl Instance {
@@ -68,6 +71,7 @@ impl Instance {
         let instance = unsafe { entry.create_instance(&create_info, None) }
             .map_err(|r| VulkanError::vk("create_instance", r))?;
 
+        let validation_error_count = Arc::new(AtomicUsize::new(0));
         let (debug_utils_loader, debug_messenger) = if validation_layer_available {
             let loader = debug_utils::Instance::new(&entry, &instance);
             let messenger_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
@@ -81,7 +85,8 @@ impl Instance {
                         | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 )
-                .pfn_user_callback(Some(debug_callback));
+                .pfn_user_callback(Some(debug_callback))
+                .user_data(Arc::as_ptr(&validation_error_count) as *mut c_void);
             // SAFETY: messenger_info outlives this call.
             let messenger = unsafe { loader.create_debug_utils_messenger(&messenger_info, None) }
                 .map_err(|r| VulkanError::vk("create_debug_utils_messenger", r))?;
@@ -101,7 +106,15 @@ impl Instance {
             instance,
             debug_utils_loader,
             debug_messenger,
+            validation_error_count,
         })
+    }
+
+    /// Number of validation-layer errors reported since this instance was
+    /// created. This lets runtime smoke tests fail instead of merely logging
+    /// an otherwise successful frame.
+    pub(crate) fn validation_error_count(&self) -> usize {
+        self.validation_error_count.load(Ordering::Acquire)
     }
 }
 
@@ -140,7 +153,7 @@ unsafe extern "system" fn debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _msg_type: vk::DebugUtilsMessageTypeFlagsEXT,
     callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) -> vk::Bool32 {
     if callback_data.is_null() {
         return vk::FALSE;
@@ -155,6 +168,12 @@ unsafe extern "system" fn debug_callback(
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
     };
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        if !user_data.is_null() {
+            // SAFETY: `user_data` points to the AtomicUsize owned by Instance;
+            // the debug messenger is destroyed before that owner is dropped.
+            let counter = unsafe { &*(user_data as *const AtomicUsize) };
+            record_validation_error(counter, severity);
+        }
         tracing::error!(target: "vulkan", "{}", message);
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
         tracing::warn!(target: "vulkan", "{}", message);
@@ -164,4 +183,23 @@ unsafe extern "system" fn debug_callback(
         tracing::debug!(target: "vulkan", "{}", message);
     }
     vk::FALSE
+}
+
+fn record_validation_error(counter: &AtomicUsize, severity: vk::DebugUtilsMessageSeverityFlagsEXT) {
+    if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        counter.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_error_counter_ignores_warnings_and_counts_errors() {
+        let counter = AtomicUsize::new(0);
+        record_validation_error(&counter, vk::DebugUtilsMessageSeverityFlagsEXT::WARNING);
+        record_validation_error(&counter, vk::DebugUtilsMessageSeverityFlagsEXT::ERROR);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+    }
 }

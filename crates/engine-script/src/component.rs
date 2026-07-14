@@ -177,7 +177,7 @@ impl ScriptManager {
             ))
         })?;
 
-        let mut instance = self.host.instantiate(handle)?;
+        let mut instance = self.host.instantiate(handle, &component.class_name)?;
 
         // Apply serialised fields to the instance
         for (name, value) in &component.fields {

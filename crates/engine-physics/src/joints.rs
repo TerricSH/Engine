@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::Entity;
+
 /// Which Rapier joint type to create.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum JointType {
@@ -37,10 +39,10 @@ pub struct JointMotor {
 /// Engine-level joint descriptor (no Rapier handles exposed).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JointDescriptor {
-    /// Index of the first entity.
-    pub entity_a: u32,
-    /// Index of the second entity (or same as `entity_a` for world-attached).
-    pub entity_b: u32,
+    /// Complete handle of the first entity.
+    pub entity_a: Entity,
+    /// Complete handle of the second entity (or same as `entity_a` for world-attached).
+    pub entity_b: Entity,
     pub joint_type: JointType,
     /// Local anchor frame relative to body A's position.
     pub anchor_a: [f32; 3],

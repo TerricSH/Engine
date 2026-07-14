@@ -1,30 +1,55 @@
 use crate::render_graph::CompiledBarrier;
 use crate::{
-    render_graph, validate_frame_input, Diagnostic, DiagnosticSeverity, FrameStats,
-    RenderFrameInput,
+    render_graph, validate_frame_input, AssetId, Diagnostic, DiagnosticSeverity, FrameStats,
+    MaterialUpload, MeshUpload, RenderFrameInput, ResourceRemoval, TextureUpload, Transparency,
+    UploadReceipt,
 };
 
-/// Backend renderer trait — implemented by concrete rendering backends
-/// (Vulkan, OpenGL, DX12) to bridge scene input to GPU execution.
+pub const DIAG_BACKEND_MISSING: &str = "RV0100";
+pub const DIAG_MESH_UPLOAD_UNSUPPORTED: &str = "RV0101";
+pub const DIAG_TEXTURE_UPLOAD_UNSUPPORTED: &str = "RV0102";
+pub const DIAG_MATERIAL_UPLOAD_UNSUPPORTED: &str = "RV0103";
+pub const DIAG_RESOURCE_REMOVAL_UNSUPPORTED: &str = "RV0104";
+pub const DIAG_RESIZE_UNSUPPORTED: &str = "RV0105";
+pub const DIAG_ABORT_UNSUPPORTED: &str = "RV0106";
+pub const DIAG_INVALID_RESOURCE_ID: &str = "RV0110";
+pub const DIAG_INVALID_MESH_VERTICES: &str = "RV0111";
+pub const DIAG_INVALID_MESH_INDICES: &str = "RV0112";
+pub const DIAG_INVALID_MESH_BOUNDS: &str = "RV0113";
+pub const DIAG_INVALID_TEXTURE_DIMENSIONS: &str = "RV0120";
+pub const DIAG_INVALID_TEXTURE_MIPS: &str = "RV0121";
+pub const DIAG_INVALID_MATERIAL_VALUES: &str = "RV0130";
+pub const DIAG_UNSUPPORTED_MATERIAL_STATE: &str = "RV0131";
+pub const DIAG_INVALID_RESIZE: &str = "RV0140";
+
+/// Backend renderer trait implemented by concrete GPU backends.
 pub trait BackendRenderer: Send {
     /// Render one frame from the given scene input (legacy single-pass path).
     fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>>;
 
     /// Begin a new frame. Called once before [`execute_pass`](Self::execute_pass).
-    /// Default: no-op, rendering happens in render_frame.
     fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
         Ok(())
     }
 
-    /// End the current frame. Called once after all passes.
-    /// Default: no-op.
+    /// End the current frame after every compiled pass succeeds.
     fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
         Ok(())
     }
 
+    /// Abandon a frame that began successfully but subsequently failed.
+    ///
+    /// A backend must release or reset any transient recording state without
+    /// presenting the incomplete frame. The default is deliberately an error:
+    /// silently claiming an unknown backend was reset is unsafe.
+    fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+        Err(unsupported_backend_operation(
+            DIAG_ABORT_UNSUPPORTED,
+            "frame abort",
+        ))
+    }
+
     /// Apply graph-compiled resource barriers before a pass executes.
-    /// Backends that rely on render-pass subpass layout transitions can
-    /// ignore barriers they do not own.
     fn apply_pass_barriers(
         &mut self,
         _input: &RenderFrameInput,
@@ -35,48 +60,57 @@ pub trait BackendRenderer: Send {
     }
 
     /// Execute a single render-graph pass. The default implementation
-    /// delegates to [`render_frame`](Self::render_frame) for backwards compat.
+    /// delegates to [`render_frame`](Self::render_frame) for compatibility.
     fn execute_pass(
         &mut self,
         input: &RenderFrameInput,
-        pass: &render_graph::PassNode,
-        frame_stats: &mut FrameStats,
+        _pass: &render_graph::PassNode,
+        _frame_stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
-        let _ = pass;
-        let _ = frame_stats;
         self.render_frame(input).map(|_| ())
     }
 
-    /// Upload mesh vertex+index data to the backend's internal mesh cache.
-    ///
-    /// After calling this, drawables that reference `mesh_id` in their
-    /// [`RenderableItem::mesh`](crate::RenderableItem::mesh) field will be
-    /// rendered with this geometry instead of a fallback quad.
-    ///
-    /// `vertex_bytes` and `index_bytes` are raw packed GPU-ready data.
-    /// `index_count` is the number of indices (not bytes).
-    /// `index_format` uses u16 when true and u32 when false.
-    ///
-    /// Default: no-op (backends that don't support mesh uploads).
-    fn upload_mesh(
+    /// Upload one owned static mesh and return its backend revision.
+    fn upload_mesh(&mut self, _upload: MeshUpload) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        Err(unsupported_backend_operation(
+            DIAG_MESH_UPLOAD_UNSUPPORTED,
+            "mesh upload",
+        ))
+    }
+
+    /// Upload one owned 2D texture and all declared mip levels.
+    fn upload_texture(&mut self, _upload: TextureUpload) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        Err(unsupported_backend_operation(
+            DIAG_TEXTURE_UPLOAD_UNSUPPORTED,
+            "texture upload",
+        ))
+    }
+
+    /// Upload one owned metallic-roughness material.
+    fn upload_material(
         &mut self,
-        _mesh_id: &str,
-        _vertex_bytes: &[u8],
-        _index_bytes: &[u8],
-        _index_count: u32,
-        _index_format_u16: bool,
-    ) -> Result<(), Vec<Diagnostic>> {
-        Ok(())
+        _upload: MaterialUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        Err(unsupported_backend_operation(
+            DIAG_MATERIAL_UPLOAD_UNSUPPORTED,
+            "material upload",
+        ))
+    }
+
+    /// Remove a previously uploaded resource.
+    fn remove_resource(&mut self, _removal: ResourceRemoval) -> Result<(), Vec<Diagnostic>> {
+        Err(unsupported_backend_operation(
+            DIAG_RESOURCE_REMOVAL_UNSUPPORTED,
+            "resource removal",
+        ))
     }
 
     /// Resize the underlying swapchain and viewport.
-    ///
-    /// Called when the application window is resized. The backend should
-    /// recreate its swapchain and update any cached dimensions.
-    ///
-    /// Default: no-op.
     fn resize(&mut self, _width: u32, _height: u32) -> Result<(), Vec<Diagnostic>> {
-        Ok(())
+        Err(unsupported_backend_operation(
+            DIAG_RESIZE_UNSUPPORTED,
+            "surface resize",
+        ))
     }
 }
 
@@ -94,6 +128,149 @@ impl Renderer {
             backend: Some(backend),
         }
     }
+
+    pub fn set_backend(&mut self, backend: Box<dyn BackendRenderer>) {
+        self.backend = Some(backend);
+    }
+
+    /// Resize the active backend's swapchain and viewport.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), Vec<Diagnostic>> {
+        if width == 0 || height == 0 {
+            return Err(vec![Diagnostic::new(
+                DIAG_INVALID_RESIZE,
+                DiagnosticSeverity::Error,
+                "renderer.contract",
+                format!("resize dimensions must be non-zero, got {width}x{height}"),
+            )]);
+        }
+        self.backend
+            .as_mut()
+            .ok_or_else(|| missing_backend("resize"))?
+            .resize(width, height)
+    }
+
+    /// Validate and upload one static PBR mesh.
+    pub fn upload_mesh(&mut self, upload: MeshUpload) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        let diagnostics = validate_mesh_upload(&upload);
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+        self.backend
+            .as_mut()
+            .ok_or_else(|| missing_backend("mesh upload"))?
+            .upload_mesh(upload)
+    }
+
+    /// Validate and upload one RGBA8 texture and its mip chain.
+    pub fn upload_texture(
+        &mut self,
+        upload: TextureUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        let diagnostics = validate_texture_upload(&upload);
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+        self.backend
+            .as_mut()
+            .ok_or_else(|| missing_backend("texture upload"))?
+            .upload_texture(upload)
+    }
+
+    /// Validate and upload one portable metallic-roughness material.
+    pub fn upload_material(
+        &mut self,
+        upload: MaterialUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        let diagnostics = validate_material_upload(&upload);
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+        self.backend
+            .as_mut()
+            .ok_or_else(|| missing_backend("material upload"))?
+            .upload_material(upload)
+    }
+
+    /// Remove a previously uploaded resource.
+    pub fn remove_resource(&mut self, removal: ResourceRemoval) -> Result<(), Vec<Diagnostic>> {
+        if let Some(diagnostic) = validate_resource_id(&removal.resource_id, "resource") {
+            return Err(vec![diagnostic]);
+        }
+        self.backend
+            .as_mut()
+            .ok_or_else(|| missing_backend("resource removal"))?
+            .remove_resource(removal)
+    }
+
+    /// Render a frame by building the render graph and executing each pass.
+    pub fn draw_scene(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
+        let diagnostics = validate_frame_input(input);
+        if diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.severity,
+                DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+            )
+        }) {
+            return Err(diagnostics);
+        }
+
+        let backend = self
+            .backend
+            .as_mut()
+            .ok_or_else(|| missing_backend("draw"))?;
+
+        let graph = crate::render_graph2::RenderGraph::build_with_config(
+            input,
+            &input.render_options.pass_graph_config,
+        );
+        let compiled = graph.compile_v2().map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0020",
+                DiagnosticSeverity::Error,
+                "renderer.render_graph",
+                format!("render graph compile_v2 failed: {error}"),
+            )]
+        })?;
+
+        let mut stats = FrameStats::default();
+        backend.begin_frame(input)?;
+
+        for (compiled_index, &pass_index) in compiled.pass_order.iter().enumerate() {
+            let Some(pass) = graph.passes.get(pass_index) else {
+                let diagnostics = vec![Diagnostic::new(
+                    "RV0021",
+                    DiagnosticSeverity::Error,
+                    "renderer.render_graph",
+                    format!("compiled graph referenced missing pass index {pass_index}"),
+                )];
+                return Err(abort_after_failure(backend.as_mut(), diagnostics));
+            };
+            let barriers = compiled
+                .barriers_per_pass
+                .get(compiled_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let span = tracing::info_span!("frame.view.{}.{}", input.frame_index, pass.name);
+            let _guard = span.enter();
+            tracing::info!(pass = pass.name, "executing render pass");
+
+            if let Some(legacy_pass) = pass.to_legacy() {
+                if let Err(diagnostics) = backend.apply_pass_barriers(input, &legacy_pass, barriers)
+                {
+                    return Err(abort_after_failure(backend.as_mut(), diagnostics));
+                }
+                if let Err(diagnostics) = backend.execute_pass(input, &legacy_pass, &mut stats) {
+                    return Err(abort_after_failure(backend.as_mut(), diagnostics));
+                }
+            }
+        }
+
+        if let Err(diagnostics) = backend.end_frame(&mut stats) {
+            return Err(abort_after_failure(backend.as_mut(), diagnostics));
+        }
+
+        Ok(stats)
+    }
 }
 
 impl Default for Renderer {
@@ -102,112 +279,246 @@ impl Default for Renderer {
     }
 }
 
-impl Renderer {
-    pub fn set_backend(&mut self, backend: Box<dyn BackendRenderer>) {
-        self.backend = Some(backend);
+fn unsupported_backend_operation(code: &str, operation: &str) -> Vec<Diagnostic> {
+    vec![Diagnostic::new(
+        code,
+        DiagnosticSeverity::Error,
+        "renderer.backend",
+        format!("backend does not implement {operation}"),
+    )]
+}
+
+fn missing_backend(operation: &str) -> Vec<Diagnostic> {
+    vec![Diagnostic::new(
+        DIAG_BACKEND_MISSING,
+        DiagnosticSeverity::Error,
+        "renderer.backend",
+        format!("cannot perform {operation}: no renderer backend is installed"),
+    )]
+}
+
+fn abort_after_failure(
+    backend: &mut dyn BackendRenderer,
+    mut diagnostics: Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
+    if let Err(mut abort_diagnostics) = backend.abort_frame() {
+        diagnostics.append(&mut abort_diagnostics);
+    }
+    diagnostics
+}
+
+fn validate_resource_id(resource_id: &AssetId, label: &str) -> Option<Diagnostic> {
+    resource_id.id.trim().is_empty().then(|| {
+        let mut diagnostic = Diagnostic::new(
+            DIAG_INVALID_RESOURCE_ID,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            format!("{label} id must not be empty or whitespace"),
+        );
+        diagnostic.asset = Some(resource_id.clone());
+        diagnostic
+    })
+}
+
+fn validate_mesh_upload(upload: &MeshUpload) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Some(diagnostic) = validate_resource_id(&upload.mesh_id, "mesh") {
+        diagnostics.push(diagnostic);
     }
 
-    /// Resize the active backend's swapchain and viewport.
-    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), Vec<Diagnostic>> {
-        if let Some(backend) = self.backend.as_mut() {
-            backend.resize(width, height)
-        } else {
-            Ok(())
+    let stride = upload.vertex_format.stride_bytes() as usize;
+    let expected_vertex_bytes = (upload.vertex_count as usize).checked_mul(stride);
+    if upload.vertex_count == 0
+        || expected_vertex_bytes.is_none()
+        || expected_vertex_bytes != Some(upload.vertex_bytes.len())
+    {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_MESH_VERTICES,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            format!(
+                "mesh vertex data must contain exactly vertex_count ({}) * stride ({stride}) bytes; got {}",
+                upload.vertex_count,
+                upload.vertex_bytes.len()
+            ),
+        ));
+    }
+
+    let index_size = upload.index_format.byte_size();
+    let expected_index_bytes = (upload.index_count as usize).checked_mul(index_size);
+    if upload.index_count == 0
+        || upload.index_count % 3 != 0
+        || expected_index_bytes.is_none()
+        || expected_index_bytes != Some(upload.index_bytes.len())
+    {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_MESH_INDICES,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            format!(
+                "triangle-list index data must contain a non-zero multiple of three indices and exactly index_count ({}) * index size ({index_size}) bytes; got {}",
+                upload.index_count,
+                upload.index_bytes.len()
+            ),
+        ));
+    }
+
+    let bounds_finite = upload
+        .bounds
+        .min
+        .iter()
+        .chain(upload.bounds.max.iter())
+        .all(|value| value.is_finite());
+    let bounds_ordered = (0..3).all(|axis| upload.bounds.min[axis] <= upload.bounds.max[axis]);
+    if !bounds_finite || !bounds_ordered {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_MESH_BOUNDS,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            "mesh bounds must be finite and min must not exceed max",
+        ));
+    }
+
+    diagnostics
+}
+
+fn validate_texture_upload(upload: &TextureUpload) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Some(diagnostic) = validate_resource_id(&upload.texture_id, "texture") {
+        diagnostics.push(diagnostic);
+    }
+    if upload.width == 0 || upload.height == 0 {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_TEXTURE_DIMENSIONS,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            format!(
+                "texture dimensions must be non-zero, got {}x{}",
+                upload.width, upload.height
+            ),
+        ));
+        return diagnostics;
+    }
+
+    if upload.mip_levels.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_TEXTURE_MIPS,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            "texture must contain at least mip level zero",
+        ));
+        return diagnostics;
+    }
+
+    let maximum_mips = u32::BITS - upload.width.max(upload.height).leading_zeros();
+    if upload.mip_levels.len() > maximum_mips as usize {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_TEXTURE_MIPS,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            format!(
+                "texture {}x{} can contain at most {maximum_mips} mip levels; got {}",
+                upload.width,
+                upload.height,
+                upload.mip_levels.len()
+            ),
+        ));
+    }
+
+    let bytes_per_pixel = upload.format.bytes_per_pixel();
+    let mut expected_width = upload.width;
+    let mut expected_height = upload.height;
+    for (level_index, level) in upload.mip_levels.iter().enumerate() {
+        if level.width != expected_width || level.height != expected_height {
+            diagnostics.push(Diagnostic::new(
+                DIAG_INVALID_TEXTURE_MIPS,
+                DiagnosticSeverity::Error,
+                "renderer.contract",
+                format!(
+                    "mip {level_index} must be {expected_width}x{expected_height}, got {}x{}",
+                    level.width, level.height
+                ),
+            ));
+        }
+        let expected_bytes = (expected_width as usize)
+            .checked_mul(expected_height as usize)
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel));
+        if expected_bytes.is_none() || expected_bytes != Some(level.bytes.len()) {
+            diagnostics.push(Diagnostic::new(
+                DIAG_INVALID_TEXTURE_MIPS,
+                DiagnosticSeverity::Error,
+                "renderer.contract",
+                format!(
+                    "mip {level_index} must contain exactly {expected_width} * {expected_height} * {bytes_per_pixel} RGBA bytes; got {}",
+                    level.bytes.len()
+                ),
+            ));
+        }
+        expected_width = (expected_width / 2).max(1);
+        expected_height = (expected_height / 2).max(1);
+    }
+
+    diagnostics
+}
+
+fn validate_material_upload(upload: &MaterialUpload) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Some(diagnostic) = validate_resource_id(&upload.material_id, "material") {
+        diagnostics.push(diagnostic);
+    }
+    if let Some(texture_id) = &upload.base_color_texture {
+        if let Some(diagnostic) = validate_resource_id(texture_id, "base-color texture") {
+            diagnostics.push(diagnostic);
         }
     }
 
-    /// Upload mesh vertex+index data to the active backend's mesh cache.
-    ///
-    /// See [`BackendRenderer::upload_mesh`] for details.
-    pub fn upload_mesh(
-        &mut self,
-        mesh_id: &str,
-        vertex_bytes: &[u8],
-        index_bytes: &[u8],
-        index_count: u32,
-        index_format_u16: bool,
-    ) -> Result<(), Vec<Diagnostic>> {
-        if let Some(backend) = self.backend.as_mut() {
-            backend.upload_mesh(mesh_id, vertex_bytes, index_bytes, index_count, index_format_u16)
-        } else {
-            Ok(())
-        }
+    let factors_valid = upload
+        .base_color
+        .iter()
+        .chain([
+            &upload.metallic,
+            &upload.roughness,
+            &upload.ambient_occlusion,
+        ])
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(value));
+    if !factors_valid {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_MATERIAL_VALUES,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            "material color, metallic, roughness, and ambient occlusion must be finite values in [0, 1]",
+        ));
     }
 
-    /// Render a frame by building the render graph and executing each pass.
-    pub fn draw_scene(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        let diagnostics = validate_frame_input(input);
-        if diagnostics.iter().any(|d| {
-            matches!(
-                d.severity,
-                DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
-            )
-        }) {
-            return Err(diagnostics);
+    if let Transparency::Masked { cutoff } = &upload.transparency {
+        if !cutoff.is_finite() || !(0.0..=1.0).contains(cutoff) {
+            diagnostics.push(Diagnostic::new(
+                DIAG_INVALID_MATERIAL_VALUES,
+                DiagnosticSeverity::Error,
+                "renderer.contract",
+                "masked material cutoff must be finite and in [0, 1]",
+            ));
         }
+    }
+    if !matches!(&upload.transparency, Transparency::Opaque) || upload.double_sided {
+        diagnostics.push(Diagnostic::new(
+            DIAG_UNSUPPORTED_MATERIAL_STATE,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            "the portable material upload path currently supports only opaque, single-sided materials",
+        ));
+    }
 
-        if let Some(backend) = self.backend.as_mut() {
-            // Build the render graph from the frame input (DAG-based builder)
-            let graph = crate::render_graph2::RenderGraph::build_with_config(
-                input,
-                &input.render_options.pass_graph_config,
-            );
+    diagnostics
+}
 
-            // Phase B: compile the graph (topological sort, cull dead passes,
-            // infer barriers).
-            let compiled = graph.compile_v2().map_err(|err| {
-                vec![Diagnostic::new(
-                    "RV0020",
-                    DiagnosticSeverity::Error,
-                    "renderer.render_graph",
-                    format!("render graph compile_v2 failed: {err}"),
-                )]
-            })?;
-
-            let mut stats = FrameStats::default();
-
-            // Begin frame (backend allocates per-frame resources)
-            backend.begin_frame(input)?;
-
-            // Execute each live pass with tracing spans.
-            for (compiled_idx, &pass_idx) in compiled.pass_order.iter().enumerate() {
-                let Some(pass) = graph.passes.get(pass_idx) else {
-                    return Err(vec![Diagnostic::new(
-                        "RV0021",
-                        DiagnosticSeverity::Error,
-                        "renderer.render_graph",
-                        format!("compiled graph referenced missing pass index {pass_idx}"),
-                    )]);
-                };
-                let barriers = compiled
-                    .barriers_per_pass
-                    .get(compiled_idx)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let span = tracing::info_span!("frame.view.{}.{}", input.frame_index, pass.name);
-                let _guard = span.enter();
-                tracing::info!(pass = pass.name, "executing render pass");
-
-                // Convert to legacy PassNode for the backend trait.
-                let legacy = pass.to_legacy();
-                if let Some(ref legacy_pass) = legacy {
-                    backend.apply_pass_barriers(input, legacy_pass, barriers)?;
-                    backend.execute_pass(input, legacy_pass, &mut stats)?;
-                }
-            }
-
-            // End frame (backend submits and presents)
-            backend.end_frame(&mut stats)?;
-
-            Ok(stats)
-        } else {
-            // No backend attached — return mock stats (for contract-only testing)
-            Ok(FrameStats {
-                visible_drawables: input.drawables.len() as u32 + input.skinned_items.len() as u32,
-                visible_lights: input.lights.len() as u32,
-                draw_calls: input.drawables.len() as u32 + input.skinned_items.len() as u32,
-                ..FrameStats::default()
-            })
-        }
+#[cfg(test)]
+mod contract_layout_tests {
+    #[test]
+    fn pbr32_vertex_has_the_documented_stride() {
+        assert_eq!(
+            std::mem::size_of::<crate::Pbr32Vertex>(),
+            crate::PBR32_VERTEX_STRIDE as usize
+        );
     }
 }

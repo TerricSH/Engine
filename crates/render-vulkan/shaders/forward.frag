@@ -27,7 +27,7 @@ layout(binding = 0) uniform PerFrameUBO {
 layout(set = 1, binding = 0) uniform sampler2DArrayShadow u_shadow_map;
 
 // Environment cubemap (set=1, binding=1) — IBL irradiance / prefiltered env
-layout(binding = 1) uniform samplerCube u_irradiance_map;
+layout(set = 1, binding = 1) uniform samplerCube u_irradiance_map;
 
 // Additional lights SSBO (set=1, binding=2) — clustered shading
 struct Light {
@@ -92,7 +92,7 @@ float sample_cascade_shadow(vec4 light_pos, int cascade) {
 
     float bias = 0.005;
     float ref_depth = proj.z - bias;
-    return texture(u_shadow_map, vec3(proj.xy, cascade), ref_depth);
+    return texture(u_shadow_map, vec4(proj.xy, float(cascade), ref_depth));
 }
 
 /// Compute the shadow factor for the current fragment using 3-cascade CSM.
@@ -135,12 +135,10 @@ void main() {
     vec3 N = normalize(v_normal);
     vec3 V = normalize(ubo.camera_pos.xyz - v_world_pos);
 
-    // Compute base color from texture (if bound) or uniform fallback.
-    vec3 base_color = material.base_color.rgb;
-    vec3 tex_color = texture(u_base_color_texture, v_uv).rgb;
-    if (tex_color != vec3(0.0)) {
-        base_color = tex_color * material.base_color.rgb;
-    }
+    // A valid descriptor is always bound. Materials without a texture use the
+    // renderer's 1x1 white fallback, so black texture data stays black.
+    vec3 base_color = material.base_color.rgb
+                    * texture(u_base_color_texture, v_uv).rgb;
 
     vec3 F0 = mix(vec3(0.04), base_color, material.metallic);
 

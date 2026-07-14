@@ -20,7 +20,6 @@
 use ash::vk;
 use ash::Device as AshDevice;
 
-use crate::allocator::Allocation;
 use crate::device_impl::VulkanDevice;
 use crate::error::VulkanError;
 // ============================================================================
@@ -59,15 +58,6 @@ pub enum ReloadData {
 /// this enum and stored in [`GpuReloadCoordinator`] for at least two frame
 /// boundaries before being destroyed.
 pub enum GpuResource {
-    /// A replaced texture (image, view, and optional allocation).
-    Texture {
-        /// Old Vulkan image handle.
-        old_image: vk::Image,
-        /// Old Vulkan image view handle.
-        old_view: vk::ImageView,
-        /// Old memory allocation (freed on final retirement).
-        old_allocation: Option<Allocation>,
-    },
     /// A replaced graphics pipeline.
     Shader {
         /// Old Vulkan pipeline handle.
@@ -84,7 +74,7 @@ pub enum GpuResource {
 /// A pending reload request with the data needed to create new GPU resources.
 struct PendingReload {
     /// Asset identifier (for diagnostics / lookup).
-    _asset_id: String,
+    asset_id: String,
     /// Cooked data to use when creating the new resource.
     data: ReloadData,
     /// Which pipeline target this reload affects.
@@ -92,6 +82,7 @@ struct PendingReload {
 }
 
 /// Identifies which resource on [`VulkanDevice`] to replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReloadTarget {
     /// Replace the MVP triangle pipeline.
     MvpPipeline,
@@ -101,6 +92,8 @@ enum ReloadTarget {
     ShadowPipeline,
     /// Replace the shadow-map texture (image / view / allocation).
     ShadowMap,
+    /// The asset name does not identify a supported GPU target.
+    Unsupported,
 }
 
 /// A retiring resource with a remaining frame counter.
@@ -164,7 +157,7 @@ impl GpuReloadCoordinator {
             "reload queued"
         );
         self.pending.push(PendingReload {
-            _asset_id: asset_id,
+            asset_id,
             data,
             target,
         });
@@ -181,54 +174,20 @@ impl GpuReloadCoordinator {
         };
 
         match req.data {
-            ReloadData::Texture {
-                width,
-                height,
-                mip_count,
-                data,
-            } => {
+            ReloadData::Texture { .. } => {
                 // ── Create new texture ──────────────────────────────────
-                match device.create_sampled_texture(width, height, mip_count, &data) {
-                    Ok((new_image, new_view, new_allocation)) => {
-                        // Swap the shadow map if this reload targets it.
-                        match req.target {
-                            ReloadTarget::ShadowMap => {
-                                // CSM shadow maps are 3-layer depth arrays, not
-                                // single 2D color textures.  The reload system
-                                // cannot recreate the array + per-layer views,
-                                // so we destroy the new texture and keep the
-                                // existing shadow map.
-                                device.destroy_sampled_texture(new_image, new_view, new_allocation);
-                                tracing::warn!(
-                                    target: "vulkan::reload",
-                                    "shadow map reload is unsupported for CSM; keeping existing"
-                                );
-                            }
-                            ReloadTarget::MvpPipeline
-                            | ReloadTarget::ModelPipeline
-                            | ReloadTarget::ShadowPipeline => {
-                                // The texture reload did not match a known
-                                // texture target — destroy the new resource
-                                // immediately to avoid a leak.
-                                device.destroy_sampled_texture(new_image, new_view, new_allocation);
-                                tracing::warn!(
-                                    target: "vulkan::reload",
-                                    "texture reload target not matched for shadow map; discarding"
-                                );
-                            }
-                        }
-                        tracing::info!(target: "vulkan::reload", "texture reloaded");
-                        Ok(true)
+                let detail = match req.target {
+                    ReloadTarget::ShadowMap => {
+                        "CSM shadow maps are depth arrays and cannot be replaced by RGBA8 data"
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            target: "vulkan::reload",
-                            error = %e,
-                            "texture reload failed — old texture kept"
-                        );
-                        Err(e)
+                    _ => {
+                        "material descriptor rebinding is unavailable in this device-only coordinator"
                     }
-                }
+                };
+                Err(VulkanError::Loader(format!(
+                    "GPU texture reload for '{}' is unsupported: {detail}; use Renderer::upload_texture",
+                    req.asset_id
+                )))
             }
 
             ReloadData::Shader {
@@ -247,12 +206,16 @@ impl GpuReloadCoordinator {
                         device.recreate_shadow_pipeline(&vert_spirv, &frag_spirv)
                     }
                     ReloadTarget::ShadowMap => {
-                        // Shader data queued for a texture target — discard.
-                        tracing::warn!(
-                            target: "vulkan::reload",
-                            "shader reload targeted shadow map; ignoring"
-                        );
-                        return Ok(true);
+                        return Err(VulkanError::Loader(format!(
+                            "shader reload '{}' targets a shadow-map texture",
+                            req.asset_id
+                        )));
+                    }
+                    ReloadTarget::Unsupported => {
+                        return Err(VulkanError::Loader(format!(
+                            "reload asset '{}' does not identify a supported pipeline target",
+                            req.asset_id
+                        )));
                     }
                 };
 
@@ -327,35 +290,6 @@ impl GpuReloadCoordinator {
     /// in-flight queue submission.
     fn destroy_resource(device: &AshDevice, resource: GpuResource) {
         match resource {
-            GpuResource::Texture {
-                old_image,
-                old_view,
-                mut old_allocation,
-            } => {
-                // SAFETY: device is valid; handles were created by this
-                // device and are no longer referenced by any in-flight work.
-                unsafe {
-                    device.destroy_image_view(old_view, None);
-                    device.destroy_image(old_image, None);
-                }
-                // The allocation must be freed via the allocator (which
-                // needs the device), but we only have &AshDevice here.
-                // We store the allocation for external cleanup.
-                if let Some(ref mut alloc) = old_allocation {
-                    // We cannot free without the allocator — log a warning.
-                    // The caller is responsible for freeing allocations
-                    // through the allocator.  For now, leak intentionally
-                    // (the old resource is being retired after 2 frames,
-                    // and the device itself will be destroyed eventually).
-                    tracing::trace!(
-                        target: "vulkan::reload",
-                        "retired texture allocation (memory={:?}) — leaked, allocator unavailable",
-                        alloc.memory(),
-                    );
-                    // Prevent Drop from attempting to free.
-                    let _ = alloc;
-                }
-            }
             GpuResource::Shader {
                 old_pipeline,
                 old_layout,
@@ -400,13 +334,44 @@ fn target_from_asset_id(id: &str) -> ReloadTarget {
         } else if rest.starts_with("shadow") {
             ReloadTarget::ShadowPipeline
         } else {
-            // Default to model pipeline for unrecognised shader assets.
-            ReloadTarget::ModelPipeline
+            ReloadTarget::Unsupported
         }
     } else if id.starts_with("texture-") && id.contains("shadow") {
         ReloadTarget::ShadowMap
     } else {
-        // Default: treat as model pipeline reload.
-        ReloadTarget::ModelPipeline
+        ReloadTarget::Unsupported
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{target_from_asset_id, ReloadTarget};
+
+    #[test]
+    fn reload_targets_do_not_guess_for_unknown_asset_ids() {
+        assert_eq!(
+            target_from_asset_id("shader-mvp-main"),
+            ReloadTarget::MvpPipeline
+        );
+        assert_eq!(
+            target_from_asset_id("shader-forward-main"),
+            ReloadTarget::ModelPipeline
+        );
+        assert_eq!(
+            target_from_asset_id("shader-shadow-main"),
+            ReloadTarget::ShadowPipeline
+        );
+        assert_eq!(
+            target_from_asset_id("texture-shadow-atlas"),
+            ReloadTarget::ShadowMap
+        );
+        assert_eq!(
+            target_from_asset_id("shader-unrecognized"),
+            ReloadTarget::Unsupported
+        );
+        assert_eq!(
+            target_from_asset_id("texture-albedo"),
+            ReloadTarget::Unsupported
+        );
     }
 }

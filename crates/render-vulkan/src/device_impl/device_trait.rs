@@ -5,14 +5,15 @@
 //! (begin/end), and pixel readback.
 
 use ash::vk;
+use std::ops::Range;
 
 use render_core::{
-    self, AdapterInfo, BufferDescriptor, BufferHandle, CommandEncoder as CmdEncoderTrait,
-    FramebufferDescriptor, FramebufferHandle, PipelineDescriptor, PipelineHandle,
-    PipelineLayoutDescriptor, PipelineLayoutHandle, RenderPassDescriptor, RenderPassHandle,
-    RendererStatistics, ShaderModuleDescriptor, ShaderModuleHandle, SurfaceDescriptor,
-    SurfaceHandle, SwapchainDescriptor, SwapchainHandle, TextureDescriptor, TextureFormat,
-    TextureHandle,
+    self, AdapterInfo, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
+    CommandEncoder as CmdEncoderTrait, FramebufferDescriptor, FramebufferHandle,
+    PipelineDescriptor, PipelineHandle, PipelineLayoutDescriptor, PipelineLayoutHandle,
+    RenderPassDescriptor, RenderPassHandle, RendererStatistics, ShaderModuleDescriptor,
+    ShaderModuleHandle, SurfaceDescriptor, SurfaceHandle, SwapchainDescriptor, SwapchainHandle,
+    TextureDescriptor, TextureFormat, TextureHandle,
 };
 
 use crate::allocator::{AllocationCreateDesc, AllocationScheme, MemoryLocation};
@@ -25,6 +26,111 @@ use super::{
     slab::{BufEntry, PipeEntry, PlEntry},
     vfmt, VulkanDevice,
 };
+
+fn fallback_pipeline_set_layouts(
+    frame: Option<vk::DescriptorSetLayout>,
+    shadow: Option<vk::DescriptorSetLayout>,
+    material: Option<vk::DescriptorSetLayout>,
+) -> Result<Vec<vk::DescriptorSetLayout>, render_core::RhiError> {
+    let slots = [frame, shadow, material];
+    let Some(last_used) = slots.iter().rposition(Option::is_some) else {
+        return Ok(Vec::new());
+    };
+
+    slots
+        .into_iter()
+        .take(last_used + 1)
+        .enumerate()
+        .map(|(set_index, layout)| match layout {
+            Some(layout) if layout != vk::DescriptorSetLayout::null() => Ok(layout),
+            _ => Err(render_core::RhiError::InvalidDescriptor {
+                field: "bind_group_layouts".into(),
+                reason: format!(
+                    "descriptor set layout {set_index} must be initialized before later sets"
+                ),
+            }),
+        })
+        .collect()
+}
+
+fn validate_contiguous_bind_group_layouts(
+    layouts: &[BindGroupLayoutDescriptor],
+) -> Result<(), render_core::RhiError> {
+    let Some(max_set) = layouts.iter().map(|layout| layout.set_index).max() else {
+        return Ok(());
+    };
+    let mut seen = vec![false; max_set as usize + 1];
+    for layout in layouts {
+        let slot = &mut seen[layout.set_index as usize];
+        if *slot {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "bind_group_layouts".into(),
+                reason: format!("duplicate descriptor set layout {}", layout.set_index),
+            });
+        }
+        *slot = true;
+    }
+    if let Some(missing) = seen.iter().position(|present| !present) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "bind_group_layouts".into(),
+            reason: format!("missing descriptor set layout {missing}"),
+        });
+    }
+    Ok(())
+}
+
+fn ordered_bind_group_layouts(
+    layouts: &[BindGroupLayoutDescriptor],
+) -> Result<Vec<&BindGroupLayoutDescriptor>, render_core::RhiError> {
+    validate_contiguous_bind_group_layouts(layouts)?;
+    let mut ordered: Vec<_> = layouts.iter().collect();
+    ordered.sort_by_key(|layout| layout.set_index);
+    Ok(ordered)
+}
+
+fn color_attachment_format(
+    requested: Option<&TextureFormat>,
+    swapchain_format: Option<vk::Format>,
+) -> vk::Format {
+    match requested {
+        Some(TextureFormat::Bgra8Unorm) => swapchain_format.unwrap_or(vk::Format::B8G8R8A8_UNORM),
+        Some(TextureFormat::Rgba8Unorm) => vk::Format::R8G8B8A8_UNORM,
+        Some(TextureFormat::Rgba16Float) => vk::Format::R16G16B16A16_SFLOAT,
+        _ => swapchain_format.unwrap_or(vk::Format::B8G8R8A8_UNORM),
+    }
+}
+
+fn checked_buffer_write_range(
+    buffer_size: u64,
+    offset: u64,
+    data_len: usize,
+) -> Result<Range<usize>, render_core::RhiError> {
+    let start = usize::try_from(offset).map_err(|_| render_core::RhiError::InvalidDescriptor {
+        field: "write_buffer.range".into(),
+        reason: format!("offset {offset} cannot be represented on this platform"),
+    })?;
+    let logical_size =
+        usize::try_from(buffer_size).map_err(|_| render_core::RhiError::Backend {
+            detail: format!("buffer size {buffer_size} cannot be represented on this platform"),
+        })?;
+    let end =
+        start
+            .checked_add(data_len)
+            .ok_or_else(|| render_core::RhiError::InvalidDescriptor {
+                field: "write_buffer.range".into(),
+                reason: format!("offset {offset} plus {data_len} bytes overflows address space"),
+            })?;
+    if end > logical_size {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "write_buffer.range".into(),
+            reason: format!(
+                "write range {offset}..{} exceeds buffer size {buffer_size}",
+                offset.saturating_add(data_len as u64)
+            ),
+        });
+    }
+    Ok(start..end)
+}
 
 impl render_core::Device for VulkanDevice {
     fn adapter_info(&self) -> &AdapterInfo {
@@ -40,6 +146,10 @@ impl render_core::Device for VulkanDevice {
         &mut self,
         _: &SwapchainDescriptor,
     ) -> Result<SwapchainHandle, render_core::RhiError> {
+        self.ensure_sc()
+            .map_err(|e| render_core::RhiError::Backend {
+                detail: format!("create swapchain: {e}"),
+            })?;
         Ok(SwapchainHandle::new(1, 1))
     }
 
@@ -69,29 +179,51 @@ impl render_core::Device for VulkanDevice {
         let req = unsafe { d.device.get_buffer_memory_requirements(buffer) };
         let alloc_handle = d.allocator();
         let location = MemoryLocation::CpuToGpu;
-        let mut allocation = alloc_handle
-            .lock()
-            .map_err(|e| render_core::RhiError::Backend {
-                detail: format!("allocator lock: {e}"),
-            })?
-            .allocate(&AllocationCreateDesc {
+        let allocation_result = match alloc_handle.lock() {
+            Ok(mut allocator) => allocator.allocate(&AllocationCreateDesc {
                 name: "device-buffer",
                 requirements: req,
                 location,
                 linear: true,
                 allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-            })
-            .map_err(|e| render_core::RhiError::Backend {
-                detail: e.to_string(),
-            })?;
+            }),
+            Err(error) => {
+                // SAFETY: no allocation was made, so the buffer is unbound and
+                // exclusively owned by this function.
+                unsafe {
+                    d.device.destroy_buffer(buffer, None);
+                }
+                return Err(render_core::RhiError::Backend {
+                    detail: format!("allocator lock: {error}"),
+                });
+            }
+        };
+        let mut allocation = match allocation_result {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                // SAFETY: allocation failed, so the newly-created buffer is
+                // unbound and has no other owner.
+                unsafe {
+                    d.device.destroy_buffer(buffer, None);
+                }
+                return Err(render_core::RhiError::Backend { detail: error });
+            }
+        };
         // SAFETY: `buffer` was created by this device; `allocation` was created
         // for this buffer's memory requirements; the memory and offset are valid.
         if let Err(r) = unsafe {
             d.device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
         } {
-            if let Ok(mut alloc_guard) = alloc_handle.lock() {
-                alloc_guard.free(&mut allocation);
+            match alloc_handle.lock() {
+                Ok(mut alloc_guard) => alloc_guard.free(&mut allocation),
+                Err(poisoned) => {
+                    tracing::error!(
+                        target: "vulkan::resources",
+                        "allocator mutex was poisoned after buffer bind failure"
+                    );
+                    poisoned.into_inner().free(&mut allocation);
+                }
             }
             // SAFETY: `buffer` was just created; not bound to memory; destroying
             // a freshly-created buffer is safe even on failed bind.
@@ -104,6 +236,7 @@ impl render_core::Device for VulkanDevice {
         }
         let (idx, gen) = self.buffers.insert(BufEntry {
             buffer,
+            size,
             allocator: alloc_handle,
             allocation: Some(allocation),
         });
@@ -120,6 +253,7 @@ impl render_core::Device for VulkanDevice {
             .buffers
             .get_mut(buf.index, buf.generation)
             .ok_or(render_core::RhiError::InvalidHandle)?;
+        let write_range = checked_buffer_write_range(entry.size, offset, data.len())?;
         let alloc = entry
             .allocation
             .as_mut()
@@ -131,9 +265,30 @@ impl render_core::Device for VulkanDevice {
             .ok_or_else(|| render_core::RhiError::Backend {
                 detail: "not mapped".into(),
             })?;
-        let end = (offset as usize + data.len()).min(slice.len());
-        slice[offset as usize..end].copy_from_slice(&data[..end - offset as usize]);
+        if write_range.end > slice.len() {
+            return Err(render_core::RhiError::Backend {
+                detail: format!(
+                    "mapped allocation is {} bytes but buffer write requires {} bytes",
+                    slice.len(),
+                    write_range.end
+                ),
+            });
+        }
+        slice[write_range].copy_from_slice(data);
         Ok(())
+    }
+
+    fn destroy_buffer(&mut self, buffer: BufferHandle) {
+        let Some(entry) = self.buffers.remove(buffer.index, buffer.generation) else {
+            tracing::warn!(
+                target: "vulkan::resources",
+                index = buffer.index,
+                generation = buffer.generation,
+                "ignored destroy request for an invalid or already-destroyed buffer handle"
+            );
+            return;
+        };
+        entry.destroy(&self.logical_device.device);
     }
 
     fn create_texture(
@@ -175,12 +330,10 @@ impl render_core::Device for VulkanDevice {
         desc: &RenderPassDescriptor,
     ) -> Result<RenderPassHandle, render_core::RhiError> {
         let d = &self.logical_device.device;
-        let vk_fmt = match desc.color_attachments.first() {
-            Some(TextureFormat::Bgra8Unorm) => vk::Format::B8G8R8A8_UNORM,
-            Some(TextureFormat::Rgba8Unorm) => vk::Format::R8G8B8A8_UNORM,
-            Some(TextureFormat::Rgba16Float) => vk::Format::R16G16B16A16_SFLOAT,
-            _ => vk::Format::B8G8R8A8_UNORM,
-        };
+        let vk_fmt = color_attachment_format(
+            desc.color_attachments.first(),
+            self.swapchain.as_ref().map(|swapchain| swapchain.format),
+        );
         let has_depth = desc.depth_stencil_format.is_some();
 
         // Build render pass using a flat approach to avoid ash lifetime issues
@@ -351,26 +504,19 @@ impl render_core::Device for VulkanDevice {
         // If the descriptor provides explicit bind_group_layouts, create
         // VkDescriptorSetLayout objects from them.  Otherwise fall back to
         // the existing per-frame (set=0) + shadow (set=1) layouts.
-        let mut set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
+        let mut set_layouts: Vec<vk::DescriptorSetLayout>;
         let mut owned_set_layouts: Vec<vk::DescriptorSetLayout> = Vec::new();
 
         if desc.bind_group_layouts.is_empty() {
             // Fallback: use existing per-frame + shadow + material layouts
-            if let Some(dsl) = self.desc_set_layout_0 {
-                set_layouts.push(dsl);
-            }
-            if let Some(sdl) = self.shadow_desc_layout {
-                set_layouts.push(sdl);
-            }
-            // Material descriptor set layout at set=2
-            if let Some(mdl) = self.material_desc_set_layout {
-                while set_layouts.len() <= 2 {
-                    set_layouts.push(vk::DescriptorSetLayout::null());
-                }
-                set_layouts[2] = mdl;
-            }
+            set_layouts = fallback_pipeline_set_layouts(
+                self.desc_set_layout_0,
+                self.shadow_desc_layout,
+                self.material_desc_set_layout,
+            )?;
         } else {
-            for bg in &desc.bind_group_layouts {
+            set_layouts = Vec::new();
+            for bg in ordered_bind_group_layouts(&desc.bind_group_layouts)? {
                 let vk_bindings: Vec<vk::DescriptorSetLayoutBinding> = bg
                     .bindings
                     .iter()
@@ -393,11 +539,7 @@ impl render_core::Device for VulkanDevice {
                     }
                 })?;
                 owned_set_layouts.push(sl);
-                // Ensure the vector is large enough for this set_index
-                while (set_layouts.len() as u8) <= bg.set_index {
-                    set_layouts.push(vk::DescriptorSetLayout::null());
-                }
-                set_layouts[bg.set_index as usize] = sl;
+                set_layouts.push(sl);
             }
         }
 
@@ -577,11 +719,10 @@ impl render_core::Device for VulkanDevice {
                 if let Some(rp_) = self.mvp_rp {
                     rp_
                 } else {
-                    let fmt = match desc.render_targets.first() {
-                        Some(TextureFormat::Bgra8Unorm) => vk::Format::B8G8R8A8_UNORM,
-                        Some(TextureFormat::Rgba8Unorm) => vk::Format::R8G8B8A8_UNORM,
-                        _ => vk::Format::B8G8R8A8_SRGB,
-                    };
+                    let fmt = color_attachment_format(
+                        desc.render_targets.first(),
+                        self.swapchain.as_ref().map(|swapchain| swapchain.format),
+                    );
                     let at = vk::AttachmentDescription::default()
                         .format(fmt)
                         .samples(parse_sample_count(desc.sample_count))
@@ -699,31 +840,6 @@ impl render_core::Device for VulkanDevice {
             })?;
         self.last_image_index = ii;
 
-        // Phase 5.3: CPU-wait for the timeline semaphore to reach the current
-        // value for this frame slot.  This ensures that the previous GPU work
-        // targeting this slot has fully completed before we begin recording
-        // new commands.
-        let timeline_value = self.frame_sync[fi].timeline_value;
-        let timeline_semaphore = self.frame_sync[fi].timeline_semaphore;
-        if timeline_value > 0 {
-            let sems = [timeline_semaphore];
-            let vals = [timeline_value];
-            let wait_info = vk::SemaphoreWaitInfo::default()
-                .semaphores(&sems)
-                .values(&vals);
-            // SAFETY: `self.logical_device.device` is a valid AshDevice;
-            // `timeline_semaphore` is a valid timeline semaphore;
-            // `timeline_value` is the last known signalled value.
-            unsafe {
-                self.logical_device
-                    .device
-                    .wait_semaphores(&wait_info, u64::MAX)
-                    .map_err(|r| render_core::RhiError::Backend {
-                        detail: format!("tw: {r:?}"),
-                    })?;
-            }
-        }
-
         self.begin_cb(fi)
             .map_err(|e| render_core::RhiError::Backend {
                 detail: format!("{e}"),
@@ -809,8 +925,18 @@ impl render_core::Device for VulkanDevice {
             self.swapchain = None;
         }
         self.current_frame = (fi + 1) % 2;
+        if let Some(instance) = self.instance.as_ref() {
+            let validation_errors = instance.validation_error_count();
+            if validation_errors > 0 {
+                return Err(render_core::RhiError::Backend {
+                    detail: format!("Vulkan validation reported {validation_errors} error(s)"),
+                });
+            }
+        }
         Ok(RendererStatistics {
-            draw_calls: 1,
+            // Pass implementations own draw accounting. The device lifecycle
+            // itself records no scene draw and must not fabricate one.
+            draw_calls: 0,
             triangles: 0,
             gpu_frame_ms: 0.0,
         })
@@ -1230,5 +1356,97 @@ impl render_core::Device for VulkanDevice {
         unsafe { device.destroy_buffer(staging_buffer, None) };
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ash::vk::Handle;
+
+    use super::*;
+
+    fn layout(raw: u64) -> vk::DescriptorSetLayout {
+        vk::DescriptorSetLayout::from_raw(raw)
+    }
+
+    #[test]
+    fn fallback_pipeline_layouts_require_a_contiguous_prefix() {
+        let err = fallback_pipeline_set_layouts(None, None, Some(layout(3)))
+            .expect_err("set 2 without sets 0 and 1 must be rejected");
+        assert!(matches!(
+            err,
+            render_core::RhiError::InvalidDescriptor { .. }
+        ));
+    }
+
+    #[test]
+    fn fallback_pipeline_layouts_preserve_initialized_set_order() {
+        let layouts =
+            fallback_pipeline_set_layouts(Some(layout(1)), Some(layout(2)), Some(layout(3)))
+                .expect("contiguous layouts should be accepted");
+        assert_eq!(layouts, vec![layout(1), layout(2), layout(3)]);
+        assert!(layouts
+            .iter()
+            .all(|layout| *layout != vk::DescriptorSetLayout::null()));
+    }
+
+    #[test]
+    fn explicit_pipeline_layouts_reject_set_index_gaps() {
+        let layouts = [BindGroupLayoutDescriptor {
+            set_index: 1,
+            bindings: Vec::new(),
+        }];
+        let err = validate_contiguous_bind_group_layouts(&layouts)
+            .expect_err("set 1 without set 0 must be rejected");
+        assert!(matches!(
+            err,
+            render_core::RhiError::InvalidDescriptor { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_pipeline_layouts_are_ordered_by_set_index() {
+        let layouts = [
+            BindGroupLayoutDescriptor {
+                set_index: 1,
+                bindings: Vec::new(),
+            },
+            BindGroupLayoutDescriptor {
+                set_index: 0,
+                bindings: Vec::new(),
+            },
+        ];
+        let ordered = ordered_bind_group_layouts(&layouts)
+            .expect("contiguous layouts should be sorted by set index");
+        assert_eq!(ordered[0].set_index, 0);
+        assert_eq!(ordered[1].set_index, 1);
+    }
+
+    #[test]
+    fn bgra_present_targets_use_the_actual_swapchain_format() {
+        assert_eq!(
+            color_attachment_format(
+                Some(&TextureFormat::Bgra8Unorm),
+                Some(vk::Format::B8G8R8A8_SRGB),
+            ),
+            vk::Format::B8G8R8A8_SRGB
+        );
+    }
+
+    #[test]
+    fn buffer_write_range_accepts_exact_end_and_empty_end_write() {
+        assert_eq!(checked_buffer_write_range(16, 4, 12).unwrap(), 4..16);
+        assert_eq!(checked_buffer_write_range(16, 16, 0).unwrap(), 16..16);
+    }
+
+    #[test]
+    fn buffer_write_range_rejects_out_of_bounds_without_truncation() {
+        let error = checked_buffer_write_range(16, 15, 2).unwrap_err();
+        assert!(matches!(
+            error,
+            render_core::RhiError::InvalidDescriptor { .. }
+        ));
+        assert!(checked_buffer_write_range(16, 17, 0).is_err());
+        assert!(checked_buffer_write_range(u64::MAX, u64::MAX, 1).is_err());
     }
 }

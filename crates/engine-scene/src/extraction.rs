@@ -1,8 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use engine_renderer::{
-    AxisAlignedBox, ClearFlags, LightItem, LightKind, Rect, RenderFrameInput, RenderView,
-    RenderableItem, ShadowMode, ViewCompose, IDENTITY_MAT4,
+    AxisAlignedBox, ClearFlags, ExtractionStats, LightItem, LightKind, Rect, RenderFrameInput,
+    RenderView, RenderableItem, ShadowMode, ViewCompose, IDENTITY_MAT4,
 };
 use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, PersistentId};
 
@@ -105,6 +106,12 @@ pub fn extract_renderer_input(
 
     // Sort drawables by (material, mesh) for efficient batching.
     input.drawables.sort_by_key(|d| d.sort_key);
+    input.extraction_stats = Some(ExtractionStats {
+        visible_drawables: input.drawables.len() as u32,
+        culled_drawables: 0,
+        visible_lights: input.lights.len() as u32,
+        culled_lights: 0,
+    });
 
     Ok(input)
 }
@@ -126,6 +133,11 @@ pub fn extract_renderer_input_from_world(
     let mut input = RenderFrameInput::empty(frame_index);
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
+    // Resolve every Transform once up front. Hierarchy corruption is fatal:
+    // rendering a partially-local, partially-world-space frame is less safe
+    // than rejecting the frame with a structured diagnostic.
+    let world_matrices = resolve_world_transforms(world)?;
+
     // ── Camera pass: build RenderViews ──────────────────────────────────
 
     // Collect all cameras with their transforms, sorted by priority/stack_order.
@@ -133,7 +145,7 @@ pub fn extract_renderer_input_from_world(
         i32,
         Option<PersistentId>,
         components::Camera,
-        components::Transform,
+        glam::Mat4,
         crate::Entity,
     );
     let mut cameras: Vec<CameraEntry> = Vec::new();
@@ -141,10 +153,10 @@ pub fn extract_renderer_input_from_world(
     for (entity, camera_ref) in world.query::<components::Camera>() {
         let camera = camera_ref.clone();
         let pid = world.persistent_id(entity).map(|s| s.to_string());
-        let transform = world
-            .get::<components::Transform>(entity)
-            .cloned()
-            .unwrap_or_default();
+        let world_matrix = world_matrices
+            .get(&entity)
+            .copied()
+            .unwrap_or(glam::Mat4::IDENTITY);
         let priority = camera.priority;
 
         // Validate camera near/far.
@@ -182,7 +194,43 @@ pub fn extract_renderer_input_from_world(
             );
         }
 
-        cameras.push((priority, pid, camera, transform, entity));
+        let determinant = world_matrix.determinant();
+        if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
+            diagnostics.push(
+                Diagnostic::new(
+                    "SC0029",
+                    DiagnosticSeverity::Error,
+                    "engine-scene",
+                    format!(
+                        "Camera '{}' has a non-invertible world transform",
+                        pid.as_deref().unwrap_or("?")
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .path("components.engine.transform")
+                .entity(pid.clone()),
+            );
+        }
+
+        let projection = compute_projection_matrix(&camera);
+        if !projection.is_finite() {
+            diagnostics.push(
+                Diagnostic::new(
+                    "SC0030",
+                    DiagnosticSeverity::Error,
+                    "engine-scene",
+                    format!(
+                        "Camera '{}' produces a non-finite projection matrix",
+                        pid.as_deref().unwrap_or("?")
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .path("components.engine.camera")
+                .entity(pid.clone()),
+            );
+        }
+
+        cameras.push((priority, pid, camera, world_matrix, entity));
     }
 
     if cameras.is_empty() {
@@ -195,20 +243,29 @@ pub fn extract_renderer_input_from_world(
         .contract("ECSScene-v0", ECS_SCENE_CONTRACT)]);
     }
 
+    if diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.severity,
+            DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+        )
+    }) {
+        return Err(diagnostics);
+    }
+
     // Sort by priority (ascending = earlier render).
     cameras.sort_by_key(|(priority, _, _, _, _)| *priority);
 
     // Compute the primary frustum from the first camera for culling.
     let primary_frustum: Option<[glam::Vec4; 6]> =
-        cameras.first().map(|(_, _, camera, transform, _)| {
-            let view = compute_view_matrix(transform);
+        cameras.first().map(|(_, _, camera, world_matrix, _)| {
+            let view = compute_view_matrix(*world_matrix);
             let proj = compute_projection_matrix(camera);
             let view_proj = proj * view;
             extract_frustum_planes(&view_proj)
         });
 
-    for (view_idx, (priority, pid, camera, transform, _entity)) in cameras.iter().enumerate() {
-        let view = compute_view_matrix(transform);
+    for (view_idx, (priority, pid, camera, world_matrix, _entity)) in cameras.iter().enumerate() {
+        let view = compute_view_matrix(*world_matrix);
         let proj = compute_projection_matrix(camera);
 
         let clear_color = camera.clear_color;
@@ -244,16 +301,6 @@ pub fn extract_renderer_input_from_world(
         });
     }
 
-    // Reject extraction if there are fatal diagnostics.
-    if diagnostics.iter().any(|d| {
-        matches!(
-            d.severity,
-            DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
-        )
-    }) {
-        return Err(diagnostics);
-    }
-
     // ── Renderable pass: build Drawables ────────────────────────────────
 
     let mut visible_drawables: u32 = 0;
@@ -270,20 +317,14 @@ pub fn extract_renderer_input_from_world(
         }
 
         let pid = world.persistent_id(entity).map(|s| s.to_string());
-        let transform = world
-            .get::<components::Transform>(entity)
-            .cloned()
-            .unwrap_or_default();
         let bounds = world.get::<components::Bounds>(entity);
 
-        // Compute world transform matrix.
-        let world_mat = compute_world_matrix(&transform);
-
-        // Compute AABB for frustum culling.
-        let (center, half_extents) = match bounds {
-            Some(b) => (b.center, b.half_extents),
-            None => ([0.0, 0.0, 0.0], [0.5, 0.5, 0.5]),
-        };
+        let world_matrix = world_matrices
+            .get(&entity)
+            .copied()
+            .unwrap_or(glam::Mat4::IDENTITY);
+        let world_mat = world_matrix.to_cols_array();
+        let (center, half_extents, world_bounds) = transform_bounds_to_world(bounds, world_matrix);
 
         // Perform frustum culling against the primary camera frustum.
         let is_visible = match &primary_frustum {
@@ -307,21 +348,7 @@ pub fn extract_renderer_input_from_world(
             mesh,
             material,
             world_transform: world_mat,
-            bounds: match bounds {
-                Some(b) => AxisAlignedBox {
-                    min: [
-                        b.center[0] - b.half_extents[0],
-                        b.center[1] - b.half_extents[1],
-                        b.center[2] - b.half_extents[2],
-                    ],
-                    max: [
-                        b.center[0] + b.half_extents[0],
-                        b.center[1] + b.half_extents[1],
-                        b.center[2] + b.half_extents[2],
-                    ],
-                },
-                None => AxisAlignedBox::UNIT,
-            },
+            bounds: world_bounds,
             render_layer: renderable.render_layer.clone(),
             cast_shadows: renderable.cast_shadows,
             sort_key: sk,
@@ -383,12 +410,15 @@ pub fn extract_renderer_input_from_world(
             continue;
         }
 
-        let transform = world.get::<components::Transform>(entity);
-        let position: [f32; 3] = if let Some(t) = transform {
-            t.translation.into()
-        } else {
-            [0.0, 0.0, 0.0]
-        };
+        let world_matrix = world_matrices
+            .get(&entity)
+            .copied()
+            .unwrap_or(glam::Mat4::IDENTITY);
+        let position = world_matrix.transform_point3(glam::Vec3::ZERO).to_array();
+        let direction = world_matrix
+            .transform_vector3(glam::Vec3::from(light.direction))
+            .normalize_or_zero()
+            .to_array();
 
         let spot_angles = light
             .spot_angles
@@ -401,7 +431,7 @@ pub fn extract_renderer_input_from_world(
             intensity: light.intensity,
             range: light.range,
             position,
-            direction: light.direction,
+            direction,
             spot_angles,
             shadow_mode: map_shadow_mode(light.shadow_mode),
         });
@@ -415,6 +445,12 @@ pub fn extract_renderer_input_from_world(
         culled_lights,
         visible_lights + culled_lights,
     ));
+    input.extraction_stats = Some(ExtractionStats {
+        visible_drawables,
+        culled_drawables,
+        visible_lights,
+        culled_lights,
+    });
 
     // Emit warnings as non-fatal diagnostics.
     if !diagnostics.is_empty() {
@@ -429,7 +465,8 @@ pub fn extract_renderer_input_from_world(
 // Frustum culling
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Extract the six frustum planes from a view-projection matrix.
+/// Extract the six frustum planes from a right-handed, zero-to-one-depth
+/// view-projection matrix.
 ///
 /// Returns planes as `(normal.x, normal.y, normal.z, d)` in the order:
 /// Left, Right, Bottom, Top, Near, Far. Each plane is normalized.
@@ -447,14 +484,14 @@ pub fn extract_frustum_planes(view_proj: &glam::Mat4) -> [glam::Vec4; 6] {
     let row2 = glam::Vec4::new(c0.z, c1.z, c2.z, c3.z);
     let row3 = glam::Vec4::new(c0.w, c1.w, c2.w, c3.w);
 
-    // For OpenGL clip space (NDC [-1, 1]): plane = row3 ± row_i
+    // X/Y use [-w, w]. Z uses [0, w], matching Vulkan and glam's RH helpers.
     let mut planes = [
         row3 + row0, // left:   -x - w >= 0  →  -(row0·p) - (row3·p) >= 0  →  (row3 + row0)·p >= 0
         row3 - row0, // right:   x - w <= 0  →   (row0·p) - (row3·p) <= 0  →  (row3 - row0)·p >= 0
         row3 + row1, // bottom: -y - w >= 0
         row3 - row1, // top:     y - w <= 0
-        row3 + row2, // near:   -z - w >= 0
-        row3 - row2, // far:     z - w <= 0
+        row2,        // near for zero-to-one clip depth: z >= 0
+        row3 - row2, // far: z <= w
     ];
 
     // Normalise each plane (normal = xyz, constant = w).
@@ -501,13 +538,199 @@ pub fn aabb_in_frustum(
 // Internal helpers
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Compute a 4×4 view matrix from a transform (inverse of world).
-fn compute_view_matrix(transform: &components::Transform) -> glam::Mat4 {
-    let t = glam::Mat4::from_translation(transform.translation);
-    let r = glam::Mat4::from_quat(transform.rotation);
-    let s = glam::Mat4::from_scale(transform.scale);
-    let world = t * r * s;
-    world.inverse()
+/// Resolve local TRS values into one cached world matrix per entity.
+fn resolve_world_transforms(
+    world: &World,
+) -> Result<HashMap<crate::Entity, glam::Mat4>, Vec<Diagnostic>> {
+    let entries: Vec<_> = world
+        .query_all::<components::Transform>()
+        .map(|(entity, transform)| (entity, transform.clone()))
+        .collect();
+    let transforms: HashMap<_, _> = entries.iter().cloned().collect();
+    let mut local_matrices = HashMap::with_capacity(entries.len());
+    let mut world_matrices = HashMap::with_capacity(entries.len());
+    let mut invalid = HashSet::new();
+    let mut diagnostics = Vec::new();
+
+    for (entity, transform) in &entries {
+        let local = glam::Mat4::from_scale_rotation_translation(
+            transform.scale,
+            transform.rotation,
+            transform.translation,
+        );
+        if local.is_finite() {
+            local_matrices.insert(*entity, local);
+        } else {
+            invalid.insert(*entity);
+            diagnostics.push(non_finite_transform_diagnostic(
+                world,
+                *entity,
+                "local TRS contains non-finite values",
+            ));
+        }
+    }
+
+    for (start, _) in &entries {
+        if world_matrices.contains_key(start) || invalid.contains(start) {
+            continue;
+        }
+
+        let mut chain = Vec::new();
+        let mut positions = HashMap::new();
+        let mut cursor = *start;
+
+        let base_world = loop {
+            if let Some(cached) = world_matrices.get(&cursor) {
+                break Some(*cached);
+            }
+            if invalid.contains(&cursor) {
+                break None;
+            }
+            if let Some(&cycle_start) = positions.get(&cursor) {
+                let cycle = &chain[cycle_start..];
+                diagnostics.push(transform_cycle_diagnostic(world, cycle));
+                invalid.extend(chain.iter().copied());
+                break None;
+            }
+
+            // An alive parent without a Transform is a valid identity root.
+            let Some(transform) = transforms.get(&cursor) else {
+                world_matrices.insert(cursor, glam::Mat4::IDENTITY);
+                break Some(glam::Mat4::IDENTITY);
+            };
+
+            positions.insert(cursor, chain.len());
+            chain.push(cursor);
+
+            let Some(parent) = transform.parent else {
+                break Some(glam::Mat4::IDENTITY);
+            };
+            if !world.is_alive(parent) {
+                diagnostics.push(invalid_parent_diagnostic(world, cursor, parent));
+                invalid.extend(chain.iter().copied());
+                break None;
+            }
+            cursor = parent;
+        };
+
+        let Some(mut accumulated) = base_world else {
+            invalid.extend(chain.iter().copied());
+            continue;
+        };
+
+        let root_to_leaf: Vec<_> = chain.into_iter().rev().collect();
+        for (index, entity) in root_to_leaf.iter().copied().enumerate() {
+            let Some(local) = local_matrices.get(&entity) else {
+                invalid.extend(root_to_leaf[index..].iter().copied());
+                break;
+            };
+            accumulated *= *local;
+            if !accumulated.is_finite() {
+                diagnostics.push(non_finite_transform_diagnostic(
+                    world,
+                    entity,
+                    "resolved world matrix is non-finite",
+                ));
+                invalid.extend(root_to_leaf[index..].iter().copied());
+                break;
+            }
+            world_matrices.insert(entity, accumulated);
+        }
+    }
+
+    if diagnostics.is_empty() {
+        Ok(world_matrices)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+fn invalid_parent_diagnostic(
+    world: &World,
+    child: crate::Entity,
+    parent: crate::Entity,
+) -> Diagnostic {
+    let child_pid = world.persistent_id(child).map(str::to_owned);
+    let mut diagnostic = Diagnostic::new(
+        "SC0026",
+        DiagnosticSeverity::Error,
+        "engine-scene",
+        format!(
+            "Transform parent {}:{} for entity {}:{} is stale or belongs to another World/domain",
+            parent.index(),
+            parent.generation(),
+            child.index(),
+            child.generation()
+        ),
+    )
+    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+    .path("components.engine.transform.parent")
+    .entity(child_pid);
+    diagnostic
+        .fields
+        .insert("reason".to_string(), "stale_or_foreign_domain".to_string());
+    diagnostic
+        .fields
+        .insert("parent_index".to_string(), parent.index().to_string());
+    diagnostic.fields.insert(
+        "parent_generation".to_string(),
+        parent.generation().to_string(),
+    );
+    diagnostic
+}
+
+fn transform_cycle_diagnostic(world: &World, cycle: &[crate::Entity]) -> Diagnostic {
+    let owner = cycle.first().copied();
+    let cycle_path = cycle
+        .iter()
+        .chain(cycle.first())
+        .map(|entity| format!("{}:{}", entity.index(), entity.generation()))
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    let owner_pid = owner.and_then(|entity| world.persistent_id(entity).map(str::to_owned));
+    let mut diagnostic = Diagnostic::new(
+        "SC0027",
+        DiagnosticSeverity::Error,
+        "engine-scene",
+        format!("Transform parent chain contains a cycle: {cycle_path}"),
+    )
+    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+    .path("components.engine.transform.parent")
+    .entity(owner_pid);
+    diagnostic
+        .fields
+        .insert("reason".to_string(), "parent_cycle".to_string());
+    diagnostic.fields.insert("cycle".to_string(), cycle_path);
+    diagnostic
+}
+
+fn non_finite_transform_diagnostic(
+    world: &World,
+    entity: crate::Entity,
+    reason: &str,
+) -> Diagnostic {
+    let pid = world.persistent_id(entity).map(str::to_owned);
+    let mut diagnostic = Diagnostic::new(
+        "SC0028",
+        DiagnosticSeverity::Error,
+        "engine-scene",
+        format!(
+            "Transform for entity {}:{} is invalid: {reason}",
+            entity.index(),
+            entity.generation()
+        ),
+    )
+    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+    .path("components.engine.transform")
+    .entity(pid);
+    diagnostic
+        .fields
+        .insert("reason".to_string(), reason.to_string());
+    diagnostic
+}
+
+fn compute_view_matrix(world_matrix: glam::Mat4) -> glam::Mat4 {
+    world_matrix.inverse()
 }
 
 /// Compute a 4×4 projection matrix from camera parameters.
@@ -517,19 +740,12 @@ fn compute_projection_matrix(camera: &components::Camera) -> glam::Mat4 {
 
     match camera.projection {
         components::CameraProjection::Perspective => {
-            glam::Mat4::perspective_rh_gl(camera.fov_y, ASPECT, camera.near, camera.far)
+            glam::Mat4::perspective_rh(camera.fov_y, ASPECT, camera.near, camera.far)
         }
         components::CameraProjection::Orthographic => {
             let half_w = camera.ortho_half_height * ASPECT;
             let half_h = camera.ortho_half_height;
-            glam::Mat4::orthographic_rh_gl(
-                -half_w,
-                half_w,
-                -half_h,
-                half_h,
-                camera.near,
-                camera.far,
-            )
+            glam::Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, camera.near, camera.far)
         }
     }
 }
@@ -542,12 +758,35 @@ fn batch_sort_key(material: &AssetId, mesh: &AssetId) -> u64 {
     hasher.finish()
 }
 
-/// Compute a world matrix from a transform component.
-fn compute_world_matrix(transform: &components::Transform) -> [f32; 16] {
-    let t = glam::Mat4::from_translation(transform.translation);
-    let r = glam::Mat4::from_quat(transform.rotation);
-    let s = glam::Mat4::from_scale(transform.scale);
-    (t * r * s).to_cols_array()
+/// Transform a local-space AABB into a conservative world-space AABB.
+fn transform_bounds_to_world(
+    bounds: Option<&components::Bounds>,
+    world_matrix: glam::Mat4,
+) -> ([f32; 3], [f32; 3], AxisAlignedBox) {
+    let (local_center, local_half_extents) = match bounds {
+        Some(bounds) => (
+            glam::Vec3::from(bounds.center),
+            glam::Vec3::from(bounds.half_extents).abs(),
+        ),
+        None => (glam::Vec3::ZERO, glam::Vec3::splat(0.5)),
+    };
+    let center = world_matrix.transform_point3(local_center);
+    let x_axis = world_matrix.x_axis.truncate().abs();
+    let y_axis = world_matrix.y_axis.truncate().abs();
+    let z_axis = world_matrix.z_axis.truncate().abs();
+    let half_extents = x_axis * local_half_extents.x
+        + y_axis * local_half_extents.y
+        + z_axis * local_half_extents.z;
+    let min = center - half_extents;
+    let max = center + half_extents;
+    (
+        center.to_array(),
+        half_extents.to_array(),
+        AxisAlignedBox {
+            min: min.to_array(),
+            max: max.to_array(),
+        },
+    )
 }
 
 /// Map the engine's camera `clear_flags` bitmask to the renderer's [`ClearFlags`].
@@ -590,6 +829,26 @@ mod tests {
     use crate::sample_scene;
     use crate::World;
 
+    fn assert_mat4_approx(actual: &[f32; 16], expected: glam::Mat4) {
+        for (index, (actual, expected)) in actual
+            .iter()
+            .zip(expected.to_cols_array().iter())
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 1.0e-5,
+                "matrix element {index} differs: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    fn add_default_camera(world: &mut World) -> crate::Entity {
+        let camera = world.create_entity();
+        world.add_component(camera, components::Camera::default());
+        world.add_component(camera, components::Transform::default());
+        camera
+    }
+
     // ── Frustum culling tests ───────────────────────────────────────────
 
     #[test]
@@ -612,8 +871,7 @@ mod tests {
     #[test]
     fn aabb_inside_default_frustum() {
         // A simple perspective frustum looking down -Z.
-        let proj =
-            glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
+        let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
         let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
@@ -623,8 +881,7 @@ mod tests {
 
     #[test]
     fn aabb_outside_frustum_culled() {
-        let proj =
-            glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
+        let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
         let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
@@ -638,8 +895,7 @@ mod tests {
 
     #[test]
     fn aabb_far_beyond_far_plane() {
-        let proj =
-            glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
+        let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
         let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
@@ -653,8 +909,7 @@ mod tests {
 
     #[test]
     fn aabb_partially_inside_is_visible() {
-        let proj =
-            glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
+        let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 16.0 / 9.0, 0.1, 100.0);
         let view = glam::Mat4::IDENTITY;
         let frustum = extract_frustum_planes(&(proj * view));
 
@@ -662,6 +917,61 @@ mod tests {
         assert!(aabb_in_frustum(
             [0.0, 0.0, -2.0],
             [10.0, 10.0, 10.0],
+            &frustum
+        ));
+    }
+
+    #[test]
+    fn zero_to_one_frustum_uses_exact_near_and_far_planes() {
+        let near = 1.0;
+        let far = 10.0;
+        let projection = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, near, far);
+        let frustum = extract_frustum_planes(&projection);
+
+        assert!(aabb_in_frustum(
+            [0.0, 0.0, -(near + 0.01)],
+            [0.0; 3],
+            &frustum
+        ));
+        assert!(!aabb_in_frustum(
+            [0.0, 0.0, -(near - 0.1)],
+            [0.0; 3],
+            &frustum
+        ));
+        assert!(aabb_in_frustum(
+            [0.0, 0.0, -(far - 0.01)],
+            [0.0; 3],
+            &frustum
+        ));
+        assert!(!aabb_in_frustum(
+            [0.0, 0.0, -(far + 0.1)],
+            [0.0; 3],
+            &frustum
+        ));
+
+        let near_clip = projection * glam::Vec4::new(0.0, 0.0, -near, 1.0);
+        let far_clip = projection * glam::Vec4::new(0.0, 0.0, -far, 1.0);
+        assert!((near_clip.z / near_clip.w).abs() <= 1.0e-6);
+        assert!((far_clip.z / far_clip.w - 1.0).abs() <= 1.0e-6);
+    }
+
+    #[test]
+    fn zero_to_one_orthographic_frustum_uses_exact_near_and_far_planes() {
+        let near = 2.0;
+        let far = 6.0;
+        let projection = glam::Mat4::orthographic_rh(-2.0, 2.0, -2.0, 2.0, near, far);
+        let frustum = extract_frustum_planes(&projection);
+
+        assert!(aabb_in_frustum([0.0, 0.0, -near], [0.0; 3], &frustum));
+        assert!(!aabb_in_frustum(
+            [0.0, 0.0, -(near - 0.1)],
+            [0.0; 3],
+            &frustum
+        ));
+        assert!(aabb_in_frustum([0.0, 0.0, -far], [0.0; 3], &frustum));
+        assert!(!aabb_in_frustum(
+            [0.0, 0.0, -(far + 0.1)],
+            [0.0; 3],
             &frustum
         ));
     }
@@ -718,6 +1028,16 @@ mod tests {
             scene_input.lights.len(),
             "light count mismatch"
         );
+        assert_eq!(
+            scene_input.extraction_stats,
+            Some(ExtractionStats {
+                visible_drawables: scene_input.drawables.len() as u32,
+                culled_drawables: 0,
+                visible_lights: scene_input.lights.len() as u32,
+                culled_lights: 0,
+            }),
+            "legacy extraction must publish structured totals"
+        );
 
         // Compare drawable mesh/material/render_layer.
         for (wd, sd) in world_input
@@ -762,7 +1082,7 @@ mod tests {
         world.add_component(
             e_front,
             components::Bounds {
-                center: [0.0, 0.0, -5.0],
+                center: [0.0, 0.0, 0.0],
                 half_extents: [0.5, 0.5, 0.5],
             },
         );
@@ -789,7 +1109,7 @@ mod tests {
         world.add_component(
             e_back,
             components::Bounds {
-                center: [0.0, 0.0, 10.0],
+                center: [0.0, 0.0, 0.0],
                 half_extents: [0.5, 0.5, 0.5],
             },
         );
@@ -801,6 +1121,15 @@ mod tests {
         // Only the front drawable should survive culling.
         assert_eq!(input.drawables.len(), 1, "expected 1 visible drawable");
         assert_eq!(input.drawables[0].mesh.id, "mesh-visible");
+        assert_eq!(
+            input.extraction_stats,
+            Some(ExtractionStats {
+                visible_drawables: 1,
+                culled_drawables: 1,
+                visible_lights: 0,
+                culled_lights: 0,
+            })
+        );
     }
 
     #[test]
@@ -829,5 +1158,269 @@ mod tests {
         assert_eq!(input.lights[0].color, [1.0, 0.5, 0.2]);
         assert_eq!(input.lights[0].intensity, 100.0);
         assert_eq!(input.lights[0].range, 20.0);
+    }
+
+    #[test]
+    fn drawable_uses_cached_multilevel_parent_world_transform() {
+        let mut world = World::new();
+        add_default_camera(&mut world);
+
+        let root = world.create_entity();
+        let root_transform = components::Transform {
+            translation: glam::Vec3::new(0.0, 0.0, -8.0),
+            rotation: glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            scale: glam::Vec3::splat(2.0),
+            parent: None,
+        };
+        world.add_component(root, root_transform.clone());
+
+        let middle = world.create_entity();
+        let middle_transform = components::Transform {
+            translation: glam::Vec3::X,
+            rotation: glam::Quat::from_rotation_y(0.25),
+            scale: glam::Vec3::new(0.5, 1.0, 0.5),
+            parent: Some(root),
+        };
+        world.add_component(middle, middle_transform.clone());
+
+        let drawable = world.create_entity();
+        let drawable_transform = components::Transform {
+            translation: glam::Vec3::Y,
+            rotation: glam::Quat::from_rotation_x(-0.4),
+            scale: glam::Vec3::new(1.0, 0.75, 1.25),
+            parent: Some(middle),
+        };
+        world.add_component(drawable, drawable_transform.clone());
+        world.add_component(
+            drawable,
+            components::Renderable {
+                mesh_asset: "hierarchy-mesh".into(),
+                material_asset: "hierarchy-material".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            drawable,
+            components::Bounds {
+                center: [0.0; 3],
+                half_extents: [0.1; 3],
+            },
+        );
+
+        let input = extract_renderer_input_from_world(&world, 3).expect("hierarchy extracts");
+        let item = input
+            .drawables
+            .iter()
+            .find(|item| item.mesh.id == "hierarchy-mesh")
+            .expect("drawable remains visible");
+        let expected = glam::Mat4::from_scale_rotation_translation(
+            root_transform.scale,
+            root_transform.rotation,
+            root_transform.translation,
+        ) * glam::Mat4::from_scale_rotation_translation(
+            middle_transform.scale,
+            middle_transform.rotation,
+            middle_transform.translation,
+        ) * glam::Mat4::from_scale_rotation_translation(
+            drawable_transform.scale,
+            drawable_transform.rotation,
+            drawable_transform.translation,
+        );
+        assert_mat4_approx(&item.world_transform, expected);
+        let expected_center = expected.transform_point3(glam::Vec3::ZERO);
+        let actual_center = glam::Vec3::from_array([
+            (item.bounds.min[0] + item.bounds.max[0]) * 0.5,
+            (item.bounds.min[1] + item.bounds.max[1]) * 0.5,
+            (item.bounds.min[2] + item.bounds.max[2]) * 0.5,
+        ]);
+        assert!(actual_center.abs_diff_eq(expected_center, 1.0e-5));
+    }
+
+    #[test]
+    fn parented_camera_view_is_inverse_of_resolved_world_transform() {
+        let mut world = World::new();
+        let parent = world.create_entity();
+        let parent_transform = components::Transform {
+            translation: glam::Vec3::new(1.0, 2.0, 3.0),
+            rotation: glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            scale: glam::Vec3::new(2.0, 1.0, 0.5),
+            parent: None,
+        };
+        world.add_component(parent, parent_transform.clone());
+
+        let camera = world.create_entity();
+        let camera_transform = components::Transform {
+            translation: glam::Vec3::new(0.0, 0.0, 2.0),
+            rotation: glam::Quat::from_rotation_x(0.2),
+            scale: glam::Vec3::ONE,
+            parent: Some(parent),
+        };
+        world.add_component(camera, camera_transform.clone());
+        world.add_component(camera, components::Camera::default());
+
+        let input =
+            extract_renderer_input_from_world(&world, 4).expect("camera hierarchy extracts");
+        let parent_world = glam::Mat4::from_scale_rotation_translation(
+            parent_transform.scale,
+            parent_transform.rotation,
+            parent_transform.translation,
+        );
+        let local_camera = glam::Mat4::from_scale_rotation_translation(
+            camera_transform.scale,
+            camera_transform.rotation,
+            camera_transform.translation,
+        );
+        assert_mat4_approx(
+            &input.views[0].view_matrix,
+            (parent_world * local_camera).inverse(),
+        );
+    }
+
+    #[test]
+    fn parented_light_uses_world_position_and_rotated_direction() {
+        let mut world = World::new();
+        add_default_camera(&mut world);
+
+        let parent = world.create_entity();
+        let parent_transform = components::Transform {
+            translation: glam::Vec3::new(1.0, 2.0, -5.0),
+            rotation: glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            scale: glam::Vec3::new(2.0, 3.0, 4.0),
+            parent: None,
+        };
+        world.add_component(parent, parent_transform.clone());
+
+        let light = world.create_entity();
+        let light_transform = components::Transform {
+            translation: glam::Vec3::X,
+            parent: Some(parent),
+            ..Default::default()
+        };
+        world.add_component(light, light_transform.clone());
+        world.add_component(
+            light,
+            components::Light {
+                kind: components::LightKind::Directional,
+                color: [1.0; 3],
+                intensity: 1.0,
+                range: 10.0,
+                spot_angles: None,
+                shadow_mode: 0,
+                direction: [1.0, 0.0, 0.0],
+            },
+        );
+
+        let input = extract_renderer_input_from_world(&world, 5).expect("light hierarchy extracts");
+        let parent_world = glam::Mat4::from_scale_rotation_translation(
+            parent_transform.scale,
+            parent_transform.rotation,
+            parent_transform.translation,
+        );
+        let local_light = glam::Mat4::from_scale_rotation_translation(
+            light_transform.scale,
+            light_transform.rotation,
+            light_transform.translation,
+        );
+        let light_world = parent_world * local_light;
+        let expected_position = light_world.transform_point3(glam::Vec3::ZERO);
+        let expected_direction = light_world.transform_vector3(glam::Vec3::X).normalize();
+        assert!(glam::Vec3::from(input.lights[0].position).abs_diff_eq(expected_position, 1.0e-5));
+        assert!(glam::Vec3::from(input.lights[0].direction).abs_diff_eq(expected_direction, 1.0e-5));
+    }
+
+    #[test]
+    fn stale_parent_fails_closed_with_structured_diagnostic() {
+        let mut world = World::new();
+        add_default_camera(&mut world);
+        let stale_parent = world.create_entity();
+        assert!(world.destroy_entity(stale_parent));
+
+        let child = world.create_entity();
+        world.add_component(
+            child,
+            components::Transform {
+                parent: Some(stale_parent),
+                ..Default::default()
+            },
+        );
+
+        let diagnostics = extract_renderer_input_from_world(&world, 6)
+            .expect_err("stale parent must reject extraction");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "SC0026")
+            .expect("invalid-parent diagnostic");
+        assert_eq!(
+            diagnostic.fields.get("reason").map(String::as_str),
+            Some("stale_or_foreign_domain")
+        );
+        assert_eq!(
+            diagnostic.fields.get("parent_generation"),
+            Some(&stale_parent.generation().to_string())
+        );
+    }
+
+    #[test]
+    fn foreign_world_parent_fails_closed_with_structured_diagnostic() {
+        let mut foreign_world = World::new();
+        let foreign_parent = foreign_world.create_entity();
+
+        let mut world = World::new();
+        add_default_camera(&mut world);
+        let child = world.create_entity();
+        world.add_component(
+            child,
+            components::Transform {
+                parent: Some(foreign_parent),
+                ..Default::default()
+            },
+        );
+
+        let diagnostics = extract_renderer_input_from_world(&world, 7)
+            .expect_err("foreign parent must reject extraction");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "SC0026"
+                && diagnostic.fields.get("reason").map(String::as_str)
+                    == Some("stale_or_foreign_domain")
+        }));
+    }
+
+    #[test]
+    fn parent_cycle_fails_closed_without_recursing_forever() {
+        let mut world = World::new();
+        add_default_camera(&mut world);
+        let first = world.create_entity();
+        let second = world.create_entity();
+        world.add_component(
+            first,
+            components::Transform {
+                parent: Some(second),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            second,
+            components::Transform {
+                parent: Some(first),
+                ..Default::default()
+            },
+        );
+
+        let diagnostics = extract_renderer_input_from_world(&world, 8)
+            .expect_err("cyclic hierarchy must reject extraction");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "SC0027")
+            .expect("cycle diagnostic");
+        assert_eq!(
+            diagnostic.fields.get("reason").map(String::as_str),
+            Some("parent_cycle")
+        );
+        assert!(diagnostic.fields.get("cycle").is_some_and(|cycle| {
+            cycle.contains(&format!("{}:{}", first.index(), first.generation()))
+                && cycle.contains(&format!("{}:{}", second.index(), second.generation()))
+        }));
     }
 }

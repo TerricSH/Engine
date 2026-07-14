@@ -1,11 +1,10 @@
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use windows::{
-    Win32::Foundation::RECT,
-    Win32::Graphics::Direct3D::*,
-    Win32::Graphics::Direct3D12::*,
+    Win32::Foundation::RECT, Win32::Graphics::Direct3D::*, Win32::Graphics::Direct3D12::*,
     Win32::Graphics::Dxgi::Common::*,
 };
 
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use render_core::{
     BufferHandle, CommandEncoder, FramebufferHandle, IndexFormat, PipelineHandle,
     PipelineLayoutHandle, RenderPassHandle,
@@ -73,11 +72,7 @@ impl CommandEncoder for Dx12CommandEncoder {
             let device = &*self.device;
             let views: Vec<D3D12_VERTEX_BUFFER_VIEW> = buffers
                 .iter()
-                .zip(
-                    offsets
-                        .iter()
-                        .chain(std::iter::repeat(&0u64))
-                )
+                .zip(offsets.iter().chain(std::iter::repeat(&0u64)))
                 .filter_map(|(bh, &off)| {
                     let (_, table_idx) = Dx12Device::decode_handle(bh.index);
                     device.buffers.get(table_idx).map(|inner| {

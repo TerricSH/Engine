@@ -4,6 +4,9 @@ use engine_serialize::HashDigest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::error::UpdateError;
+use crate::path_safety::safe_join;
+
 // ---------------------------------------------------------------------------
 // PackageState
 // ---------------------------------------------------------------------------
@@ -107,8 +110,8 @@ impl Package {
     }
 
     /// Compute the staged payload path for a given manifest payload entry.
-    pub fn payload_path(&self, relative: &str) -> PathBuf {
-        self.staging_dir().join(relative)
+    pub fn payload_path(&self, relative: &str) -> Result<PathBuf, UpdateError> {
+        safe_join(&self.staging_dir(), relative, "package payload path")
     }
 }
 

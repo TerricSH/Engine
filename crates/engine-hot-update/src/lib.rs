@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! # engine-hot-update
 //!
@@ -31,13 +31,16 @@
 //! Any phase can transition to `Rejected(reason)` on failure.
 
 pub mod apply;
+mod atomic_fs;
 pub mod cache;
 pub mod download;
 pub mod error;
 pub mod install;
 pub mod manager;
 pub mod package;
+mod path_safety;
 pub mod rollback;
+mod transaction;
 pub mod verify;
 
 // Re-export key public types.
@@ -49,4 +52,5 @@ pub use install::Installer;
 pub use manager::PackageManager;
 pub use package::{Package, PackageState};
 pub use rollback::RollbackManager;
-pub use verify::Verifier;
+pub use transaction::{ActivationPhase, ActivationRecord};
+pub use verify::{canonical_manifest_bytes, sign_manifest_ed25519, SignaturePolicy, Verifier};

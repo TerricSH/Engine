@@ -82,7 +82,7 @@ impl VulkanDevice {
 
         // ── Shadow mapping ──────────────────────────────────────────────
         self.ensure_shadow()?;
-        let light_mvp = self.compute_light_mvp();
+        let light_mvp = self.compute_legacy_fallback_light_mvp();
         // SAFETY: `light_mvp` is a stack-local array whose address is valid for
         // the full size of `[[f32; 4]; 4]`; the resulting byte slice has the same
         // lifetime as the borrow of `self`.

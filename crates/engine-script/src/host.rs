@@ -135,10 +135,12 @@ pub trait ScriptHost {
         assembly_data: &[u8],
     ) -> Result<ScriptHandle, ScriptError>;
 
-    /// Create a new instance of a previously loaded assembly.
+    /// Create a new instance of a fully-qualified class from a previously
+    /// loaded assembly.
     fn instantiate(
         &mut self,
         handle: &ScriptHandle,
+        class_name: &str,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError>;
 
     /// Unload an assembly and release its resources.
@@ -195,6 +197,7 @@ impl ScriptHost for NullScriptHost {
     fn instantiate(
         &mut self,
         _handle: &ScriptHandle,
+        _class_name: &str,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
         Err(ScriptError::UnsupportedFeature(
             "NullScriptHost does not support instantiating scripts".into(),
@@ -303,6 +306,7 @@ impl ScriptHost for MockHost {
     fn instantiate(
         &mut self,
         _handle: &ScriptHandle,
+        _class_name: &str,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
         Ok(Box::new(MockScriptInstance::new()))
     }
@@ -423,7 +427,7 @@ mod tests {
     fn null_script_host_instantiate_fails() {
         let mut host = NullScriptHost::new();
         let handle = ScriptHandle::new("test");
-        let result = host.instantiate(&handle);
+        let result = host.instantiate(&handle, "Test.Script");
         assert!(result.is_err());
     }
 
@@ -460,7 +464,7 @@ mod tests {
     fn mock_host_instantiate_succeeds() {
         let mut host = MockHost::new();
         let handle = host.load_assembly("asm", b"data").unwrap();
-        let instance = host.instantiate(&handle);
+        let instance = host.instantiate(&handle, "Test.Script");
         assert!(instance.is_ok());
     }
 

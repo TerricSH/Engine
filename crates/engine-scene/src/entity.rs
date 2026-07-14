@@ -27,14 +27,29 @@ impl Entity {
 /// to invalidate stale handles.
 pub struct EntityManager {
     generations: Vec<u32>,
+    alive: Vec<bool>,
     free_list: Vec<u32>,
+    alive_count: usize,
+    initial_generation: u32,
 }
 
 impl EntityManager {
     pub fn new() -> Self {
+        Self::with_initial_generation(0)
+    }
+
+    /// Create an empty manager whose newly allocated slots start at a
+    /// caller-provided generation.
+    ///
+    /// Worlds use distinct seeds so replacing or clearing a World does not
+    /// immediately make handles from the previous World valid again.
+    pub(crate) fn with_initial_generation(initial_generation: u32) -> Self {
         Self {
             generations: Vec::new(),
+            alive: Vec::new(),
             free_list: Vec::new(),
+            alive_count: 0,
+            initial_generation,
         }
     }
 
@@ -46,11 +61,15 @@ impl EntityManager {
     pub fn allocate(&mut self) -> Entity {
         if let Some(index) = self.free_list.pop() {
             let generation = self.generations[index as usize];
+            self.alive[index as usize] = true;
+            self.alive_count += 1;
             Entity::new(index, generation)
         } else {
             let index = self.generations.len() as u32;
-            self.generations.push(0);
-            Entity::new(index, 0)
+            self.generations.push(self.initial_generation);
+            self.alive.push(true);
+            self.alive_count += 1;
+            Entity::new(index, self.initial_generation)
         }
     }
 
@@ -63,20 +82,37 @@ impl EntityManager {
             return false;
         }
         let idx = entity.index as usize;
-        self.generations[idx] += 1;
+        self.alive[idx] = false;
+        self.generations[idx] = self.generations[idx].wrapping_add(1);
         self.free_list.push(entity.index);
+        self.alive_count -= 1;
         true
     }
 
     /// Returns `true` if the entity handle is still live.
     pub fn is_alive(&self, entity: Entity) -> bool {
         let idx = entity.index as usize;
-        idx < self.generations.len() && self.generations[idx] == entity.generation
+        idx < self.generations.len()
+            && self.alive[idx]
+            && self.generations[idx] == entity.generation
     }
 
     /// Number of live entities.
     pub fn alive_count(&self) -> usize {
-        self.generations.len() - self.free_list.len()
+        self.alive_count
+    }
+
+    /// Return the current live handle for `index`.
+    ///
+    /// This is useful for index-based world metadata tables: callers must not
+    /// guess generation zero because a recycled slot carries a newer
+    /// generation.
+    pub fn live_entity_at(&self, index: u32) -> Option<Entity> {
+        let idx = index as usize;
+        if idx >= self.generations.len() || !self.alive[idx] {
+            return None;
+        }
+        Some(Entity::new(index, self.generations[idx]))
     }
 
     /// Total capacity (including freed slots).
@@ -129,6 +165,21 @@ mod tests {
     }
 
     #[test]
+    fn freed_slot_is_not_alive_before_it_is_reallocated() {
+        let mut mgr = EntityManager::new();
+        let old = mgr.allocate();
+        assert!(mgr.free(old));
+
+        let guessed_next_generation = Entity::new(old.index(), old.generation() + 1);
+        assert!(!mgr.is_alive(guessed_next_generation));
+        assert!(!mgr.free(guessed_next_generation));
+
+        let recycled = mgr.allocate();
+        assert_eq!(recycled, guessed_next_generation);
+        assert!(mgr.is_alive(recycled));
+    }
+
+    #[test]
     fn entity_free_nonexistent_returns_false() {
         let mut mgr = EntityManager::new();
         // An entity with index 0, generation 0 before any allocation is invalid.
@@ -149,5 +200,19 @@ mod tests {
         assert!(mgr.capacity() >= 3);
         let _ = e1;
         let _ = e3;
+    }
+
+    #[test]
+    fn live_entity_at_returns_the_recycled_generation() {
+        let mut mgr = EntityManager::new();
+        let first = mgr.allocate();
+        assert_eq!(mgr.live_entity_at(first.index()), Some(first));
+
+        assert!(mgr.free(first));
+        assert_eq!(mgr.live_entity_at(first.index()), None);
+
+        let recycled = mgr.allocate();
+        assert_ne!(recycled.generation(), first.generation());
+        assert_eq!(mgr.live_entity_at(recycled.index()), Some(recycled));
     }
 }

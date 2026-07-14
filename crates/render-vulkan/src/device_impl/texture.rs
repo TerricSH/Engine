@@ -9,7 +9,9 @@ use ash::vk;
 
 use crate::error::VkResult;
 
-use super::VulkanDevice;
+use super::{reload::SampledTextureDescriptor, VulkanDevice};
+
+pub(crate) const FALLBACK_MATERIAL_TEXTURE_ID: &str = "__engine_fallback_white";
 
 impl VulkanDevice {
     // ------------------------------------------------------------------
@@ -19,6 +21,22 @@ impl VulkanDevice {
     // ------------------------------------------------------------------
     // Descriptor binding
     // ------------------------------------------------------------------
+
+    /// Ensure every material can bind a valid texture descriptor even when
+    /// the source material has no base-color texture.
+    pub(crate) fn create_fallback_material_texture(&mut self) -> VkResult<()> {
+        if self.textures.contains_key(FALLBACK_MATERIAL_TEXTURE_ID) {
+            return Ok(());
+        }
+
+        let texture = self.create_sampled_texture_resource(
+            SampledTextureDescriptor::rgba8_unorm(1, 1, 1, &[255; 4]),
+        )?;
+
+        self.textures
+            .insert(FALLBACK_MATERIAL_TEXTURE_ID.to_owned(), texture);
+        Ok(())
+    }
 
     /// Write the COMBINED_IMAGE_SAMPLER descriptor for `asset_id` into
     /// the given `desc_set` at binding=1 (set=2 — binding=0 is the MaterialUBO).
@@ -58,7 +76,7 @@ impl VulkanDevice {
     // ------------------------------------------------------------------
 
     /// Destroy a single `GpuTexture` (image, view, allocation, sampler).
-    fn destroy_gpu_texture(&self, tex: super::GpuTexture) {
+    pub(crate) fn destroy_gpu_texture(&self, tex: super::GpuTexture) {
         let d = &self.logical_device.device;
         // SAFETY: all handles were created by this device and are still alive.
         unsafe {
@@ -66,9 +84,16 @@ impl VulkanDevice {
             d.destroy_image_view(tex.view, None);
             d.destroy_image(tex.image, None);
         }
-        if let Ok(mut guard) = self.logical_device.allocator().lock() {
-            let mut a = tex.allocation;
-            guard.free(&mut a);
+        let mut allocation = tex.allocation;
+        match self.logical_device.allocator().lock() {
+            Ok(mut guard) => guard.free(&mut allocation),
+            Err(poisoned) => {
+                tracing::error!(
+                    target: "vulkan::resources",
+                    "allocator mutex was poisoned while destroying a sampled texture"
+                );
+                poisoned.into_inner().free(&mut allocation);
+            }
         }
     }
 

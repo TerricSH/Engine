@@ -4,16 +4,19 @@
 //! All D3D12-specific code is gated behind `#[cfg(target_os = "windows")]`
 //! and the `backend-dx12` feature flag.
 
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use std::collections::HashMap;
 
+use render_core::{AdapterInfo, Device};
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use render_core::{
-    AdapterInfo, BackendCapabilities, BackendKind, BufferDescriptor, BufferHandle, BufferUsage,
-    CommandEncoder, Device, DeviceDescriptor, FramebufferDescriptor, FramebufferHandle,
-    MemoryHint, PipelineDescriptor, PipelineHandle, PipelineLayoutDescriptor,
-    PipelineLayoutHandle, RenderPassDescriptor, RenderPassHandle, RendererStatistics,
-    ResourceLimits, RhiError, ShaderFormat, ShaderModuleDescriptor, ShaderModuleHandle,
-    SurfaceDescriptor, SurfaceHandle, SwapchainDescriptor, SwapchainHandle, TextureDescriptor,
-    TextureFormat, TextureHandle, TextureUsage,
+    BackendCapabilities, BackendKind, BufferDescriptor, BufferHandle, BufferUsage, CommandEncoder,
+    DeviceDescriptor, FramebufferDescriptor, FramebufferHandle, MemoryHint, PipelineDescriptor,
+    PipelineHandle, PipelineLayoutDescriptor, PipelineLayoutHandle, RenderPassDescriptor,
+    RenderPassHandle, RendererStatistics, ResourceLimits, RhiError, ShaderFormat,
+    ShaderModuleDescriptor, ShaderModuleHandle, SurfaceDescriptor, SurfaceHandle,
+    SwapchainDescriptor, SwapchainHandle, TextureDescriptor, TextureFormat, TextureHandle,
+    TextureUsage,
 };
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
@@ -27,13 +30,18 @@ use windows::{
     Win32::System::Threading::{CreateEventA, WaitForSingleObject},
 };
 
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use crate::encoder::Dx12CommandEncoder;
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use crate::handle::HandleTable;
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use crate::pipeline::{Dx12PipelineInner, Dx12PipelineLayoutInner};
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use crate::resources::{
     Dx12BufferInner, Dx12FramebufferInner, Dx12RenderPassInner, Dx12ShaderModuleInner,
     Dx12TextureInner,
 };
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use crate::swapchain::{Dx12SurfaceInner, Dx12SwapchainInner};
 
 // ============================================================================
@@ -110,10 +118,9 @@ impl Dx12Device {
             for i in 0.. {
                 match factory.EnumAdapters1(i) {
                     Ok(a) => {
-                        let desc = a.GetDesc1()
-                            .map_err(|e| RhiError::Backend {
-                                detail: format!("DX12: GetDesc1 failed: {e}"),
-                            })?;
+                        let desc = a.GetDesc1().map_err(|e| RhiError::Backend {
+                            detail: format!("DX12: GetDesc1 failed: {e}"),
+                        })?;
                         if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
                             continue;
                         }
@@ -128,24 +135,19 @@ impl Dx12Device {
                 detail: "DX12: no suitable hardware adapter found".to_string(),
             })?;
 
-            let desc = adapter
-                .GetDesc1()
-                .map_err(|e| RhiError::Backend {
-                    detail: format!("DX12: GetDesc1 failed: {e}"),
-                })?;
+            let desc = adapter.GetDesc1().map_err(|e| RhiError::Backend {
+                detail: format!("DX12: GetDesc1 failed: {e}"),
+            })?;
             let adapter_name = String::from_utf16_lossy(&desc.Description)
                 .trim_end_matches('\0')
                 .to_string();
 
             // Create D3D12 device
             let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(
-                &adapter,
-                D3D_FEATURE_LEVEL_11_0,
-                &mut device,
-            )
-            .map_err(|e| RhiError::Backend {
-                detail: format!("DX12: D3D12CreateDevice failed: {e}"),
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).map_err(|e| {
+                RhiError::Backend {
+                    detail: format!("DX12: D3D12CreateDevice failed: {e}"),
+                }
             })?;
             let d3d12_device = device.ok_or(RhiError::Backend {
                 detail: "DX12: D3D12CreateDevice returned null".to_string(),
@@ -158,11 +160,12 @@ impl Dx12Device {
                 Flags: D3D12_COMMAND_QUEUE_FLAGS(0),
                 NodeMask: 0,
             };
-            let queue: ID3D12CommandQueue = d3d12_device
-                .CreateCommandQueue(&queue_desc)
-                .map_err(|e| RhiError::Backend {
-                    detail: format!("DX12: CreateCommandQueue failed: {e}"),
-                })?;
+            let queue: ID3D12CommandQueue =
+                d3d12_device
+                    .CreateCommandQueue(&queue_desc)
+                    .map_err(|e| RhiError::Backend {
+                        detail: format!("DX12: CreateCommandQueue failed: {e}"),
+                    })?;
 
             // Create command allocators and lists per frame in flight
             let mut allocators = Vec::new();
@@ -174,31 +177,25 @@ impl Dx12Device {
                         detail: format!("DX12: CreateCommandAllocator failed: {e}"),
                     })?;
                 let cmd_list: ID3D12GraphicsCommandList = d3d12_device
-                    .CreateCommandList(
-                        0,
-                        D3D12_COMMAND_LIST_TYPE_DIRECT,
-                        &alloc,
-                        None,
-                    )
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
                     .map_err(|e| RhiError::Backend {
                         detail: format!("DX12: CreateCommandList failed: {e}"),
                     })?;
                 // Close initially — will be reset in begin_frame
-                cmd_list
-                    .Close()
-                    .map_err(|e| RhiError::Backend {
-                        detail: format!("DX12: Close(init) failed: {e}"),
-                    })?;
+                cmd_list.Close().map_err(|e| RhiError::Backend {
+                    detail: format!("DX12: Close(init) failed: {e}"),
+                })?;
                 allocators.push(alloc);
                 cmd_lists.push(cmd_list);
             }
 
             // Create fence
-            let fence: ID3D12Fence = d3d12_device
-                .CreateFence(0, D3D12_FENCE_FLAGS(0))
-                .map_err(|e| RhiError::Backend {
-                    detail: format!("DX12: CreateFence failed: {e}"),
-                })?;
+            let fence: ID3D12Fence =
+                d3d12_device
+                    .CreateFence(0, D3D12_FENCE_FLAGS(0))
+                    .map_err(|e| RhiError::Backend {
+                        detail: format!("DX12: CreateFence failed: {e}"),
+                    })?;
             let fence_event: HANDLE =
                 CreateEventA(None, BOOL(0), BOOL(0), None).map_err(|e| RhiError::Backend {
                     detail: format!("DX12: CreateEventA failed: {e}"),
@@ -288,9 +285,7 @@ impl Dx12Device {
                     Anonymous: D3D12_RESOURCE_BARRIER_0 {
                         Transition: std::mem::ManuallyDrop::new(
                             D3D12_RESOURCE_TRANSITION_BARRIER {
-                                pResource: std::mem::ManuallyDrop::new(Some(
-                                    resource.clone(),
-                                )),
+                                pResource: std::mem::ManuallyDrop::new(Some(resource.clone())),
                                 Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                 StateBefore: before,
                                 StateAfter: after,
@@ -330,9 +325,14 @@ impl Device for Dx12Device {
     }
 
     // --- Surface ---
-    fn create_surface(&mut self, descriptor: &SurfaceDescriptor) -> Result<SurfaceHandle, RhiError> {
+    fn create_surface(
+        &mut self,
+        descriptor: &SurfaceDescriptor,
+    ) -> Result<SurfaceHandle, RhiError> {
         let hwnd = match &descriptor.window_handle {
-            render_core::SurfaceTarget::RawWindowHandleToken(token) => HWND(*token as *mut std::ffi::c_void),
+            render_core::SurfaceTarget::RawWindowHandleToken(token) => {
+                HWND(*token as *mut std::ffi::c_void)
+            }
             render_core::SurfaceTarget::Headless => HWND::default(),
         };
         let index = self.surfaces.insert(Dx12SurfaceInner {
@@ -384,13 +384,7 @@ impl Device for Dx12Device {
             };
 
             let swapchain: IDXGISwapChain1 = factory
-                .CreateSwapChainForHwnd(
-                    &self.queue,
-                    hwnd,
-                    &desc,
-                    None,
-                    None,
-                )
+                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
                 .map_err(|e| RhiError::Backend {
                     detail: format!("DX12: CreateSwapChainForHwnd failed: {e}"),
                 })?;
@@ -406,24 +400,22 @@ impl Device for Dx12Device {
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAGS(0),
                 NodeMask: 0,
             };
-            let rtv_heap = self
+            let rtv_heap =
+                self.device
+                    .CreateDescriptorHeap(&rtv_desc)
+                    .map_err(|e| RhiError::Backend {
+                        detail: format!("DX12: CreateDescriptorHeap(RTV) failed: {e}"),
+                    })?;
+            let rtv_size = self
                 .device
-                .CreateDescriptorHeap(&rtv_desc)
-                .map_err(|e| RhiError::Backend {
-                    detail: format!("DX12: CreateDescriptorHeap(RTV) failed: {e}"),
-                })?;
-            let rtv_size = self.device.GetDescriptorHandleIncrementSize(
-                D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-            );
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
             // Get back buffers
             let mut back_buffers = Vec::new();
             for i in 0..3 {
-                let bb: ID3D12Resource = swapchain
-                    .GetBuffer(i)
-                    .map_err(|e| RhiError::Backend {
-                        detail: format!("DX12: GetBuffer({i}) failed: {e}"),
-                    })?;
+                let bb: ID3D12Resource = swapchain.GetBuffer(i).map_err(|e| RhiError::Backend {
+                    detail: format!("DX12: GetBuffer({i}) failed: {e}"),
+                })?;
                 back_buffers.push(bb);
             }
 
@@ -457,17 +449,22 @@ impl Device for Dx12Device {
             sc.back_buffers.clear();
 
             sc.swapchain
-                .ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))
+                .ResizeBuffers(
+                    0,
+                    width,
+                    height,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )
                 .map_err(|e| RhiError::Backend {
                     detail: format!("DX12: ResizeBuffers failed: {e}"),
                 })?;
 
             for i in 0..3 {
-                let bb: ID3D12Resource = sc.swapchain.GetBuffer(i).map_err(|e| {
-                    RhiError::Backend {
+                let bb: ID3D12Resource =
+                    sc.swapchain.GetBuffer(i).map_err(|e| RhiError::Backend {
                         detail: format!("DX12: GetBuffer({i}) resize failed: {e}"),
-                    }
-                })?;
+                    })?;
                 sc.back_buffers.push(bb);
             }
             sc.width = width;
@@ -534,8 +531,7 @@ impl Device for Dx12Device {
             };
 
             let mut resource: Option<ID3D12Resource> = None;
-            self
-                .device
+            self.device
                 .CreateCommittedResource(
                     &heap_props,
                     D3D12_HEAP_FLAGS(0),
@@ -571,6 +567,20 @@ impl Device for Dx12Device {
         unsafe {
             let (_, idx) = Self::decode_handle(buffer.index);
             let buf = self.buffers.get(idx).ok_or(RhiError::InvalidHandle)?;
+            let write_end =
+                offset
+                    .checked_add(data.len() as u64)
+                    .ok_or_else(|| RhiError::Backend {
+                        detail: "DX12: buffer write range overflowed u64".to_string(),
+                    })?;
+            if write_end > buf.size {
+                return Err(RhiError::Backend {
+                    detail: format!(
+                        "DX12: buffer write range {offset}..{write_end} exceeds buffer size {}",
+                        buf.size
+                    ),
+                });
+            }
 
             let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
             buf.resource
@@ -639,8 +649,7 @@ impl Device for Dx12Device {
             };
 
             let mut resource: Option<ID3D12Resource> = None;
-            self
-                .device
+            self.device
                 .CreateCommittedResource(
                     &heap_props,
                     D3D12_HEAP_FLAGS(0),
@@ -790,12 +799,12 @@ impl Device for Dx12Device {
                 std::slice::from_raw_parts(ptr, len)
             };
 
-            let root_sig: ID3D12RootSignature = self
-                .device
-                .CreateRootSignature(0, buf)
-                .map_err(|e| RhiError::Backend {
-                    detail: format!("DX12: CreateRootSignature failed: {e}"),
-                })?;
+            let root_sig: ID3D12RootSignature =
+                self.device
+                    .CreateRootSignature(0, buf)
+                    .map_err(|e| RhiError::Backend {
+                        detail: format!("DX12: CreateRootSignature failed: {e}"),
+                    })?;
 
             let index = self.pipeline_layouts.insert(Dx12PipelineLayoutInner {
                 root_signature: root_sig,
@@ -839,8 +848,11 @@ impl Device for Dx12Device {
 
             // Input layout
             let _vertex_size_bytes = descriptor.vertex_layout.stride_bytes;
-            let input_elements: Vec<D3D12_INPUT_ELEMENT_DESC> =
-                descriptor.vertex_layout.attributes.iter().map(|attr| {
+            let input_elements: Vec<D3D12_INPUT_ELEMENT_DESC> = descriptor
+                .vertex_layout
+                .attributes
+                .iter()
+                .map(|attr| {
                     let fmt = Self::attribute_format_to_dxgi(&attr.format);
                     D3D12_INPUT_ELEMENT_DESC {
                         SemanticName: windows::core::PCSTR::from_raw(attr.semantic.as_ptr()),
@@ -851,7 +863,8 @@ impl Device for Dx12Device {
                         InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
                         InstanceDataStepRate: 0,
                     }
-                }).collect();
+                })
+                .collect();
 
             // Raster state
             let cull_mode = match descriptor.raster_state.cull_mode.as_deref() {
@@ -916,7 +929,10 @@ impl Device for Dx12Device {
                 .map_err(|e| RhiError::Backend {
                     detail: format!("DX12: default root sig serialize: {e}"),
                 })?;
-                let blob = blob.unwrap();
+                let blob = blob.ok_or_else(|| RhiError::Backend {
+                    detail: "DX12: root signature serialization succeeded without a blob"
+                        .to_string(),
+                })?;
                 let buf = std::slice::from_raw_parts(
                     blob.GetBufferPointer() as *const u8,
                     blob.GetBufferSize(),
@@ -1083,9 +1099,11 @@ impl Device for Dx12Device {
                 .ok_or(RhiError::InvalidHandle)?;
 
             let fi = self.frame_index;
-            self.frame_index = (self.frame_index + 1) % Self::FRAMES_IN_FLIGHT;
 
-            // Wait for previous frame
+            // Wait for the most recently submitted frame before reusing any
+            // allocator. `fence_value` tracks submissions only; merely
+            // beginning a frame must not create a fence value that can never
+            // be signalled if recording is later aborted.
             let prev_value = self.fence_value;
             if prev_value > 0 && self.fence.GetCompletedValue() < prev_value {
                 self.fence
@@ -1096,19 +1114,15 @@ impl Device for Dx12Device {
                 WaitForSingleObject(self.fence_event, u32::MAX);
             }
 
-            self.fence_value += 1;
-
             // Reset allocator and command list
-            self.allocators[fi]
-                .Reset()
-                .map_err(|e| RhiError::Backend {
-                    detail: format!("DX12: Reset allocator: {e}"),
-                })?;
-            self.cmd_lists[fi].Reset(&self.allocators[fi], None).map_err(|e| {
-                RhiError::Backend {
-                    detail: format!("DX12: Reset cmd list: {e}"),
-                }
+            self.allocators[fi].Reset().map_err(|e| RhiError::Backend {
+                detail: format!("DX12: Reset allocator: {e}"),
             })?;
+            self.cmd_lists[fi]
+                .Reset(&self.allocators[fi], None)
+                .map_err(|e| RhiError::Backend {
+                    detail: format!("DX12: Reset cmd list: {e}"),
+                })?;
 
             // Get current back buffer index
             let image_index = sc.swapchain.GetCurrentBackBufferIndex();
@@ -1133,10 +1147,15 @@ impl Device for Dx12Device {
             self.cmd_lists[fi].ClearRenderTargetView(rtv_handle, &clear_color, None);
 
             // Set the render target on the command list.
-            self.cmd_lists[fi]
-                .OMSetRenderTargets(1, Some(&rtv_handle as *const _ as *const _), false, None);
+            self.cmd_lists[fi].OMSetRenderTargets(
+                1,
+                Some(&rtv_handle as *const _ as *const _),
+                false,
+                None,
+            );
 
             let encoder = Dx12CommandEncoder::new(self.cmd_lists[fi].clone(), self as *const _);
+            self.frame_index = (fi + 1) % Self::FRAMES_IN_FLIGHT;
             Ok((image_index, Box::new(encoder)))
         }
     }
@@ -1166,31 +1185,36 @@ impl Device for Dx12Device {
             );
 
             // Close command list
-            self.cmd_lists[fi]
-                .Close()
-                .map_err(|e| RhiError::Backend {
-                    detail: format!("DX12: Close: {e}"),
-                })?;
+            self.cmd_lists[fi].Close().map_err(|e| RhiError::Backend {
+                detail: format!("DX12: Close: {e}"),
+            })?;
+
+            // Reserve the submission fence value before execution. Failing
+            // after ExecuteCommandLists would leave GPU work with no fence that
+            // the engine can safely wait on.
+            let submitted_fence_value =
+                self.fence_value
+                    .checked_add(1)
+                    .ok_or_else(|| RhiError::Backend {
+                        detail: "DX12: fence value overflow".to_string(),
+                    })?;
 
             // Execute
-            let cmd_lists: [Option<ID3D12CommandList>; 1] = [
-                Some(
-                    self.cmd_lists[fi]
-                        .clone()
-                        .cast()
-                        .map_err(|e| RhiError::Backend {
-                            detail: format!("DX12: cast to ID3D12CommandList: {e}"),
-                        })?,
-                ),
-            ];
+            let cmd_lists: [Option<ID3D12CommandList>; 1] =
+                [Some(self.cmd_lists[fi].clone().cast().map_err(|e| {
+                    RhiError::Backend {
+                        detail: format!("DX12: cast to ID3D12CommandList: {e}"),
+                    }
+                })?)];
             self.queue.ExecuteCommandLists(&cmd_lists);
 
-            // Signal fence
+            // Signal the reserved fence value after command-list execution.
             self.queue
-                .Signal(&self.fence, self.fence_value)
+                .Signal(&self.fence, submitted_fence_value)
                 .map_err(|e| RhiError::Backend {
                     detail: format!("DX12: Signal: {e}"),
                 })?;
+            self.fence_value = submitted_fence_value;
 
             // Present
             let sync_interval = 1u32; // vsync
@@ -1232,6 +1256,30 @@ impl Device for Dx12Device {
         Err(RhiError::UnsupportedFeature {
             feature: "DX12 framebuffer readback".to_string(),
         })
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+impl Dx12Device {
+    /// Close the command list for the most recently begun frame without
+    /// executing it or presenting its swapchain image.
+    ///
+    /// The recorded PRESENT -> RENDER_TARGET transition was never submitted,
+    /// so the real back buffer remains in PRESENT state. Closing the list is
+    /// required before its allocator/list can be reset by a later frame.
+    pub(crate) fn abort_frame(
+        &mut self,
+        _encoder: Box<dyn CommandEncoder>,
+    ) -> Result<(), RhiError> {
+        let frame = (self.frame_index + Self::FRAMES_IN_FLIGHT - 1) % Self::FRAMES_IN_FLIGHT;
+        unsafe {
+            self.cmd_lists[frame]
+                .Close()
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: Close aborted command list failed: {error}"),
+                })?;
+        }
+        Ok(())
     }
 }
 

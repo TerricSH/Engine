@@ -1,10 +1,29 @@
 use crate::{
     BodyType, Collider, ColliderDebugInfo, ColliderShape, CollisionEvent, CollisionEventKind,
-    Component, Entity, PhysicsCommand, PhysicsEvents, PhysicsMaterial, PhysicsWorld, RapierBackend,
-    RigidBody, Transform, TriggerEvent, TriggerEventKind,
+    Component, Entity, JointDescriptor, JointType, PhysicsCommand, PhysicsEvents, PhysicsMaterial,
+    PhysicsWorld, RapierBackend, RigidBody, Transform, TriggerEvent, TriggerEventKind,
 };
 use engine_renderer::DebugDrawProvider;
 use engine_scene::World;
+
+fn entity(index: u32) -> Entity {
+    Entity::new(index, 0)
+}
+
+fn fixed_joint(entity_a: Entity, entity_b: Entity) -> JointDescriptor {
+    JointDescriptor {
+        entity_a,
+        entity_b,
+        joint_type: JointType::Fixed,
+        anchor_a: [0.0; 3],
+        anchor_b: [0.0; 3],
+        axis: [1.0, 0.0, 0.0],
+        limits: None,
+        motor: None,
+        break_force: 0.0,
+        break_torque: 0.0,
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Component Tests
@@ -189,14 +208,14 @@ fn physics_world_gravity_moves_dynamic_body() {
 
     let transform = Transform::default();
     let rb = RigidBody::default(); // Dynamic
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     // Add a collider so the body has mass.
     world
         .backend
-        .create_collider(0, &Collider::default(), 0, None);
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
     world.backend.sync_query_pipeline();
 
-    let pos_before = world.backend.sync_body_transform(0).unwrap();
+    let pos_before = world.backend.sync_body_transform(entity(0)).unwrap();
     assert!((pos_before.0.y - 0.0).abs() < 1e-6);
 
     // Step multiple times for gravity to take effect.
@@ -204,7 +223,7 @@ fn physics_world_gravity_moves_dynamic_body() {
         world.backend.step();
     }
 
-    let pos_after = world.backend.sync_body_transform(0).unwrap();
+    let pos_after = world.backend.sync_body_transform(entity(0)).unwrap();
     assert!(
         pos_after.0.y < pos_before.0.y,
         "body should fall: before={:?} after={:?}",
@@ -222,17 +241,17 @@ fn static_body_does_not_fall() {
         body_type: BodyType::Static,
         ..RigidBody::default()
     };
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     world.backend.sync_query_pipeline();
 
-    let pos_before = world.backend.sync_body_transform(0).unwrap();
+    let pos_before = world.backend.sync_body_transform(entity(0)).unwrap();
 
     // Step multiple times.
     for _ in 0..10 {
         world.backend.step();
     }
 
-    let pos_after = world.backend.sync_body_transform(0).unwrap();
+    let pos_after = world.backend.sync_body_transform(entity(0)).unwrap();
     assert!(
         (pos_after.0.y - pos_before.0.y).abs() < 1e-6,
         "static body should not move: {:?}",
@@ -257,7 +276,7 @@ fn raycast_hits_entity() {
         body_type: BodyType::Static,
         ..RigidBody::default()
     };
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
 
     let collider = Collider {
         shape: ColliderShape::Cuboid {
@@ -267,7 +286,9 @@ fn raycast_hits_entity() {
         },
         ..Collider::default()
     };
-    world.backend.create_collider(0, &collider, 0, None);
+    world
+        .backend
+        .create_collider(entity(0), &collider, entity(0), None);
     world.backend.sync_query_pipeline();
 
     // Cast a ray from above, pointing down.
@@ -312,10 +333,10 @@ fn raycast_miss_beyond_max_distance() {
         body_type: BodyType::Static,
         ..RigidBody::default()
     };
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     world
         .backend
-        .create_collider(0, &Collider::default(), 0, None);
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
     world.backend.sync_query_pipeline();
 
     // Ray starts far away but max_distance is very short.
@@ -340,10 +361,10 @@ fn query_proximity_finds_overlapping_entities() {
         body_type: BodyType::Static,
         ..RigidBody::default()
     };
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     world
         .backend
-        .create_collider(0, &Collider::default(), 0, None);
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
     world.backend.sync_query_pipeline();
 
     // Query with a shape that overlaps the entity at origin.
@@ -371,10 +392,10 @@ fn query_proximity_no_overlap() {
         body_type: BodyType::Static,
         ..RigidBody::default()
     };
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     world
         .backend
-        .create_collider(0, &Collider::default(), 0, None);
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
     world.backend.sync_query_pipeline();
 
     let hits = world.query_proximity(&ColliderShape::Ball { radius: 1.0 }, glam::Vec3::ZERO);
@@ -400,9 +421,9 @@ fn collision_detected_by_proximity() {
         body_type: BodyType::Static,
         ..RigidBody::default()
     };
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     world.backend.create_collider(
-        0,
+        entity(0),
         &Collider {
             shape: ColliderShape::Cuboid {
                 hx: 10.0,
@@ -411,7 +432,7 @@ fn collision_detected_by_proximity() {
             },
             ..Collider::default()
         },
-        0,
+        entity(0),
         None,
     );
     world.backend.sync_query_pipeline();
@@ -437,10 +458,12 @@ fn collision_events_triggered() {
         ..Default::default()
     };
     let box_body = RigidBody::default();
-    world.backend.create_body(0, &box_body, &box_transform);
     world
         .backend
-        .create_collider(0, &Collider::default(), 0, None);
+        .create_body(entity(0), &box_body, &box_transform);
+    world
+        .backend
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
 
     // Create a static body also at origin (overlapping).
     let static_transform = Transform {
@@ -453,10 +476,10 @@ fn collision_events_triggered() {
     };
     world
         .backend
-        .create_body(1, &static_body, &static_transform);
+        .create_body(entity(1), &static_body, &static_transform);
     world
         .backend
-        .create_collider(1, &Collider::default(), 1, None);
+        .create_collider(entity(1), &Collider::default(), entity(1), None);
     world.backend.sync_query_pipeline();
 
     // Step to detect collision.
@@ -530,9 +553,9 @@ fn sensor_collider_generates_trigger_events() {
     // Sensor (trigger) collider on body 0.
     world
         .backend
-        .create_body(0, &RigidBody::default(), &Transform::default());
+        .create_body(entity(0), &RigidBody::default(), &Transform::default());
     world.backend.create_collider(
-        0,
+        entity(0),
         &Collider {
             shape: ColliderShape::Cuboid {
                 hx: 5.0,
@@ -542,13 +565,13 @@ fn sensor_collider_generates_trigger_events() {
             is_trigger: true,
             ..Collider::default()
         },
-        0,
+        entity(0),
         None,
     );
 
     // Regular collider on body 1, overlapping.
     world.backend.create_body(
-        1,
+        entity(1),
         &RigidBody {
             body_type: BodyType::Static,
             ..RigidBody::default()
@@ -556,12 +579,12 @@ fn sensor_collider_generates_trigger_events() {
         &Transform::default(),
     );
     world.backend.create_collider(
-        1,
+        entity(1),
         &Collider {
             shape: ColliderShape::Ball { radius: 1.0 },
             ..Collider::default()
         },
-        1,
+        entity(1),
         None,
     );
     world.backend.sync_query_pipeline();
@@ -596,9 +619,11 @@ fn sensor_collider_generates_trigger_events() {
     // (Removing the body would also remove its collider from collider_map,
     // preventing event resolution; teleporting keeps the entity alive.)
     // Teleport body 1 far away and update the query pipeline.
-    world
-        .backend
-        .set_body_transform(1, glam::Vec3::new(100.0, 0.0, 0.0), glam::Quat::IDENTITY);
+    world.backend.set_body_transform(
+        entity(1),
+        glam::Vec3::new(100.0, 0.0, 0.0),
+        glam::Quat::IDENTITY,
+    );
     world.backend.sync_query_pipeline();
 
     let step3 = world.backend.step();
@@ -641,13 +666,13 @@ fn apply_force_moves_body() {
 
     let transform = Transform::default();
     let rb = RigidBody::default(); // Dynamic
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     world
         .backend
-        .create_collider(0, &Collider::default(), 0, None);
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
     world.backend.sync_query_pipeline();
 
-    let pos_before = world.backend.sync_body_transform(0).unwrap();
+    let pos_before = world.backend.sync_body_transform(entity(0)).unwrap();
 
     // Apply an upward force via command queue.
     world.queue_command(PhysicsCommand::ApplyForce {
@@ -659,7 +684,7 @@ fn apply_force_moves_body() {
     let _events = world.backend.step();
     world.backend.sync_query_pipeline();
 
-    let pos_after = world.backend.sync_body_transform(0).unwrap();
+    let pos_after = world.backend.sync_body_transform(entity(0)).unwrap();
     // Note: commands are queued in the PhysicsWorld but step() is called
     // on the backend directly, so the command isn't processed.
     // Since the force was not applied, just check that gravity works.
@@ -677,25 +702,25 @@ fn apply_impulse_changes_velocity() {
 
     let transform = Transform::default();
     let rb = RigidBody::default(); // Dynamic
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     world
         .backend
-        .create_collider(0, &Collider::default(), 0, None);
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
     world.backend.sync_query_pipeline();
 
-    let pos_before = world.backend.sync_body_transform(0).unwrap();
+    let pos_before = world.backend.sync_body_transform(entity(0)).unwrap();
 
     // Apply a horizontal impulse directly to the backend.
     world
         .backend
-        .apply_impulse(0, glam::Vec3::new(100.0, 0.0, 0.0));
+        .apply_impulse(entity(0), glam::Vec3::new(100.0, 0.0, 0.0));
 
     // Step multiple times to integrate the impulse.
     for _ in 0..5 {
         world.backend.step();
     }
 
-    let pos_after = world.backend.sync_body_transform(0).unwrap();
+    let pos_after = world.backend.sync_body_transform(entity(0)).unwrap();
     assert!(
         pos_after.0.x > pos_before.0.x,
         "body should move in +X after impulse: before={} after={}",
@@ -710,7 +735,7 @@ fn set_body_position_command() {
 
     let transform = Transform::default();
     let rb = RigidBody::default(); // Dynamic
-    world.backend.create_body(0, &rb, &transform);
+    world.backend.create_body(entity(0), &rb, &transform);
     world.backend.sync_query_pipeline();
 
     // Queue a teleport command.
@@ -721,11 +746,13 @@ fn set_body_position_command() {
 
     // The command will be executed during the next step.
     // Instead of stepping, let's directly test via the backend.
-    world
-        .backend
-        .set_body_transform(0, glam::Vec3::new(10.0, 20.0, 30.0), glam::Quat::IDENTITY);
+    world.backend.set_body_transform(
+        entity(0),
+        glam::Vec3::new(10.0, 20.0, 30.0),
+        glam::Quat::IDENTITY,
+    );
 
-    let pos = world.backend.sync_body_transform(0).unwrap();
+    let pos = world.backend.sync_body_transform(entity(0)).unwrap();
     assert!((pos.0.x - 10.0).abs() < 1e-6, "x should be 10: {}", pos.0.x);
     assert!((pos.0.y - 20.0).abs() < 1e-6, "y should be 20: {}", pos.0.y);
     assert!((pos.0.z - 30.0).abs() < 1e-6, "z should be 30: {}", pos.0.z);
@@ -755,11 +782,11 @@ fn sync_from_ecs_creates_bodies() {
     world.sync_from_ecs(&ecs);
 
     // Verify body was created.
-    assert!(world.backend.has_body(entity.index()));
-    assert!(world.backend.has_collider(entity.index()));
+    assert!(world.backend.has_body(entity));
+    assert!(world.backend.has_collider(entity));
 
     // Verify position matches.
-    let (pos, _rot) = world.backend.sync_body_transform(entity.index()).unwrap();
+    let (pos, _rot) = world.backend.sync_body_transform(entity).unwrap();
     assert!((pos.x - 1.0).abs() < 1e-6);
     assert!((pos.y - 2.0).abs() < 1e-6);
     assert!((pos.z - 3.0).abs() < 1e-6);
@@ -805,7 +832,7 @@ fn sync_from_ecs_removes_stale_bodies() {
     ecs.add_component(entity, RigidBody::default());
 
     world.sync_from_ecs(&ecs);
-    assert!(world.backend.has_body(entity.index()));
+    assert!(world.backend.has_body(entity));
 
     // Remove the RigidBody component from the ECS.
     ecs.remove_component::<RigidBody>(entity);
@@ -814,7 +841,7 @@ fn sync_from_ecs_removes_stale_bodies() {
     world.sync_from_ecs(&ecs);
 
     // Body should have been removed.
-    assert!(!world.backend.has_body(entity.index()));
+    assert!(!world.backend.has_body(entity));
 }
 
 #[test]
@@ -836,8 +863,8 @@ fn sync_from_ecs_creates_collider_with_material() {
     );
 
     world.sync_from_ecs(&ecs);
-    assert!(world.backend.has_body(entity.index()));
-    assert!(world.backend.has_collider(entity.index()));
+    assert!(world.backend.has_body(entity));
+    assert!(world.backend.has_collider(entity));
 }
 
 #[test]
@@ -986,34 +1013,34 @@ fn backend_create_and_remove_body() {
 
     let transform = Transform::default();
     let rb = RigidBody::default();
-    backend.create_body(42, &rb, &transform);
-    assert!(backend.has_body(42));
+    backend.create_body(entity(42), &rb, &transform);
+    assert!(backend.has_body(entity(42)));
     assert_eq!(backend.body_map.len(), 1);
 
-    backend.remove_body(42);
-    assert!(!backend.has_body(42));
+    backend.remove_body(entity(42));
+    assert!(!backend.has_body(entity(42)));
     assert_eq!(backend.body_map.len(), 0);
 }
 
 #[test]
 fn backend_remove_nonexistent_body_no_panic() {
     let mut backend = RapierBackend::new(glam::Vec3::ZERO);
-    backend.remove_body(999); // should not panic
+    backend.remove_body(entity(999)); // should not panic
 }
 
 #[test]
 fn backend_remove_nonexistent_collider_no_panic() {
     let mut backend = RapierBackend::new(glam::Vec3::ZERO);
-    backend.remove_collider(999); // should not panic
+    backend.remove_collider(entity(999)); // should not panic
 }
 
 #[test]
 fn backend_create_collider_without_body_no_panic() {
     let mut backend = RapierBackend::new(glam::Vec3::ZERO);
     let collider = Collider::default();
-    backend.create_collider(0, &collider, 0, None);
+    backend.create_collider(entity(0), &collider, entity(0), None);
     // Should not have created since body doesn't exist.
-    assert!(!backend.has_collider(0));
+    assert!(!backend.has_collider(entity(0)));
 }
 
 #[test]
@@ -1021,8 +1048,8 @@ fn backend_create_duplicate_body_is_idempotent() {
     let mut backend = RapierBackend::new(glam::Vec3::ZERO);
     let transform = Transform::default();
     let rb = RigidBody::default();
-    backend.create_body(0, &rb, &transform);
-    let _count = backend.create_body(0, &rb, &transform);
+    backend.create_body(entity(0), &rb, &transform);
+    let _count = backend.create_body(entity(0), &rb, &transform);
     // Should not increase body count.
     assert_eq!(backend.body_map.len(), 1);
 }
@@ -1035,12 +1062,16 @@ fn backeund_set_body_transform_works() {
         body_type: BodyType::Static,
         ..RigidBody::default()
     };
-    backend.create_body(0, &rb, &transform);
+    backend.create_body(entity(0), &rb, &transform);
     backend.sync_query_pipeline();
 
-    backend.set_body_transform(0, glam::Vec3::new(5.0, 10.0, 15.0), glam::Quat::IDENTITY);
+    backend.set_body_transform(
+        entity(0),
+        glam::Vec3::new(5.0, 10.0, 15.0),
+        glam::Quat::IDENTITY,
+    );
 
-    let (pos, _rot) = backend.sync_body_transform(0).unwrap();
+    let (pos, _rot) = backend.sync_body_transform(entity(0)).unwrap();
     assert!((pos.x - 5.0).abs() < 1e-6);
     assert!((pos.y - 10.0).abs() < 1e-6);
     assert!((pos.z - 15.0).abs() < 1e-6);
@@ -1049,7 +1080,354 @@ fn backeund_set_body_transform_works() {
 #[test]
 fn backeund_sync_body_transform_returns_none_for_missing() {
     let backend = RapierBackend::new(glam::Vec3::ZERO);
-    assert!(backend.sync_body_transform(999).is_none());
+    assert!(backend.sync_body_transform(entity(999)).is_none());
+}
+
+#[test]
+fn recycled_index_replaces_body_and_all_queries_report_new_generation() {
+    let mut backend = RapierBackend::new(glam::Vec3::ZERO);
+    let old = Entity::new(7, 3);
+    let recycled = Entity::new(7, 4);
+    let rigid_body = RigidBody {
+        body_type: BodyType::Static,
+        ..RigidBody::default()
+    };
+    let collider = Collider::default();
+    let transform = Transform::default();
+
+    backend.create_body(old, &rigid_body, &transform);
+    backend.create_collider(old, &collider, old, None);
+    assert!(backend.has_body(old));
+    assert!(backend.has_collider(old));
+
+    // Creating a newer generation at the same index must eagerly remove all
+    // Rapier state and reverse mappings for the old generation.
+    backend.replace_body_for_current_entity(recycled, &rigid_body, &transform);
+    backend.replace_collider_for_current_entity(recycled, &collider, recycled, None);
+    backend.sync_query_pipeline();
+
+    assert!(!backend.has_body(old));
+    assert!(!backend.has_collider(old));
+    assert!(backend.has_body(recycled));
+    assert!(backend.has_collider(recycled));
+    assert_eq!(backend.body_map.len(), 1);
+    assert_eq!(backend.collider_map.len(), 1);
+
+    let ray_hit = backend
+        .raycast(glam::Vec3::new(0.0, 0.0, 5.0), glam::Vec3::NEG_Z, 10.0)
+        .expect("ray should hit recycled entity");
+    assert_eq!(ray_hit.entity, recycled);
+
+    let proximity = backend.query_proximity(&ColliderShape::Ball { radius: 1.0 }, glam::Vec3::ZERO);
+    assert!(proximity.contains(&recycled));
+    assert!(!proximity.contains(&old));
+
+    let mut batcher = crate::QueryBatcher::new();
+    batcher.push_raycast(crate::RaycastQuery {
+        origin: glam::Vec3::new(0.0, 0.0, 5.0),
+        direction: glam::Vec3::NEG_Z,
+        max_distance: 10.0,
+    });
+    batcher.push_overlap(crate::OverlapQuery {
+        shape: ColliderShape::Ball { radius: 1.0 },
+        position: glam::Vec3::ZERO,
+    });
+    batcher.push_sweep(crate::SweepQuery {
+        shape: ColliderShape::Ball { radius: 0.1 },
+        from: glam::Vec3::new(0.0, 0.0, 5.0),
+        to: glam::Vec3::new(0.0, 0.0, -5.0),
+    });
+
+    let results = backend.execute_batched_queries(&batcher);
+    assert!(results.hits.iter().all(|&hit| hit == recycled));
+    assert_eq!(results.raycast_details[0][0].entity, recycled);
+    assert_eq!(results.overlap_details[0][0].entity, recycled);
+    assert_eq!(results.sweep_details[0][0].entity, recycled);
+}
+
+#[test]
+fn public_backend_creation_rejects_delayed_conflicting_generations() {
+    let mut backend = RapierBackend::new(glam::Vec3::ZERO);
+    let current = Entity::new(7, 4);
+    let delayed_old = Entity::new(7, 3);
+    let rigid_body = RigidBody {
+        body_type: BodyType::Static,
+        ..RigidBody::default()
+    };
+    let collider = Collider::default();
+
+    backend.create_body(current, &rigid_body, &Transform::default());
+    backend.create_collider(current, &collider, current, None);
+
+    // The public low-level API cannot prove which generation is live, so a
+    // conflicting delayed call must leave the installed slot untouched.
+    backend.create_body(delayed_old, &rigid_body, &Transform::default());
+    backend.create_collider(delayed_old, &collider, delayed_old, None);
+
+    assert!(backend.has_body(current));
+    assert!(backend.has_collider(current));
+    assert!(!backend.has_body(delayed_old));
+    assert!(!backend.has_collider(delayed_old));
+    assert_eq!(backend.body_map.len(), 1);
+    assert_eq!(backend.collider_map.len(), 1);
+
+    // Do not rely on numeric generation ordering: this must also reject the
+    // ambiguous wrap boundary.
+    let wrapped_current = Entity::new(9, 0);
+    let pre_wrap_stale = Entity::new(9, u32::MAX);
+    backend.create_body(wrapped_current, &rigid_body, &Transform::default());
+    backend.create_body(pre_wrap_stale, &rigid_body, &Transform::default());
+    assert!(backend.has_body(wrapped_current));
+    assert!(!backend.has_body(pre_wrap_stale));
+}
+
+#[test]
+fn zero_substep_recycle_refreshes_query_pipeline() {
+    let mut physics = PhysicsWorld::new(glam::Vec3::ZERO);
+    let mut ecs = World::new();
+
+    let old = ecs.create_entity();
+    ecs.add_component(old, Transform::default());
+    ecs.add_component(
+        old,
+        RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+    );
+    ecs.add_component(old, Collider::default());
+    physics.step(0.0, &mut ecs);
+    assert_eq!(
+        physics
+            .raycast(glam::Vec3::new(0.0, 0.0, 5.0), glam::Vec3::NEG_Z, 10.0)
+            .unwrap()
+            .entity,
+        old
+    );
+
+    assert!(ecs.destroy_entity(old));
+    let recycled = ecs.create_entity();
+    assert_eq!(recycled.index(), old.index());
+    ecs.add_component(
+        recycled,
+        Transform {
+            translation: glam::Vec3::new(5.0, 0.0, 0.0),
+            ..Transform::default()
+        },
+    );
+    ecs.add_component(
+        recycled,
+        RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+    );
+    ecs.add_component(recycled, Collider::default());
+
+    // No fixed simulation substep runs, but queries must immediately see the
+    // replacement collider and its full current Entity handle.
+    physics.step(0.0, &mut ecs);
+    let hit = physics
+        .raycast(glam::Vec3::new(5.0, 0.0, 5.0), glam::Vec3::NEG_Z, 10.0)
+        .expect("recycled collider should be queryable without a physics substep");
+    assert_eq!(hit.entity, recycled);
+    assert_ne!(hit.entity, old);
+}
+
+#[test]
+fn recycled_index_rejects_stale_commands_and_syncs_only_current_generation() {
+    let mut physics = PhysicsWorld::new(glam::Vec3::ZERO);
+    let mut ecs = World::new();
+
+    let old = ecs.create_entity();
+    ecs.add_component(old, Transform::default());
+    ecs.add_component(old, RigidBody::default());
+    ecs.add_component(old, Collider::default());
+    physics.sync_from_ecs(&ecs);
+
+    physics.queue_command(PhysicsCommand::SetBodyPosition {
+        entity: old,
+        position: glam::Vec3::splat(100.0),
+    });
+
+    assert!(ecs.destroy_entity(old));
+    let recycled = ecs.create_entity();
+    assert_eq!(recycled.index(), old.index());
+    assert_ne!(recycled.generation(), old.generation());
+    ecs.add_component(
+        recycled,
+        Transform {
+            translation: glam::Vec3::new(2.0, 3.0, 4.0),
+            ..Transform::default()
+        },
+    );
+    ecs.add_component(recycled, RigidBody::default());
+    ecs.add_component(recycled, Collider::default());
+
+    // A zero-delta step still synchronises structures and drains commands.
+    physics.step(0.0, &mut ecs);
+
+    assert!(!physics.backend.has_body(old));
+    assert!(!physics.backend.has_collider(old));
+    assert!(physics.backend.has_body(recycled));
+    assert!(physics.backend.has_collider(recycled));
+    assert_eq!(physics.backend.body_map.len(), 1);
+    assert_eq!(physics.backend.collider_map.len(), 1);
+
+    let transform = ecs.get::<Transform>(recycled).unwrap();
+    assert_eq!(transform.translation, glam::Vec3::new(2.0, 3.0, 4.0));
+}
+
+#[test]
+fn joints_are_keyed_by_complete_entity_and_removed_on_recycle() {
+    let mut physics = PhysicsWorld::new(glam::Vec3::ZERO);
+    let old_a = Entity::new(4, 9);
+    let recycled_a = Entity::new(4, 10);
+    let entity_b = Entity::new(8, 2);
+    let body = RigidBody::default();
+
+    physics
+        .backend
+        .create_body(old_a, &body, &Transform::default());
+    physics
+        .backend
+        .create_body(entity_b, &body, &Transform::default());
+    assert!(physics.create_joint(fixed_joint(old_a, entity_b)).is_some());
+    assert_eq!(physics.joint_count(), 1);
+    assert!(physics.backend.joint_entity_map.contains_key(&old_a));
+    assert!(physics.backend.joint_entity_map.contains_key(&entity_b));
+
+    physics
+        .backend
+        .replace_body_for_current_entity(recycled_a, &body, &Transform::default());
+    assert_eq!(physics.joint_count(), 0);
+    assert!(!physics.backend.joint_entity_map.contains_key(&old_a));
+    assert!(physics.create_joint(fixed_joint(old_a, entity_b)).is_none());
+    assert!(physics
+        .create_joint(fixed_joint(recycled_a, entity_b))
+        .is_some());
+    assert!(physics.backend.joint_entity_map.contains_key(&recycled_a));
+}
+
+#[test]
+fn events_preserve_entity_generations() {
+    let mut backend = RapierBackend::new(glam::Vec3::ZERO);
+    let sensor = Entity::new(1, 11);
+    let other = Entity::new(2, 23);
+
+    backend.create_body(sensor, &RigidBody::default(), &Transform::default());
+    backend.create_collider(
+        sensor,
+        &Collider {
+            is_trigger: true,
+            ..Collider::default()
+        },
+        sensor,
+        None,
+    );
+    backend.create_body(
+        other,
+        &RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+        &Transform::default(),
+    );
+    backend.create_collider(other, &Collider::default(), other, None);
+
+    let entered = backend.step();
+    let entered = entered
+        .triggers
+        .iter()
+        .find(|event| event.kind == TriggerEventKind::Entered)
+        .expect("overlapping sensor should enter");
+    assert_eq!(
+        std::collections::HashSet::from([entered.entity_a, entered.entity_b]),
+        std::collections::HashSet::from([sensor, other])
+    );
+
+    let staying = backend.step();
+    let staying = staying
+        .triggers
+        .iter()
+        .find(|event| event.kind == TriggerEventKind::Stay)
+        .expect("overlapping sensor should stay");
+    assert_eq!(
+        std::collections::HashSet::from([staying.entity_a, staying.entity_b]),
+        std::collections::HashSet::from([sensor, other])
+    );
+
+    let recycled_sensor = Entity::new(sensor.index(), sensor.generation() + 1);
+    backend.replace_body_for_current_entity(
+        recycled_sensor,
+        &RigidBody::default(),
+        &Transform::default(),
+    );
+    backend.replace_collider_for_current_entity(
+        recycled_sensor,
+        &Collider {
+            is_trigger: true,
+            ..Collider::default()
+        },
+        recycled_sensor,
+        None,
+    );
+
+    let recycled_events = backend.step();
+    assert!(recycled_events
+        .triggers
+        .iter()
+        .all(|event| event.entity_a != sensor && event.entity_b != sensor));
+    let recycled_enter = recycled_events
+        .triggers
+        .iter()
+        .find(|event| event.kind == TriggerEventKind::Entered)
+        .expect("recycled sensor must start a fresh overlap");
+    assert_eq!(
+        std::collections::HashSet::from([recycled_enter.entity_a, recycled_enter.entity_b]),
+        std::collections::HashSet::from([recycled_sensor, other])
+    );
+}
+
+#[test]
+fn collision_events_preserve_entity_generations() {
+    let mut backend = RapierBackend::new(glam::Vec3::ZERO);
+    let dynamic = Entity::new(20, 5);
+    let fixed = Entity::new(21, 8);
+
+    backend.create_body(dynamic, &RigidBody::default(), &Transform::default());
+    backend.create_collider(dynamic, &Collider::default(), dynamic, None);
+    backend.create_body(
+        fixed,
+        &RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+        &Transform::default(),
+    );
+    backend.create_collider(fixed, &Collider::default(), fixed, None);
+
+    let events = backend.step();
+    let started = events
+        .collisions
+        .iter()
+        .find(|event| event.kind == CollisionEventKind::ContactStarted)
+        .expect("overlapping dynamic and fixed bodies should start contact");
+    assert_eq!(
+        std::collections::HashSet::from([started.entity_a, started.entity_b]),
+        std::collections::HashSet::from([dynamic, fixed])
+    );
+
+    let staying = backend.step();
+    let staying = staying
+        .collisions
+        .iter()
+        .find(|event| event.kind == CollisionEventKind::ContactStaying)
+        .expect("persistent contact should report staying");
+    assert_eq!(
+        std::collections::HashSet::from([staying.entity_a, staying.entity_b]),
+        std::collections::HashSet::from([dynamic, fixed])
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

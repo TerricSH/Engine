@@ -1,10 +1,7 @@
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-use windows::{
-    Win32::Foundation::HWND,
-    Win32::Graphics::Dxgi::*,
-    Win32::Graphics::Direct3D12::*,
-};
+use windows::{Win32::Foundation::HWND, Win32::Graphics::Direct3D12::*, Win32::Graphics::Dxgi::*};
 
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use render_core::TextureFormat;
 
 // ============================================================================

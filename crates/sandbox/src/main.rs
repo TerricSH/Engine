@@ -4,6 +4,226 @@ use engine_asset::ReloadCoordinator;
 use engine_core::{EngineConfig, EngineRuntime};
 
 mod diagnostics;
+#[cfg(feature = "backend-vulkan")]
+mod model_viewer;
+
+#[cfg(feature = "backend-vulkan")]
+fn hash_upload_parts(parts: &[&[u8]]) -> engine_renderer::HashDigest {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn mesh_upload_from_data(
+    mesh_id: impl Into<String>,
+    mesh: &engine_asset::mesh::MeshData,
+) -> engine_renderer::MeshUpload {
+    use engine_renderer::{AssetId, AxisAlignedBox, IndexFormat, MeshUpload, MeshVertexFormat};
+
+    let mesh_id = AssetId::new(mesh_id);
+    let (vertex_bytes, index_bytes, index_count, _) =
+        engine_asset::mesh::mesh_data_to_upload_bytes(mesh);
+    let content_hash = hash_upload_parts(&[&vertex_bytes, &index_bytes]);
+    MeshUpload {
+        mesh_id,
+        vertex_format: MeshVertexFormat::Pbr32,
+        vertex_count: mesh.positions.len() as u32,
+        vertex_bytes,
+        index_format: IndexFormat::U32,
+        index_count,
+        index_bytes,
+        bounds: AxisAlignedBox {
+            min: mesh.bounds.0.to_array(),
+            max: mesh.bounds.1.to_array(),
+        },
+        content_hash,
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn log_renderer_diagnostics(operation: &str, diagnostics: &[engine_renderer::Diagnostic]) {
+    for diagnostic in diagnostics {
+        tracing::error!(
+            operation,
+            code = diagnostic.code,
+            system = diagnostic.system,
+            message = diagnostic.message,
+            "renderer operation failed"
+        );
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn log_upload_receipt(operation: &str, receipt: &engine_renderer::UploadReceipt) {
+    tracing::info!(
+        operation,
+        revision = receipt.revision,
+        "renderer upload completed"
+    );
+    for warning in &receipt.warnings {
+        tracing::warn!(
+            operation,
+            code = warning.code,
+            system = warning.system,
+            message = warning.message,
+            "renderer upload warning"
+        );
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn parse_model_path(default_path: &str) -> Result<String, String> {
+    let mut args = std::env::args().skip(2);
+    let mut positional = None;
+    while let Some(argument) = args.next() {
+        if argument == "--model" {
+            let path = args
+                .next()
+                .ok_or_else(|| "--model requires a path".to_string())?;
+            if path.is_empty() || path.starts_with("--") {
+                return Err("--model requires a non-empty path".to_string());
+            }
+            return Ok(path);
+        }
+        if let Some(path) = argument.strip_prefix("--model=") {
+            if path.is_empty() {
+                return Err("--model requires a non-empty path".to_string());
+            }
+            return Ok(path.to_string());
+        }
+        if argument == "--frames" {
+            let _ = args.next();
+            continue;
+        }
+        if argument.starts_with("--frames=") {
+            continue;
+        }
+        if !argument.starts_with("--") && positional.is_none() {
+            positional = Some(argument);
+        }
+    }
+    Ok(positional.unwrap_or_else(|| default_path.to_string()))
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn gltf_sampler_descriptor(
+    sampler: engine_asset::gltf::GltfSampler,
+) -> engine_renderer::SamplerDescriptor {
+    use engine_renderer::{SamplerAddressMode, SamplerDescriptor, SamplerFilter};
+    use gltf::texture::{MagFilter, MinFilter, WrappingMode};
+
+    let mag_filter = match sampler.mag_filter {
+        Some(MagFilter::Nearest) => SamplerFilter::Nearest,
+        Some(MagFilter::Linear) | None => SamplerFilter::Linear,
+    };
+    let (min_filter, mip_filter) = match sampler.min_filter {
+        Some(MinFilter::Nearest) => (SamplerFilter::Nearest, SamplerFilter::Nearest),
+        Some(MinFilter::Linear) | None => (SamplerFilter::Linear, SamplerFilter::Linear),
+        Some(MinFilter::NearestMipmapNearest) => (SamplerFilter::Nearest, SamplerFilter::Nearest),
+        Some(MinFilter::LinearMipmapNearest) => (SamplerFilter::Linear, SamplerFilter::Nearest),
+        Some(MinFilter::NearestMipmapLinear) => (SamplerFilter::Nearest, SamplerFilter::Linear),
+        Some(MinFilter::LinearMipmapLinear) => (SamplerFilter::Linear, SamplerFilter::Linear),
+    };
+    let address = |mode| match mode {
+        WrappingMode::ClampToEdge => SamplerAddressMode::ClampToEdge,
+        WrappingMode::MirroredRepeat => SamplerAddressMode::MirroredRepeat,
+        WrappingMode::Repeat => SamplerAddressMode::Repeat,
+    };
+    SamplerDescriptor {
+        min_filter,
+        mag_filter,
+        mip_filter,
+        address_u: address(sampler.wrap_s),
+        address_v: address(sampler.wrap_t),
+        address_w: SamplerAddressMode::Repeat,
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn rgba8_mip_chain(
+    width: u32,
+    height: u32,
+    base: &[u8],
+    color_space: engine_renderer::ColorSpace,
+) -> Vec<engine_renderer::TextureMipLevel> {
+    use engine_renderer::{ColorSpace, TextureMipLevel};
+
+    fn srgb_to_linear(value: f32) -> f32 {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn linear_to_srgb(value: f32) -> f32 {
+        if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    let mut levels = vec![TextureMipLevel {
+        width,
+        height,
+        bytes: base.to_vec(),
+    }];
+    while levels
+        .last()
+        .is_some_and(|level| level.width > 1 || level.height > 1)
+    {
+        let source = levels.last().expect("mip chain is non-empty");
+        let next_width = (source.width / 2).max(1);
+        let next_height = (source.height / 2).max(1);
+        let mut bytes = Vec::with_capacity(next_width as usize * next_height as usize * 4);
+        for y in 0..next_height {
+            for x in 0..next_width {
+                let mut sum = [0.0f32; 4];
+                let mut samples = 0.0f32;
+                let source_y_begin = y * source.height / next_height;
+                let source_y_end = (y + 1) * source.height / next_height;
+                let source_x_begin = x * source.width / next_width;
+                let source_x_end = (x + 1) * source.width / next_width;
+                for source_y in source_y_begin..source_y_end {
+                    for source_x in source_x_begin..source_x_end {
+                        let offset = ((source_y * source.width + source_x) * 4) as usize;
+                        for (channel, sum_channel) in sum.iter_mut().enumerate() {
+                            let encoded = source.bytes[offset + channel] as f32 / 255.0;
+                            *sum_channel += if channel < 3 && color_space == ColorSpace::Srgb {
+                                srgb_to_linear(encoded)
+                            } else {
+                                encoded
+                            };
+                        }
+                        samples += 1.0;
+                    }
+                }
+                for (channel, value) in sum.into_iter().enumerate() {
+                    let linear = value / samples;
+                    let encoded = if channel < 3 && color_space == ColorSpace::Srgb {
+                        linear_to_srgb(linear)
+                    } else {
+                        linear
+                    };
+                    bytes.push((encoded.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+            }
+        }
+        levels.push(TextureMipLevel {
+            width: next_width,
+            height: next_height,
+            bytes,
+        });
+    }
+    levels
+}
 
 fn main() {
     tracing_subscriber::fmt::init();
@@ -17,8 +237,7 @@ fn main() {
         "contract-triangle" => run_contract_triangle(),
         "static-lit-scene" => run_static_lit_scene(),
         "triangle" => run_triangle(),
-        "model-viewer" => run_model_viewer(),
-        "engine-model-viewer" => run_engine_model_viewer(),
+        "model-viewer" | "engine-model-viewer" => run_engine_model_viewer(),
         "textured-object" => run_textured_object(),
         "resize-smoke" => run_resize_smoke(),
         "editor" => run_editor(),
@@ -42,7 +261,16 @@ fn run_editor() {
 
 fn run_gate04_scene() {
     let mut runtime = EngineRuntime::new(EngineConfig::default());
-    runtime.load_scene(engine_scene::sample_scene());
+    if let Err(diagnostics) = runtime.load_scene(engine_scene::sample_scene()) {
+        for diagnostic in diagnostics {
+            tracing::error!(
+                code = diagnostic.code,
+                message = diagnostic.message,
+                "scene load failed"
+            );
+        }
+        std::process::exit(2);
+    }
 
     let dir = std::env::temp_dir().join("sandbox_reload");
     let _ = std::fs::create_dir_all(&dir);
@@ -129,7 +357,7 @@ fn run_contract_triangle() {
                     "RV0099",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("triangle frame failed: {e}"),
+                    format!("triangle frame failed: {e}"),
                 )]),
             }
         }
@@ -139,7 +367,6 @@ fn run_contract_triangle() {
         renderer: Option<Renderer>,
         frames: u64,
         max_frames: Option<u64>,
-        backend: Option<ContractBackend>,
     }
 
     impl WindowApp for ContractTriangleApp {
@@ -205,10 +432,8 @@ fn run_contract_triangle() {
                                 );
                             }
                             Err(diags) => {
-                                for d in &diags {
-                                    tracing::error!(code = d.code, message = d.message);
-                                }
-                                return EventFlow::Exit;
+                                log_renderer_diagnostics("contract-triangle draw", &diags);
+                                std::process::exit(1);
                             }
                         }
                         self.frames += 1;
@@ -237,7 +462,6 @@ fn run_contract_triangle() {
         renderer: None,
         frames: 0,
         max_frames,
-        backend: None,
     };
     if let Err(err) = platform::run(
         WindowDescriptor {
@@ -317,7 +541,7 @@ fn run_static_lit_scene() {
                     "RV0099",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("init: {e}"),
+                    format!("init: {e}"),
                 )]
             })?;
             let vb_desc = BufferDescriptor {
@@ -331,7 +555,7 @@ fn run_static_lit_scene() {
                     "RV0100",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("{e:?}"),
+                    format!("{e:?}"),
                 )]
             })?;
             self.device.write_buffer(vb, VERTEX_DATA, 0).map_err(|e| {
@@ -339,7 +563,7 @@ fn run_static_lit_scene() {
                     "RV0101",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("{e:?}"),
+                    format!("{e:?}"),
                 )]
             })?;
             let rp_desc = RenderPassDescriptor {
@@ -353,7 +577,7 @@ fn run_static_lit_scene() {
                     "RV0102",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("{e:?}"),
+                    format!("{e:?}"),
                 )]
             })?;
             let pll_desc = PipelineLayoutDescriptor {
@@ -370,7 +594,7 @@ fn run_static_lit_scene() {
                     "RV0107",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("{e:?}"),
+                    format!("{e:?}"),
                 )]
             })?;
             let pl_desc = PipelineDescriptor {
@@ -415,7 +639,7 @@ fn run_static_lit_scene() {
                     "RV0103",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("{e:?}"),
+                    format!("{e:?}"),
                 )]
             })?;
             self.vertex_buf = Some(vb);
@@ -450,7 +674,7 @@ fn run_static_lit_scene() {
                     "RV0105",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("{e:?}"),
+                    format!("{e:?}"),
                 )]
             })?;
             if let (Some(rp), Some(fb)) = (self.rp, self.fb) {
@@ -491,7 +715,7 @@ fn run_static_lit_scene() {
                     "RV0106",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("{e:?}"),
+                    format!("{e:?}"),
                 )]
             })?;
             Ok(FrameStats {
@@ -518,7 +742,7 @@ fn run_static_lit_scene() {
                     "RV0105",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    &format!("{e:?}"),
+                    format!("{e:?}"),
                 )]
             })?;
             self.cur_sc = Some(sc_h);
@@ -603,7 +827,7 @@ fn run_static_lit_scene() {
                         "RV0106",
                         DiagnosticSeverity::Error,
                         "sandbox",
-                        &format!("{e:?}"),
+                        format!("{e:?}"),
                     )]
                 })?;
                 stats.draw_calls = s.draw_calls;
@@ -688,10 +912,8 @@ fn run_static_lit_scene() {
                                 "model-viewer frame"
                             ),
                             Err(diags) => {
-                                for d in &diags {
-                                    tracing::error!(code = d.code, msg = d.message);
-                                }
-                                return EventFlow::Exit;
+                                log_renderer_diagnostics("static-lit-scene draw", &diags);
+                                std::process::exit(1);
                             }
                         }
                         self.frames += 1;
@@ -744,7 +966,10 @@ fn run_static_lit_scene() {
 #[cfg(feature = "backend-vulkan")]
 fn run_engine_character_demo() {
     use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use std::time::Instant;
 
     use engine_character::{CharacterController, CharacterMovement};
@@ -753,9 +978,7 @@ fn run_engine_character_demo() {
     use engine_gameplay::input::{
         self as gameplay_input, InputAction, InputActionMap, InputValue, InputValueType, KeyCode,
     };
-    use engine_physics::{
-        BodyType, Collider, ColliderShape, PhysicsWorld, RigidBody,
-    };
+    use engine_physics::{BodyType, Collider, ColliderShape, PhysicsWorld, RigidBody};
     use engine_scene::components::Transform;
     use engine_scene::Entity;
     use glam::Quat;
@@ -775,15 +998,16 @@ fn run_engine_character_demo() {
         last_frame_time: Instant,
         player_entity: Entity,
         camera_entity: Entity,
+        render_failed: Arc<AtomicBool>,
     }
 
     // ── Map winit PhysicalKey scancodes → engine-gameplay KeyCodes ──
     fn scancode_to_keycode(scancode: u32) -> Option<KeyCode> {
         match scancode {
-            26 => Some(KeyCode::W), // HID Keyboard W
-            4  => Some(KeyCode::A), // HID Keyboard A
-            22 => Some(KeyCode::S), // HID Keyboard S
-            7  => Some(KeyCode::D), // HID Keyboard D
+            26 => Some(KeyCode::W),     // HID Keyboard W
+            4 => Some(KeyCode::A),      // HID Keyboard A
+            22 => Some(KeyCode::S),     // HID Keyboard S
+            7 => Some(KeyCode::D),      // HID Keyboard D
             44 => Some(KeyCode::Space), // HID Keyboard Space
             _ => None,
         }
@@ -820,10 +1044,10 @@ fn run_engine_character_demo() {
 
     // ── Mesh builders using engine_asset ─────────────────────────
 
-    fn build_ground_mesh() -> (Vec<u8>, Vec<u8>, u32, bool) {
-        use engine_asset::mesh::{mesh_data_to_color_bytes, MeshData};
+    fn build_ground_mesh() -> engine_asset::mesh::MeshData {
+        use engine_asset::mesh::MeshData;
         use glam::Vec3;
-        let mesh = MeshData {
+        MeshData {
             positions: vec![
                 Vec3::new(-10.0, -0.5, -10.0),
                 Vec3::new(10.0, -0.5, -10.0),
@@ -836,12 +1060,11 @@ fn run_engine_character_demo() {
             bounds: (Vec3::new(-10.0, -0.5, -10.0), Vec3::new(10.0, -0.5, 10.0)),
             joints: vec![],
             weights: vec![],
-        };
-        mesh_data_to_color_bytes(&mesh)
+        }
     }
 
-    fn build_capsule_mesh() -> (Vec<u8>, Vec<u8>, u32, bool) {
-        use engine_asset::mesh::{mesh_data_to_color_bytes, MeshData};
+    fn build_capsule_mesh() -> engine_asset::mesh::MeshData {
+        use engine_asset::mesh::MeshData;
         use glam::Vec3;
         let segs: u32 = 12;
         let rings_top: u32 = 3;
@@ -889,17 +1112,26 @@ fn run_engine_character_demo() {
                 let b = ring * segs + ns;
                 let c = (ring + 1) * segs + seg;
                 let d = (ring + 1) * segs + ns;
-                indices.push(a); indices.push(b); indices.push(c);
-                indices.push(b); indices.push(d); indices.push(c);
+                indices.push(a);
+                indices.push(b);
+                indices.push(c);
+                indices.push(b);
+                indices.push(d);
+                indices.push(c);
             }
         }
-        let mesh = MeshData {
-            positions, normals,
-            uvs: vec![], indices,
-            bounds: (Vec3::new(-radius, -half_h - radius, -radius), Vec3::new(radius, half_h + radius, radius)),
-            joints: vec![], weights: vec![],
-        };
-        mesh_data_to_color_bytes(&mesh)
+        MeshData {
+            positions,
+            normals,
+            uvs: vec![],
+            indices,
+            bounds: (
+                Vec3::new(-radius, -half_h - radius, -radius),
+                Vec3::new(radius, half_h + radius, radius),
+            ),
+            joints: vec![],
+            weights: vec![],
+        }
     }
 
     impl WindowApp for EngineCharacterApp {
@@ -920,6 +1152,8 @@ fn run_engine_character_demo() {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("backend creation failed: {e}");
+                    self.render_failed.store(true, Ordering::Release);
+                    window.request_redraw();
                     return;
                 }
             };
@@ -1020,33 +1254,33 @@ fn run_engine_character_demo() {
             );
 
             // ── Upload meshes through engine renderer API ──────────────
-            let (ground_vb, ground_ib, ground_ic, ground_u16) = build_ground_mesh();
-            let (cube_vb, cube_ib, cube_ic, cube_u16) = build_capsule_mesh();
-
-            let _ = game_loop.runtime.renderer_mut().upload_mesh(
-                "mesh-ground",
-                &ground_vb,
-                &ground_ib,
-                ground_ic,
-                ground_u16,
-            );
-            let _ = game_loop.runtime.renderer_mut().upload_mesh(
-                "mesh-hero",
-                &cube_vb,
-                &cube_ib,
-                cube_ic,
-                cube_u16,
-            );
+            let ground_mesh = build_ground_mesh();
+            let hero_mesh = build_capsule_mesh();
+            for upload in [
+                mesh_upload_from_data("mesh-ground", &ground_mesh),
+                mesh_upload_from_data("mesh-hero", &hero_mesh),
+            ] {
+                let mesh_id = upload.mesh_id.id.clone();
+                if let Err(diagnostics) = game_loop.runtime.renderer_mut().upload_mesh(upload) {
+                    log_renderer_diagnostics(
+                        &format!("engine-character-demo upload mesh '{mesh_id}'"),
+                        &diagnostics,
+                    );
+                    self.render_failed.store(true, Ordering::Release);
+                    window.request_redraw();
+                    return;
+                }
+            }
 
             // ── Place the World in EngineRuntime ───────────────────────
-            // After this, use game_loop.runtime.world_mut() exclusively.
+            // After this, access the world through EngineRuntime closures.
             game_loop.runtime.set_world(world);
 
             // ── Init physics ───────────────────────────────────────────
             let mut physics = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0));
-            if let Some(w) = game_loop.runtime.world() {
-                physics.sync_from_ecs(w);
-            }
+            game_loop
+                .runtime
+                .with_world(|world| physics.sync_from_ecs(world));
 
             // ── Character controller ───────────────────────────────────
             let mut controller = CharacterController::new();
@@ -1061,13 +1295,16 @@ fn run_engine_character_demo() {
         }
 
         fn on_event(&mut self, window: &Window, event: PlatformEvent) -> EventFlow {
+            if self.render_failed.load(Ordering::Acquire) {
+                return EventFlow::Exit;
+            }
             match event {
                 PlatformEvent::KeyPressed { key, .. } => {
                     self.held_keys.insert(key);
                     if let Some(gk) = scancode_to_keycode(key) {
                         gameplay_input::set_current_value(
                             &mut self.input_map,
-                            &action_name_for(gk),
+                            action_name_for(gk),
                             InputValue::Bool(true),
                         );
                     }
@@ -1077,31 +1314,35 @@ fn run_engine_character_demo() {
                     if let Some(gk) = scancode_to_keycode(key) {
                         gameplay_input::set_current_value(
                             &mut self.input_map,
-                            &action_name_for(gk),
+                            action_name_for(gk),
                             InputValue::Bool(false),
                         );
                     }
                 }
                 PlatformEvent::Resized { width, height } => {
                     if let Some(ref mut gl) = self.game_loop {
-                        let _ = gl.runtime.renderer_mut().resize(width, height);
+                        if let Err(diagnostics) = gl.runtime.renderer_mut().resize(width, height) {
+                            log_renderer_diagnostics("engine-character-demo resize", &diagnostics);
+                            self.render_failed.store(true, Ordering::Release);
+                            return EventFlow::Exit;
+                        }
                     }
                 }
                 PlatformEvent::Redraw => {
                     let dt = self.last_frame_time.elapsed().as_secs_f32();
                     self.last_frame_time = Instant::now();
 
-                        // ── Read movement from InputActionMap ──────────
-                        let fwd = current_bool(&self.input_map, "move_forward");
-                        let back = current_bool(&self.input_map, "move_back");
-                        let left = current_bool(&self.input_map, "move_left");
-                        let right = current_bool(&self.input_map, "move_right");
-                        let jump = current_bool(&self.input_map, "jump");
+                    // ── Read movement from InputActionMap ──────────
+                    let fwd = current_bool(&self.input_map, "move_forward");
+                    let back = current_bool(&self.input_map, "move_back");
+                    let left = current_bool(&self.input_map, "move_left");
+                    let right = current_bool(&self.input_map, "move_right");
+                    let jump = current_bool(&self.input_map, "jump");
 
-                        let (dx, dz) = (
-                            (right as i8 - left as i8) as f32,
-                            (fwd as i8 - back as i8) as f32,
-                        );
+                    let (dx, dz) = (
+                        (right as i8 - left as i8) as f32,
+                        (fwd as i8 - back as i8) as f32,
+                    );
                     let dir = Vec3::new(dx, 0.0, dz);
                     let dir = if dir.length_squared() > 0.001 {
                         dir.normalize()
@@ -1122,15 +1363,15 @@ fn run_engine_character_demo() {
                         ctrl.update(&input, Some(physics));
 
                         // Write character position to runtime's world
-                        if let Some(rw) = gl.runtime.world_mut() {
+                        gl.runtime.with_world_mut(|rw| {
                             let pos = ctrl.position();
                             if let Some(t) = rw.get_mut::<Transform>(self.player_entity) {
                                 t.translation = pos;
                             }
-                        }
+                        });
 
                         // ── Orbit camera follows the player ────────────
-                        if let Some(rw) = gl.runtime.world_mut() {
+                        gl.runtime.with_world_mut(|rw| {
                             let pos = ctrl.position();
                             if let Some(t) = rw.get_mut::<Transform>(self.camera_entity) {
                                 let eye = pos + Vec3::new(0.0, 5.0, 8.0);
@@ -1138,18 +1379,20 @@ fn run_engine_character_demo() {
                                 t.translation = eye;
                                 t.rotation = Quat::from_rotation_arc(-Vec3::Z, dir);
                             }
-                        }
+                        });
 
                         // Step physics on runtime's world
-                        if let Some(rw) = gl.runtime.world_mut() {
+                        gl.runtime.with_world_mut(|rw| {
                             physics.step(dt.min(0.1), rw);
-                        }
+                        });
 
                         // Render
                         if let Err(errs) = gl.render(self.frames) {
                             for e in &errs {
                                 tracing::warn!(code = e.code, "render error: {}", e.message);
                             }
+                            self.render_failed.store(true, Ordering::Release);
+                            return EventFlow::Exit;
                         }
                     }
                     window.request_redraw();
@@ -1173,6 +1416,7 @@ fn run_engine_character_demo() {
     }
 
     let max_frames = parse_frame_limit();
+    let render_failed = Arc::new(AtomicBool::new(false));
     let app = EngineCharacterApp {
         game_loop: None,
         controller: None,
@@ -1184,17 +1428,23 @@ fn run_engine_character_demo() {
         last_frame_time: Instant::now(),
         player_entity: Entity::new(0, 0),
         camera_entity: Entity::new(0, 0),
+        render_failed: Arc::clone(&render_failed),
     };
 
-    if let Err(e) = platform::run(
+    let run_result = platform::run(
         WindowDescriptor {
             title: "Engine Character Demo".into(),
             width: 1280,
             height: 720,
         },
         app,
-    ) {
+    );
+    if let Err(e) = run_result {
         tracing::error!("{e}");
+        std::process::exit(1);
+    }
+    if render_failed.load(Ordering::Acquire) {
+        std::process::exit(1);
     }
 }
 
@@ -1205,611 +1455,13 @@ fn run_engine_character_demo() {
 }
 
 // ============================================================================
-// model-viewer: loads a glTF mesh and renders it with orbit camera + FORWARD
-// shaders through the VulkanDevice model rendering path.
-// ============================================================================
-
-#[cfg(feature = "backend-vulkan")]
-fn run_model_viewer() {
-    use engine_asset::mesh::load_mesh_from_gltf;
-    use engine_renderer::{
-        BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, RenderFrameInput, Renderer,
-    };
-    use glam::{Mat4, Vec2, Vec3};
-    use platform::winit::window::Window;
-    use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
-    use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-    use render_core::{BufferDescriptor, BufferHandle, Device, MemoryHint};
-    use render_vulkan::device_impl::VulkanDevice;
-    use std::sync::Arc;
-
-    // ── CLI ───────────────────────────────────────────────────────────────
-    // Parse model path (skip --frames / --frames=N flags).
-    let model_path = std::env::args().skip(2).find(|a| !a.starts_with("--"));
-    let mesh = match model_path.as_deref() {
-        Some(path) if !path.is_empty() => match load_mesh_from_gltf(std::path::Path::new(path)) {
-            Ok(m) => m,
-            Err(err) => {
-                tracing::warn!(path, error = %err, "glTF load failed, using test cube");
-                engine_asset::mesh::create_test_cube()
-            }
-        },
-        _ => {
-            tracing::info!("no model path provided, using test cube");
-            engine_asset::mesh::create_test_cube()
-        }
-    };
-    tracing::info!(
-        vertices = mesh.positions.len(),
-        indices = mesh.indices.len(),
-        "mesh loaded"
-    );
-
-    // ── BackendRenderer implementation ────────────────────────────────────
-    struct ModelViewerBackend {
-        device: VulkanDevice,
-        vertex_buf: BufferHandle,
-        index_buf: BufferHandle,
-        index_count: u32,
-        camera_angle: f32,
-        width: f32,
-        height: f32,
-        saved_screenshot: bool,
-    }
-
-    impl BackendRenderer for ModelViewerBackend {
-        fn execute_pass(
-            &mut self,
-            input: &RenderFrameInput,
-            pass: &engine_renderer::render_graph::PassNode,
-            stats: &mut FrameStats,
-        ) -> Result<(), Vec<Diagnostic>> {
-            if pass.kind != engine_renderer::render_graph::PassKind::OpaquePbrForward {
-                return Ok(()); // only render on the forward pass
-            }
-            let frame_stats = self.render_frame(input)?;
-            stats.draw_calls += frame_stats.draw_calls;
-            stats.triangles += frame_stats.triangles;
-            stats.visible_drawables += frame_stats.visible_drawables;
-            Ok(())
-        }
-
-        fn render_frame(
-            &mut self,
-            _input: &RenderFrameInput,
-        ) -> Result<FrameStats, Vec<Diagnostic>> {
-            let width = self.width;
-            let height = self.height;
-
-            // ── Orbit camera ──────────────────────────────────────────
-            self.camera_angle += 0.015;
-            let radius = 3.0;
-            let eye = Vec3::new(
-                radius * self.camera_angle.sin(),
-                0.6,
-                radius * self.camera_angle.cos(),
-            );
-            let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-            let aspect = width / height;
-            let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, aspect, 0.1, 100.0);
-
-            // OpenGL NDC [-1,1] → Vulkan NDC [0,1] (flip Y + remap Z)
-            let vulkan_correction = Mat4::from_cols_array_2d(&[
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0, 0.0],
-                [0.0, 0.0, 0.5, 0.0],
-                [0.0, 0.0, 0.5, 1.0],
-            ]);
-            let view_proj = vulkan_correction * proj * view;
-
-            // Model matrix = identity (mesh is at origin).
-            let model = Mat4::IDENTITY;
-
-            // ── Pack UBO (176 bytes matching forward shader layout) ───
-            let mut ubo = Vec::with_capacity(176);
-            // model (mat4, offset 0)
-            for v in model.to_cols_array_2d().iter().flatten() {
-                ubo.extend_from_slice(&v.to_ne_bytes());
-            }
-            // view_proj (mat4, offset 64)
-            for v in view_proj.to_cols_array_2d().iter().flatten() {
-                ubo.extend_from_slice(&v.to_ne_bytes());
-            }
-            // light_dir (vec4, offset 128) — normalized, pointing down-right
-            let light_dir = Vec3::new(0.5, -0.707, 0.5).normalize();
-            for v in &[light_dir.x, light_dir.y, light_dir.z, 0.0f32] {
-                ubo.extend_from_slice(&v.to_ne_bytes());
-            }
-            // light_color (vec4, offset 144) — bright white, intensity 1.5
-            for v in &[1.5f32, 1.5f32, 1.5f32, 1.5f32] {
-                ubo.extend_from_slice(&v.to_ne_bytes());
-            }
-            // camera_pos (vec4, offset 160)
-            for v in &[eye.x, eye.y, eye.z, 1.0f32] {
-                ubo.extend_from_slice(&v.to_ne_bytes());
-            }
-
-            self.device.write_ubo_current(&ubo, 0);
-
-            // ── Render ────────────────────────────────────────────────
-            let stats = match self.device.render_model_frame(
-                self.vertex_buf,
-                self.index_buf,
-                self.index_count,
-            ) {
-                Ok(s) => s,
-                Err(err) => {
-                    return Err(vec![Diagnostic::new(
-                        "RV0099",
-                        DiagnosticSeverity::Error,
-                        "sandbox",
-                        &format!("model frame failed: {err}"),
-                    )]);
-                }
-            };
-            // Screenshot after first successful render (swapchain exists)
-            if !self.saved_screenshot {
-                self.saved_screenshot = true;
-                use render_core::Device;
-                if let Err(e) = engine_renderer::screenshot::save_framebuffer(
-                    &mut self.device,
-                    std::path::Path::new("screenshot.png"),
-                    0,
-                    0,
-                    self.width as u32,
-                    self.height as u32,
-                ) {
-                    tracing::warn!("screenshot failed: {e}");
-                }
-            }
-            Ok(FrameStats {
-                draw_calls: stats.draw_calls,
-                triangles: stats.triangles,
-                visible_drawables: 1,
-                ..FrameStats::default()
-            })
-        }
-    }
-
-    // ── WindowApp ─────────────────────────────────────────────────────────
-    struct ModelViewerApp {
-        renderer: Option<Renderer>,
-        frames: u64,
-        max_frames: Option<u64>,
-        mesh: Option<engine_asset::mesh::MeshData>,
-        last_frame_time: std::time::Instant,
-    }
-
-    impl WindowApp for ModelViewerApp {
-        fn on_create(&mut self, window: Arc<Window>) {
-            let size = window.inner_size();
-            let display_handle = match window.display_handle() {
-                Ok(h) => h.as_raw(),
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to acquire raw display handle");
-                    return;
-                }
-            };
-            let window_handle = match window.window_handle() {
-                Ok(h) => h.as_raw(),
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to acquire raw window handle");
-                    return;
-                }
-            };
-            let enable_validation = std::env::var("ENGINE_VK_VALIDATION").is_ok();
-
-            let mut device: VulkanDevice = match VulkanDevice::new(
-                display_handle,
-                window_handle,
-                size.width.max(1),
-                size.height.max(1),
-                enable_validation,
-                Some(std::path::Path::new("./pso_cache")),
-            ) {
-                Ok(d) => d,
-                Err(err) => {
-                    tracing::error!(error = %err, "VulkanDevice creation failed");
-                    std::process::exit(1);
-                }
-            };
-
-            // Set FORWARD shaders.
-            device.set_mvp_shaders(
-                render_vulkan::shaders_embedded::FORWARD_VERT_SPV,
-                render_vulkan::shaders_embedded::FORWARD_FRAG_SPV,
-            );
-
-            // ── Build interleaved vertex buffer (cube + ground plane) ─
-            let mesh = self.mesh.take().expect("mesh loaded earlier");
-            let stride = 32u64; // position(12) + normal(12) + uv(8)
-
-            // Ground plane: a 6×6 quad at y=−1.0, normal +Y
-            let plane_verts: [(f32, f32, f32); 4] = [
-                (-3.0, -1.0, -3.0),
-                (3.0, -1.0, -3.0),
-                (3.0, -1.0, 3.0),
-                (-3.0, -1.0, 3.0),
-            ];
-            let plane_uvs: [(f32, f32); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-            let plane_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
-
-            let cube_vert_count = mesh.positions.len();
-            let plane_vert_offset = cube_vert_count as u32;
-            let total_verts = cube_vert_count + plane_verts.len();
-            let total_indices = mesh.indices.len() + plane_indices.len();
-
-            let mut vert_bytes: Vec<u8> = Vec::with_capacity(total_verts * stride as usize);
-            // Cube vertices
-            for i in 0..cube_vert_count {
-                let p = mesh.positions[i];
-                let n = mesh.normals[i];
-                let uv = mesh.uvs.get(i).copied().unwrap_or(Vec2::ZERO);
-                vert_bytes.extend_from_slice(&p.x.to_ne_bytes());
-                vert_bytes.extend_from_slice(&p.y.to_ne_bytes());
-                vert_bytes.extend_from_slice(&p.z.to_ne_bytes());
-                vert_bytes.extend_from_slice(&n.x.to_ne_bytes());
-                vert_bytes.extend_from_slice(&n.y.to_ne_bytes());
-                vert_bytes.extend_from_slice(&n.z.to_ne_bytes());
-                vert_bytes.extend_from_slice(&uv.x.to_ne_bytes());
-                vert_bytes.extend_from_slice(&uv.y.to_ne_bytes());
-            }
-            // Plane vertices (normal = 0, 1, 0)
-            for (i, &(px, py, pz)) in plane_verts.iter().enumerate() {
-                let uv = plane_uvs[i];
-                vert_bytes.extend_from_slice(&px.to_ne_bytes());
-                vert_bytes.extend_from_slice(&py.to_ne_bytes());
-                vert_bytes.extend_from_slice(&pz.to_ne_bytes());
-                let one: f32 = 1.0;
-                let zero: f32 = 0.0;
-                vert_bytes.extend_from_slice(&zero.to_ne_bytes());
-                vert_bytes.extend_from_slice(&one.to_ne_bytes());
-                vert_bytes.extend_from_slice(&zero.to_ne_bytes());
-                vert_bytes.extend_from_slice(&uv.0.to_ne_bytes());
-                vert_bytes.extend_from_slice(&uv.1.to_ne_bytes());
-            }
-
-            let vb_desc = BufferDescriptor {
-                size_bytes: vert_bytes.len() as u64,
-                usage_flags: render_core::BufferUsage(0),
-                memory_hint: MemoryHint::CpuToGpu,
-                debug_label: Some("model-vertices".into()),
-            };
-            let vertex_buf = match device.create_buffer(&vb_desc) {
-                Ok(b) => b,
-                Err(err) => {
-                    tracing::error!(error = ?err, "failed to create vertex buffer");
-                    std::process::exit(1);
-                }
-            };
-            if let Err(err) = device.write_buffer(vertex_buf, &vert_bytes, 0) {
-                tracing::error!(error = ?err, "failed to write vertex buffer");
-                std::process::exit(1);
-            }
-
-            // ── Build index buffer (cube + plane, plane indices offset) ─
-            let mut idx_bytes: Vec<u8> = Vec::with_capacity(total_indices * 4);
-            for i in &mesh.indices {
-                idx_bytes.extend_from_slice(&i.to_ne_bytes());
-            }
-            for i in plane_indices {
-                idx_bytes.extend_from_slice(&(i + plane_vert_offset).to_ne_bytes());
-            }
-            let ib_desc = BufferDescriptor {
-                size_bytes: idx_bytes.len() as u64,
-                usage_flags: render_core::BufferUsage(0),
-                memory_hint: MemoryHint::CpuToGpu,
-                debug_label: Some("model-indices".into()),
-            };
-            let index_buf = match device.create_buffer(&ib_desc) {
-                Ok(b) => b,
-                Err(err) => {
-                    tracing::error!(error = ?err, "failed to create index buffer");
-                    std::process::exit(1);
-                }
-            };
-            if let Err(err) = device.write_buffer(index_buf, &idx_bytes, 0) {
-                tracing::error!(error = ?err, "failed to write index buffer");
-                std::process::exit(1);
-            }
-
-            let index_count = total_indices as u32;
-
-            let backend = ModelViewerBackend {
-                device,
-                vertex_buf,
-                index_buf,
-                index_count,
-                camera_angle: 0.0,
-                width: size.width.max(1) as f32,
-                height: size.height.max(1) as f32,
-                saved_screenshot: false,
-            };
-
-            let mut renderer = Renderer::new();
-            renderer.set_backend(Box::new(backend));
-            self.renderer = Some(renderer);
-            tracing::info!("model-viewer renderer initialized");
-        }
-
-        fn on_event(&mut self, _window: &Window, event: PlatformEvent) -> EventFlow {
-            match event {
-                PlatformEvent::Resized { .. } => EventFlow::Continue,
-                PlatformEvent::Redraw => {
-                    // FPS limiter: target ~60 FPS
-                    let elapsed = self.last_frame_time.elapsed();
-                    let target_frame_time = std::time::Duration::from_secs_f64(1.0 / 60.0);
-                    if elapsed < target_frame_time {
-                        std::thread::sleep(target_frame_time - elapsed);
-                    }
-                    self.last_frame_time = std::time::Instant::now();
-
-                    if let Some(ref mut renderer) = self.renderer {
-                        let mut input = RenderFrameInput::empty(self.frames);
-                        input.views.push(engine_renderer::RenderView {
-                            view_id: 0,
-                            camera_entity: None,
-                            viewport: engine_renderer::Rect::FULL,
-                            viewport_rect_normalized: engine_renderer::Rect::FULL,
-                            view_matrix: engine_renderer::IDENTITY_MAT4,
-                            projection_matrix: engine_renderer::IDENTITY_MAT4,
-                            clear_flags: engine_renderer::ClearFlags::ColorAndDepth,
-                            clear_color: [0.02, 0.02, 0.06, 1.0],
-                            render_layer_mask: u32::MAX,
-                            msaa_samples: 1,
-                            compose: engine_renderer::ViewCompose::Base {
-                                clear: engine_renderer::ClearFlags::ColorAndDepth,
-                                clear_color: [0.02, 0.02, 0.06, 1.0],
-                            },
-                            stack_order: 0,
-                            frustum: None,
-                        });
-                        match renderer.draw_scene(&input) {
-                            Ok(stats) => {
-                                tracing::info!(
-                                    draw_calls = stats.draw_calls,
-                                    triangles = stats.triangles,
-                                    "model-viewer frame"
-                                );
-                            }
-                            Err(diags) => {
-                                for d in &diags {
-                                    tracing::error!(code = d.code, message = d.message);
-                                }
-                                return EventFlow::Exit;
-                            }
-                        }
-                        self.frames += 1;
-                        if let Some(limit) = self.max_frames {
-                            if self.frames >= limit {
-                                tracing::info!(
-                                    frames = self.frames,
-                                    "frame limit reached; exiting"
-                                );
-                                return EventFlow::Exit;
-                            }
-                        }
-                    }
-                    EventFlow::Continue
-                }
-                PlatformEvent::CloseRequested => EventFlow::Exit,
-                PlatformEvent::Resumed | PlatformEvent::Suspended => EventFlow::Continue,
-                _ => EventFlow::Continue,
-            }
-        }
-    }
-
-    let max_frames = parse_frame_limit();
-
-    let app = ModelViewerApp {
-        renderer: None,
-        frames: 0,
-        max_frames,
-        mesh: Some(mesh),
-        last_frame_time: std::time::Instant::now(),
-    };
-    if let Err(err) = platform::run(
-        WindowDescriptor {
-            title: "Engine Sandbox - Model Viewer".to_string(),
-            width: 1280,
-            height: 720,
-        },
-        app,
-    ) {
-        tracing::error!(error = %err, "platform run failed");
-        std::process::exit(1);
-    }
-}
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn run_model_viewer() {
-    tracing::error!("model-viewer requires `backend-vulkan` feature");
-    std::process::exit(2);
-}
-
-// ============================================================================
-// engine-model-viewer: glTF model viewer using the standard engine pipeline
-// (GameLoop → EngineRuntime → SceneRenderer → VulkanDevice).
+// model-viewer / engine-model-viewer: fixed glTF resource-chain sample using
+// typed uploads and Renderer → SceneRenderer → VulkanDevice.
 // ============================================================================
 
 #[cfg(feature = "backend-vulkan")]
 fn run_engine_model_viewer() {
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    use engine_asset::gltf::load_gltf_scene;
-    use engine_asset::mesh::mesh_data_to_color_bytes;
-    use engine_core::game_loop::GameLoop;
-    use engine_core::EngineConfig;
-    use engine_scene::components::{Camera, Renderable, Transform};
-    use engine_scene::Entity;
-    use engine_scene::World;
-    use glam::Vec3;
-    use platform::winit::window::Window;
-    use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
-    use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-    use render_vulkan::device_impl::VulkanDevice;
-    use render_vulkan::scene_renderer::SceneRenderer;
-
-    struct EngineModelViewerApp {
-        game_loop: Option<GameLoop>,
-        frames: u64,
-        last_frame_time: Instant,
-        camera_angle: f32,
-    }
-
-    impl WindowApp for EngineModelViewerApp {
-        fn on_create(&mut self, window: Arc<Window>) {
-            let size = window.inner_size();
-            let w = size.width.max(1);
-            let h = size.height.max(1);
-
-            // ── CLI argument: model path ──────────────────────────────
-            let model_path = std::env::args().skip(2).find(|a| !a.starts_with("--"));
-            let model_path = model_path.unwrap_or_else(|| "assets/models/DamagedHelmet.gltf".into());
-
-            // ── Load glTF ─────────────────────────────────────────────
-            let gltf_scene = match load_gltf_scene(std::path::Path::new(&model_path)) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("glTF load failed: {e}");
-                    return;
-                }
-            };
-            tracing::info!(
-                meshes = gltf_scene.meshes.len(),
-                materials = gltf_scene.materials.len(),
-                textures = gltf_scene.textures.len(),
-                nodes = gltf_scene.nodes.len(),
-                "glTF scene loaded"
-            );
-
-            // ── Create device + renderer ──────────────────────────────
-            let device = match VulkanDevice::new(
-                window.display_handle().unwrap().as_raw(),
-                window.window_handle().unwrap().as_raw(),
-                w, h,
-                cfg!(debug_assertions),
-                None,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!("VulkanDevice: {e}");
-                    return;
-                }
-            };
-            let scene_renderer = SceneRenderer::new(device, w, h);
-
-            let mut game_loop = GameLoop::new(EngineConfig {
-                application_name: "engine-model-viewer".into(),
-            });
-            game_loop.runtime.renderer_mut().set_backend(Box::new(scene_renderer));
-
-            // ── Build ECS world ───────────────────────────────────────
-            let mut world = World::new();
-
-            // Camera entity
-            let camera = world.create_entity();
-            world.add_component(camera, Transform {
-                translation: Vec3::new(0.0, 2.0, 5.0),
-                ..Transform::default()
-            });
-            world.add_component(camera, Camera::default());
-
-            // Upload each mesh and create a renderable entity for each node.
-            for (i, mesh_data) in gltf_scene.meshes.iter().enumerate() {
-                let mesh_id = format!("mesh-{i}");
-                let (vb, ib, ic, iu16) = mesh_data_to_color_bytes(mesh_data);
-                let _ = game_loop.runtime.renderer_mut().upload_mesh(&mesh_id, &vb, &ib, ic, iu16);
-
-                let entity = world.create_entity();
-                // Use the node's world transform if available.
-                let pos = gltf_scene.nodes.get(i).map(|n| {
-                    let (_, _, t) = n.transform.to_scale_rotation_translation();
-                    t
-                }).unwrap_or(Vec3::ZERO);
-                world.add_component(entity, Transform {
-                    translation: pos,
-                    ..Transform::default()
-                });
-                world.add_component(entity, Renderable {
-                    mesh_asset: mesh_id,
-                    material_asset: "default".into(),
-                    visible: true,
-                    cast_shadows: true,
-                    render_layer: "default".into(),
-                });
-            }
-
-            game_loop.runtime.set_world(world);
-            self.game_loop = Some(game_loop);
-        }
-
-        fn on_event(&mut self, _window: &Window, event: PlatformEvent) -> EventFlow {
-            match event {
-                PlatformEvent::Redraw => {
-                    let dt = self.last_frame_time.elapsed().as_secs_f32();
-                    self.last_frame_time = Instant::now();
-                    self.camera_angle += dt * 0.3;
-
-                    if let Some(ref mut gl) = self.game_loop {
-                        // Rotate orbit camera around origin.
-                        let dist = 5.0f32;
-                        let eye = Vec3::new(
-                            self.camera_angle.sin() * dist,
-                            2.0,
-                            self.camera_angle.cos() * dist,
-                        );
-                        if let Some(w) = gl.runtime.world_mut() {
-                            // Find the first (camera) entity by iterating
-                            let cameras: Vec<Entity> = w.query::<Camera>()
-                                .map(|(e, _)| e)
-                                .collect();
-                            for ce in cameras {
-                                if let Some(t) = w.get_mut::<Transform>(ce) {
-                                    let dir = (-eye).normalize();
-                                    t.translation = eye;
-                                    t.rotation = glam::Quat::from_rotation_arc(-Vec3::Z, dir);
-                                }
-                            }
-                        }
-                        if let Err(errs) = gl.render(self.frames) {
-                            for d in &errs {
-                                tracing::warn!(code = d.code, "render: {}", d.message);
-                            }
-                        }
-                    }
-                    _window.request_redraw();
-                    self.frames += 1;
-                }
-                PlatformEvent::Resized { width, height } => {
-                    if let Some(ref mut gl) = self.game_loop {
-                        let _ = gl.runtime.renderer_mut().resize(width, height);
-                    }
-                }
-                PlatformEvent::CloseRequested => return EventFlow::Exit,
-                _ => {}
-            }
-            EventFlow::Continue
-        }
-    }
-
-    let app = EngineModelViewerApp {
-        game_loop: None,
-        frames: 0,
-        last_frame_time: Instant::now(),
-        camera_angle: 0.0,
-    };
-    if let Err(e) = platform::run(
-        WindowDescriptor {
-            title: "Engine Model Viewer".into(),
-            width: 1280,
-            height: 720,
-        },
-        app,
-    ) {
-        tracing::error!("{e}");
-    }
+    model_viewer::run();
 }
 
 #[cfg(not(feature = "backend-vulkan"))]

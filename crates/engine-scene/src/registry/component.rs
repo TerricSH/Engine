@@ -37,6 +37,7 @@ pub type DeserializeFn = fn(&BTreeMap<String, Value>) -> Box<dyn std::any::Any>;
 // ---------------------------------------------------------------------------
 
 /// A registered component extension.
+#[derive(Clone)]
 pub struct ComponentExtension {
     pub meta: ComponentMeta,
     pub storage_factory: StorageFactory,
@@ -63,6 +64,7 @@ impl std::fmt::Debug for ComponentExtension {
 ///
 /// Allows subsystems (physics, animation, UI, audio, …) to register their own
 /// component types without modifying core `engine-scene` sources.
+#[derive(Clone, Debug)]
 pub struct ComponentRegistry {
     extensions: BTreeMap<&'static str, ComponentExtension>,
     order: Vec<&'static str>,

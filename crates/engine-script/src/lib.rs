@@ -277,7 +277,7 @@ mod tests {
     fn null_script_host_instantiate_fails() {
         let mut host = NullScriptHost::new();
         let handle = ScriptHandle::new("test");
-        let result = host.instantiate(&handle);
+        let result = host.instantiate(&handle, "Test.Script");
         assert!(result.is_err());
         match result {
             Err(ScriptError::UnsupportedFeature(msg)) => {

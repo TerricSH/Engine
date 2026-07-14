@@ -171,10 +171,11 @@ impl RenderGraph {
 
         for view in &views {
             let has_shadow_casters = input.lights.iter().any(|l| {
-                matches!(
-                    l.shadow_mode,
-                    crate::ShadowMode::Hard | crate::ShadowMode::Soft
-                )
+                l.kind == crate::LightKind::Directional
+                    && matches!(
+                        l.shadow_mode,
+                        crate::ShadowMode::Hard | crate::ShadowMode::Soft
+                    )
             });
 
             // 1. Directional shadow pass (only if shadows are needed)
@@ -197,25 +198,7 @@ impl RenderGraph {
                 writes_swapchain: false,
             });
 
-            // 3. SSAO pass (ambient occlusion)
-            passes.push(PassNode {
-                kind: PassKind::Custom("ssao"),
-                name: "ssao_pass",
-                view_id: view.view_id,
-                reads_depth: true,
-                writes_swapchain: false,
-            });
-
-            // 4. Bloom pass (brightness extraction + blur)
-            passes.push(PassNode {
-                kind: PassKind::Custom("bloom"),
-                name: "bloom_pass",
-                view_id: view.view_id,
-                reads_depth: false,
-                writes_swapchain: false,
-            });
-
-            // 5. Tone-map pass
+            // 3. Tone-map pass
             passes.push(PassNode {
                 kind: PassKind::ToneMap,
                 name: "tone_map_pass",
@@ -224,7 +207,7 @@ impl RenderGraph {
                 writes_swapchain: false,
             });
 
-            // 6. Present
+            // 4. Present
             passes.push(PassNode {
                 kind: PassKind::Present,
                 name: "present",

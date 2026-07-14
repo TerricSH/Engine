@@ -1,9 +1,120 @@
 use engine_core::{EngineConfig, EngineRuntime};
 use engine_renderer::{
-    validate_frame_input, LightItem, LightKind, RenderFrameInput, RenderView, ShadowMode,
-    ViewCompose, IDENTITY_MAT4,
+    validate_frame_input, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, LightItem,
+    LightKind, RenderFrameInput, RenderView, ShadowMode, ViewCompose, IDENTITY_MAT4,
 };
 use engine_scene::{sample_scene, validate_scene};
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct ContractTrace {
+    frame_active: bool,
+    begin_count: u32,
+    executed_passes: Vec<String>,
+    end_count: u32,
+    abort_count: u32,
+}
+
+struct ContractBackend {
+    trace: Arc<Mutex<ContractTrace>>,
+}
+
+fn backend_error(code: &str, message: &str) -> Vec<Diagnostic> {
+    vec![Diagnostic::new(
+        code,
+        DiagnosticSeverity::Error,
+        "sandbox.integration.contract_backend",
+        message,
+    )]
+}
+
+impl BackendRenderer for ContractBackend {
+    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
+        Err(backend_error(
+            "SBX_TEST_LEGACY_RENDER",
+            "the integration backend only accepts the render-graph lifecycle",
+        ))
+    }
+
+    fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        let mut trace = self.trace.lock().unwrap();
+        if trace.frame_active {
+            return Err(backend_error(
+                "SBX_TEST_DOUBLE_BEGIN",
+                "begin_frame called while another frame is active",
+            ));
+        }
+        trace.frame_active = true;
+        trace.begin_count += 1;
+        Ok(())
+    }
+
+    fn execute_pass(
+        &mut self,
+        input: &RenderFrameInput,
+        pass: &engine_renderer::render_graph::PassNode,
+        stats: &mut FrameStats,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut trace = self.trace.lock().unwrap();
+        if !trace.frame_active {
+            return Err(backend_error(
+                "SBX_TEST_EXECUTE_WITHOUT_BEGIN",
+                "execute_pass called without an active frame",
+            ));
+        }
+        trace.executed_passes.push(pass.name.to_string());
+        if pass.kind == engine_renderer::render_graph::PassKind::OpaquePbrForward {
+            stats.draw_calls += input.drawables.len() as u32;
+            stats.visible_drawables = input.drawables.len() as u32;
+        }
+        Ok(())
+    }
+
+    fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
+        let mut trace = self.trace.lock().unwrap();
+        if !trace.frame_active {
+            return Err(backend_error(
+                "SBX_TEST_END_WITHOUT_BEGIN",
+                "end_frame called without an active frame",
+            ));
+        }
+        trace.frame_active = false;
+        trace.end_count += 1;
+        Ok(())
+    }
+
+    fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+        let mut trace = self.trace.lock().unwrap();
+        if !trace.frame_active {
+            return Err(backend_error(
+                "SBX_TEST_ABORT_WITHOUT_BEGIN",
+                "abort_frame called without an active frame",
+            ));
+        }
+        trace.frame_active = false;
+        trace.abort_count += 1;
+        Ok(())
+    }
+}
+
+fn runtime_with_contract_backend() -> (EngineRuntime, Arc<Mutex<ContractTrace>>) {
+    let trace = Arc::new(Mutex::new(ContractTrace::default()));
+    let backend = ContractBackend {
+        trace: Arc::clone(&trace),
+    };
+    let mut runtime = EngineRuntime::new(EngineConfig::default());
+    runtime.renderer_mut().set_backend(Box::new(backend));
+    (runtime, trace)
+}
+
+fn assert_completed_contract_frame(trace: &Arc<Mutex<ContractTrace>>) {
+    let trace = trace.lock().unwrap();
+    assert_eq!(trace.begin_count, 1);
+    assert!(!trace.executed_passes.is_empty());
+    assert_eq!(trace.end_count, 1);
+    assert_eq!(trace.abort_count, 0);
+    assert!(!trace.frame_active);
+}
 
 // ============================================================================
 // Core engine lifecycle tests
@@ -37,8 +148,10 @@ fn engine_render_frame_no_scene_fails() {
 
 #[test]
 fn engine_load_scene_and_render_succeeds() {
-    let mut runtime = EngineRuntime::new(EngineConfig::default());
-    runtime.load_scene(sample_scene());
+    let (mut runtime, trace) = runtime_with_contract_backend();
+    runtime
+        .load_scene(sample_scene())
+        .expect("sample scene should load into a World");
     let result = runtime.render_frame(0);
     assert!(
         result.is_ok(),
@@ -48,6 +161,7 @@ fn engine_load_scene_and_render_succeeds() {
     let stats = result.unwrap();
     assert_eq!(stats.visible_drawables, 1);
     assert_eq!(stats.draw_calls, 1);
+    assert_completed_contract_frame(&trace);
 }
 
 #[test]
@@ -343,8 +457,11 @@ fn full_pipeline_load_scene_and_extract() {
     let scene = sample_scene();
     assert!(validate_scene(&scene).is_empty());
 
-    let mut runtime = EngineRuntime::new(EngineConfig::default());
-    runtime.load_scene(scene);
+    let (mut runtime, trace) = runtime_with_contract_backend();
+    runtime
+        .load_scene(scene)
+        .expect("validated scene should load into a World");
     let result = runtime.render_frame(0);
     assert!(result.is_ok(), "full pipeline failed: {:?}", result);
+    assert_completed_contract_frame(&trace);
 }

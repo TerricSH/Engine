@@ -22,8 +22,7 @@ pub fn orbit_view_matrix(target: Vec3, offset: Vec3) -> Mat4 {
 /// * `height` — vertical offset from the target.
 /// * `yaw` — horizontal rotation in radians.
 pub fn spherical_orbit_view(target: Vec3, distance: f32, height: f32, yaw: f32) -> Mat4 {
-    let eye = target
-        + Vec3::new(yaw.sin() * distance, height, yaw.cos() * distance);
+    let eye = target + Vec3::new(yaw.sin() * distance, height, yaw.cos() * distance);
     Mat4::look_at_rh(eye, target, Vec3::Y)
 }
 

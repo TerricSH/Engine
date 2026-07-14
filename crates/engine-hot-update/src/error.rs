@@ -4,6 +4,14 @@ use thiserror::Error;
 /// Errors that can occur during the hot update lifecycle.
 #[derive(Debug, Error)]
 pub enum UpdateError {
+    /// A manifest or cache path was unsafe to use for filesystem I/O.
+    #[error("unsafe path in {field} `{path}`: {reason}")]
+    UnsafePath {
+        field: String,
+        path: String,
+        reason: String,
+    },
+
     /// The manifest failed semantic validation.
     #[error("manifest parse error: {0}")]
     ManifestParse(String),
@@ -28,9 +36,29 @@ pub enum UpdateError {
     #[error("signature missing")]
     SignatureMissing,
 
+    /// The manifest uses a signature algorithm this runtime does not support.
+    #[error("unsupported signature algorithm `{algorithm}`")]
+    SignatureUnsupportedAlgorithm { algorithm: String },
+
+    /// The signature references a key that is not in the trusted key set.
+    #[error("signature key `{key_id}` is not trusted")]
+    SignatureUnknownKey { key_id: String },
+
     /// The manifest signature is invalid.
-    #[error("signature invalid: {0}")]
-    SignatureInvalid(String),
+    #[error("signature is invalid for key `{key_id}`")]
+    SignatureInvalid { key_id: String },
+
+    /// A configured Ed25519 public key is malformed.
+    #[error("trusted Ed25519 key `{key_id}` is invalid")]
+    TrustedKeyInvalid { key_id: String },
+
+    /// A signing helper was given a malformed private key.
+    #[error("Ed25519 signing key is invalid")]
+    SigningKeyInvalid,
+
+    /// The manifest could not be converted to the stable signing format.
+    #[error("manifest canonicalization failed")]
+    ManifestCanonicalizationFailed,
 
     /// An I/O error occurred.
     #[error("io error: {0}")]
@@ -109,8 +137,13 @@ mod tests {
 
     #[test]
     fn update_error_signature_invalid_display() {
-        let err = UpdateError::SignatureInvalid("bad key".into());
-        assert_eq!(err.to_string(), "signature invalid: bad key");
+        let err = UpdateError::SignatureInvalid {
+            key_id: "release-2026".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "signature is invalid for key `release-2026`"
+        );
     }
 
     #[test]

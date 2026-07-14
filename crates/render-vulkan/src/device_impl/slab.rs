@@ -11,15 +11,51 @@ use crate::allocator::{Allocation, SharedAllocator};
 
 pub(crate) struct BufEntry {
     pub(crate) buffer: vk::Buffer,
+    /// Logical buffer size requested from the RHI.  The backing allocation can
+    /// be larger because Vulkan memory requirements include alignment padding,
+    /// so write bounds must be checked against this value instead of the
+    /// mapped allocation length.
+    pub(crate) size: vk::DeviceSize,
     pub(crate) allocator: SharedAllocator,
     pub(crate) allocation: Option<Allocation>,
 }
 
+impl BufEntry {
+    fn free_allocation(&mut self) {
+        let Some(mut allocation) = self.allocation.take() else {
+            return;
+        };
+
+        match self.allocator.lock() {
+            Ok(mut allocator) => allocator.free(&mut allocation),
+            Err(poisoned) => {
+                tracing::error!(
+                    target: "vulkan::resources",
+                    "allocator mutex was poisoned while freeing a buffer allocation"
+                );
+                poisoned.into_inner().free(&mut allocation);
+            }
+        }
+    }
+
+    /// Destroy the Vulkan buffer before releasing its bound memory.
+    pub(crate) fn destroy(mut self, device: &AshDevice) {
+        // SAFETY: this entry exclusively owns `buffer`; callers remove the
+        // entry from the slab before invoking this method.
+        unsafe {
+            device.destroy_buffer(self.buffer, None);
+        }
+        self.buffer = vk::Buffer::null();
+        self.free_allocation();
+    }
+}
+
 impl Drop for BufEntry {
     fn drop(&mut self) {
-        if let Some(mut a) = self.allocation.take() {
-            self.allocator.lock().unwrap().free(&mut a);
-        }
+        // The Vulkan buffer itself requires an `AshDevice` and is therefore
+        // destroyed by `BufEntry::destroy`.  This fallback still prevents a
+        // memory leak if an entry is unwound before reaching that path.
+        self.free_allocation();
     }
 }
 
@@ -72,6 +108,19 @@ impl<T> Slab<T> {
         }
         Some(value)
     }
+
+    /// Remove every live value and invalidate all outstanding handles.
+    pub(crate) fn drain_values(&mut self) -> Vec<T> {
+        let mut values = Vec::new();
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            let Some((generation, value)) = slot.take() else {
+                continue;
+            };
+            self.free_generations[index] = generation.wrapping_add(1).max(1);
+            values.push(value);
+        }
+        values
+    }
 }
 
 // ============================================================================
@@ -96,15 +145,10 @@ pub(crate) struct PlEntry {
 // ============================================================================
 
 pub(crate) struct FrameSync {
-    /// Single timeline semaphore replacing the old binary pair
-    /// (image_available + render_finished).  After each acquire the
-    /// semaphore value increments by 1; after each submit+present the
-    /// value increments by another 1.
-    pub(crate) timeline_semaphore: vk::Semaphore,
-    /// Tracks the last signalled value for this frame slot.
-    /// In begin_frame we CPU-wait for this value; after submit we
-    /// signal value+2 (one from acquire, one from submit).
-    pub(crate) timeline_value: u64,
+    /// Binary semaphore signalled by `vkAcquireNextImageKHR`.
+    pub(crate) image_available: vk::Semaphore,
+    /// Binary semaphore signalled by queue submission and waited by present.
+    pub(crate) render_finished: vk::Semaphore,
     pub(crate) in_flight_fence: vk::Fence,
     pub(crate) command_pool: vk::CommandPool,
     pub(crate) command_buffer: vk::CommandBuffer,
@@ -126,5 +170,35 @@ mod tests {
         assert_eq!(reused_index, index);
         assert_ne!(new_generation, generation);
         assert_eq!(slab.get(reused_index, new_generation), Some(&20));
+    }
+
+    #[test]
+    fn stale_or_repeated_remove_is_a_safe_noop() {
+        let mut slab = Slab::new();
+        let (index, generation) = slab.insert(10u32);
+
+        assert!(slab.remove(index, generation.wrapping_add(1)).is_none());
+        assert_eq!(slab.get(index, generation), Some(&10));
+        assert_eq!(slab.remove(index, generation), Some(10));
+        assert!(slab.remove(index, generation).is_none());
+        assert!(slab.remove(u32::MAX, generation).is_none());
+    }
+
+    #[test]
+    fn drain_invalidates_live_handles_and_preserves_reuse() {
+        let mut slab = Slab::new();
+        let (first_index, first_generation) = slab.insert(10u32);
+        let (second_index, second_generation) = slab.insert(20u32);
+
+        let mut drained = slab.drain_values();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![10, 20]);
+        assert!(slab.get(first_index, first_generation).is_none());
+        assert!(slab.get(second_index, second_generation).is_none());
+
+        let (reused_index, reused_generation) = slab.insert(30u32);
+        assert_eq!(reused_index, first_index);
+        assert_ne!(reused_generation, first_generation);
+        assert_eq!(slab.get(reused_index, reused_generation), Some(&30));
     }
 }

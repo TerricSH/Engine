@@ -28,7 +28,9 @@ mod watcher;
 
 pub use hot_reload::HotReload;
 pub use loader::{AssetError, AssetHandle, AssetLoader, BincodeLoader, CachedEntry, RawLoader};
-pub use path::asset_path;
+pub use path::{
+    asset_path, asset_path_from_root, asset_relative_path, validate_asset_id, AssetPathError,
+};
 pub use registry::{AssetInfo, AssetRegistry, AssetState};
 pub use reload::ReloadCoordinator;
 pub use watcher::FileWatcher;
@@ -183,6 +185,58 @@ mod tests {
         let id = AssetId::new("simpleid");
         let path = asset_path(&id);
         assert_eq!(path, ap("assets/simpleid.asset"));
+    }
+
+    #[test]
+    fn asset_paths_reject_traversal_and_windows_syntax_portably() {
+        for id in [
+            AssetId::new("../escape"),
+            AssetId::new("C:escape"),
+            AssetId::new("mesh\\cube"),
+            AssetId::new("CON"),
+            AssetId::with_path("safe", "../escape.bin"),
+            AssetId::with_path("safe", "C:/escape.bin"),
+            AssetId::with_path("safe", "dir\\escape.bin"),
+            AssetId::with_path("safe", "assets//bad.bin"),
+        ] {
+            assert!(
+                validate_asset_id(&id).is_err(),
+                "unsafe ID accepted: {id:?}"
+            );
+            assert!(asset_path(&id).is_none());
+        }
+    }
+
+    #[test]
+    fn reload_from_root_is_transactional_and_replaces_cached_bytes() {
+        let root =
+            std::env::temp_dir().join(format!("engine_asset_reload_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let base = root.join("base");
+        let update = root.join("update");
+        let id = AssetId::with_path("texture-runtime", "textures/runtime.bin");
+        let relative = asset_relative_path(&id).unwrap();
+        let base_path = base.join(&relative);
+        let update_path = update.join(&relative);
+        std::fs::create_dir_all(base_path.parent().unwrap()).unwrap();
+        std::fs::write(&base_path, b"old bytes").unwrap();
+
+        let mut registry = AssetRegistry::new();
+        registry.reload_from_root(&id, &base).unwrap();
+        let old_handle = registry.load(&id).unwrap();
+        assert_eq!(old_handle.get().as_slice(), b"old bytes");
+
+        // A read failure must not evict or partially replace the cache.
+        assert!(registry.reload_from_root(&id, &update).is_err());
+        assert_eq!(registry.load(&id).unwrap().get().as_slice(), b"old bytes");
+
+        std::fs::create_dir_all(update_path.parent().unwrap()).unwrap();
+        std::fs::write(&update_path, b"new bytes").unwrap();
+        registry.reload_from_root(&id, &update).unwrap();
+        assert_eq!(registry.load(&id).unwrap().get().as_slice(), b"new bytes");
+        // Existing handles retain the old immutable Arc, as documented.
+        assert_eq!(old_handle.get().as_slice(), b"old bytes");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // ── RawLoader tests ──────────────────────────────────────────────────

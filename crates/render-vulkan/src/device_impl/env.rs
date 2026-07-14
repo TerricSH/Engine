@@ -100,14 +100,14 @@ impl VulkanDevice {
         // ---- 4. Upload placeholder gray data via staging buffer ----
         self.upload_env_placeholder(image)?;
 
-        // ---- 5. Update descriptor set binding=1 ----
-        self.update_env_descriptor_set();
-
-        // ---- Store ----
+        // ---- Store, then update descriptor set binding=1 ----
+        // `update_env_descriptor_set` reads these handles from `self`, so the
+        // resources must be visible there before the descriptor write.
         self.env_cubemap = Some(image);
         self.env_cubemap_view = Some(image_view);
         self.env_cubemap_allocation = Some(allocation);
         self.env_sampler = Some(sampler);
+        self.update_env_descriptor_set();
 
         Ok(())
     }

@@ -24,6 +24,52 @@ pub const PREFAB_CONTRACT: &str = "Prefab-v0.1.0";
 /// Current prefab schema version.
 pub const PREFAB_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 1, 0);
 
+/// Maximum number of nested prefab edges accepted by validation and runtime
+/// instantiation. The root prefab is at depth zero.
+pub const MAX_PREFAB_NESTING_DEPTH: usize = 64;
+
+/// A structural error found while validating a prefab dependency graph.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PrefabValidationError {
+    #[error("prefab '{asset_id}' has an empty hierarchy")]
+    EmptyHierarchy { asset_id: String },
+    #[error("prefab '{asset_id}' contains an empty persistent_id")]
+    EmptyPersistentId { asset_id: String },
+    #[error("prefab '{asset_id}' contains duplicate persistent_id '{persistent_id}'")]
+    DuplicatePersistentId {
+        asset_id: String,
+        persistent_id: String,
+    },
+    #[error(
+        "prefab '{asset_id}' entity '{entity_persistent_id}' references missing parent '{parent_persistent_id}'"
+    )]
+    MissingParentEntity {
+        asset_id: String,
+        entity_persistent_id: String,
+        parent_persistent_id: String,
+    },
+    #[error(
+        "prefab '{asset_id}' child '{child_asset_id}' references missing attachment entity '{entity_persistent_id}'"
+    )]
+    MissingAttachmentEntity {
+        asset_id: String,
+        child_asset_id: String,
+        entity_persistent_id: String,
+    },
+    #[error(
+        "prefab '{asset_id}' references missing child prefab asset '{child_asset_id}' at entity '{entity_persistent_id}'"
+    )]
+    MissingChildAsset {
+        asset_id: String,
+        child_asset_id: String,
+        entity_persistent_id: String,
+    },
+    #[error("prefab dependency cycle detected: {cycle:?}")]
+    DependencyCycle { cycle: Vec<String> },
+    #[error("prefab nesting exceeds maximum depth {max_depth} while validating '{asset_id}'")]
+    MaximumDepthExceeded { asset_id: String, max_depth: usize },
+}
+
 /// A reference to a child prefab nested inside a parent prefab.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PrefabChildRef {
@@ -151,61 +197,146 @@ pub fn register_prefab_asset_type(asset_type_registry: &mut crate::registry::Ass
 
 // ── Nested prefab validation ──────────────────────────────────────────
 
-/// Validate a prefab and its nested children for structural correctness.
+/// Validate a prefab and every reachable nested child using a concrete prefab
+/// asset resolver.
 ///
-/// Checks:
-/// - All `child_prefab_refs` point to entities that exist in `hierarchy`.
-/// - All child prefab assets exist in the registry.
-/// - No circular dependencies exist (detected via DFS over the asset graph).
-///
-/// Returns `Ok(())` if validation passes, or `Err` with a list of error
-/// messages describing each problem found.
+/// This deliberately does not use [`crate::registry::AssetTypeRegistry`]: an
+/// asset-type registry knows how to load the `prefab` type, but cannot prove
+/// that a particular child asset exists.
 pub fn validate_prefab(
     prefab: &Prefab,
-    registry: &crate::registry::AssetTypeRegistry,
-) -> Result<(), Vec<String>> {
-    let mut errors: Vec<String> = Vec::new();
+    registry: &dyn crate::prefab_instance::PrefabLoad,
+) -> Result<(), Vec<PrefabValidationError>> {
+    validate_prefab_graph(prefab, registry)
+}
 
-    // Collect persistent IDs present in this prefab's hierarchy.
-    let hierarchy_ids: HashSet<&str> = prefab
-        .hierarchy
-        .iter()
-        .map(|r| r.persistent_id.as_str())
-        .collect();
+fn validate_prefab_graph(
+    prefab: &Prefab,
+    registry: &dyn crate::prefab_instance::PrefabLoad,
+) -> Result<(), Vec<PrefabValidationError>> {
+    let mut errors = Vec::new();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut path = Vec::new();
+    validate_prefab_node(
+        &prefab.source_asset.id,
+        prefab,
+        registry,
+        0,
+        &mut visiting,
+        &mut visited,
+        &mut path,
+        &mut errors,
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
-    // Check child_prefab_refs reference existing entities.
+#[allow(clippy::too_many_arguments)]
+fn validate_prefab_node(
+    asset_id: &str,
+    prefab: &Prefab,
+    registry: &dyn crate::prefab_instance::PrefabLoad,
+    depth: usize,
+    visiting: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+    path: &mut Vec<String>,
+    errors: &mut Vec<PrefabValidationError>,
+) {
+    if depth > MAX_PREFAB_NESTING_DEPTH {
+        errors.push(PrefabValidationError::MaximumDepthExceeded {
+            asset_id: asset_id.to_string(),
+            max_depth: MAX_PREFAB_NESTING_DEPTH,
+        });
+        return;
+    }
+    if visiting.contains(asset_id) {
+        let start = path
+            .iter()
+            .position(|candidate| candidate == asset_id)
+            .unwrap_or(0);
+        let mut cycle = path[start..].to_vec();
+        cycle.push(asset_id.to_string());
+        errors.push(PrefabValidationError::DependencyCycle { cycle });
+        return;
+    }
+    if visited.contains(asset_id) {
+        return;
+    }
+
+    visiting.insert(asset_id.to_string());
+    path.push(asset_id.to_string());
+
+    if prefab.hierarchy.is_empty() {
+        errors.push(PrefabValidationError::EmptyHierarchy {
+            asset_id: asset_id.to_string(),
+        });
+    }
+
+    let mut hierarchy_ids = HashSet::new();
+    for record in &prefab.hierarchy {
+        if record.persistent_id.is_empty() {
+            errors.push(PrefabValidationError::EmptyPersistentId {
+                asset_id: asset_id.to_string(),
+            });
+        } else if !hierarchy_ids.insert(record.persistent_id.as_str()) {
+            errors.push(PrefabValidationError::DuplicatePersistentId {
+                asset_id: asset_id.to_string(),
+                persistent_id: record.persistent_id.clone(),
+            });
+        }
+    }
+
+    for record in &prefab.hierarchy {
+        if let Some(parent_id) = &record.parent {
+            if !hierarchy_ids.contains(parent_id.as_str()) {
+                errors.push(PrefabValidationError::MissingParentEntity {
+                    asset_id: asset_id.to_string(),
+                    entity_persistent_id: record.persistent_id.clone(),
+                    parent_persistent_id: parent_id.clone(),
+                });
+            }
+        }
+    }
+
     for child_ref in &prefab.child_prefab_refs {
         if !hierarchy_ids.contains(child_ref.entity_persistent_id.as_str()) {
-            errors.push(format!(
-                "Child prefab '{}' references non-existent entity '{}' in hierarchy",
-                child_ref.prefab_asset.id, child_ref.entity_persistent_id
-            ));
+            errors.push(PrefabValidationError::MissingAttachmentEntity {
+                asset_id: asset_id.to_string(),
+                child_asset_id: child_ref.prefab_asset.id.clone(),
+                entity_persistent_id: child_ref.entity_persistent_id.clone(),
+            });
         }
     }
 
-    // Check child prefab assets exist in the asset type registry.
     for child_ref in &prefab.child_prefab_refs {
-        if registry.get(&child_ref.prefab_asset.id).is_some() {
+        if let Some(child) = registry.load_prefab(&child_ref.prefab_asset.id) {
+            validate_prefab_node(
+                &child_ref.prefab_asset.id,
+                child,
+                registry,
+                depth + 1,
+                visiting,
+                visited,
+                path,
+                errors,
+            );
             // Asset type registered — good enough for structure validation.
         } else {
-            errors.push(format!(
-                "Child prefab asset '{}' (referenced by entity '{}') is not registered in the asset type registry",
-                child_ref.prefab_asset.id, child_ref.entity_persistent_id
-            ));
+            errors.push(PrefabValidationError::MissingChildAsset {
+                asset_id: asset_id.to_string(),
+                child_asset_id: child_ref.prefab_asset.id.clone(),
+                entity_persistent_id: child_ref.entity_persistent_id.clone(),
+            });
         }
     }
 
-    // Cycle detection: the asset graph is defined by the child_prefab_refs
-    // edges.  Since we only have the current prefab in memory, full cycle
-    // detection across the chain requires loading referenced prefabs.
-    // The cycle_detected flag below is a placeholder for the full algorithm.
-    // We currently emit a warning that deep validation is unimplemented.
-
-    if !errors.is_empty() {
-        Err(errors)
-    } else {
-        Ok(())
-    }
+    path.pop();
+    visiting.remove(asset_id);
+    visited.insert(asset_id.to_string());
 }
 
 /// Detect dependency cycles starting from `root_prefab`.
@@ -225,12 +356,16 @@ pub fn detect_prefab_cycles(
 
     fn dfs(
         asset_id: &str,
+        depth: usize,
         loader: &mut impl FnMut(&str) -> Option<Prefab>,
         visited: &mut HashSet<String>,
         in_stack: &mut HashSet<String>,
         path: &mut Vec<String>,
         cycles: &mut Vec<Vec<String>>,
     ) {
+        if depth > MAX_PREFAB_NESTING_DEPTH {
+            return;
+        }
         if in_stack.contains(asset_id) {
             // Found a cycle: extract the loop from the current path.
             let start = path.iter().position(|id| id == asset_id).unwrap_or(0);
@@ -242,7 +377,6 @@ pub fn detect_prefab_cycles(
             return;
         }
 
-        visited.insert(asset_id.to_string());
         in_stack.insert(asset_id.to_string());
         path.push(asset_id.to_string());
 
@@ -250,6 +384,7 @@ pub fn detect_prefab_cycles(
             for child in &prefab.child_prefab_refs {
                 dfs(
                     &child.prefab_asset.id,
+                    depth + 1,
                     loader,
                     visited,
                     in_stack,
@@ -261,10 +396,12 @@ pub fn detect_prefab_cycles(
 
         path.pop();
         in_stack.remove(asset_id);
+        visited.insert(asset_id.to_string());
     }
 
     dfs(
         &root_prefab.source_asset.id,
+        0,
         &mut loader,
         &mut visited,
         &mut in_stack,

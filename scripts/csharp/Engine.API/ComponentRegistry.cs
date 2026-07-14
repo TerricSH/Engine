@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace Engine;
 
 /// <summary>
@@ -6,26 +8,28 @@ namespace Engine;
 /// </summary>
 public static class ComponentRegistry
 {
-    private static readonly Dictionary<Type, int> _typeIds = new();
+    private static readonly ConcurrentDictionary<Type, uint> TypeIds = new();
 
     /// <summary>
     /// Register a component type with its Rust-side name.
     /// </summary>
-    public static void Register<T>(string name) where T : unmanaged
+    public static void Register<T>(string name)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
         var id = EngineAPI.ffi_component_type_id(name);
         if (id == 0)
             throw new InvalidOperationException(
-                $"Component type '{name}' is not registered in the engine");
-        _typeIds[typeof(T)] = id;
+                $"Component type '{name}' is not registered or is not script-serializable " +
+                "in the active engine runtime");
+        TypeIds[typeof(T)] = id;
     }
 
     /// <summary>
     /// Look up the numeric ID for a component type.
     /// </summary>
-    public static int GetId<T>() where T : unmanaged
+    public static uint GetId<T>()
     {
-        if (!_typeIds.TryGetValue(typeof(T), out var id))
+        if (!TypeIds.TryGetValue(typeof(T), out var id))
             throw new InvalidOperationException(
                 $"Component {typeof(T).Name} is not registered. " +
                 $"Call ComponentRegistry.Register<{typeof(T).Name}>() first.");
@@ -35,5 +39,5 @@ public static class ComponentRegistry
     /// <summary>
     /// Clear all registrations (used when reloading runtime).
     /// </summary>
-    public static void Clear() => _typeIds.Clear();
+    public static void Clear() => TypeIds.Clear();
 }

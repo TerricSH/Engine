@@ -54,9 +54,10 @@ pub struct PlatformPayload {
 }
 
 /// Target platform discriminator.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlatformKind {
     /// Cross-platform (applies to all targets).
+    #[default]
     All,
     /// Desktop (Windows, macOS, Linux).
     Desktop,
@@ -82,6 +83,10 @@ pub struct AssemblyPayload {
 /// A payload hash entry for integrity verification.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PayloadHash {
+    /// Target platform for this file. Missing values in legacy manifests
+    /// default to [`PlatformKind::All`].
+    #[serde(default)]
+    pub platform: PlatformKind,
     /// File path relative to the package root.
     pub path: String,
     /// Hash algorithm name (e.g. "sha256").
@@ -249,7 +254,18 @@ impl HotUpdateManifest {
     pub fn payloads_for_platform(&self, platform: PlatformKind) -> Vec<&PlatformPayload> {
         self.platform_payloads
             .iter()
-            .filter(|p| p.platform == platform || p.platform == PlatformKind::All)
+            .filter(|p| p.platform.applies_to(platform))
+            .collect()
+    }
+
+    /// Get integrity entries selected for a specific runtime platform.
+    ///
+    /// Legacy entries without an explicit platform deserialize as
+    /// [`PlatformKind::All`] and are selected on every runtime platform.
+    pub fn payload_hashes_for_platform(&self, platform: PlatformKind) -> Vec<&PayloadHash> {
+        self.payload_hashes
+            .iter()
+            .filter(|payload| payload.platform.applies_to(platform))
             .collect()
     }
 
@@ -266,6 +282,13 @@ impl HotUpdateManifest {
                 computed[..] == h.hash[..]
             })
             .unwrap_or(false)
+    }
+}
+
+impl PlatformKind {
+    /// Whether a manifest entry for this target applies to `runtime`.
+    pub fn applies_to(self, runtime: Self) -> bool {
+        self == Self::All || self == runtime
     }
 }
 
@@ -292,6 +315,7 @@ mod tests {
                 optional_assembly: None,
             }],
             payload_hashes: vec![PayloadHash {
+                platform: PlatformKind::Desktop,
                 path: "data/desktop/patch.bundle".into(),
                 algorithm: "sha256".into(),
                 hash: [0xAA; 32],
@@ -489,6 +513,7 @@ mod tests {
     fn manifest_validate_duplicate_payload_hash() {
         let mut manifest = sample_manifest();
         manifest.payload_hashes.push(PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "data/desktop/patch.bundle".into(),
             algorithm: "sha256".into(),
             hash: [0xBB; 32],
@@ -504,6 +529,7 @@ mod tests {
     fn manifest_validate_empty_payload_hash_path() {
         let mut manifest = sample_manifest();
         manifest.payload_hashes.push(PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "".into(),
             algorithm: "sha256".into(),
             hash: [0xBB; 32],
@@ -564,6 +590,54 @@ mod tests {
         assert_eq!(android.len(), 2);
         assert!(android.iter().any(|p| p.platform == PlatformKind::Android));
         assert!(android.iter().any(|p| p.platform == PlatformKind::All));
+    }
+
+    #[test]
+    fn legacy_payload_hash_without_platform_defaults_to_all() {
+        let manifest = sample_manifest();
+        let mut json = serde_json::to_value(&manifest).unwrap();
+        json["payload_hashes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("platform");
+
+        let legacy: HotUpdateManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.payload_hashes[0].platform, PlatformKind::All);
+        assert_eq!(
+            legacy
+                .payload_hashes_for_platform(PlatformKind::Android)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn payload_hashes_for_platform_selects_all_and_exact_match() {
+        let mut manifest = sample_manifest();
+        manifest.payload_hashes.extend([
+            PayloadHash {
+                platform: PlatformKind::All,
+                path: "common.bin".into(),
+                algorithm: "sha256".into(),
+                hash: [1; 32],
+            },
+            PayloadHash {
+                platform: PlatformKind::Android,
+                path: "android.bin".into(),
+                algorithm: "sha256".into(),
+                hash: [2; 32],
+            },
+        ]);
+
+        let desktop = manifest.payload_hashes_for_platform(PlatformKind::Desktop);
+        assert_eq!(desktop.len(), 2);
+        assert!(desktop.iter().any(|payload| payload.path == "common.bin"));
+        assert!(!desktop.iter().any(|payload| payload.path == "android.bin"));
+
+        let android = manifest.payload_hashes_for_platform(PlatformKind::Android);
+        assert_eq!(android.len(), 2);
+        assert!(android.iter().any(|payload| payload.path == "common.bin"));
+        assert!(android.iter().any(|payload| payload.path == "android.bin"));
     }
 
     // ── Edge-case tests ────────────────────────────────────────────────

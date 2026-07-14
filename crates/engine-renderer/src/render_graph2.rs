@@ -199,10 +199,11 @@ impl RenderGraph {
 
         for view in &views {
             let has_shadow_casters = input.lights.iter().any(|l| {
-                matches!(
-                    l.shadow_mode,
-                    crate::ShadowMode::Hard | crate::ShadowMode::Soft
-                )
+                l.kind == crate::LightKind::Directional
+                    && matches!(
+                        l.shadow_mode,
+                        crate::ShadowMode::Hard | crate::ShadowMode::Soft
+                    )
             });
 
             // 1. Directional shadow pass (only if shadows are needed)
@@ -269,48 +270,7 @@ impl RenderGraph {
                 }),
             });
 
-            // 3. SSAO pass (ambient occlusion)
-            graph.add_pass(PassNode {
-                kind: PassKind::Custom("ssao"),
-                name: "ssao_pass",
-                view_id: view.view_id,
-                inputs: vec![PassAttachment {
-                    name: "depth_stencil".into(),
-                    format: Some("D32".into()),
-                    clear: false,
-                    load_op: "load".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Read,
-                }],
-                outputs: vec![PassAttachment {
-                    name: "ssao_output".into(),
-                    format: Some("R8".into()),
-                    clear: true,
-                    load_op: "clear".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Write,
-                }],
-                depth_stencil: None,
-            });
-
-            // 4. Bloom pass (brightness extraction + blur)
-            graph.add_pass(PassNode {
-                kind: PassKind::Custom("bloom"),
-                name: "bloom_pass",
-                view_id: view.view_id,
-                inputs: vec![PassAttachment {
-                    name: "hdr_color".into(),
-                    format: Some("RGBA16F".into()),
-                    clear: false,
-                    load_op: "load".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Read,
-                }],
-                outputs: vec![],
-                depth_stencil: None,
-            });
-
-            // 5. Tone-map pass
+            // 3. Tone-map pass
             graph.add_pass(PassNode {
                 kind: PassKind::ToneMap,
                 name: "tone_map_pass",
@@ -334,7 +294,7 @@ impl RenderGraph {
                 depth_stencil: None,
             });
 
-            // 6. Present
+            // 4. Present
             graph.add_pass(PassNode {
                 kind: PassKind::Present,
                 name: "present",
@@ -395,10 +355,11 @@ impl RenderGraph {
             .collect();
 
         let has_shadow_casters = input.lights.iter().any(|l| {
-            matches!(
-                l.shadow_mode,
-                crate::ShadowMode::Hard | crate::ShadowMode::Soft
-            )
+            l.kind == crate::LightKind::Directional
+                && matches!(
+                    l.shadow_mode,
+                    crate::ShadowMode::Hard | crate::ShadowMode::Soft
+                )
         });
 
         let mut graph = Self::new();
@@ -873,14 +834,6 @@ impl Default for PassGraphConfig {
                 },
                 PassConfigEntry {
                     kind: "OpaquePbrForward".into(),
-                    enabled: true,
-                },
-                PassConfigEntry {
-                    kind: "ssao".into(),
-                    enabled: true,
-                },
-                PassConfigEntry {
-                    kind: "bloom".into(),
                     enabled: true,
                 },
                 PassConfigEntry {

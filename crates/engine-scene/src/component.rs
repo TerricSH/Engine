@@ -15,11 +15,13 @@ pub trait Component: Sized + Send + 'static {
 
 /// Sparse-set storage for a single component type.
 ///
-/// Provides O(1) insert, remove, and lookup by entity index.
-/// Uses a dense vector of `(entity_index, component)` pairs and a sparse
-/// vector mapping entity indices to dense indices.
+/// Provides O(1) insert, remove, and lookup by entity handle.
+/// Uses a dense vector of `(entity, component)` pairs and a sparse vector
+/// mapping entity indices to dense indices. The complete entity handle is
+/// retained so recycled indices cannot expose components through stale
+/// generations.
 pub struct SparseSet<T: Component> {
-    dense: Vec<(u32, T)>,
+    dense: Vec<(Entity, T)>,
     sparse: Vec<Option<u32>>,
 }
 
@@ -39,12 +41,13 @@ impl<T: Component> SparseSet<T> {
         self.ensure_sparse(entity_index);
 
         if let Some(dense_idx) = self.sparse[entity_index as usize] {
-            // Overwrite existing entry.
-            self.dense[dense_idx as usize] = (entity_index, component);
+            // Overwrite the slot, including its generation. This also makes a
+            // direct insertion for a recycled index invalidate the old handle.
+            self.dense[dense_idx as usize] = (entity, component);
         } else {
             let dense_idx = self.dense.len() as u32;
             self.sparse[entity_index as usize] = Some(dense_idx);
-            self.dense.push((entity_index, component));
+            self.dense.push((entity, component));
         }
     }
 
@@ -57,23 +60,17 @@ impl<T: Component> SparseSet<T> {
             return None;
         }
 
-        let dense_idx = self.sparse[entity_index as usize]?;
-        let last = self.dense.len() - 1;
-
-        // Unset sparse entry for the entity being removed.
-        self.sparse[entity_index as usize] = None;
-
-        if (dense_idx as usize) != last {
-            // Swap-remove: pop the last entry and move it into the vacated slot.
-            let last_entry = self.dense.pop()?;
-            // Update sparse entry for the moved entity.
-            self.sparse[last_entry.0 as usize] = Some(dense_idx);
-            let old_entry = std::mem::replace(&mut self.dense[dense_idx as usize], last_entry);
-            Some(old_entry.1)
-        } else {
-            let entry = self.dense.pop()?;
-            Some(entry.1)
+        let dense_idx = self.sparse[entity_index as usize]? as usize;
+        if self.dense.get(dense_idx).map(|entry| entry.0) != Some(entity) {
+            return None;
         }
+
+        self.sparse[entity_index as usize] = None;
+        let (_, component) = self.dense.swap_remove(dense_idx);
+        if let Some((moved_entity, _)) = self.dense.get(dense_idx) {
+            self.sparse[moved_entity.index() as usize] = Some(dense_idx as u32);
+        }
+        Some(component)
     }
 
     /// Borrow the component for the given entity.
@@ -82,8 +79,9 @@ impl<T: Component> SparseSet<T> {
         if (entity_index as usize) >= self.sparse.len() {
             return None;
         }
-        let dense_idx = self.sparse[entity_index as usize]?;
-        Some(&self.dense[dense_idx as usize].1)
+        let dense_idx = self.sparse[entity_index as usize]? as usize;
+        let (stored_entity, component) = self.dense.get(dense_idx)?;
+        (*stored_entity == entity).then_some(component)
     }
 
     /// Mutably borrow the component for the given entity.
@@ -92,31 +90,24 @@ impl<T: Component> SparseSet<T> {
         if (entity_index as usize) >= self.sparse.len() {
             return None;
         }
-        let dense_idx = self.sparse[entity_index as usize]?;
-        Some(&mut self.dense[dense_idx as usize].1)
+        let dense_idx = self.sparse[entity_index as usize]? as usize;
+        let (stored_entity, component) = self.dense.get_mut(dense_idx)?;
+        (*stored_entity == entity).then_some(component)
     }
 
     /// Returns `true` if the entity has this component.
     pub fn contains(&self, entity: Entity) -> bool {
-        let entity_index = entity.index();
-        (entity_index as usize) < self.sparse.len() && self.sparse[entity_index as usize].is_some()
+        self.get(entity).is_some()
     }
 
     /// Iterate over all `(Entity, &T)` pairs in arbitrary order.
     pub fn iter(&self) -> impl Iterator<Item = (Entity, &T)> + '_ {
-        self.dense.iter().map(|(idx, comp)| {
-            // We don't store generations in the sparse set, so we return
-            // Entity with generation 0.  This is fine for iteration; world
-            // queries should validate lifetime externally.
-            (Entity::new(*idx, 0), comp)
-        })
+        self.dense.iter().map(|(entity, comp)| (*entity, comp))
     }
 
     /// Iterate over all `(Entity, &mut T)` pairs in arbitrary order.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> + '_ {
-        self.dense
-            .iter_mut()
-            .map(|(idx, comp)| (Entity::new(*idx, 0), comp))
+        self.dense.iter_mut().map(|(entity, comp)| (*entity, comp))
     }
 
     /// Remove all components from this storage.
@@ -233,7 +224,7 @@ impl<T: Component> ComponentStorageDyn for SparseSet<T> {
     fn iter_any(&self) -> Vec<(Entity, &dyn std::any::Any)> {
         self.dense
             .iter()
-            .map(|(idx, comp)| (Entity::new(*idx, 0), comp as &dyn std::any::Any))
+            .map(|(entity, comp)| (*entity, comp as &dyn std::any::Any))
             .collect()
     }
 
@@ -328,10 +319,12 @@ mod tests {
     #[test]
     fn sparse_set_iter() {
         let mut set = SparseSet::<TestComp>::new();
-        set.insert(e(2), TestComp(30));
+        let generated = Entity::new(2, 7);
+        set.insert(generated, TestComp(30));
         set.insert(e(5), TestComp(60));
         let pairs: Vec<_> = set.iter().collect();
         assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().any(|(entity, _)| *entity == generated));
     }
 
     #[test]
@@ -343,5 +336,49 @@ mod tests {
             c.0 = 42;
         }
         assert_eq!(set.get(e0).unwrap().0, 42);
+    }
+
+    #[test]
+    fn sparse_set_rejects_stale_generation_for_every_operation() {
+        let mut set = SparseSet::<TestComp>::new();
+        let current = Entity::new(3, 9);
+        let stale = Entity::new(3, 8);
+        set.insert(current, TestComp(41));
+
+        assert!(set.get(stale).is_none());
+        assert!(set.get_mut(stale).is_none());
+        assert!(!set.contains(stale));
+        assert!(set.remove(stale).is_none());
+        assert_eq!(set.get(current).map(|value| value.0), Some(41));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn sparse_set_new_generation_replaces_recycled_index() {
+        let mut set = SparseSet::<TestComp>::new();
+        let old = Entity::new(4, 2);
+        let new = Entity::new(4, 3);
+        set.insert(old, TestComp(1));
+        set.insert(new, TestComp(2));
+
+        assert!(set.get(old).is_none());
+        assert_eq!(set.get(new).map(|value| value.0), Some(2));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn dynamic_storage_preserves_and_checks_generation() {
+        let current = Entity::new(6, 5);
+        let stale = Entity::new(6, 4);
+        let mut storage: Box<dyn ComponentStorageDyn> = Box::new(SparseSet::<TestComp>::new());
+        storage
+            .insert_any(current, Box::new(TestComp(77)))
+            .expect("matching dynamic component");
+
+        assert!(storage.get_any(stale).is_none());
+        assert!(!storage.contains(stale));
+        assert_eq!(storage.iter_any()[0].0, current);
+        storage.remove(stale);
+        assert!(storage.contains(current));
     }
 }

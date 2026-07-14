@@ -1,13 +1,14 @@
 //! DirectX 12 backend — adapter, backend struct, enumeration, helpers.
 
 use render_core::{
-    AdapterInfo, Backend, BackendCapabilities, BackendKind, Device, DeviceDescriptor, RhiError,
-    ResourceLimits, ShaderFormat, TextureFormat,
+    AdapterInfo, Backend, BackendCapabilities, BackendKind, Device, DeviceDescriptor,
+    ResourceLimits, RhiError, ShaderFormat, TextureFormat,
 };
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use windows::Win32::Graphics::Dxgi::*;
 
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use crate::device::Dx12Device;
 
 // ============================================================================
@@ -55,7 +56,10 @@ impl Backend for DirectX12Backend {
                 supports_timestamps: false,
                 supports_debug_markers: false,
                 supported_shader_formats: vec![ShaderFormat::Dxil, ShaderFormat::Hlsl],
-                supported_surface_formats: vec![TextureFormat::Rgba8Unorm, TextureFormat::Bgra8Unorm],
+                supported_surface_formats: vec![
+                    TextureFormat::Rgba8Unorm,
+                    TextureFormat::Bgra8Unorm,
+                ],
                 limits: ResourceLimits {
                     max_buffer_bytes: 256 * 1024 * 1024,
                     max_texture_array_layers: 256,
@@ -76,7 +80,8 @@ impl Backend for DirectX12Backend {
     #[cfg(not(all(target_os = "windows", feature = "backend-dx12")))]
     fn create_device(&self, _: &DeviceDescriptor) -> Result<Box<dyn Device>, RhiError> {
         Err(RhiError::Backend {
-            detail: "DirectX 12 backend requires Windows and the `backend-dx12` feature".to_string(),
+            detail: "DirectX 12 backend requires Windows and the `backend-dx12` feature"
+                .to_string(),
         })
     }
 
@@ -94,10 +99,9 @@ impl Backend for DirectX12Backend {
 fn enumerate_adapters_impl() -> Result<Vec<AdapterInfo>, RhiError> {
     unsafe {
         let flags = DXGI_CREATE_FACTORY_FLAGS(0);
-        let factory: IDXGIFactory2 =
-            CreateDXGIFactory2(flags).map_err(|e| RhiError::Backend {
-                detail: format!("DXGI: failed to create factory: {e}"),
-            })?;
+        let factory: IDXGIFactory2 = CreateDXGIFactory2(flags).map_err(|e| RhiError::Backend {
+            detail: format!("DXGI: failed to create factory: {e}"),
+        })?;
 
         let mut adapters = Vec::new();
 

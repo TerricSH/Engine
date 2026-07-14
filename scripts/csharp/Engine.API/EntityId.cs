@@ -5,7 +5,7 @@ namespace Engine;
 /// <summary>
 /// FFI-safe entity identifier, repr(C) compatible with Rust's FfiEntityId.
 /// </summary>
-[StructLayout(LayoutKind.Sequential)]
+[StructLayout(LayoutKind.Sequential, Size = 8)]
 public readonly struct EntityId
 {
     public readonly uint Index;

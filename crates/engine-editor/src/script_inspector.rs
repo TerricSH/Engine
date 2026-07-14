@@ -279,26 +279,16 @@ impl Default for ScriptInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_ui::UiEvent;
     use crate::EditorUi;
 
     #[test]
-    fn script_inspector_new() {
-        let inspector = ScriptInspector::new();
-        assert!(inspector.expanded_scripts.is_empty());
-    }
-
-    #[test]
-    fn script_inspector_default() {
-        let inspector = ScriptInspector::default();
-        assert!(inspector.expanded_scripts.is_empty());
-    }
-
-    #[test]
-    fn script_inspector_ui_empty_scripts() {
-        let mut inspector = ScriptInspector::new();
-        let mut ui = EditorUi::new();
-        let cmds = inspector.ui(&mut ui, "entity-001", &[]);
-        assert!(cmds.is_empty());
+    fn script_inspector_constructors_render_empty_scripts() {
+        for mut inspector in [ScriptInspector::new(), ScriptInspector::default()] {
+            let mut ui = EditorUi::new();
+            let cmds = inspector.ui(&mut ui, "entity-001", &[]);
+            assert!(cmds.is_empty());
+        }
     }
 
     #[test]
@@ -313,6 +303,21 @@ mod tests {
         let cmds = inspector.ui(&mut ui, "entity-001", &scripts);
         // Scaffolding editor returns no edits, so commands should be empty
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn script_inspector_uses_editor_ui_events_for_expansion_and_edits() {
+        let mut inspector = ScriptInspector::new();
+        let mut ui = EditorUi::new();
+        ui.inject_event(UiEvent::ButtonClick("MyScript [x]".to_string()));
+        ui.inject_event(UiEvent::SliderDrag("MyScript/speed".to_string(), 250.0));
+
+        let scripts = vec![ScriptComponent::new("asm-01", "MyScript")
+            .with_field("speed", ScriptValue::Float(100.0))];
+
+        let cmds = inspector.ui(&mut ui, "entity-001", &scripts);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].name(), "Set Component Field");
     }
 
     #[test]

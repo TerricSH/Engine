@@ -41,7 +41,7 @@ pub extern "C" fn ffi_entity_destroy(entity: FfiEntityId) -> bool {
 #[no_mangle]
 pub extern "C" fn ffi_entity_is_alive(entity: FfiEntityId) -> bool {
     if !registry::is_initialized() {
-        return entity.is_valid();
+        return false;
     }
     (registry::get().entity_is_alive)(entity)
 }
@@ -84,12 +84,12 @@ mod tests {
     }
 
     #[test]
-    fn alive_before_init_uses_fallback() {
+    fn alive_before_init_returns_false() {
         let valid = FfiEntityId {
             index: 1,
             generation: 0,
         };
-        assert!(ffi_entity_is_alive(valid));
+        assert!(!ffi_entity_is_alive(valid));
         assert!(!ffi_entity_is_alive(FfiEntityId::INVALID));
     }
 }

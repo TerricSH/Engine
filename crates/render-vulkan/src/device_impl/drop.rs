@@ -67,7 +67,8 @@ impl Drop for VulkanDevice {
             // fences, semaphores, and pools.
             unsafe {
                 d.destroy_fence(fs.in_flight_fence, None);
-                d.destroy_semaphore(fs.timeline_semaphore, None);
+                d.destroy_semaphore(fs.image_available, None);
+                d.destroy_semaphore(fs.render_finished, None);
                 d.destroy_command_pool(fs.command_pool, None);
             }
         }
@@ -77,16 +78,8 @@ impl Drop for VulkanDevice {
                 d.destroy_pipeline(e.pipeline, None);
             }
         }
-        for (_, mut e) in self.buffers.slots.drain(..).flatten() {
-            // SAFETY: `e.buffer` was created by this device.
-            unsafe {
-                d.destroy_buffer(e.buffer, None);
-            }
-            if let Some(mut a) = e.allocation.take() {
-                if let Ok(mut guard) = e.allocator.lock() {
-                    guard.free(&mut a);
-                }
-            }
+        for entry in self.buffers.drain_values() {
+            entry.destroy(d);
         }
         for (_, rp) in self.render_passes.slots.drain(..).flatten() {
             // SAFETY: `rp` was created by this device.

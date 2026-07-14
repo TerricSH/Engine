@@ -1,8 +1,12 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
-use engine_asset::AssetRegistry;
+use engine_asset::{asset_relative_path, AssetRegistry};
 use engine_serialize::{Diagnostic, DiagnosticSeverity, HotUpdateManifest, PlatformKind};
 use tracing::{debug, info, warn};
+
+use crate::error::UpdateError;
+use crate::path_safety::{safe_join, validate_manifest_paths};
 
 // ---------------------------------------------------------------------------
 // UpdateApplier
@@ -19,28 +23,74 @@ pub struct UpdateApplier;
 impl UpdateApplier {
     /// Apply resource updates through the asset registry.
     ///
-    /// For every asset ID listed in the manifest's platform payloads that
-    /// matches the current platform, the registry's `reload()` is called
-    /// to refresh the cached asset from disk.
+    /// For every selected asset ID, resolve `<active_dir>/assets/...`, require
+    /// that exact relative path to be covered by a selected signed payload
+    /// hash, and transactionally replace the registry cache from that root.
     ///
     /// Diagnostics are collected for each operation and returned.
     pub fn apply_resource_updates(
         manifest: &HotUpdateManifest,
         active_dir: &Path,
         registry: &mut AssetRegistry,
+        platform: &PlatformKind,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
+        if let Err(errors) = validate_manifest_paths(manifest) {
+            return path_error_diagnostics(errors);
+        }
 
-        // Collect all asset IDs from all platform payloads (the active
-        // directory contains the correct payloads for the current platform).
-        for payload in &manifest.platform_payloads {
+        let mut diagnostics = Vec::new();
+        let selected_hash_paths: BTreeSet<&str> = manifest
+            .payload_hashes_for_platform(*platform)
+            .into_iter()
+            .map(|payload| payload.path.as_str())
+            .collect();
+
+        for payload in manifest.payloads_for_platform(*platform) {
             for asset_id in &payload.asset_ids {
+                let relative_path = match asset_relative_path(asset_id) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        diagnostics.push(
+                            Diagnostic::new(
+                                "HOT_UPDATE_PATH_REJECTED",
+                                DiagnosticSeverity::Error,
+                                "hot-update",
+                                error.to_string(),
+                            )
+                            .contract("HotUpdate", "0.1"),
+                        );
+                        continue;
+                    }
+                };
+                let source_path = active_dir.join(&relative_path);
+                if !selected_hash_paths.contains(relative_path.as_str()) {
+                    warn!(
+                        asset = %asset_id.id,
+                        path = %relative_path,
+                        "asset is not covered by a selected payload hash"
+                    );
+                    diagnostics.push(
+                        Diagnostic::new(
+                            "HOT_UPDATE_RESOURCE_UNMAPPED",
+                            DiagnosticSeverity::Error,
+                            "hot-update",
+                            format!(
+                                "asset {} is not mapped to selected signed payload {relative_path}",
+                                asset_id.id
+                            ),
+                        )
+                        .path(source_path.display().to_string())
+                        .contract("HotUpdate", "0.1"),
+                    );
+                    continue;
+                }
                 debug!(
                     asset = %asset_id.id,
+                    path = %source_path.display(),
                     "reloading asset from active package"
                 );
 
-                match registry.reload(asset_id) {
+                match registry.reload_from_root(asset_id, active_dir) {
                     Ok(()) => {
                         diagnostics.push(
                             Diagnostic::new(
@@ -49,7 +99,7 @@ impl UpdateApplier {
                                 "hot-update",
                                 format!("asset reloaded: {}", asset_id.id),
                             )
-                            .path(active_dir.display().to_string())
+                            .path(source_path.display().to_string())
                             .contract("HotUpdate", "0.1"),
                         );
                     }
@@ -66,7 +116,7 @@ impl UpdateApplier {
                                 "hot-update",
                                 format!("failed to reload asset {}: {e}", asset_id.id),
                             )
-                            .path(active_dir.display().to_string())
+                            .path(source_path.display().to_string())
                             .contract("HotUpdate", "0.1"),
                         );
                     }
@@ -91,87 +141,110 @@ impl UpdateApplier {
     /// Currently the logic asset payload path is derived from the logic
     /// asset ID (mapped to a file name).  A future gate will use proper
     /// mapping metadata.
-    pub fn apply_logic_assets(manifest: &HotUpdateManifest, active_dir: &Path) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
+    pub fn apply_logic_assets(
+        manifest: &HotUpdateManifest,
+        active_dir: &Path,
+        platform: &PlatformKind,
+    ) -> Vec<Diagnostic> {
+        if let Err(errors) = validate_manifest_paths(manifest) {
+            return path_error_diagnostics(errors);
+        }
 
-        for payload in &manifest.platform_payloads {
+        let target_dir = Path::new("assets/logic");
+        let mut prepared = Vec::new();
+        for payload in manifest.payloads_for_platform(*platform) {
             for logic_id in &payload.logic_asset_ids {
-                // Derive the source path from the active dir.
-                let source = active_dir.join(format!("logic/{logic_id}.lua"));
+                let source = match safe_join(
+                    active_dir,
+                    &format!("logic/{logic_id}.lua"),
+                    "logic asset source",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => return path_error_diagnostics(vec![error]),
+                };
+                let target = match safe_join(
+                    target_dir,
+                    &format!("{logic_id}.lua"),
+                    "logic asset destination",
+                ) {
+                    Ok(path) => path,
+                    Err(error) => return path_error_diagnostics(vec![error]),
+                };
+                prepared.push((logic_id, source, target));
+            }
+        }
 
-                let target_dir = Path::new("assets/logic");
-                let target = target_dir.join(format!("{logic_id}.lua"));
+        let mut diagnostics = Vec::new();
+        for (logic_id, source, target) in prepared {
+            if !source.exists() {
+                warn!(
+                    logic_id = %logic_id,
+                    path = %source.display(),
+                    "logic asset source not found"
+                );
+                diagnostics.push(
+                    Diagnostic::new(
+                        "HOT_UPDATE_LOGIC_MISSING",
+                        DiagnosticSeverity::Warning,
+                        "hot-update",
+                        format!("logic asset source not found: {logic_id}"),
+                    )
+                    .path(source.display().to_string()),
+                );
+                continue;
+            }
 
-                if !source.exists() {
-                    warn!(
+            // Ensure target directory exists.
+            if let Err(e) = std::fs::create_dir_all(target_dir) {
+                warn!(
+                    logic_id = %logic_id,
+                    error = %e,
+                    "cannot create logic asset directory"
+                );
+                diagnostics.push(
+                    Diagnostic::new(
+                        "HOT_UPDATE_LOGIC_DIR_FAIL",
+                        DiagnosticSeverity::Error,
+                        "hot-update",
+                        format!("cannot create logic directory: {e}"),
+                    )
+                    .path(target_dir.display().to_string()),
+                );
+                continue;
+            }
+
+            match std::fs::copy(&source, &target) {
+                Ok(n) => {
+                    debug!(
                         logic_id = %logic_id,
-                        path = %source.display(),
-                        "logic asset source not found"
+                        bytes = n,
+                        "logic asset applied"
                     );
                     diagnostics.push(
                         Diagnostic::new(
-                            "HOT_UPDATE_LOGIC_MISSING",
-                            DiagnosticSeverity::Warning,
+                            "HOT_UPDATE_LOGIC_OK",
+                            DiagnosticSeverity::Info,
                             "hot-update",
-                            format!("logic asset source not found: {logic_id}"),
+                            format!("logic asset applied: {logic_id}"),
                         )
-                        .path(source.display().to_string()),
+                        .path(target.display().to_string()),
                     );
-                    continue;
                 }
-
-                // Ensure target directory exists.
-                if let Err(e) = std::fs::create_dir_all(target_dir) {
+                Err(e) => {
                     warn!(
                         logic_id = %logic_id,
                         error = %e,
-                        "cannot create logic asset directory"
+                        "failed to copy logic asset"
                     );
                     diagnostics.push(
                         Diagnostic::new(
-                            "HOT_UPDATE_LOGIC_DIR_FAIL",
+                            "HOT_UPDATE_LOGIC_COPY_FAIL",
                             DiagnosticSeverity::Error,
                             "hot-update",
-                            format!("cannot create logic directory: {e}"),
+                            format!("failed to copy logic asset {logic_id}: {e}"),
                         )
-                        .path(target_dir.display().to_string()),
+                        .path(target.display().to_string()),
                     );
-                    continue;
-                }
-
-                match std::fs::copy(&source, &target) {
-                    Ok(n) => {
-                        debug!(
-                            logic_id = %logic_id,
-                            bytes = n,
-                            "logic asset applied"
-                        );
-                        diagnostics.push(
-                            Diagnostic::new(
-                                "HOT_UPDATE_LOGIC_OK",
-                                DiagnosticSeverity::Info,
-                                "hot-update",
-                                format!("logic asset applied: {logic_id}"),
-                            )
-                            .path(target.display().to_string()),
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            logic_id = %logic_id,
-                            error = %e,
-                            "failed to copy logic asset"
-                        );
-                        diagnostics.push(
-                            Diagnostic::new(
-                                "HOT_UPDATE_LOGIC_COPY_FAIL",
-                                DiagnosticSeverity::Error,
-                                "hot-update",
-                                format!("failed to copy logic asset {logic_id}: {e}"),
-                            )
-                            .path(target.display().to_string()),
-                        );
-                    }
                 }
             }
         }
@@ -188,79 +261,100 @@ impl UpdateApplier {
     pub fn apply_android_assembly(
         manifest: &HotUpdateManifest,
         active_dir: &Path,
+        platform: &PlatformKind,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
+        if let Err(errors) = validate_manifest_paths(manifest) {
+            return path_error_diagnostics(errors);
+        }
 
-        // Find Android payload with optional assembly.
-        for payload in &manifest.platform_payloads {
-            if payload.platform != PlatformKind::Android && payload.platform != PlatformKind::All {
+        let target_dir = Path::new("assets/assemblies");
+        let mut prepared = Vec::new();
+        if *platform == PlatformKind::Android {
+            for payload in manifest.payloads_for_platform(*platform) {
+                let Some(assembly) = &payload.optional_assembly else {
+                    continue;
+                };
+                let source = match safe_join(active_dir, &assembly.path, "assembly source") {
+                    Ok(path) => path,
+                    Err(error) => return path_error_diagnostics(vec![error]),
+                };
+                let Some(file_name) = Path::new(&assembly.path)
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                else {
+                    return path_error_diagnostics(vec![UpdateError::UnsafePath {
+                        field: "assembly destination".into(),
+                        path: assembly.path.clone(),
+                        reason: "assembly path has no valid file name".into(),
+                    }]);
+                };
+                let target = match safe_join(target_dir, file_name, "assembly destination") {
+                    Ok(path) => path,
+                    Err(error) => return path_error_diagnostics(vec![error]),
+                };
+                prepared.push((assembly, source, target));
+            }
+        }
+
+        let mut diagnostics = Vec::new();
+        for (assembly, source, target) in prepared {
+            if !source.exists() {
+                warn!(
+                    path = %source.display(),
+                    "Android assembly source not found"
+                );
+                diagnostics.push(
+                    Diagnostic::new(
+                        "HOT_UPDATE_ASSEMBLY_MISSING",
+                        DiagnosticSeverity::Warning,
+                        "hot-update",
+                        format!("Android assembly not found: {}", assembly.path),
+                    )
+                    .path(source.display().to_string()),
+                );
                 continue;
             }
 
-            if let Some(ref assembly) = payload.optional_assembly {
-                let source = active_dir.join(&assembly.path);
-                if !source.exists() {
-                    warn!(
-                        path = %source.display(),
-                        "Android assembly source not found"
-                    );
-                    diagnostics.push(
-                        Diagnostic::new(
-                            "HOT_UPDATE_ASSEMBLY_MISSING",
-                            DiagnosticSeverity::Warning,
-                            "hot-update",
-                            format!("Android assembly not found: {}", assembly.path),
-                        )
-                        .path(source.display().to_string()),
-                    );
-                    continue;
-                }
+            if let Err(e) = std::fs::create_dir_all(target_dir) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "HOT_UPDATE_ASSEMBLY_DIR_FAIL",
+                        DiagnosticSeverity::Error,
+                        "hot-update",
+                        format!("cannot create assemblies directory: {e}"),
+                    )
+                    .path(target_dir.display().to_string()),
+                );
+                continue;
+            }
 
-                let target_dir = Path::new("assets/assemblies");
-                if let Err(e) = std::fs::create_dir_all(target_dir) {
+            match std::fs::copy(&source, &target) {
+                Ok(n) => {
+                    info!(
+                        path = %assembly.path,
+                        bytes = n,
+                        "Android assembly applied"
+                    );
                     diagnostics.push(
                         Diagnostic::new(
-                            "HOT_UPDATE_ASSEMBLY_DIR_FAIL",
+                            "HOT_UPDATE_ASSEMBLY_OK",
+                            DiagnosticSeverity::Info,
+                            "hot-update",
+                            format!("Android assembly applied: {}", assembly.path),
+                        )
+                        .path(target.display().to_string()),
+                    );
+                }
+                Err(e) => {
+                    diagnostics.push(
+                        Diagnostic::new(
+                            "HOT_UPDATE_ASSEMBLY_COPY_FAIL",
                             DiagnosticSeverity::Error,
                             "hot-update",
-                            format!("cannot create assemblies directory: {e}"),
+                            format!("failed to copy assembly: {e}"),
                         )
-                        .path(target_dir.display().to_string()),
+                        .path(target.display().to_string()),
                     );
-                    continue;
-                }
-
-                let target =
-                    target_dir.join(Path::new(&assembly.path).file_name().unwrap_or_default());
-
-                match std::fs::copy(&source, &target) {
-                    Ok(n) => {
-                        info!(
-                            path = %assembly.path,
-                            bytes = n,
-                            "Android assembly applied"
-                        );
-                        diagnostics.push(
-                            Diagnostic::new(
-                                "HOT_UPDATE_ASSEMBLY_OK",
-                                DiagnosticSeverity::Info,
-                                "hot-update",
-                                format!("Android assembly applied: {}", assembly.path),
-                            )
-                            .path(target.display().to_string()),
-                        );
-                    }
-                    Err(e) => {
-                        diagnostics.push(
-                            Diagnostic::new(
-                                "HOT_UPDATE_ASSEMBLY_COPY_FAIL",
-                                DiagnosticSeverity::Error,
-                                "hot-update",
-                                format!("failed to copy assembly: {e}"),
-                            )
-                            .path(target.display().to_string()),
-                        );
-                    }
                 }
             }
         }
@@ -278,11 +372,26 @@ impl UpdateApplier {
     }
 }
 
+fn path_error_diagnostics(errors: Vec<UpdateError>) -> Vec<Diagnostic> {
+    errors
+        .into_iter()
+        .map(|error| {
+            Diagnostic::new(
+                "HOT_UPDATE_PATH_REJECTED",
+                DiagnosticSeverity::Error,
+                "hot-update",
+                error.to_string(),
+            )
+            .contract("HotUpdate", "0.1")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use engine_serialize::{
-        AssemblyPayload, AssetId, PlatformPayload, RollbackMetadata, SchemaVersion,
+        AssemblyPayload, AssetId, PayloadHash, PlatformPayload, RollbackMetadata, SchemaVersion,
     };
 
     fn sample_manifest() -> HotUpdateManifest {
@@ -317,11 +426,17 @@ mod tests {
         let mut registry = AssetRegistry::new();
         let dir = std::env::temp_dir().join("apply_res_empty");
 
-        let diags = UpdateApplier::apply_resource_updates(&manifest, &dir, &mut registry);
-        // Desktop payload has mesh-cube asset but it won't exist on disk,
-        // so reload will fail.
+        let diags = UpdateApplier::apply_resource_updates(
+            &manifest,
+            &dir,
+            &mut registry,
+            &PlatformKind::Desktop,
+        );
+        // The asset is not mapped to a selected signed payload hash.
         assert!(!diags.is_empty());
-        assert!(diags.iter().any(|d| d.code == "HOT_UPDATE_RESOURCE_FAIL"));
+        assert!(diags
+            .iter()
+            .any(|d| d.code == "HOT_UPDATE_RESOURCE_UNMAPPED"));
     }
 
     #[test]
@@ -331,8 +446,159 @@ mod tests {
         let mut registry = AssetRegistry::new();
         let dir = std::env::temp_dir().join("apply_res_none");
 
-        let diags = UpdateApplier::apply_resource_updates(&manifest, &dir, &mut registry);
+        let diags = UpdateApplier::apply_resource_updates(
+            &manifest,
+            &dir,
+            &mut registry,
+            &PlatformKind::Desktop,
+        );
         assert!(diags.is_empty());
+    }
+
+    fn resource_manifest(asset_id: AssetId) -> HotUpdateManifest {
+        let mut manifest = sample_manifest();
+        manifest.platform_payloads = vec![PlatformPayload {
+            platform: PlatformKind::Desktop,
+            asset_ids: vec![asset_id],
+            logic_asset_ids: Vec::new(),
+            optional_assembly: None,
+        }];
+        manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
+            path: "assets/textures/runtime.bin".into(),
+            algorithm: "sha256".into(),
+            hash: [7; 32],
+        }];
+        manifest
+    }
+
+    fn seed_cached_asset(registry: &mut AssetRegistry, root: &Path, asset_id: &AssetId) {
+        let source = root.join("assets/textures/runtime.bin");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source, b"old bytes").unwrap();
+        registry.reload_from_root(asset_id, root).unwrap();
+        assert_eq!(
+            registry.load(asset_id).unwrap().get().as_slice(),
+            b"old bytes"
+        );
+    }
+
+    #[test]
+    fn apply_resource_updates_reads_new_bytes_from_active_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let active = temp.path().join("active");
+        let asset_id = AssetId::with_path("texture-runtime", "textures/runtime.bin");
+        let manifest = resource_manifest(asset_id.clone());
+        let mut registry = AssetRegistry::new();
+        seed_cached_asset(&mut registry, &base, &asset_id);
+        let source = active.join("assets/textures/runtime.bin");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"new bytes").unwrap();
+
+        let diagnostics = UpdateApplier::apply_resource_updates(
+            &manifest,
+            &active,
+            &mut registry,
+            &PlatformKind::Desktop,
+        );
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "HOT_UPDATE_RESOURCE_OK"));
+        assert_eq!(
+            registry.load(&asset_id).unwrap().get().as_slice(),
+            b"new bytes"
+        );
+    }
+
+    #[test]
+    fn missing_active_resource_keeps_old_cached_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let active = temp.path().join("active");
+        let asset_id = AssetId::with_path("texture-runtime", "textures/runtime.bin");
+        let manifest = resource_manifest(asset_id.clone());
+        let mut registry = AssetRegistry::new();
+        seed_cached_asset(&mut registry, &base, &asset_id);
+
+        let diagnostics = UpdateApplier::apply_resource_updates(
+            &manifest,
+            &active,
+            &mut registry,
+            &PlatformKind::Desktop,
+        );
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "HOT_UPDATE_RESOURCE_FAIL"));
+        assert_eq!(
+            registry.load(&asset_id).unwrap().get().as_slice(),
+            b"old bytes"
+        );
+    }
+
+    #[test]
+    fn unsigned_extra_resource_is_not_loaded_and_keeps_old_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let active = temp.path().join("active");
+        let asset_id = AssetId::with_path("texture-runtime", "textures/runtime.bin");
+        let mut manifest = resource_manifest(asset_id.clone());
+        manifest.payload_hashes.clear();
+        let mut registry = AssetRegistry::new();
+        seed_cached_asset(&mut registry, &base, &asset_id);
+        let source = active.join("assets/textures/runtime.bin");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source, b"unsigned bytes").unwrap();
+
+        let diagnostics = UpdateApplier::apply_resource_updates(
+            &manifest,
+            &active,
+            &mut registry,
+            &PlatformKind::Desktop,
+        );
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "HOT_UPDATE_RESOURCE_UNMAPPED"));
+        assert_eq!(
+            registry.load(&asset_id).unwrap().get().as_slice(),
+            b"old bytes"
+        );
+    }
+
+    #[test]
+    fn malicious_asset_paths_reject_entire_apply_before_cache_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("base");
+        let active = temp.path().join("active");
+        let safe_id = AssetId::with_path("texture-runtime", "textures/runtime.bin");
+        let mut manifest = resource_manifest(safe_id.clone());
+        manifest.platform_payloads[0].asset_ids.extend([
+            AssetId::new("../escape"),
+            AssetId::with_path("texture-evil", "..\\escape.bin"),
+        ]);
+        let mut registry = AssetRegistry::new();
+        seed_cached_asset(&mut registry, &base, &safe_id);
+        let source = active.join("assets/textures/runtime.bin");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source, b"new bytes").unwrap();
+
+        let diagnostics = UpdateApplier::apply_resource_updates(
+            &manifest,
+            &active,
+            &mut registry,
+            &PlatformKind::Desktop,
+        );
+
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == "HOT_UPDATE_PATH_REJECTED"));
+        assert_eq!(
+            registry.load(&safe_id).unwrap().get().as_slice(),
+            b"old bytes"
+        );
     }
 
     // ── Logic asset tests ──────────────────────────────────────────────
@@ -342,7 +608,7 @@ mod tests {
         let manifest = sample_manifest();
         let dir = std::env::temp_dir().join("apply_logic_miss");
 
-        let diags = UpdateApplier::apply_logic_assets(&manifest, &dir);
+        let diags = UpdateApplier::apply_logic_assets(&manifest, &dir, &PlatformKind::Desktop);
         assert!(!diags.is_empty());
         assert!(diags.iter().any(|d| d.code == "HOT_UPDATE_LOGIC_MISSING"));
     }
@@ -362,7 +628,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("logic")).unwrap();
         std::fs::write(dir.join("logic/test-script.lua"), b"return 42").unwrap();
 
-        let diags = UpdateApplier::apply_logic_assets(&manifest, &dir);
+        let diags = UpdateApplier::apply_logic_assets(&manifest, &dir, &PlatformKind::Desktop);
 
         // Should have at least an OK diagnostic.
         assert!(diags.iter().any(|d| d.code == "HOT_UPDATE_LOGIC_OK"));
@@ -383,8 +649,67 @@ mod tests {
         }];
 
         let dir = std::env::temp_dir().join("apply_logic_empty");
-        let diags = UpdateApplier::apply_logic_assets(&manifest, &dir);
+        let diags = UpdateApplier::apply_logic_assets(&manifest, &dir, &PlatformKind::Desktop);
         assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn apply_logic_assets_only_applies_current_platform_and_all() {
+        let mut manifest = sample_manifest();
+        manifest.platform_payloads = vec![
+            PlatformPayload {
+                platform: PlatformKind::Desktop,
+                asset_ids: vec![],
+                logic_asset_ids: vec!["platform-desktop".into()],
+                optional_assembly: None,
+            },
+            PlatformPayload {
+                platform: PlatformKind::Android,
+                asset_ids: vec![],
+                logic_asset_ids: vec!["platform-android-missing".into()],
+                optional_assembly: None,
+            },
+            PlatformPayload {
+                platform: PlatformKind::All,
+                asset_ids: vec![],
+                logic_asset_ids: vec!["platform-common".into()],
+                optional_assembly: None,
+            },
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let logic = temp.path().join("logic");
+        std::fs::create_dir_all(&logic).unwrap();
+        std::fs::write(logic.join("platform-desktop.lua"), b"desktop").unwrap();
+        std::fs::write(logic.join("platform-common.lua"), b"common").unwrap();
+
+        let diagnostics =
+            UpdateApplier::apply_logic_assets(&manifest, temp.path(), &PlatformKind::Desktop);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "HOT_UPDATE_LOGIC_OK")
+                .count(),
+            2
+        );
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("platform-android-missing")));
+        let _ = std::fs::remove_file("assets/logic/platform-desktop.lua");
+        let _ = std::fs::remove_file("assets/logic/platform-common.lua");
+    }
+
+    #[test]
+    fn apply_logic_assets_rejects_malicious_id_before_copying() {
+        let mut manifest = sample_manifest();
+        manifest.platform_payloads[0].logic_asset_ids = vec!["../escaped".into()];
+        let temp = tempfile::tempdir().unwrap();
+
+        let diagnostics =
+            UpdateApplier::apply_logic_assets(&manifest, temp.path(), &PlatformKind::Desktop);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "HOT_UPDATE_PATH_REJECTED");
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Error);
     }
 
     // ── Android assembly tests ─────────────────────────────────────────
@@ -394,7 +719,7 @@ mod tests {
         let manifest = sample_manifest(); // Desktop platform only
         let dir = std::env::temp_dir().join("apply_asm_noop");
 
-        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir);
+        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir, &PlatformKind::Desktop);
         // Should have the NOOP diagnostic.
         assert!(diags.iter().any(|d| d.code == "HOT_UPDATE_ASSEMBLY_NOOP"));
     }
@@ -419,7 +744,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/GameAssembly.dll"), b"assembly data").unwrap();
 
-        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir);
+        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir, &PlatformKind::Android);
         assert!(diags.iter().any(|d| d.code == "HOT_UPDATE_ASSEMBLY_OK"));
 
         // Clean up
@@ -446,7 +771,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir);
+        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir, &PlatformKind::Android);
         assert!(diags
             .iter()
             .any(|d| d.code == "HOT_UPDATE_ASSEMBLY_MISSING"));
@@ -472,7 +797,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("all")).unwrap();
         std::fs::write(dir.join("all/asm.dll"), b"assembly").unwrap();
 
-        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir);
+        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir, &PlatformKind::Android);
         // "All" platform is matched by the apply logic.
         let codes: Vec<_> = diags.iter().map(|d| d.code.as_str()).collect();
         assert!(
@@ -482,5 +807,27 @@ mod tests {
 
         let _ = std::fs::remove_file("assets/assemblies/asm.dll");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_android_assembly_rejects_traversal_before_copying() {
+        let mut manifest = sample_manifest();
+        manifest.platform_payloads = vec![PlatformPayload {
+            platform: PlatformKind::Android,
+            asset_ids: vec![],
+            logic_asset_ids: vec![],
+            optional_assembly: Some(AssemblyPayload {
+                path: "../../outside.dll".into(),
+                size_bytes: 1,
+                hash: [0u8; 32],
+                min_engine_version: "1.5.0".into(),
+            }),
+        }];
+        let temp = tempfile::tempdir().unwrap();
+
+        let diagnostics =
+            UpdateApplier::apply_android_assembly(&manifest, temp.path(), &PlatformKind::Android);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "HOT_UPDATE_PATH_REJECTED");
     }
 }

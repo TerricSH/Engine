@@ -89,6 +89,7 @@ impl ScriptEngine {
     pub fn instantiate(
         &mut self,
         handle: &ScriptHandle,
+        class_name: &str,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
         let manager = self
             .managers
@@ -101,7 +102,7 @@ impl ScriptEngine {
                 ))
             })?;
 
-        manager.host_mut().instantiate(handle)
+        manager.host_mut().instantiate(handle, class_name)
     }
 
     // ── Component-based lifecycle API ─────────────────────────────────────

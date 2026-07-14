@@ -3,28 +3,25 @@
 //! Consumes [`RenderFrameInput`] and renders each drawable through a
 //! forward-shaded pipeline with lighting.
 //!
-//! # First-pass limitations
+//! Resources are uploaded through the typed renderer contract before a frame
+//! references them. The render graph records shadow, HDR forward, tone-map and
+//! present passes with explicit abort handling when any pass fails.
 //!
-//! * Meshes that are not yet cached fall back to a hard-coded coloured quad.
-//! * The framebuffer attachment is a placeholder (null image-view) so the
-//!   render pass begin is structurally present but may not produce visible
-//!   output on all drivers.  The frame lifecycle (acquire �?record �?submit
-//!   �?present) is otherwise complete.
-//! * Material handling currently covers pipeline variants plus basic raster and
-//!   blend state, but textures and uniform bindings are not yet consumed.
-//! * No texture loading, skeletal animation, or multi-pass optimisation.
+//! The portable material contract currently accepts opaque, single-sided PBR
+//! base-color materials. Unsupported alpha and raster states are rejected by
+//! the contract instead of being rendered with an implicit approximation.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ash::vk;
 use glam::Mat4;
-use glam::Vec4 as GlamVec4;
 
 use engine_renderer::{
-    render_graph, AssetId, AxisAlignedBox, BackendRenderer, Diagnostic, DiagnosticSeverity,
-    FrameStats, LightItem, LightKind, MaterialBinding, MaterialPipelineContext, MaterialResolver,
-    ParamBlock, PassRegistry, RenderFrameInput, RenderableItem, SkinnedItem, Transparency, UiBatch,
-    UiVertex,
+    render_graph, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, LightItem,
+    LightKind, MaterialBinding, MaterialPipelineContext, MaterialResolver, MaterialUpload,
+    MeshUpload, ParamBlock, PassRegistry, RenderFrameInput, RenderableItem, ResourceKind,
+    ResourceRemoval, SamplerAddressMode, SamplerFilter, ShadowMode, SkinnedItem, TextureSlot,
+    TextureUpload, Transparency, UiBatch, UploadReceipt,
 };
 use render_core::{
     self, BindGroupLayoutBinding, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
@@ -54,6 +51,21 @@ pub struct GpuMesh {
     pub index_buffer: BufferHandle,
     pub index_count: u32,
     pub index_format: IndexFormat,
+    pub content_hash: [u8; 32],
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UploadedResourceState {
+    content_hash: [u8; 32],
+    revision: u64,
+}
+
+#[derive(Clone, Debug)]
+struct UploadedMaterialState {
+    binding: MaterialBinding,
+    content_hash: [u8; 32],
+    revision: u64,
 }
 
 // ============================================================================
@@ -62,39 +74,62 @@ pub struct GpuMesh {
 
 /// Single vertex for the fallback mesh.
 ///
-/// Layout: position (float32x3) + color (float32x4) + padding (float32)
-/// Total stride = 32 bytes, matching the shadow pipeline's vertex-input
-/// stride so the same vertex buffer can be used for both forward and
-/// shadow rendering.
+/// Layout: position (float32x3) + normal (float32x3) + uv (float32x2).
+/// Total stride = 32 bytes, matching both the forward and shadow pipelines.
 #[repr(C)]
 struct FallbackVertex {
     position: [f32; 3],
-    color: [f32; 4],
-    _pad: f32,
+    normal: [f32; 3],
+    uv: [f32; 2],
 }
 
 const FALLBACK_VERTICES: [FallbackVertex; 4] = [
     FallbackVertex {
         position: [-0.5, -0.5, 0.0],
-        color: [1.0, 0.0, 0.0, 1.0],
-        _pad: 0.0,
+        normal: [0.0, 0.0, 1.0],
+        uv: [0.0, 1.0],
     },
     FallbackVertex {
         position: [0.5, -0.5, 0.0],
-        color: [0.0, 1.0, 0.0, 1.0],
-        _pad: 0.0,
+        normal: [0.0, 0.0, 1.0],
+        uv: [1.0, 1.0],
     },
     FallbackVertex {
         position: [0.5, 0.5, 0.0],
-        color: [0.0, 0.0, 1.0, 1.0],
-        _pad: 0.0,
+        normal: [0.0, 0.0, 1.0],
+        uv: [1.0, 0.0],
     },
     FallbackVertex {
         position: [-0.5, 0.5, 0.0],
-        color: [1.0, 1.0, 0.0, 1.0],
-        _pad: 0.0,
+        normal: [0.0, 0.0, 1.0],
+        uv: [0.0, 0.0],
     },
 ];
+
+fn extraction_stats(input: &RenderFrameInput) -> engine_renderer::ExtractionStats {
+    input
+        .extraction_stats
+        .unwrap_or(engine_renderer::ExtractionStats {
+            visible_drawables: u32::try_from(
+                input
+                    .drawables
+                    .len()
+                    .saturating_add(input.skinned_items.len()),
+            )
+            .unwrap_or(u32::MAX),
+            culled_drawables: 0,
+            visible_lights: u32::try_from(input.lights.len()).unwrap_or(u32::MAX),
+            culled_lights: 0,
+        })
+}
+
+fn apply_extraction_stats(stats: &mut FrameStats, input: &RenderFrameInput) {
+    let extraction = extraction_stats(input);
+    stats.visible_drawables = extraction.visible_drawables;
+    stats.culled_drawables = extraction.culled_drawables;
+    stats.visible_lights = extraction.visible_lights;
+    stats.culled_lights = extraction.culled_lights;
+}
 
 fn fallback_vertex_bytes() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(FALLBACK_VERTICES.len() * 32);
@@ -103,8 +138,8 @@ fn fallback_vertex_bytes() -> Vec<u8> {
             .position
             .iter()
             .copied()
-            .chain(v.color.iter().copied())
-            .chain(std::iter::once(v._pad))
+            .chain(v.normal.iter().copied())
+            .chain(v.uv.iter().copied())
         {
             bytes.extend_from_slice(&f.to_ne_bytes());
         }
@@ -113,6 +148,14 @@ fn fallback_vertex_bytes() -> Vec<u8> {
 }
 
 const FALLBACK_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
+
+#[inline]
+fn vulkan_index_type(format: IndexFormat) -> vk::IndexType {
+    match format {
+        IndexFormat::U16 => vk::IndexType::UINT16,
+        IndexFormat::U32 => vk::IndexType::UINT32,
+    }
+}
 
 fn fallback_index_bytes() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(FALLBACK_INDICES.len() * 2);
@@ -126,9 +169,7 @@ const SCENE_FORWARD_PIPELINE_ID: &str = "scene-forward";
 
 fn scene_forward_vertex_layout() -> VertexLayout {
     VertexLayout {
-        // 32-byte stride: float32x3 + float32x4 + 4-byte padding.
-        // The padding ensures the stride matches the shadow pipeline's
-        // vertex-input stride so the same buffers can be used for both.
+        // 32-byte stride: position + normal + UV.
         stride_bytes: 32,
         attributes: vec![
             VertexAttribute {
@@ -137,9 +178,14 @@ fn scene_forward_vertex_layout() -> VertexLayout {
                 offset_bytes: 0,
             },
             VertexAttribute {
-                semantic: "color".into(),
-                format: "float32x4".into(),
+                semantic: "normal".into(),
+                format: "float32x3".into(),
                 offset_bytes: 12,
+            },
+            VertexAttribute {
+                semantic: "uv".into(),
+                format: "float32x2".into(),
+                offset_bytes: 24,
             },
         ],
     }
@@ -257,6 +303,47 @@ fn fallback_material_binding(material_id: &AssetId) -> MaterialBinding {
     }
 }
 
+fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
+    let mut bytes = Vec::with_capacity(32);
+    for value in upload.base_color {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    for value in [
+        upload.metallic,
+        upload.roughness,
+        upload.ambient_occlusion,
+        0.0,
+    ] {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    let textures = upload
+        .base_color_texture
+        .as_ref()
+        .map(|texture| {
+            vec![TextureSlot {
+                binding: 1,
+                texture: texture.clone(),
+                sampler: AssetId::new(format!("{}::sampler", texture.id)),
+                color_space: engine_renderer::ColorSpace::Srgb,
+                mip_bias: 0.0,
+            }]
+        })
+        .unwrap_or_default();
+    MaterialBinding {
+        material_id: upload.material_id.clone(),
+        pipeline: AssetId::new(SCENE_FORWARD_PIPELINE_ID),
+        variant_key: 0,
+        textures,
+        uniforms: ParamBlock {
+            bytes,
+            layout_hash: upload.content_hash,
+        },
+        pass_mask: 1,
+        transparency: upload.transparency.clone(),
+        double_sided: upload.double_sided,
+    }
+}
+
 /// CPU-side material UBO layout (32 bytes total).
 ///
 /// Field layout (std140):
@@ -280,7 +367,10 @@ struct MaterialUBO {
 /// Cache entry for a material descriptor set + UBO buffer.
 struct MaterialCacheEntry {
     desc_set: vk::DescriptorSet,
+    handle: BufferHandle,
     buffer: vk::Buffer,
+    ubo_data: [u8; 32],
+    bound_texture_id: String,
 }
 
 const MAX_MATERIALS: usize = 256;
@@ -290,12 +380,14 @@ const MAX_MATERIALS: usize = 256;
 struct BonePaletteCacheEntry {
     desc_set: vk::DescriptorSet,
     bone_buffer: vk::Buffer,
+    bound_texture_id: String,
 }
 
 /// Cached bone UBO buffer (handle for writes + raw VkBuffer for descriptor binding).
 struct CachedBoneBuffer {
     handle: BufferHandle,
     vk_buffer: vk::Buffer,
+    ubo_data: Vec<u8>,
 }
 
 const MAX_BONE_PALETTES: usize = 64;
@@ -424,58 +516,6 @@ pub struct IndirectDrawCommand {
 pub(crate) const MAX_INDIRECT_DRAWS: u32 = 1024;
 
 // ============================================================================
-// Frustum-culling helpers
-// ============================================================================
-
-/// Test whether an [`AxisAlignedBox`] transformed by `world_transform`
-/// intersects the given view-frustum planes.
-///
-/// Each frustum plane is `(nx, ny, nz, d)` where the half-space
-/// `nx·x + ny·y + nz·z + d �?0` is considered "inside".
-///
-/// Returns `true` if the AABB is at least partially visible.
-pub(crate) fn is_aabb_visible(
-    bounds: &AxisAlignedBox,
-    world_transform: &[f32; 16],
-    frustum_planes: &[[f32; 4]; 6],
-) -> bool {
-    // 8 corners of the AABB in local space.
-    let corners = [
-        [bounds.min[0], bounds.min[1], bounds.min[2], 1.0],
-        [bounds.max[0], bounds.min[1], bounds.min[2], 1.0],
-        [bounds.min[0], bounds.max[1], bounds.min[2], 1.0],
-        [bounds.max[0], bounds.max[1], bounds.min[2], 1.0],
-        [bounds.min[0], bounds.min[1], bounds.max[2], 1.0],
-        [bounds.max[0], bounds.min[1], bounds.max[2], 1.0],
-        [bounds.min[0], bounds.max[1], bounds.max[2], 1.0],
-        [bounds.max[0], bounds.max[1], bounds.max[2], 1.0],
-    ];
-
-    // Build transform matrix once.
-    let m = Mat4::from_cols_array(world_transform);
-
-    for plane in frustum_planes {
-        let (nx, ny, nz, d) = (plane[0], plane[1], plane[2], plane[3]);
-        let mut all_outside = true;
-
-        for corner in &corners {
-            let world_corner = m * GlamVec4::new(corner[0], corner[1], corner[2], corner[3]);
-            let dist = nx * world_corner.x + ny * world_corner.y + nz * world_corner.z + d;
-            if dist >= 0.0 {
-                all_outside = false;
-                break;
-            }
-        }
-
-        if all_outside {
-            return false; // Entire AABB is on the outside of this plane.
-        }
-    }
-
-    true
-}
-
-// ============================================================================
 // SceneRenderer
 // ============================================================================
 
@@ -491,6 +531,8 @@ pub struct SceneRenderer {
     /// Cache of loaded meshes indexed by their [`AssetId`](engine_serialize::AssetId) string.
     meshes: BTreeMap<String, GpuMesh>,
     material_resolver: MaterialResolver,
+    texture_uploads: HashMap<String, UploadedResourceState>,
+    uploaded_materials: HashMap<String, UploadedMaterialState>,
 
     /// Cache of material descriptor sets + buffers, keyed by material_id.
     /// Limited to [`MAX_MATERIALS`] entries; oldest entries evicted when full.
@@ -537,9 +579,7 @@ pub struct SceneRenderer {
 
     /// UI overlay vertex/index buffer cache.
     ui_vb: Option<BufferHandle>,
-    ui_ib: Option<BufferHandle>,
     ui_vb_capacity: u64,
-    ui_ib_capacity: u64,
 }
 
 impl SceneRenderer {
@@ -553,6 +593,8 @@ impl SceneRenderer {
             initialized: false,
             material_resolver: MaterialResolver::new(16),
             meshes: BTreeMap::new(),
+            texture_uploads: HashMap::new(),
+            uploaded_materials: HashMap::new(),
             material_cache: HashMap::new(),
             material_cache_order: Vec::new(),
             bone_palette_buffers: HashMap::new(),
@@ -564,9 +606,7 @@ impl SceneRenderer {
             ui_pl: None,
             ui_pll: None,
             ui_vb: None,
-            ui_ib: None,
             ui_vb_capacity: 0,
-            ui_ib_capacity: 0,
             framebuffers: Vec::new(),
             cur_fb_index: 0,
             cur_sc: None,
@@ -596,6 +636,14 @@ impl SceneRenderer {
     // Pipeline initialisation  (lazy �?called on the first frame)
     // ------------------------------------------------------------------
 
+    fn configure_scene_shaders(&mut self) {
+        self.device
+            .set_mvp_shaders(FORWARD_VERT_SPV, FORWARD_FRAG_SPV);
+        if !SKINNED_VERT_SPV.is_empty() {
+            self.device.set_skinned_vertex_shader(SKINNED_VERT_SPV);
+        }
+    }
+
     /// Create the render pass and pipeline layout used by scene-forward draws.
     ///
     /// This is called once from [`begin_frame_impl`] when
@@ -603,15 +651,6 @@ impl SceneRenderer {
     fn init_once(&mut self) -> Result<(), Vec<Diagnostic>> {
         if self.initialized {
             return Ok(());
-        }
-
-        // Point the device at the forward-shader SPIR-V blobs so that
-        // `Device::create_pipeline` can find them.
-        self.device
-            .set_mvp_shaders(FORWARD_VERT_SPV, FORWARD_FRAG_SPV);
-        // Register the skinned vertex shader for skinned-mesh pipelines.
-        if !SKINNED_VERT_SPV.is_empty() {
-            self.device.set_skinned_vertex_shader(SKINNED_VERT_SPV);
         }
 
         // Ensure material descriptor infrastructure (set=2) exists before
@@ -818,17 +857,14 @@ impl SceneRenderer {
                 render_pass: Some(rp),
                 specialization: Vec::new(),
             };
-            let ui_pl = self
-                .device
-                .create_pipeline(&ui_desc)
-                .map_err(|e| {
-                    vec![Diagnostic::new(
-                        "RV0215",
-                        DiagnosticSeverity::Error,
-                        "scene_renderer",
-                        format!("create_ui_pipeline: {e:?}"),
-                    )]
-                })?;
+            let ui_pl = self.device.create_pipeline(&ui_desc).map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0215",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_ui_pipeline: {e:?}"),
+                )]
+            })?;
 
             self.ui_pll = Some(ui_pll);
             self.ui_pl = Some(ui_pl);
@@ -843,6 +879,45 @@ impl SceneRenderer {
         Ok(())
     }
 
+    fn ensure_scene_framebuffers(&mut self) -> Result<(), Vec<Diagnostic>> {
+        if !self.framebuffers.is_empty() {
+            return Ok(());
+        }
+        let render_pass = self.rp.ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0232",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "scene render pass is unavailable while rebuilding framebuffers",
+            )]
+        })?;
+        let vk_render_pass = self
+            .device
+            .render_passes
+            .get(render_pass.index, render_pass.generation)
+            .copied()
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0233",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    "scene render-pass handle is stale while rebuilding framebuffers",
+                )]
+            })?;
+        self.framebuffers = self
+            .device
+            .create_scene_framebuffers(vk_render_pass)
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0234",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_scene_framebuffers: {error:?}"),
+                )]
+            })?;
+        Ok(())
+    }
+
     fn material_binding_for_drawable(
         &self,
         input: &RenderFrameInput,
@@ -853,7 +928,172 @@ impl SceneRenderer {
             .iter()
             .find(|material| material.material_id == *material_id)
             .cloned()
+            .or_else(|| {
+                self.uploaded_materials
+                    .get(&material_id.id)
+                    .map(|state| state.binding.clone())
+            })
             .unwrap_or_else(|| fallback_material_binding(material_id))
+    }
+
+    fn prepare_frame_cache_capacity(
+        &mut self,
+        input: &RenderFrameInput,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let required_materials: BTreeSet<String> = input
+            .drawables
+            .iter()
+            .map(|item| item.material.id.clone())
+            .chain(
+                input
+                    .skinned_items
+                    .iter()
+                    .map(|item| item.material.id.clone()),
+            )
+            .collect();
+        if required_materials.len() > MAX_MATERIALS {
+            return Err(vec![Diagnostic::new(
+                "RV0271",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!(
+                    "frame needs {} materials, backend capacity is {MAX_MATERIALS}",
+                    required_materials.len()
+                ),
+            )]);
+        }
+        let missing_materials = required_materials
+            .iter()
+            .filter(|id| !self.material_cache.contains_key(*id))
+            .count();
+        while self.material_cache.len() + missing_materials > MAX_MATERIALS {
+            let candidate = self
+                .material_cache_order
+                .iter()
+                .find(|id| !required_materials.contains(*id))
+                .cloned()
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "RV0272",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        "material cache cannot reserve the current frame's working set",
+                    )]
+                })?;
+            self.evict_material_by_id(&candidate)?;
+        }
+
+        let required_skeletons: BTreeSet<String> = input
+            .skinned_items
+            .iter()
+            .map(|item| item.skeleton.id.clone())
+            .collect();
+        let required_skinned_sets: BTreeSet<String> = input
+            .skinned_items
+            .iter()
+            .map(|item| format!("{}:{}", item.material.id, item.skeleton.id))
+            .collect();
+        if required_skeletons.len() > MAX_BONE_PALETTES
+            || required_skinned_sets.len() > MAX_BONE_PALETTES
+        {
+            return Err(vec![Diagnostic::new(
+                "RV0273",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!(
+                    "frame exceeds skinned capacity: {} skeletons, {} material/skeleton pairs, limit {MAX_BONE_PALETTES}",
+                    required_skeletons.len(),
+                    required_skinned_sets.len()
+                ),
+            )]);
+        }
+        let missing_skeletons = required_skeletons
+            .iter()
+            .filter(|id| !self.bone_palette_buffers.contains_key(*id))
+            .count();
+        while self.bone_palette_buffers.len() + missing_skeletons > MAX_BONE_PALETTES {
+            let candidate = self
+                .bone_palette_buffers_order
+                .iter()
+                .find(|id| !required_skeletons.contains(*id))
+                .cloned()
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "RV0274",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        "bone cache cannot reserve the current frame's working set",
+                    )]
+                })?;
+            self.evict_skeleton_by_id(&candidate)?;
+        }
+        let missing_skinned_sets = required_skinned_sets
+            .iter()
+            .filter(|key| !self.skinned_desc_cache.contains_key(*key))
+            .count();
+        while self.skinned_desc_cache.len() + missing_skinned_sets > MAX_BONE_PALETTES {
+            let candidate = self
+                .skinned_desc_cache_order
+                .iter()
+                .find(|key| !required_skinned_sets.contains(*key))
+                .cloned()
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "RV0275",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        "skinned descriptor cache cannot reserve the current frame's working set",
+                    )]
+                })?;
+            self.evict_skinned_descriptor_by_key(&candidate)?;
+        }
+        Ok(())
+    }
+
+    fn validate_uploaded_meshes(&self, input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        for mesh_id in input
+            .drawables
+            .iter()
+            .map(|item| &item.mesh.id)
+            .chain(input.skinned_items.iter().map(|item| &item.mesh.id))
+        {
+            let Some(mesh) = self.meshes.get(mesh_id) else {
+                return Err(vec![Diagnostic::new(
+                    "RV0230",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("drawable references mesh '{mesh_id}' before a successful upload"),
+                )]);
+            };
+            let vertex_is_live = self
+                .device
+                .buffers
+                .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
+                .is_some();
+            let index_is_live = self
+                .device
+                .buffers
+                .get(mesh.index_buffer.index, mesh.index_buffer.generation)
+                .is_some();
+            if !vertex_is_live || !index_is_live {
+                return Err(vec![Diagnostic::new(
+                    "RV0231",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("mesh '{mesh_id}' refers to released GPU buffers"),
+                )]);
+            }
+        }
+        for material_id in input
+            .drawables
+            .iter()
+            .map(|item| &item.material)
+            .chain(input.skinned_items.iter().map(|item| &item.material))
+        {
+            let material = self.material_binding_for_drawable(input, material_id);
+            self.selected_material_texture_id(&material)?;
+        }
+        Ok(())
     }
 
     fn pipeline_for_drawable(
@@ -960,6 +1200,9 @@ impl SceneRenderer {
 
         // Check bone buffer cache �?if found, update data and return.
         if let Some(cached) = self.bone_palette_buffers.get(skeleton_id) {
+            let handle = cached.handle;
+            let vk_buffer = cached.vk_buffer;
+            let needs_update = cached.ubo_data != ubo_data;
             // Promote in LRU order
             if let Some(pos) = self
                 .bone_palette_buffers_order
@@ -970,9 +1213,30 @@ impl SceneRenderer {
                 self.bone_palette_buffers_order
                     .push(skeleton_id.to_string());
             }
-            // Update the buffer contents with the latest bone data.
-            let _ = self.device.write_buffer(cached.handle, &ubo_data, 0);
-            return Ok(cached.vk_buffer);
+            if needs_update {
+                self.device.wait_idle_checked().map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0254",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("cannot update in-flight skeleton '{skeleton_id}': {error:?}"),
+                    )]
+                })?;
+                self.device
+                    .write_buffer(handle, &ubo_data, 0)
+                    .map_err(|error| {
+                        vec![Diagnostic::new(
+                            "RV0255",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!("write_buffer(bone UBO): {error:?}"),
+                        )]
+                    })?;
+                if let Some(cached) = self.bone_palette_buffers.get_mut(skeleton_id) {
+                    cached.ubo_data.clone_from(&ubo_data);
+                }
+            }
+            return Ok(vk_buffer);
         }
 
         // Create the buffer
@@ -990,14 +1254,15 @@ impl SceneRenderer {
                 format!("create_buffer(bone UBO): {e:?}"),
             )]
         })?;
-        self.device.write_buffer(buf, &ubo_data, 0).map_err(|e| {
-            vec![Diagnostic::new(
+        if let Err(error) = self.device.write_buffer(buf, &ubo_data, 0) {
+            self.device.destroy_buffer(buf);
+            return Err(vec![Diagnostic::new(
                 "RV0219",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                format!("write_buffer(bone UBO): {e:?}"),
-            )]
-        })?;
+                format!("write_buffer(bone UBO): {error:?}"),
+            )]);
+        }
 
         // Resolve raw Vulkan buffer handle
         let vk_buf = self
@@ -1007,6 +1272,7 @@ impl SceneRenderer {
             .map(|e| e.buffer)
             .unwrap_or(vk::Buffer::null());
         if vk_buf == vk::Buffer::null() {
+            self.device.destroy_buffer(buf);
             return Err(vec![Diagnostic::new(
                 "RV0220",
                 DiagnosticSeverity::Error,
@@ -1015,12 +1281,14 @@ impl SceneRenderer {
             )]);
         }
 
-        // Evict oldest if at capacity
         if self.bone_palette_buffers.len() >= MAX_BONE_PALETTES {
-            if let Some(oldest_key) = self.bone_palette_buffers_order.first().cloned() {
-                self.bone_palette_buffers_order.remove(0);
-                self.bone_palette_buffers.remove(&oldest_key);
-            }
+            self.device.destroy_buffer(buf);
+            return Err(vec![Diagnostic::new(
+                "RV0279",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "bone cache capacity was not reserved before frame recording",
+            )]);
         }
 
         self.bone_palette_buffers.insert(
@@ -1028,6 +1296,7 @@ impl SceneRenderer {
             CachedBoneBuffer {
                 handle: buf,
                 vk_buffer: vk_buf,
+                ubo_data,
             },
         );
         self.bone_palette_buffers_order
@@ -1064,12 +1333,13 @@ impl SceneRenderer {
             return Ok(entry.desc_set);
         }
 
-        // Evict oldest if at capacity
         if self.skinned_desc_cache.len() >= MAX_BONE_PALETTES {
-            if let Some(oldest_key) = self.skinned_desc_cache_order.first().cloned() {
-                self.skinned_desc_cache_order.remove(0);
-                self.skinned_desc_cache.remove(&oldest_key);
-            }
+            return Err(vec![Diagnostic::new(
+                "RV0280",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "skinned descriptor capacity was not reserved before frame recording",
+            )]);
         }
 
         // Allocate a new skinned descriptor set from the material pool
@@ -1091,6 +1361,8 @@ impl SceneRenderer {
             BonePaletteCacheEntry {
                 desc_set,
                 bone_buffer,
+                bound_texture_id: crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID
+                    .to_string(),
             },
         );
         self.skinned_desc_cache_order.push(cache_key);
@@ -1112,11 +1384,16 @@ impl SceneRenderer {
     ///
     /// If `bytes` is empty or too short, sane defaults are used.
     fn parse_material_ubo(bytes: &[u8]) -> MaterialUBO {
-        let read_f32 = |offset: usize| -> f32 {
+        let read_f32 = |offset: usize, fallback: f32| -> f32 {
             if offset + 4 <= bytes.len() {
-                f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+                let value = f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                if value.is_finite() {
+                    value
+                } else {
+                    fallback
+                }
             } else {
-                0.0
+                fallback
             }
         };
         let read_vec4 = |offset: usize| -> [f32; 4] {
@@ -1133,11 +1410,135 @@ impl SceneRenderer {
         };
         MaterialUBO {
             base_color: read_vec4(0),
-            metallic: read_f32(16),
-            roughness: read_f32(20),
-            ao: read_f32(24),
+            metallic: read_f32(16, 0.0).clamp(0.0, 1.0),
+            roughness: read_f32(20, 1.0).clamp(0.04, 1.0),
+            ao: read_f32(24, 1.0).clamp(0.0, 1.0),
             _padding: [0.0],
         }
+    }
+
+    fn selected_material_texture_id(
+        &self,
+        material: &MaterialBinding,
+    ) -> Result<String, Vec<Diagnostic>> {
+        use crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID;
+
+        let Some(slot) = material
+            .textures
+            .iter()
+            .find(|slot| slot.binding == 1)
+            .or_else(|| material.textures.first())
+        else {
+            return Ok(FALLBACK_MATERIAL_TEXTURE_ID.to_string());
+        };
+        if !self.device.textures.contains_key(&slot.texture.id) {
+            return Err(vec![Diagnostic::new(
+                "RV0260",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!(
+                    "material '{}' references texture '{}' before a successful upload",
+                    material.material_id.id, slot.texture.id
+                ),
+            )]);
+        }
+        Ok(slot.texture.id.clone())
+    }
+
+    fn bind_material_texture_if_changed(
+        &mut self,
+        material_id: &str,
+        material: &MaterialBinding,
+        descriptor_set: vk::DescriptorSet,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let selected = self.selected_material_texture_id(material)?;
+        let current = self
+            .material_cache
+            .get(material_id)
+            .map(|entry| entry.bound_texture_id.clone())
+            .unwrap_or_default();
+        if current == selected {
+            return Ok(());
+        }
+        self.device.wait_idle_checked().map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0261",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("cannot update in-flight material texture: {error:?}"),
+            )]
+        })?;
+        let bound = self
+            .device
+            .bind_material_texture(&selected, descriptor_set)
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0262",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("bind material texture '{selected}': {error:?}"),
+                )]
+            })?;
+        if !bound {
+            return Err(vec![Diagnostic::new(
+                "RV0263",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("material texture '{selected}' disappeared before descriptor update"),
+            )]);
+        }
+        if let Some(entry) = self.material_cache.get_mut(material_id) {
+            entry.bound_texture_id = selected;
+        }
+        Ok(())
+    }
+
+    fn bind_skinned_texture_if_changed(
+        &mut self,
+        cache_key: &str,
+        material: &MaterialBinding,
+        descriptor_set: vk::DescriptorSet,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let selected = self.selected_material_texture_id(material)?;
+        let current = self
+            .skinned_desc_cache
+            .get(cache_key)
+            .map(|entry| entry.bound_texture_id.clone())
+            .unwrap_or_default();
+        if current == selected {
+            return Ok(());
+        }
+        self.device.wait_idle_checked().map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0264",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("cannot update in-flight skinned texture: {error:?}"),
+            )]
+        })?;
+        let bound = self
+            .device
+            .bind_material_texture(&selected, descriptor_set)
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0265",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("bind skinned texture '{selected}': {error:?}"),
+                )]
+            })?;
+        if !bound {
+            return Err(vec![Diagnostic::new(
+                "RV0266",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("skinned texture '{selected}' disappeared before descriptor update"),
+            )]);
+        }
+        if let Some(entry) = self.skinned_desc_cache.get_mut(cache_key) {
+            entry.bound_texture_id = selected;
+        }
+        Ok(())
     }
 
     /// Look up or create a material descriptor set + buffer for the given
@@ -1147,8 +1548,20 @@ impl SceneRenderer {
         material_id: &str,
         ubo_data: &[u8],
     ) -> Result<(vk::DescriptorSet, vk::Buffer), Vec<Diagnostic>> {
+        let ubo_array: [u8; 32] = ubo_data.try_into().map_err(|_| {
+            vec![Diagnostic::new(
+                "RV0250",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "material UBO must be exactly 32 bytes",
+            )]
+        })?;
         // Check cache first (and move to front for LRU)
         if let Some(entry) = self.material_cache.get(material_id) {
+            let desc_set = entry.desc_set;
+            let buffer = entry.buffer;
+            let handle = entry.handle;
+            let old_data = entry.ubo_data;
             // Promote in LRU order (simple move-to-front)
             if let Some(pos) = self
                 .material_cache_order
@@ -1158,12 +1571,39 @@ impl SceneRenderer {
                 self.material_cache_order.remove(pos);
                 self.material_cache_order.push(material_id.to_string());
             }
-            return Ok((entry.desc_set, entry.buffer));
+            if old_data.as_slice() != ubo_data {
+                self.device.wait_idle_checked().map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0248",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("cannot update in-flight material '{material_id}': {error:?}"),
+                    )]
+                })?;
+                self.device
+                    .write_buffer(handle, ubo_data, 0)
+                    .map_err(|error| {
+                        vec![Diagnostic::new(
+                            "RV0249",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!("write_buffer(material UBO): {error:?}"),
+                        )]
+                    })?;
+                if let Some(entry) = self.material_cache.get_mut(material_id) {
+                    entry.ubo_data.copy_from_slice(ubo_data);
+                }
+            }
+            return Ok((desc_set, buffer));
         }
 
-        // Evict oldest if at capacity
         if self.material_cache.len() >= MAX_MATERIALS {
-            self.evict_oldest_material();
+            return Err(vec![Diagnostic::new(
+                "RV0281",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "material cache capacity was not reserved before frame recording",
+            )]);
         }
 
         // Create a small UBO buffer (32 bytes for MaterialUBO)
@@ -1181,14 +1621,15 @@ impl SceneRenderer {
                 format!("create_buffer(material UBO): {e:?}"),
             )]
         })?;
-        self.device.write_buffer(buf, ubo_data, 0).map_err(|e| {
-            vec![Diagnostic::new(
+        if let Err(error) = self.device.write_buffer(buf, ubo_data, 0) {
+            self.device.destroy_buffer(buf);
+            return Err(vec![Diagnostic::new(
                 "RV0215",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                format!("write_buffer(material UBO): {e:?}"),
-            )]
-        })?;
+                format!("write_buffer(material UBO): {error:?}"),
+            )]);
+        }
 
         // Resolve raw Vulkan buffer handle for the descriptor set
         let vk_buf = self
@@ -1198,6 +1639,7 @@ impl SceneRenderer {
             .map(|e| e.buffer)
             .unwrap_or(vk::Buffer::null());
         if vk_buf == vk::Buffer::null() {
+            self.device.destroy_buffer(buf);
             return Err(vec![Diagnostic::new(
                 "RV0216",
                 DiagnosticSeverity::Error,
@@ -1207,21 +1649,25 @@ impl SceneRenderer {
         }
 
         // Allocate and update descriptor set via the device
-        let desc_set = self
-            .device
-            .allocate_material_descriptor_set(vk_buf, 32)
-            .map_err(|e| {
-                vec![Diagnostic::new(
+        let desc_set = match self.device.allocate_material_descriptor_set(vk_buf, 32) {
+            Ok(desc_set) => desc_set,
+            Err(error) => {
+                self.device.destroy_buffer(buf);
+                return Err(vec![Diagnostic::new(
                     "RV0217",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    format!("allocate_material_descriptor_set: {e:?}"),
-                )]
-            })?;
+                    format!("allocate_material_descriptor_set: {error:?}"),
+                )]);
+            }
+        };
 
         let entry = MaterialCacheEntry {
             desc_set,
+            handle: buf,
             buffer: vk_buf,
+            ubo_data: ubo_array,
+            bound_texture_id: crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID.to_string(),
         };
         self.material_cache.insert(material_id.to_string(), entry);
         self.material_cache_order.push(material_id.to_string());
@@ -1229,14 +1675,116 @@ impl SceneRenderer {
         Ok((desc_set, vk_buf))
     }
 
-    /// Evict the oldest entry from the material cache (LRU).
-    fn evict_oldest_material(&mut self) {
-        if let Some(oldest_key) = self.material_cache_order.first().cloned() {
-            self.material_cache_order.remove(0);
-            self.material_cache.remove(&oldest_key);
-            // NOTE: Vulkan buffers and descriptor sets are freed when the
-            // descriptor pool is destroyed (no per-allocation free needed).
+    fn evict_material_by_id(&mut self, material_id: &str) -> Result<(), Vec<Diagnostic>> {
+        if !self.material_cache.contains_key(material_id) {
+            return Ok(());
         }
+        self.device.wait_idle_checked().map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0251",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("cannot evict in-flight material '{material_id}': {error:?}"),
+            )]
+        })?;
+
+        let skinned_prefix = format!("{material_id}:");
+        let skinned_keys: Vec<String> = self
+            .skinned_desc_cache
+            .keys()
+            .filter(|key| key.starts_with(&skinned_prefix))
+            .cloned()
+            .collect();
+        for key in skinned_keys {
+            if let Some(entry) = self.skinned_desc_cache.remove(&key) {
+                self.device
+                    .free_material_descriptor_set(entry.desc_set)
+                    .map_err(|error| {
+                        vec![Diagnostic::new(
+                            "RV0252",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!("free skinned descriptor set: {error:?}"),
+                        )]
+                    })?;
+            }
+        }
+        self.skinned_desc_cache_order
+            .retain(|key| !key.starts_with(&skinned_prefix));
+
+        self.material_cache_order.retain(|key| key != material_id);
+        if let Some(entry) = self.material_cache.remove(material_id) {
+            self.device
+                .free_material_descriptor_set(entry.desc_set)
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0253",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("free material descriptor set: {error:?}"),
+                    )]
+                })?;
+            self.device.destroy_buffer(entry.handle);
+        }
+        Ok(())
+    }
+
+    fn evict_skinned_descriptor_by_key(&mut self, cache_key: &str) -> Result<(), Vec<Diagnostic>> {
+        if !self.skinned_desc_cache.contains_key(cache_key) {
+            return Ok(());
+        }
+        self.device.wait_idle_checked().map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0276",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("cannot evict in-flight skinned descriptor: {error:?}"),
+            )]
+        })?;
+        self.skinned_desc_cache_order.retain(|key| key != cache_key);
+        if let Some(entry) = self.skinned_desc_cache.remove(cache_key) {
+            self.device
+                .free_material_descriptor_set(entry.desc_set)
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0277",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("free skinned descriptor set: {error:?}"),
+                    )]
+                })?;
+        }
+        Ok(())
+    }
+
+    fn evict_skeleton_by_id(&mut self, skeleton_id: &str) -> Result<(), Vec<Diagnostic>> {
+        if !self.bone_palette_buffers.contains_key(skeleton_id) {
+            return Ok(());
+        }
+        self.device.wait_idle_checked().map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0278",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("cannot evict in-flight skeleton '{skeleton_id}': {error:?}"),
+            )]
+        })?;
+        let suffix = format!(":{skeleton_id}");
+        let descriptor_keys: Vec<String> = self
+            .skinned_desc_cache
+            .keys()
+            .filter(|key| key.ends_with(&suffix))
+            .cloned()
+            .collect();
+        for key in descriptor_keys {
+            self.evict_skinned_descriptor_by_key(&key)?;
+        }
+        self.bone_palette_buffers_order
+            .retain(|key| key != skeleton_id);
+        if let Some(entry) = self.bone_palette_buffers.remove(skeleton_id) {
+            self.device.destroy_buffer(entry.handle);
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1269,16 +1817,15 @@ impl SceneRenderer {
                 format!("create_buffer(vertices): {e:?}"),
             )]
         })?;
-        self.device
-            .write_buffer(vb, &vertex_bytes, 0)
-            .map_err(|e| {
-                vec![Diagnostic::new(
-                    "RV0204",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!("write_buffer(vertices): {e:?}"),
-                )]
-            })?;
+        if let Err(error) = self.device.write_buffer(vb, &vertex_bytes, 0) {
+            self.device.destroy_buffer(vb);
+            return Err(vec![Diagnostic::new(
+                "RV0204",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("write_buffer(vertices): {error:?}"),
+            )]);
+        }
 
         // --- Index buffer ---
         let ib_desc = BufferDescriptor {
@@ -1287,22 +1834,28 @@ impl SceneRenderer {
             memory_hint: MemoryHint::CpuToGpu,
             debug_label: Some(format!("mesh-{mesh_id}-indices")),
         };
-        let ib = self.device.create_buffer(&ib_desc).map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0205",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("create_buffer(indices): {e:?}"),
-            )]
-        })?;
-        self.device.write_buffer(ib, &index_bytes, 0).map_err(|e| {
-            vec![Diagnostic::new(
+        let ib = match self.device.create_buffer(&ib_desc) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                self.device.destroy_buffer(vb);
+                return Err(vec![Diagnostic::new(
+                    "RV0205",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_buffer(indices): {error:?}"),
+                )]);
+            }
+        };
+        if let Err(error) = self.device.write_buffer(ib, &index_bytes, 0) {
+            self.device.destroy_buffer(ib);
+            self.device.destroy_buffer(vb);
+            return Err(vec![Diagnostic::new(
                 "RV0206",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                format!("write_buffer(indices): {e:?}"),
-            )]
-        })?;
+                format!("write_buffer(indices): {error:?}"),
+            )]);
+        }
 
         let index_count = (index_bytes.len() / 2) as u32; // u16 indices
         let mesh = GpuMesh {
@@ -1310,6 +1863,8 @@ impl SceneRenderer {
             index_buffer: ib,
             index_count,
             index_format: IndexFormat::U16,
+            content_hash: [0; 32],
+            revision: 1,
         };
 
         self.meshes.insert(mesh_id.to_string(), mesh.clone());
@@ -1329,16 +1884,43 @@ impl SceneRenderer {
     /// resource creation.
     fn begin_frame_impl(
         &mut self,
+        input: &RenderFrameInput,
         msaa_samples: vk::SampleCountFlags,
     ) -> Result<(SwapchainHandle, u32, Box<dyn CommandEncoder>), Vec<Diagnostic>> {
+        let (view, projection) = input
+            .views
+            .first()
+            .map(|view| {
+                (
+                    Mat4::from_cols_array(&view.view_matrix),
+                    Mat4::from_cols_array(&view.projection_matrix),
+                )
+            })
+            .unwrap_or((Mat4::IDENTITY, Mat4::IDENTITY));
+        let matrices_are_finite = view
+            .to_cols_array()
+            .into_iter()
+            .chain(projection.to_cols_array())
+            .all(f32::is_finite);
+        if !matrices_are_finite || view.determinant().abs() <= f32::EPSILON {
+            return Err(vec![Diagnostic::new(
+                "RV0210",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "view and projection matrices must be finite and the view matrix invertible",
+            )]);
+        }
+        self.validate_uploaded_meshes(input)?;
+        self.prepare_frame_cache_capacity(input)?;
+
         // Apply the requested MSAA sample count to the device before any
         // resource creation takes place (ensure_sc �?ensure_hdr_resources).
         self.device.hdr_msaa_samples = msaa_samples;
-        self.init_once()?;
-
-        // The device's descriptor infrastructure expects per-frame UBO data
-        // to be written before `begin_frame`.
-        self.device.write_default_ubo();
+        if !self.initialized {
+            // Swapchain setup creates the HDR forward pipeline, so the scene
+            // shaders must be registered before `create_swapchain`.
+            self.configure_scene_shaders();
+        }
 
         let sc_desc = SwapchainDescriptor {
             surface: render_core::SurfaceHandle::new(0, 1),
@@ -1356,6 +1938,12 @@ impl SceneRenderer {
             )]
         })?;
 
+        // Swapchain creation also establishes the per-frame, shadow, and
+        // material descriptor layouts. Scene pipelines and framebuffers must
+        // not be created until those Vulkan objects are valid.
+        self.init_once()?;
+        self.ensure_scene_framebuffers()?;
+
         let (ii, encoder) = self.device.begin_frame(sc_h).map_err(|e| {
             vec![Diagnostic::new(
                 "RV0208",
@@ -1366,6 +1954,24 @@ impl SceneRenderer {
         })?;
 
         self.cur_fb_index = ii;
+
+        // `begin_frame` waits for the current frame fence. Only now is it safe
+        // to update the persistently mapped UBO owned by that frame slot.
+        self.device.write_default_ubo();
+        let view_projection = (projection * view).to_cols_array();
+        let mut view_projection_bytes = Vec::with_capacity(64);
+        for value in view_projection {
+            view_projection_bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        self.device.write_ubo_current(&view_projection_bytes, 64);
+
+        let camera_world = view.inverse().w_axis;
+        let camera_position = [camera_world.x, camera_world.y, camera_world.z, 1.0f32];
+        let mut camera_bytes = Vec::with_capacity(16);
+        for value in camera_position {
+            camera_bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        self.device.write_ubo_current(&camera_bytes, 160);
 
         Ok((sc_h, ii, encoder))
     }
@@ -1393,8 +1999,17 @@ impl SceneRenderer {
             .device
             .hdr_forward_pipeline_layout
             .unwrap_or(vk::PipelineLayout::null());
-        if hdr_rp == vk::RenderPass::null() || hdr_pl == vk::Pipeline::null() {
-            return Ok(());
+        if hdr_rp == vk::RenderPass::null()
+            || hdr_fb == vk::Framebuffer::null()
+            || hdr_pl == vk::Pipeline::null()
+            || hdr_pll == vk::PipelineLayout::null()
+        {
+            return Err(vec![Diagnostic::new(
+                "RV0225",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "HDR forward pass resources are incomplete",
+            )]);
         }
 
         // Clone device + cmd handles to avoid borrow-checker conflicts
@@ -1538,6 +2153,24 @@ impl SceneRenderer {
             }
         }
 
+        // Bind the shadow/environment/light descriptor set with the exact
+        // layout used by the HDR pipeline. Earlier passes may have bound set=1
+        // through a different pipeline layout, which does not guarantee that
+        // the binding remains compatible after set=0 is rebound above.
+        if let Some(desc_set) = self.device.shadow_desc_set {
+            let sets = [desc_set];
+            unsafe {
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    hdr_pll,
+                    1,
+                    &sets,
+                    &[],
+                );
+            }
+        }
+
         // Draw calls with dynamic batching (drawables pre-sorted by (material, mesh))
         let mut last_material_id: Option<&str> = None;
         let mut last_mesh_id: Option<&str> = None;
@@ -1575,10 +2208,7 @@ impl SceneRenderer {
                     }
                     cached_vb = vk_vb;
                     cached_ib = vk_ib;
-                    cached_idx_ty = match m.index_format {
-                        IndexFormat::U16 => vk::IndexType::UINT16,
-                        IndexFormat::U32 => vk::IndexType::UINT32,
-                    };
+                    cached_idx_ty = vulkan_index_type(m.index_format);
                     cached_index_count = m.index_count;
                     last_mesh_id = Some(mesh_id.as_str());
                     // Bind VB/IB
@@ -1611,33 +2241,19 @@ impl SceneRenderer {
                         std::mem::size_of::<MaterialUBO>(),
                     )
                 };
-                let (mat_desc_set, _mat_buf) = self
-                    .get_or_create_material_desc_set(material_id, ubo_bytes)
-                    .unwrap_or_else(|diags| {
-                        for d in &diags {
-                            tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
-                        }
-                        (vk::DescriptorSet::null(), vk::Buffer::null())
-                    });
-                if mat_desc_set != vk::DescriptorSet::null() {
-                    for tex_slot in &material.textures {
-                        let tex_id = &tex_slot.texture.id;
-                        if self.device.textures.contains_key(tex_id) {
-                            let _ = self.device.bind_material_texture(tex_id, mat_desc_set);
-                            break;
-                        }
-                    }
-                    let sets = [mat_desc_set];
-                    unsafe {
-                        d.cmd_bind_descriptor_sets(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            hdr_pll,
-                            2,
-                            &sets,
-                            &[],
-                        );
-                    }
+                let (mat_desc_set, _mat_buf) =
+                    self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
+                self.bind_material_texture_if_changed(material_id, &material, mat_desc_set)?;
+                let sets = [mat_desc_set];
+                unsafe {
+                    d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        hdr_pll,
+                        2,
+                        &sets,
+                        &[],
+                    );
                 }
                 last_material_id = Some(material_id.as_str());
             }
@@ -1701,16 +2317,18 @@ impl SceneRenderer {
                         skinned_cached_vb = vk_vb;
                         skinned_cached_ib = vk_ib;
                         skinned_cached_index_count = m.index_count;
-                        skinned_cached_idx_ty = match m.index_format {
-                            IndexFormat::U16 => vk::IndexType::UINT16,
-                            IndexFormat::U32 => vk::IndexType::UINT32,
-                        };
+                        skinned_cached_idx_ty = vulkan_index_type(m.index_format);
                         last_skinned_mesh = Some(mesh_id.as_str());
                         let vbs = [skinned_cached_vb];
                         let offsets = [0u64];
                         unsafe {
                             d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
-                            d.cmd_bind_index_buffer(cmd, skinned_cached_ib, 0, skinned_cached_idx_ty);
+                            d.cmd_bind_index_buffer(
+                                cmd,
+                                skinned_cached_ib,
+                                0,
+                                skinned_cached_idx_ty,
+                            );
                         }
                     }
                     None => {
@@ -1734,55 +2352,22 @@ impl SceneRenderer {
                     std::mem::size_of::<MaterialUBO>(),
                 )
             };
-            let (mat_desc_set, mat_buf) = self
-                .get_or_create_material_desc_set(material_id, ubo_bytes)
-                .unwrap_or_else(|diags| {
-                    for d in &diags {
-                        tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
-                    }
-                    (vk::DescriptorSet::null(), vk::Buffer::null())
-                });
-            if mat_desc_set == vk::DescriptorSet::null() {
-                continue;
-            }
+            let (mat_desc_set, mat_buf) =
+                self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
 
             let skeleton_id = &skinned.skeleton.id;
-            let bone_buf = match self.get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette)
-            {
-                Ok(b) => b,
-                Err(diags) => {
-                    for d in &diags {
-                        tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
-                    }
-                    continue;
-                }
-            };
+            let bone_buf = self.get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette)?;
 
-            let skinned_desc_set = self
-                .get_or_create_skinned_desc_set(
-                    material_id,
-                    skeleton_id,
-                    mat_desc_set,
-                    mat_buf,
-                    bone_buf,
-                )
-                .unwrap_or_else(|diags| {
-                    for d in &diags {
-                        tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
-                    }
-                    vk::DescriptorSet::null()
-                });
-            if skinned_desc_set == vk::DescriptorSet::null() {
-                continue;
-            }
+            let skinned_desc_set = self.get_or_create_skinned_desc_set(
+                material_id,
+                skeleton_id,
+                mat_desc_set,
+                mat_buf,
+                bone_buf,
+            )?;
 
-            for tex_slot in &material.textures {
-                let tex_id = &tex_slot.texture.id;
-                if self.device.textures.contains_key(tex_id) {
-                    let _ = self.device.bind_material_texture(tex_id, skinned_desc_set);
-                    break;
-                }
-            }
+            let skinned_cache_key = format!("{material_id}:{skeleton_id}");
+            self.bind_skinned_texture_if_changed(&skinned_cache_key, &material, skinned_desc_set)?;
             let sets = [skinned_desc_set];
             unsafe {
                 d.cmd_bind_descriptor_sets(
@@ -1795,8 +2380,12 @@ impl SceneRenderer {
                 );
             }
 
+            let mut pc_bytes = Vec::with_capacity(128);
+            for value in &skinned.world_transform {
+                pc_bytes.extend_from_slice(&value.to_ne_bytes());
+            }
+            pc_bytes.resize(128, 0);
             unsafe {
-                let pc_bytes = [0u8; 128];
                 d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
                 d.cmd_draw_indexed(cmd, skinned_cached_index_count, 1, 0, 0, 0);
             }
@@ -1805,148 +2394,9 @@ impl SceneRenderer {
             stats.triangles += skinned_cached_index_count as u64 / 3;
         }
 
-        // Frustum cull + indirect draw (Phase 5.1)
-        if let Some(planes) = input.views.first().and_then(|v| v.frustum) {
-            let fp: [[f32; 4]; 6] = planes;
-            let mut visible_indices: Vec<usize> = Vec::new();
-            for (i, drawable) in input.drawables.iter().enumerate() {
-                if !self.meshes.contains_key(&drawable.mesh.id) {
-                    continue;
-                }
-                if is_aabb_visible(&drawable.bounds, &drawable.world_transform, &fp) {
-                    visible_indices.push(i);
-                }
-            }
-
-            if !visible_indices.is_empty() {
-                let mut indirect_bytes: Vec<u8> = Vec::with_capacity(visible_indices.len() * 20);
-
-                for &idx in &visible_indices {
-                    let drawable = &input.drawables[idx];
-                    let mesh = self.meshes.get(&drawable.mesh.id).unwrap();
-                    indirect_bytes.extend_from_slice(&mesh.index_count.to_ne_bytes());
-                    indirect_bytes.extend_from_slice(&1u32.to_ne_bytes());
-                    indirect_bytes.extend_from_slice(&0u32.to_ne_bytes());
-                    indirect_bytes.extend_from_slice(&0i32.to_ne_bytes());
-                    indirect_bytes.extend_from_slice(&0u32.to_ne_bytes());
-                }
-
-                self.device.write_indirect_draw_buffer(&indirect_bytes, 0);
-
-                let indirect_buf = self
-                    .device
-                    .indirect_draw_buffer
-                    .unwrap_or(vk::Buffer::null());
-
-                if indirect_buf != vk::Buffer::null() {
-                    unsafe {
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, hdr_pl);
-                    }
-
-                    for (cmd_idx, &visible_idx) in visible_indices.iter().enumerate() {
-                        let drawable = &input.drawables[visible_idx];
-                        let mesh = match self.meshes.get(&drawable.mesh.id).cloned() {
-                            Some(m) => m,
-                            None => continue,
-                        };
-
-                        let material =
-                            self.material_binding_for_drawable(input, &drawable.material);
-                        let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
-                        let ubo_bytes: &[u8] = unsafe {
-                            std::slice::from_raw_parts(
-                                &material_ubo as *const _ as *const u8,
-                                std::mem::size_of::<MaterialUBO>(),
-                            )
-                        };
-                        let (mat_desc_set, _mat_buf) = self
-                            .get_or_create_material_desc_set(&drawable.material.id, ubo_bytes)
-                            .unwrap_or_else(|diags| {
-                                for d in &diags {
-                                    tracing::warn!(
-                                        target: "scene_renderer",
-                                        code = d.code,
-                                        message = d.message,
-                                    );
-                                }
-                                (vk::DescriptorSet::null(), vk::Buffer::null())
-                            });
-
-                        if mat_desc_set != vk::DescriptorSet::null() {
-                            for tex_slot in &material.textures {
-                                let tex_id = &tex_slot.texture.id;
-                                if self.device.textures.contains_key(tex_id) {
-                                    let _ = self.device.bind_material_texture(tex_id, mat_desc_set);
-                                    break;
-                                }
-                            }
-                            let sets = [mat_desc_set];
-                            unsafe {
-                                d.cmd_bind_descriptor_sets(
-                                    cmd,
-                                    vk::PipelineBindPoint::GRAPHICS,
-                                    hdr_pll,
-                                    2,
-                                    &sets,
-                                    &[],
-                                );
-                            }
-                        }
-
-                        let world = &drawable.world_transform;
-                        let mut pc_bytes = Vec::with_capacity(128);
-                        for v in world {
-                            pc_bytes.extend_from_slice(&v.to_ne_bytes());
-                        }
-                        pc_bytes.resize(128, 0u8);
-                        unsafe {
-                            d.cmd_push_constants(
-                                cmd,
-                                hdr_pll,
-                                vk::ShaderStageFlags::VERTEX,
-                                0,
-                                &pc_bytes,
-                            );
-                        }
-
-                        let vk_vb = self
-                            .device
-                            .buffers
-                            .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
-                            .map(|e| e.buffer)
-                            .unwrap_or(vk::Buffer::null());
-                        let vk_ib = self
-                            .device
-                            .buffers
-                            .get(mesh.index_buffer.index, mesh.index_buffer.generation)
-                            .map(|e| e.buffer)
-                            .unwrap_or(vk::Buffer::null());
-
-                        if vk_vb != vk::Buffer::null() {
-                            let vbs = [vk_vb];
-                            let offsets = [0u64];
-                            let idx_ty = match mesh.index_format {
-                                IndexFormat::U16 => vk::IndexType::UINT16,
-                                IndexFormat::U32 => vk::IndexType::UINT32,
-                            };
-                            unsafe {
-                                d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
-                                d.cmd_bind_index_buffer(cmd, vk_ib, 0, idx_ty);
-                            }
-
-                            let cmd_offset = cmd_idx as u64 * 20;
-                            unsafe {
-                                d.cmd_draw_indexed_indirect(cmd, indirect_buf, cmd_offset, 1, 20);
-                            }
-                        }
-                    }
-
-                    stats.visible_drawables = visible_indices.len() as u32;
-                    stats.culled_drawables =
-                        input.drawables.len() as u32 - visible_indices.len() as u32;
-                }
-            }
-        }
+        // Scene extraction owns frustum culling. RenderFrameInput contains the
+        // visible working set, so issuing a second indirect pass here would
+        // draw every visible static object twice.
 
         // End HDR render pass
         unsafe {
@@ -1981,8 +2431,7 @@ impl SceneRenderer {
             }
         }
 
-        stats.visible_drawables = input.drawables.len() as u32;
-        stats.visible_lights = input.lights.len() as u32;
+        apply_extraction_stats(stats, input);
         Ok(())
     }
 
@@ -1992,30 +2441,77 @@ impl SceneRenderer {
         input: &RenderFrameInput,
         stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
+        let Some(shadow_light) = input.lights.iter().find(|light| {
+            light.kind == LightKind::Directional
+                && matches!(light.shadow_mode, ShadowMode::Hard | ShadowMode::Soft)
+        }) else {
+            // No directional light requested a shadow map this frame. Do not
+            // manufacture a fixed light or issue stale/fake shadow draws.
+            apply_extraction_stats(stats, input);
+            return Ok(());
+        };
+
+        let light_direction = VulkanDevice::normalize_shadow_light_direction(glam::Vec3::from(
+            shadow_light.direction,
+        ))
+        .map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0286",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("invalid directional shadow light: {error}"),
+            )]
+        })?;
+
+        let view = input.views.first().ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0287",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "directional shadow pass requires a RenderView",
+            )]
+        })?;
+        let view_mat = Mat4::from_cols_array(&view.view_matrix);
+        let proj_mat = Mat4::from_cols_array(&view.projection_matrix);
+        let (near, far) = VulkanDevice::derive_rh_zo_clip_planes(&proj_mat).map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0288",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("cannot derive directional-shadow clip planes: {error}"),
+            )]
+        })?;
+        let (cascade_splits, light_vps) =
+            VulkanDevice::compute_cascade_data(&view_mat, &proj_mat, near, far, light_direction)
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0289",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("cannot compute directional-shadow cascades: {error}"),
+                    )]
+                })?;
+
         let rp = self.device.shadow_rp.unwrap_or(vk::RenderPass::null());
         let pll = self
             .device
             .shadow_pipeline_layout
             .unwrap_or(vk::PipelineLayout::null());
         let pl = self.device.shadow_pipeline.unwrap_or(vk::Pipeline::null());
-        if rp == vk::RenderPass::null() || pl == vk::Pipeline::null() {
-            return Ok(());
+        if rp == vk::RenderPass::null()
+            || pll == vk::PipelineLayout::null()
+            || pl == vk::Pipeline::null()
+        {
+            return Err(vec![Diagnostic::new(
+                "RV0226",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "directional shadow pass resources are incomplete",
+            )]);
         }
 
         const SHADOW_SIZE: u32 = 2048;
         const CASCADE_COUNT: usize = 3;
-
-        let (view_mat, proj_mat) = if let Some(view) = input.views.first() {
-            (
-                Mat4::from_cols_array(&view.view_matrix),
-                Mat4::from_cols_array(&view.projection_matrix),
-            )
-        } else {
-            (Mat4::IDENTITY, Mat4::IDENTITY)
-        };
-
-        let (cascade_splits, light_vps) =
-            VulkanDevice::compute_cascade_data(&view_mat, &proj_mat, 0.1, 100.0);
 
         let splits_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(&cascade_splits as *const _ as *const u8, 16) };
@@ -2058,7 +2554,7 @@ impl SceneRenderer {
                         height: SHADOW_SIZE,
                     },
                 })
-            .clear_values(&clear_values);
+                .clear_values(&clear_values);
             unsafe {
                 d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
             }
@@ -2126,13 +2622,19 @@ impl SceneRenderer {
                             shadow_cached_vb = vk_vb;
                             shadow_cached_ib = vk_ib;
                             shadow_cached_index_count = m.index_count;
+                            let shadow_index_type = vulkan_index_type(m.index_format);
                             last_shadow_mesh = Some(mesh_id.as_str());
                             // Bind VB/IB
                             let vbs = [shadow_cached_vb];
                             let offsets = [0u64];
                             unsafe {
                                 d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
-                                d.cmd_bind_index_buffer(cmd, shadow_cached_ib, 0, vk::IndexType::UINT32);
+                                d.cmd_bind_index_buffer(
+                                    cmd,
+                                    shadow_cached_ib,
+                                    0,
+                                    shadow_index_type,
+                                );
                             }
                         }
                         None => {
@@ -2195,8 +2697,7 @@ impl SceneRenderer {
             }
         }
 
-        stats.visible_drawables = input.drawables.len() as u32;
-        stats.visible_lights = input.lights.len() as u32;
+        apply_extraction_stats(stats, input);
         Ok(())
     }
 
@@ -2207,7 +2708,12 @@ impl SceneRenderer {
         stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
         let Some(ref mut enc) = self.cur_enc else {
-            return Ok(());
+            return Err(vec![Diagnostic::new(
+                "RV0227",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "tone-map pass requires an active frame encoder",
+            )]);
         };
 
         let d = &self.device.logical_device.device;
@@ -2224,8 +2730,17 @@ impl SceneRenderer {
             .device
             .tone_desc_set
             .unwrap_or(vk::DescriptorSet::null());
-        if tone_rp == vk::RenderPass::null() || tone_pl == vk::Pipeline::null() {
-            return Ok(());
+        if tone_rp == vk::RenderPass::null()
+            || tone_pl == vk::Pipeline::null()
+            || tone_pll == vk::PipelineLayout::null()
+            || tone_ds == vk::DescriptorSet::null()
+        {
+            return Err(vec![Diagnostic::new(
+                "RV0228",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "tone-map pass resources are incomplete",
+            )]);
         }
 
         let tone_fb = self
@@ -2235,7 +2750,12 @@ impl SceneRenderer {
             .copied()
             .unwrap_or(vk::Framebuffer::null());
         if tone_fb == vk::Framebuffer::null() {
-            return Ok(());
+            return Err(vec![Diagnostic::new(
+                "RV0229",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "tone-map framebuffer is missing for the acquired swapchain image",
+            )]);
         }
 
         let rpbi = vk::RenderPassBeginInfo::default()
@@ -2385,20 +2905,41 @@ impl SceneRenderer {
 
         Ok(())
     }
+
+    fn recover_failed_device_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+        self.device
+            .abort_current_frame_recording()
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0244",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("failed to recover Vulkan frame state: {error:?}"),
+                )]
+            })?;
+        self.device.destroy_scene_framebuffers(&self.framebuffers);
+        self.framebuffers.clear();
+        self.device.resize(self.width, self.height);
+        Ok(())
+    }
 }
 
 // ============================================================================
-// BackendRenderer implementation
+// Retained single-pass implementation
 // ============================================================================
 
-impl BackendRenderer for SceneRenderer {
+impl SceneRenderer {
     // ------------------------------------------------------------------
     // Single-pass legacy path
     // ------------------------------------------------------------------
 
-    fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
+    #[allow(dead_code)]
+    fn render_frame_legacy(
+        &mut self,
+        input: &RenderFrameInput,
+    ) -> Result<FrameStats, Vec<Diagnostic>> {
         let msaa = self.device.msaa_samples(input.render_options.msaa_samples);
-        let (sc_h, ii, mut encoder) = self.begin_frame_impl(msaa)?;
+        let (sc_h, ii, mut encoder) = self.begin_frame_impl(input, msaa)?;
 
         // Begin a render pass covering the full viewport.
         if let Some(rp) = self.rp {
@@ -2487,14 +3028,7 @@ impl BackendRenderer for SceneRenderer {
                 }
             }
 
-            // ── Bind base color texture (set=2, binding=1) if cached ─────
-            for tex_slot in &material.textures {
-                let tex_id = &tex_slot.texture.id;
-                if self.device.textures.contains_key(tex_id) {
-                    let _ = self.device.bind_material_texture(tex_id, mat_desc_set);
-                    break; // bind at most one texture per drawable for now
-                }
-            }
+            self.bind_material_texture_if_changed(material_id, &material, mat_desc_set)?;
 
             // Push the world transform as push constants (placeholder MVP).
             if let Some(pll) = self.pll {
@@ -2590,18 +3124,17 @@ impl BackendRenderer for SceneRenderer {
                 }
             }
 
-            // ── Bind base color texture (set=2, binding=1) if cached ─────
-            for tex_slot in &material.textures {
-                let tex_id = &tex_slot.texture.id;
-                if self.device.textures.contains_key(tex_id) {
-                    let _ = self.device.bind_material_texture(tex_id, skinned_desc_set);
-                    break;
-                }
-            }
+            let skinned_cache_key = format!("{material_id}:{skeleton_id}");
+            self.bind_skinned_texture_if_changed(&skinned_cache_key, &material, skinned_desc_set)?;
 
-            // Push constants (128 B, not used by skinned.vert but required by layout)
+            // The skinned shader applies this drawable world matrix after the
+            // bone palette's model-space deformation.
             if let Some(pll) = self.pll {
-                let pc_bytes = vec![0u8; 128];
+                let mut pc_bytes = Vec::with_capacity(128);
+                for value in &skinned.world_transform {
+                    pc_bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+                pc_bytes.resize(128, 0);
                 encoder.push_constants(pll, 0x01, 0, &pc_bytes);
             }
 
@@ -2637,15 +3170,99 @@ impl BackendRenderer for SceneRenderer {
             )]
         })?;
 
+        let extraction = extraction_stats(input);
         Ok(FrameStats {
-            visible_drawables: input.drawables.len() as u32,
-            visible_lights: input.lights.len() as u32,
-            culled_drawables: 0,
-            culled_lights: 0,
+            visible_drawables: extraction.visible_drawables,
+            visible_lights: extraction.visible_lights,
+            culled_drawables: extraction.culled_drawables,
+            culled_lights: extraction.culled_lights,
             draw_calls,
             triangles,
             gpu_frame_ms: stats.gpu_frame_ms,
         })
+    }
+}
+
+// ============================================================================
+// BackendRenderer implementation
+// ============================================================================
+
+impl BackendRenderer for SceneRenderer {
+    fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
+        let diagnostics = engine_renderer::validate_frame_input(input);
+        if diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.severity,
+                DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+            )
+        }) {
+            return Err(diagnostics);
+        }
+
+        let graph = engine_renderer::render_graph2::RenderGraph::build_with_config(
+            input,
+            &input.render_options.pass_graph_config,
+        );
+        if let Some(name) = graph.passes.iter().find_map(|pass| match &pass.kind {
+            engine_renderer::render_graph2::PassKind::Custom(name)
+                if self.pass_registry.find(name).is_none() =>
+            {
+                Some(*name)
+            }
+            _ => None,
+        }) {
+            return Err(vec![Diagnostic::new(
+                "RV0291",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("render graph references unregistered custom pass '{name}'"),
+            )]);
+        }
+        let compiled = graph.compile_v2().map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0284",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("render graph compile failed: {error}"),
+            )]
+        })?;
+        let abort_after_error = |renderer: &mut SceneRenderer, mut diagnostics: Vec<Diagnostic>| {
+            if let Err(mut abort_diagnostics) = renderer.abort_frame() {
+                diagnostics.append(&mut abort_diagnostics);
+            }
+            diagnostics
+        };
+
+        let mut stats = FrameStats::default();
+        self.begin_frame(input)?;
+        for (compiled_index, &pass_index) in compiled.pass_order.iter().enumerate() {
+            let Some(pass) = graph.passes.get(pass_index) else {
+                let diagnostics = vec![Diagnostic::new(
+                    "RV0285",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("compiled graph referenced missing pass index {pass_index}"),
+                )];
+                return Err(abort_after_error(self, diagnostics));
+            };
+            let barriers = compiled
+                .barriers_per_pass
+                .get(compiled_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if let Some(legacy_pass) = pass.to_legacy() {
+                if let Err(diagnostics) = self.apply_pass_barriers(input, &legacy_pass, barriers) {
+                    return Err(abort_after_error(self, diagnostics));
+                }
+                if let Err(diagnostics) = self.execute_pass(input, &legacy_pass, &mut stats) {
+                    return Err(abort_after_error(self, diagnostics));
+                }
+            }
+        }
+        if let Err(diagnostics) = self.end_frame(&mut stats) {
+            return Err(abort_after_error(self, diagnostics));
+        }
+        Ok(stats)
     }
 
     // ------------------------------------------------------------------
@@ -2664,97 +3281,163 @@ impl BackendRenderer for SceneRenderer {
     }
 
     fn begin_frame(&mut self, input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        if self.cur_enc.is_some() || self.cur_sc.is_some() || self.cur_ii.is_some() {
+            return Err(vec![Diagnostic::new(
+                "RV0269",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "begin_frame called while another frame is active",
+            )]);
+        }
+        if input.views.len() > 1 {
+            return Err(vec![Diagnostic::new(
+                "RV0290",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!(
+                    "Vulkan backend currently supports at most one render view, received {}",
+                    input.views.len()
+                ),
+            )]);
+        }
         let msaa = self.device.msaa_samples(input.render_options.msaa_samples);
-        let (sc_h, ii, enc) = self.begin_frame_impl(msaa)?;
+        let (sc_h, ii, enc) = match self.begin_frame_impl(input, msaa) {
+            Ok(frame) => frame,
+            Err(mut diagnostics) => {
+                if let Err(mut recovery_diagnostics) = self.recover_failed_device_frame() {
+                    diagnostics.append(&mut recovery_diagnostics);
+                }
+                return Err(diagnostics);
+            }
+        };
         self.cur_sc = Some(sc_h);
         self.cur_ii = Some(ii);
         self.cur_enc = Some(enc);
         Ok(())
     }
 
-    #[allow(unexpected_cfgs, clippy::redundant_guards)]
     fn execute_pass(
         &mut self,
         input: &RenderFrameInput,
         pass: &render_graph::PassNode,
         stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
-        if cfg!(feature = "legacy_dispatch") {
-            if self.cur_enc.is_none() {
-                return Ok(());
-            }
-
-            match pass.kind {
-                render_graph::PassKind::OpaquePbrForward => {
-                    self.execute_hdr_forward_pass(input, stats)?;
-                }
-                render_graph::PassKind::DirectionalShadow => {
-                    self.execute_shadow_pass(input, stats)?;
-                }
-                render_graph::PassKind::ToneMap => {
-                    self.execute_tonemap_pass(input, stats)?;
-                }
-                render_graph::PassKind::Present => {}
-
-                render_graph::PassKind::Custom(name) => {
-                    tracing::warn!(target: "scene_renderer", pass = name, "unknown custom render pass");
-                }
-            }
-
-            return Ok(());
+        if self.cur_enc.is_none() {
+            return Err(vec![Diagnostic::new(
+                "RV0224",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "execute_pass called without an active frame encoder",
+            )]);
         }
 
-        // Default path: dispatch through the PassRegistry.
-        if let Some(rp) = self.pass_registry.find_mut(pass.kind.name()) {
-            let enc = self.cur_enc.as_mut().unwrap();
-            rp.execute(input, &mut **enc, stats)
-        } else {
-            Ok(())
+        // Built-in passes own backend-specific Vulkan resources and must be
+        // dispatched directly. In particular, the tone-map pass performs the
+        // render-pass transition from UNDEFINED to PRESENT_SRC_KHR for the
+        // acquired swapchain image. Custom passes continue to use the
+        // pluggable registry.
+        match pass.kind {
+            render_graph::PassKind::OpaquePbrForward => {
+                self.execute_hdr_forward_pass(input, stats)?;
+            }
+            render_graph::PassKind::DirectionalShadow => {
+                self.execute_shadow_pass(input, stats)?;
+            }
+            render_graph::PassKind::ToneMap => {
+                self.execute_tonemap_pass(input, stats)?;
+            }
+            render_graph::PassKind::Present => {}
+            render_graph::PassKind::Custom(name) => {
+                if let Some(rp) = self.pass_registry.find_mut(name) {
+                    if rp.is_enabled(input) {
+                        let enc = self.cur_enc.as_mut().expect("encoder checked above");
+                        rp.execute(input, &mut **enc, stats)?;
+                    }
+                } else {
+                    return Err(vec![Diagnostic::new(
+                        "RV0291",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("render graph references unregistered custom pass '{name}'"),
+                    )]);
+                }
+            }
         }
+
+        Ok(())
     }
 
     fn end_frame(&mut self, stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
-        if let (Some(sc_h), Some(ii)) = (self.cur_sc.take(), self.cur_ii.take()) {
-            // SAFETY: the encoder was created by `begin_frame` and is still
-            // valid; `end_frame` takes ownership and submits the command
-            // buffer that has been recorded into during `execute_pass`.
-            let enc = self.cur_enc.take().unwrap();
-            let s = self.device.end_frame(sc_h, enc, ii).map_err(|e| {
-                vec![Diagnostic::new(
-                    "RV0209",
+        match (self.cur_sc.take(), self.cur_ii.take(), self.cur_enc.take()) {
+            (Some(sc_h), Some(ii), Some(enc)) => {
+                // SAFETY: the encoder was created by `begin_frame` and is still
+                // valid; `end_frame` takes ownership and submits the command
+                // buffer that has been recorded into during `execute_pass`.
+                let s = match self.device.end_frame(sc_h, enc, ii) {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        let mut diagnostics = vec![Diagnostic::new(
+                            "RV0209",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!("end_frame: {error:?}"),
+                        )];
+                        if let Err(mut recovery_diagnostics) = self.recover_failed_device_frame() {
+                            diagnostics.append(&mut recovery_diagnostics);
+                        }
+                        return Err(diagnostics);
+                    }
+                };
+                // Built-in Vulkan passes issue several draws directly because
+                // they need backend-specific descriptor and render-pass state.
+                // The generic encoder only accounts for the draws recorded
+                // through its own methods (for example the tone-map pass), so
+                // replacing the pass totals here would erase the scene work.
+                stats.draw_calls = stats.draw_calls.saturating_add(s.draw_calls);
+                stats.triangles = stats.triangles.saturating_add(s.triangles);
+                stats.gpu_frame_ms = s.gpu_frame_ms;
+            }
+            (None, None, None) => {
+                return Err(vec![Diagnostic::new(
+                    "RV0267",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    format!("end_frame: {e:?}"),
-                )]
-            })?;
-            stats.draw_calls = s.draw_calls;
-            stats.triangles = s.triangles;
-            stats.gpu_frame_ms = s.gpu_frame_ms;
+                    "end_frame called without an active frame",
+                )]);
+            }
+            _ => {
+                let mut diagnostics = vec![Diagnostic::new(
+                    "RV0268",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    "Vulkan frame state is internally inconsistent",
+                )];
+                if let Err(mut recovery_diagnostics) = self.recover_failed_device_frame() {
+                    diagnostics.append(&mut recovery_diagnostics);
+                }
+                return Err(diagnostics);
+            }
         }
         Ok(())
     }
 
-    fn upload_mesh(
-        &mut self,
-        mesh_id: &str,
-        vertex_bytes: &[u8],
-        index_bytes: &[u8],
-        index_count: u32,
-        index_format_u16: bool,
-    ) -> Result<(), Vec<Diagnostic>> {
-        // Destroy old GPU buffers if re-uploading the same mesh ID.
-        if let Some(old) = self.meshes.remove(mesh_id) {
-            self.device.destroy_buffer(old.vertex_buffer);
-            self.device.destroy_buffer(old.index_buffer);
+    fn upload_mesh(&mut self, upload: MeshUpload) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        let mesh_id = upload.mesh_id.id.clone();
+        if let Some(existing) = self.meshes.get(&mesh_id) {
+            if existing.content_hash == upload.content_hash {
+                return Ok(UploadReceipt::new(existing.revision));
+            }
         }
+        let revision = self
+            .meshes
+            .get(&mesh_id)
+            .map_or(1, |existing| existing.revision.saturating_add(1));
 
-        // Combined vertex + transfer-dst usage for the vertex buffer.
         let vb_usage = render_core::BufferUsage(
-            render_core::BufferUsage::VERTEX.0
-                | render_core::BufferUsage::COPY_DST.0,
+            render_core::BufferUsage::VERTEX.0 | render_core::BufferUsage::COPY_DST.0,
         );
         let vb_desc = render_core::BufferDescriptor {
-            size_bytes: vertex_bytes.len() as u64,
+            size_bytes: upload.vertex_bytes.len() as u64,
             usage_flags: vb_usage,
             memory_hint: render_core::MemoryHint::CpuToGpu,
             debug_label: Some(format!("mesh-{mesh_id}-vertices")),
@@ -2767,63 +3450,466 @@ impl BackendRenderer for SceneRenderer {
                 format!("upload_mesh create_buffer(vertices): {e:?}"),
             )]
         })?;
-        self.device
-            .write_buffer(vb, vertex_bytes, 0)
-            .map_err(|e| {
-                vec![Diagnostic::new(
-                    "RV0204",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!("upload_mesh write_buffer(vertices): {e:?}"),
-                )]
-            })?;
+        if let Err(error) = self.device.write_buffer(vb, &upload.vertex_bytes, 0) {
+            self.device.destroy_buffer(vb);
+            return Err(vec![Diagnostic::new(
+                "RV0204",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("upload_mesh write_buffer(vertices): {error:?}"),
+            )]);
+        }
 
-        // Index buffer with INDEX usage.
         let ib_usage = render_core::BufferUsage(
             render_core::BufferUsage::INDEX.0 | render_core::BufferUsage::COPY_DST.0,
         );
         let ib_desc = render_core::BufferDescriptor {
-            size_bytes: index_bytes.len() as u64,
+            size_bytes: upload.index_bytes.len() as u64,
             usage_flags: ib_usage,
             memory_hint: render_core::MemoryHint::CpuToGpu,
             debug_label: Some(format!("mesh-{mesh_id}-indices")),
         };
-        let ib = self.device.create_buffer(&ib_desc).map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0205",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("upload_mesh create_buffer(indices): {e:?}"),
-            )]
-        })?;
-        self.device.write_buffer(ib, index_bytes, 0).map_err(|e| {
-            vec![Diagnostic::new(
+        let ib = match self.device.create_buffer(&ib_desc) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                self.device.destroy_buffer(vb);
+                return Err(vec![Diagnostic::new(
+                    "RV0205",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("upload_mesh create_buffer(indices): {error:?}"),
+                )]);
+            }
+        };
+        if let Err(error) = self.device.write_buffer(ib, &upload.index_bytes, 0) {
+            self.device.destroy_buffer(ib);
+            self.device.destroy_buffer(vb);
+            return Err(vec![Diagnostic::new(
                 "RV0206",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                format!("upload_mesh write_buffer(indices): {e:?}"),
-            )]
-        })?;
+                format!("upload_mesh write_buffer(indices): {error:?}"),
+            )]);
+        }
 
-        let index_format = if index_format_u16 {
-            IndexFormat::U16
-        } else {
-            IndexFormat::U32
+        let index_format = match upload.index_format {
+            engine_renderer::IndexFormat::U16 => IndexFormat::U16,
+            engine_renderer::IndexFormat::U32 => IndexFormat::U32,
         };
         let mesh = GpuMesh {
             vertex_buffer: vb,
             index_buffer: ib,
-            index_count,
+            index_count: upload.index_count,
             index_format,
+            content_hash: upload.content_hash,
+            revision,
         };
-        self.meshes.insert(mesh_id.to_string(), mesh);
+
+        if self.meshes.contains_key(&mesh_id) {
+            if let Err(error) = self.device.wait_idle_checked() {
+                self.device.destroy_buffer(vb);
+                self.device.destroy_buffer(ib);
+                return Err(vec![Diagnostic::new(
+                    "RV0235",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("cannot replace in-flight mesh '{mesh_id}': {error:?}"),
+                )]);
+            }
+        }
+        if let Some(old) = self.meshes.insert(mesh_id, mesh) {
+            self.device.destroy_buffer(old.vertex_buffer);
+            self.device.destroy_buffer(old.index_buffer);
+        }
+        Ok(UploadReceipt::new(revision))
+    }
+
+    fn upload_texture(&mut self, upload: TextureUpload) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        use crate::device_impl::reload::{
+            SampledTextureAddressMode, SampledTextureColorSpace, SampledTextureDescriptor,
+            SampledTextureFilter, SampledTextureSamplerDescriptor,
+        };
+        use crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID;
+
+        let texture_id = upload.texture_id.id.clone();
+        if texture_id == FALLBACK_MATERIAL_TEXTURE_ID {
+            return Err(vec![Diagnostic::new(
+                "RV0236",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "the renderer fallback texture ID is reserved",
+            )]);
+        }
+        if let Some(existing) = self.texture_uploads.get(&texture_id) {
+            if existing.content_hash == upload.content_hash {
+                return Ok(UploadReceipt::new(existing.revision));
+            }
+        }
+        let revision = self
+            .texture_uploads
+            .get(&texture_id)
+            .map_or(1, |existing| existing.revision.saturating_add(1));
+        let mut mip_bytes = Vec::new();
+        for mip in &upload.mip_levels {
+            mip_bytes.extend_from_slice(&mip.bytes);
+        }
+        let map_filter = |filter| match filter {
+            SamplerFilter::Nearest => SampledTextureFilter::Nearest,
+            SamplerFilter::Linear => SampledTextureFilter::Linear,
+        };
+        let map_address = |address| match address {
+            SamplerAddressMode::Repeat => SampledTextureAddressMode::Repeat,
+            SamplerAddressMode::ClampToEdge => SampledTextureAddressMode::ClampToEdge,
+            SamplerAddressMode::MirroredRepeat => SampledTextureAddressMode::MirroredRepeat,
+        };
+        let descriptor = SampledTextureDescriptor::rgba8(
+            upload.width,
+            upload.height,
+            u8::try_from(upload.mip_levels.len()).map_err(|_| {
+                vec![Diagnostic::new(
+                    "RV0237",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    "texture mip count exceeds the Vulkan upload contract",
+                )]
+            })?,
+            &mip_bytes,
+            match upload.color_space {
+                engine_renderer::ColorSpace::Linear => SampledTextureColorSpace::Linear,
+                engine_renderer::ColorSpace::Srgb => SampledTextureColorSpace::Srgb,
+            },
+            SampledTextureSamplerDescriptor {
+                min_filter: map_filter(upload.sampler.min_filter),
+                mag_filter: map_filter(upload.sampler.mag_filter),
+                mip_filter: map_filter(upload.sampler.mip_filter),
+                address_u: map_address(upload.sampler.address_u),
+                address_v: map_address(upload.sampler.address_v),
+                address_w: map_address(upload.sampler.address_w),
+            },
+        );
+        let new_texture = self
+            .device
+            .create_sampled_texture_resource(descriptor)
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0238",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("texture upload failed for '{texture_id}': {error:?}"),
+                )]
+            })?;
+
+        if self.device.textures.contains_key(&texture_id) {
+            if let Err(error) = self.device.wait_idle_checked() {
+                self.device.destroy_gpu_texture(new_texture);
+                return Err(vec![Diagnostic::new(
+                    "RV0239",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("cannot replace in-flight texture '{texture_id}': {error:?}"),
+                )]);
+            }
+        }
+        let descriptor_sets: Vec<vk::DescriptorSet> = self
+            .material_cache
+            .values()
+            .filter(|entry| entry.bound_texture_id == texture_id)
+            .map(|entry| entry.desc_set)
+            .chain(
+                self.skinned_desc_cache
+                    .values()
+                    .filter(|entry| entry.bound_texture_id == texture_id)
+                    .map(|entry| entry.desc_set),
+            )
+            .collect();
+        let mut old_texture = self.device.textures.insert(texture_id.clone(), new_texture);
+        let mut rebind_diagnostics = Vec::new();
+        for descriptor_set in descriptor_sets.iter().copied() {
+            match self
+                .device
+                .bind_material_texture(&texture_id, descriptor_set)
+            {
+                Ok(true) => {}
+                Ok(false) => rebind_diagnostics.push(Diagnostic::new(
+                    "RV0276",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!(
+                        "replacement texture '{texture_id}' disappeared before descriptor update"
+                    ),
+                )),
+                Err(error) => rebind_diagnostics.push(Diagnostic::new(
+                    "RV0277",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("failed to rebind replacement texture '{texture_id}': {error:?}"),
+                )),
+            }
+        }
+        if !rebind_diagnostics.is_empty() {
+            let failed_texture = self.device.textures.remove(&texture_id);
+            if let Some(previous_texture) = old_texture.take() {
+                self.device
+                    .textures
+                    .insert(texture_id.clone(), previous_texture);
+                for descriptor_set in descriptor_sets {
+                    match self
+                        .device
+                        .bind_material_texture(&texture_id, descriptor_set)
+                    {
+                        Ok(true) => {}
+                        Ok(false) => rebind_diagnostics.push(Diagnostic::new(
+                            "RV0278",
+                            DiagnosticSeverity::Fatal,
+                            "scene_renderer",
+                            format!(
+                                "failed to restore texture '{texture_id}' after replacement rollback"
+                            ),
+                        )),
+                        Err(error) => rebind_diagnostics.push(Diagnostic::new(
+                            "RV0279",
+                            DiagnosticSeverity::Fatal,
+                            "scene_renderer",
+                            format!(
+                                "failed to restore texture '{texture_id}' descriptor after replacement rollback: {error:?}"
+                            ),
+                        )),
+                    }
+                }
+            }
+            if let Some(failed_texture) = failed_texture {
+                self.device.destroy_gpu_texture(failed_texture);
+            }
+            return Err(rebind_diagnostics);
+        }
+        if let Some(old_texture) = old_texture {
+            self.device.destroy_gpu_texture(old_texture);
+        }
+        self.texture_uploads.insert(
+            texture_id,
+            UploadedResourceState {
+                content_hash: upload.content_hash,
+                revision,
+            },
+        );
+        Ok(UploadReceipt::new(revision))
+    }
+
+    fn upload_material(
+        &mut self,
+        upload: MaterialUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        if let Some(texture) = &upload.base_color_texture {
+            if !self.device.textures.contains_key(&texture.id) {
+                return Err(vec![Diagnostic::new(
+                    "RV0240",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!(
+                        "material '{}' references texture '{}' before a successful upload",
+                        upload.material_id.id, texture.id
+                    ),
+                )]);
+            }
+        }
+        let material_id = upload.material_id.id.clone();
+        if let Some(existing) = self.uploaded_materials.get(&material_id) {
+            if existing.content_hash == upload.content_hash {
+                return Ok(UploadReceipt::new(existing.revision));
+            }
+        }
+        let revision = self
+            .uploaded_materials
+            .get(&material_id)
+            .map_or(1, |existing| existing.revision.saturating_add(1));
+        self.uploaded_materials.insert(
+            material_id,
+            UploadedMaterialState {
+                binding: uploaded_material_binding(&upload),
+                content_hash: upload.content_hash,
+                revision,
+            },
+        );
+        Ok(UploadReceipt::new(revision))
+    }
+
+    fn remove_resource(&mut self, removal: ResourceRemoval) -> Result<(), Vec<Diagnostic>> {
+        let resource_id = removal.resource_id.id;
+        match removal.kind {
+            ResourceKind::Mesh => {
+                if self.meshes.contains_key(&resource_id) {
+                    self.device.wait_idle_checked().map_err(|error| {
+                        vec![Diagnostic::new(
+                            "RV0241",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!("cannot remove in-flight mesh '{resource_id}': {error:?}"),
+                        )]
+                    })?;
+                }
+                if let Some(mesh) = self.meshes.remove(&resource_id) {
+                    self.device.destroy_buffer(mesh.vertex_buffer);
+                    self.device.destroy_buffer(mesh.index_buffer);
+                }
+            }
+            ResourceKind::Texture => {
+                use crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID;
+                if resource_id == FALLBACK_MATERIAL_TEXTURE_ID {
+                    return Err(vec![Diagnostic::new(
+                        "RV0242",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        "the renderer fallback texture cannot be removed",
+                    )]);
+                }
+                if let Some(dependent) = self.uploaded_materials.values().find(|material| {
+                    material
+                        .binding
+                        .textures
+                        .iter()
+                        .any(|slot| slot.texture.id == resource_id)
+                }) {
+                    return Err(vec![Diagnostic::new(
+                        "RV0270",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!(
+                            "texture '{resource_id}' is still referenced by material '{}'",
+                            dependent.binding.material_id.id
+                        ),
+                    )]);
+                }
+                self.device.wait_idle_checked().map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0243",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("cannot remove in-flight texture '{resource_id}': {error:?}"),
+                    )]
+                })?;
+                let material_keys: Vec<String> = self
+                    .material_cache
+                    .iter()
+                    .filter(|(_, entry)| entry.bound_texture_id == resource_id)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                let skinned_keys: Vec<String> = self
+                    .skinned_desc_cache
+                    .iter()
+                    .filter(|(_, entry)| entry.bound_texture_id == resource_id)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in &material_keys {
+                    let descriptor_set = self.material_cache[key].desc_set;
+                    let bound = self
+                        .device
+                        .bind_material_texture(FALLBACK_MATERIAL_TEXTURE_ID, descriptor_set)
+                        .map_err(|error| {
+                            vec![Diagnostic::new(
+                                "RV0280",
+                                DiagnosticSeverity::Error,
+                                "scene_renderer",
+                                format!(
+                                    "failed to detach texture '{resource_id}' from material '{key}': {error:?}"
+                                ),
+                            )]
+                        })?;
+                    if !bound {
+                        return Err(vec![Diagnostic::new(
+                            "RV0281",
+                            DiagnosticSeverity::Fatal,
+                            "scene_renderer",
+                            "fallback texture disappeared during resource removal",
+                        )]);
+                    }
+                }
+                for key in &skinned_keys {
+                    let descriptor_set = self.skinned_desc_cache[key].desc_set;
+                    let bound = self
+                        .device
+                        .bind_material_texture(FALLBACK_MATERIAL_TEXTURE_ID, descriptor_set)
+                        .map_err(|error| {
+                            vec![Diagnostic::new(
+                                "RV0282",
+                                DiagnosticSeverity::Error,
+                                "scene_renderer",
+                                format!(
+                                    "failed to detach texture '{resource_id}' from skinned material '{key}': {error:?}"
+                                ),
+                            )]
+                        })?;
+                    if !bound {
+                        return Err(vec![Diagnostic::new(
+                            "RV0283",
+                            DiagnosticSeverity::Fatal,
+                            "scene_renderer",
+                            "fallback texture disappeared during skinned resource removal",
+                        )]);
+                    }
+                }
+                for key in material_keys {
+                    if let Some(entry) = self.material_cache.get_mut(&key) {
+                        entry.bound_texture_id = FALLBACK_MATERIAL_TEXTURE_ID.to_owned();
+                    }
+                }
+                for key in skinned_keys {
+                    if let Some(entry) = self.skinned_desc_cache.get_mut(&key) {
+                        entry.bound_texture_id = FALLBACK_MATERIAL_TEXTURE_ID.to_owned();
+                    }
+                }
+                if let Some(texture) = self.device.textures.remove(&resource_id) {
+                    self.device.destroy_gpu_texture(texture);
+                }
+                self.texture_uploads.remove(&resource_id);
+            }
+            ResourceKind::Material => {
+                self.evict_material_by_id(&resource_id)?;
+                self.uploaded_materials.remove(&resource_id);
+            }
+        }
         Ok(())
     }
 
+    fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+        if self.cur_enc.is_none() && self.cur_sc.is_none() && self.cur_ii.is_none() {
+            return Ok(());
+        }
+        self.cur_enc.take();
+        self.cur_sc.take();
+        self.cur_ii.take();
+        self.recover_failed_device_frame()
+    }
+
     fn resize(&mut self, width: u32, height: u32) -> Result<(), Vec<Diagnostic>> {
-        self.width = width.max(1);
-        self.height = height.max(1);
-        self.device.resize(width.max(1), height.max(1));
+        if width == 0 || height == 0 {
+            return Err(vec![Diagnostic::new(
+                "RV0245",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "Vulkan surface dimensions must be non-zero",
+            )]);
+        }
+        if self.cur_enc.is_some() {
+            return Err(vec![Diagnostic::new(
+                "RV0246",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "cannot resize while a frame is being recorded",
+            )]);
+        }
+        self.device.wait_idle_checked().map_err(|error| {
+            vec![Diagnostic::new(
+                "RV0247",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("failed to wait for Vulkan resize: {error:?}"),
+            )]
+        })?;
+        self.device.destroy_scene_framebuffers(&self.framebuffers);
+        self.framebuffers.clear();
+        self.width = width;
+        self.height = height;
+        self.device.resize(width, height);
         Ok(())
     }
 }
@@ -2870,6 +3956,61 @@ mod tests {
         fn destroy_pipeline(&mut self, handle: PipelineHandle) {
             self.destroyed.push(handle);
         }
+    }
+
+    #[test]
+    fn shadow_index_binding_preserves_uploaded_index_width() {
+        assert_eq!(vulkan_index_type(IndexFormat::U16), vk::IndexType::UINT16);
+        assert_eq!(vulkan_index_type(IndexFormat::U32), vk::IndexType::UINT32);
+    }
+
+    #[test]
+    fn fallback_extraction_stats_count_static_and_skinned_drawables() {
+        let mut input = RenderFrameInput::empty(1);
+        input.drawables.push(RenderableItem {
+            entity: None,
+            mesh: AssetId::new("mesh_static"),
+            material: AssetId::new("material_static"),
+            world_transform: [0.0; 16],
+            bounds: engine_renderer::AxisAlignedBox::UNIT,
+            render_layer: "default".to_string(),
+            cast_shadows: true,
+            sort_key: 0,
+        });
+        input.skinned_items.push(SkinnedItem {
+            entity: None,
+            mesh: AssetId::new("mesh_skinned"),
+            material: AssetId::new("material_skinned"),
+            skeleton: AssetId::new("skeleton"),
+            bone_palette: Vec::new(),
+            bone_palette_layout: engine_renderer::BonePaletteLayout::Full4x4 { count: 0 },
+            world_transform: [0.0; 16],
+            bounds: engine_renderer::AxisAlignedBox::UNIT,
+            render_layer: "default".to_string(),
+            cast_shadows: true,
+            sort_key: 1,
+        });
+
+        assert_eq!(extraction_stats(&input).visible_drawables, 2);
+    }
+
+    #[test]
+    fn structured_extraction_stats_are_preserved() {
+        let mut input = RenderFrameInput::empty(2);
+        input.extraction_stats = Some(engine_renderer::ExtractionStats {
+            visible_drawables: 3,
+            culled_drawables: 5,
+            visible_lights: 2,
+            culled_lights: 7,
+        });
+        let mut frame = FrameStats::default();
+
+        apply_extraction_stats(&mut frame, &input);
+
+        assert_eq!(frame.visible_drawables, 3);
+        assert_eq!(frame.culled_drawables, 5);
+        assert_eq!(frame.visible_lights, 2);
+        assert_eq!(frame.culled_lights, 7);
     }
 
     #[test]

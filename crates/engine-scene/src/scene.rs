@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use thiserror::Error;
 
+use crate::world::World;
+
 pub const ECS_SCENE_CONTRACT: &str = "ECSScene-v0.1.0";
 
 /// Current scene schema version.  Any major bump or minor > this indicates
@@ -86,6 +88,71 @@ pub enum SceneError {
     /// RON error (serialization or deserialization).
     #[error("RON error: {0}")]
     Ron(#[from] ron::Error),
+}
+
+/// A component-level problem encountered while restoring a [`World`] from a
+/// scene with a [`crate::ComponentRegistry`].
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum SceneLoadDiagnostic {
+    #[error("entity `{entity_id}` references unknown component type `{component_type_id}`")]
+    UnknownComponent {
+        entity_id: PersistentId,
+        component_type_id: ComponentTypeId,
+    },
+    #[error(
+        "component type `{component_type_id}` on entity `{entity_id}` has no deserialize hook"
+    )]
+    MissingDeserializeHook {
+        entity_id: PersistentId,
+        component_type_id: ComponentTypeId,
+    },
+    #[error(
+        "component registry entry `{component_type_id}` created storage for `{storage_type_id}`"
+    )]
+    StorageFactoryTypeMismatch {
+        entity_id: PersistentId,
+        component_type_id: ComponentTypeId,
+        storage_type_id: ComponentTypeId,
+    },
+    #[error(
+        "deserialize hook for `{component_type_id}` returned a value incompatible with its storage on entity `{entity_id}`"
+    )]
+    StorageInsertTypeMismatch {
+        entity_id: PersistentId,
+        component_type_id: ComponentTypeId,
+    },
+}
+
+/// Non-failing scene load result. The partially restored world is retained,
+/// while every external-component failure is made visible to the caller.
+pub struct SceneLoadReport {
+    pub world: World,
+    pub diagnostics: Vec<SceneLoadDiagnostic>,
+}
+
+impl SceneLoadReport {
+    pub fn is_success(&self) -> bool {
+        self.diagnostics.is_empty()
+    }
+
+    /// Convert this report into the strict form used by
+    /// [`World::try_from_scene_with_registry`].
+    pub fn into_result(self) -> Result<World, SceneLoadError> {
+        if self.diagnostics.is_empty() {
+            Ok(self.world)
+        } else {
+            Err(SceneLoadError {
+                diagnostics: self.diagnostics,
+            })
+        }
+    }
+}
+
+/// Aggregated failure returned by strict registry-aware scene loading.
+#[derive(Debug, Error)]
+#[error("one or more scene components could not be restored")]
+pub struct SceneLoadError {
+    pub diagnostics: Vec<SceneLoadDiagnostic>,
 }
 
 // ── Scene serialization / validation helpers ────────────────────────────────

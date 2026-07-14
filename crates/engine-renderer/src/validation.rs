@@ -103,5 +103,87 @@ pub fn validate_frame_input(input: &RenderFrameInput) -> Vec<Diagnostic> {
         }
     }
 
+    validate_pass_graph_config(input, &mut diagnostics);
+
     diagnostics
+}
+
+fn validate_pass_graph_config(input: &RenderFrameInput, diagnostics: &mut Vec<Diagnostic>) {
+    let config = &input.render_options.pass_graph_config;
+    if !config.enabled {
+        return;
+    }
+
+    let enabled: Vec<(usize, &str)> = config
+        .passes
+        .iter()
+        .enumerate()
+        .filter(|(_, pass)| pass.enabled)
+        .map(|(index, pass)| (index, pass.kind.as_str()))
+        .collect();
+    let positions = |kind: &str| {
+        enabled
+            .iter()
+            .filter(|(_, candidate)| *candidate == kind)
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>()
+    };
+    let opaque = positions("OpaquePbrForward");
+    let tone_map = positions("ToneMap");
+    let present = positions("Present");
+    let shadow = positions("DirectionalShadow");
+
+    for (kind, found) in [
+        ("OpaquePbrForward", opaque.len()),
+        ("ToneMap", tone_map.len()),
+        ("Present", present.len()),
+    ] {
+        if found != 1 {
+            diagnostics.push(
+                Diagnostic::new(
+                    "RV0017",
+                    DiagnosticSeverity::Error,
+                    "engine-renderer",
+                    format!(
+                        "enabled render graph must contain exactly one {kind} pass; found {found}"
+                    ),
+                )
+                .contract("RendererInput-v0", input.contract_version.clone())
+                .path("render_options.pass_graph_config.passes"),
+            );
+        }
+    }
+    if shadow.len() > 1 {
+        diagnostics.push(
+            Diagnostic::new(
+                "RV0018",
+                DiagnosticSeverity::Error,
+                "engine-renderer",
+                "enabled render graph may contain at most one DirectionalShadow pass",
+            )
+            .contract("RendererInput-v0", input.contract_version.clone())
+            .path("render_options.pass_graph_config.passes"),
+        );
+    }
+
+    if let (Some(&opaque), Some(&tone_map), Some(&present)) =
+        (opaque.first(), tone_map.first(), present.first())
+    {
+        let shadow_is_ordered = shadow.first().map_or(true, |shadow| *shadow < opaque);
+        let present_is_final = enabled
+            .last()
+            .is_some_and(|(index, kind)| *index == present && *kind == "Present");
+        if !(shadow_is_ordered && opaque < tone_map && tone_map < present && present_is_final) {
+            diagnostics.push(
+                Diagnostic::new(
+                    "RV0019",
+                    DiagnosticSeverity::Error,
+                    "engine-renderer",
+                    "render graph order must be DirectionalShadow (optional), OpaquePbrForward, optional custom passes, ToneMap, then terminal Present",
+                )
+                .contract("RendererInput-v0", input.contract_version.clone())
+                .path("render_options.pass_graph_config.passes"),
+            );
+        }
+    }
 }

@@ -1,7 +1,9 @@
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use engine_asset::AssetRegistry;
-use engine_serialize::{Diagnostic, HotUpdateManifest, PlatformKind};
+use engine_serialize::{Diagnostic, DiagnosticSeverity, HotUpdateManifest, PlatformKind};
+use fs2::FileExt;
 use tracing::{debug, info};
 
 use crate::apply::UpdateApplier;
@@ -10,6 +12,9 @@ use crate::download::Downloader;
 use crate::error::UpdateError;
 use crate::install::Installer;
 use crate::package::{Package, PackageState};
+use crate::path_safety::{
+    ensure_no_links_in_path, remove_dir_all_safe, safe_join, validate_manifest_paths,
+};
 use crate::rollback::RollbackManager;
 use crate::verify::Verifier;
 
@@ -26,7 +31,7 @@ use crate::verify::Verifier;
 ///
 /// ```text
 /// install_package(manifest)
-///   ├─ verify signature (placeholder)
+///   ├─ verify Ed25519 signature and trusted key
 ///   ├─ verify compatibility
 ///   ├─ verify platform rules
 ///   ├─ download payloads
@@ -46,8 +51,10 @@ use crate::verify::Verifier;
 ///   └─ auto-rollback if boot marker present
 /// ```
 pub struct PackageManager {
+    /// Held for the complete manager lifetime so two processes cannot mutate
+    /// the same singleton transaction journal concurrently.
+    _cache_lock: File,
     cache: PackageCache,
-    #[expect(dead_code)]
     verifier: Verifier,
     #[expect(dead_code)]
     downloader: Downloader,
@@ -74,16 +81,81 @@ impl PackageManager {
         platform: PlatformKind,
         engine_ver: &str,
         script_api_ver: (u16, u16),
-    ) -> Self {
-        let cache = PackageCache::new(base_dir);
-        // Best-effort initialisation.
-        if let Err(e) = cache.initialize() {
-            debug!("cache init (best-effort): {e}");
-        }
+    ) -> Result<Self, UpdateError> {
+        Self::try_new(base_dir, platform, engine_ver, script_api_ver)
+    }
 
-        Self {
+    /// Strict production constructor. Cache initialisation, interrupted
+    /// transaction recovery, and exclusive-lock acquisition must all succeed.
+    pub fn try_new(
+        base_dir: &Path,
+        platform: PlatformKind,
+        engine_ver: &str,
+        script_api_ver: (u16, u16),
+    ) -> Result<Self, UpdateError> {
+        Self::try_new_with_verifier(
+            base_dir,
+            platform,
+            engine_ver,
+            script_api_ver,
+            Verifier::production(),
+        )
+    }
+
+    /// Create a manager that explicitly allows unsigned development packages.
+    pub fn new_development(
+        base_dir: &Path,
+        platform: PlatformKind,
+        engine_ver: &str,
+        script_api_ver: (u16, u16),
+    ) -> Result<Self, UpdateError> {
+        Self::try_new_development(base_dir, platform, engine_ver, script_api_ver)
+    }
+
+    /// Strict development constructor. Unsigned manifests are allowed, but
+    /// cache ownership and recovery remain fail-closed.
+    pub fn try_new_development(
+        base_dir: &Path,
+        platform: PlatformKind,
+        engine_ver: &str,
+        script_api_ver: (u16, u16),
+    ) -> Result<Self, UpdateError> {
+        Self::try_new_with_verifier(
+            base_dir,
+            platform,
+            engine_ver,
+            script_api_ver,
+            Verifier::development(),
+        )
+    }
+
+    /// Create a manager with an explicitly configured verifier and trust set.
+    pub fn new_with_verifier(
+        base_dir: &Path,
+        platform: PlatformKind,
+        engine_ver: &str,
+        script_api_ver: (u16, u16),
+        verifier: Verifier,
+    ) -> Result<Self, UpdateError> {
+        Self::try_new_with_verifier(base_dir, platform, engine_ver, script_api_ver, verifier)
+    }
+
+    /// Strict constructor with an explicitly configured verifier.
+    pub fn try_new_with_verifier(
+        base_dir: &Path,
+        platform: PlatformKind,
+        engine_ver: &str,
+        script_api_ver: (u16, u16),
+        verifier: Verifier,
+    ) -> Result<Self, UpdateError> {
+        let cache_lock = acquire_cache_lock(base_dir)?;
+        let cache = PackageCache::new(base_dir);
+        cache.initialize()?;
+
+        Ok(Self {
+            _cache_lock: cache_lock,
             cache,
-            verifier: Verifier,
+            verifier,
             downloader: Downloader,
             installer: Installer,
             rollback_manager: RollbackManager,
@@ -91,13 +163,13 @@ impl PackageManager {
             current_engine_version: engine_ver.to_string(),
             current_script_api_version: script_api_ver,
             platform,
-        }
+        })
     }
 
     /// Full hot-update pipeline for a remote (HTTP-downloaded) package.
     ///
     /// Steps:
-    /// 1. Verify manifest signature (placeholder).
+    /// 1. Verify the Ed25519 signature against the configured trusted keys.
     /// 2. Verify engine / script API compatibility.
     /// 3. Verify platform-specific rules.
     /// 4. Download all payloads for the current platform.
@@ -113,10 +185,13 @@ impl PackageManager {
         manifest: HotUpdateManifest,
         base_url: &str,
     ) -> Result<Package, Vec<UpdateError>> {
+        self.cache
+            .recover_interrupted_transaction()
+            .map_err(|error| vec![error])?;
         let mut errors: Vec<UpdateError> = Vec::new();
 
         // ── 1. Signature ────────────────────────────────────────────────
-        if let Err(e) = Verifier::verify_signature(&manifest) {
+        if let Err(e) = self.verifier.verify_signature(&manifest) {
             errors.push(e);
         }
 
@@ -133,16 +208,25 @@ impl PackageManager {
         if let Err(e) = Verifier::verify_platform_rules(&manifest, &self.platform) {
             errors.push(e);
         }
+        if let Err(mut path_errors) = validate_manifest_paths(&manifest) {
+            errors.append(&mut path_errors);
+        }
 
         if !errors.is_empty() {
             return Err(errors);
         }
 
         // ── 4. Download ─────────────────────────────────────────────────
-        let download_dir = self.cache.base_dir.join("download_temp");
+        let download_dir = safe_join(
+            &self.cache.base_dir,
+            "download_temp",
+            "temporary download directory",
+        )
+        .map_err(|error| vec![error])?;
         // Ensure a clean download directory.
         if download_dir.exists() {
-            let _ = std::fs::remove_dir_all(&download_dir);
+            remove_dir_all_safe(&download_dir, "temporary download directory")
+                .map_err(|error| vec![error])?;
         }
         std::fs::create_dir_all(&download_dir).map_err(|e| {
             vec![UpdateError::DownloadFailed(format!(
@@ -154,7 +238,7 @@ impl PackageManager {
             Downloader::download(&manifest, &download_dir, &self.platform, base_url)
         {
             errors.append(&mut dl_errors);
-            let _ = std::fs::remove_dir_all(&download_dir);
+            let _ = remove_dir_all_safe(&download_dir, "temporary download directory");
             return Err(errors);
         }
 
@@ -164,32 +248,36 @@ impl PackageManager {
         let _ = self.cache.write_state(&pkg);
 
         // ── 5. Verify hashes ────────────────────────────────────────────
-        if let Err(mut hash_errors) = Verifier::verify_payload_hashes(&manifest, &download_dir) {
+        if let Err(mut hash_errors) =
+            Verifier::verify_payload_hashes(&manifest, &download_dir, &self.platform)
+        {
             errors.append(&mut hash_errors);
-            let _ = std::fs::remove_dir_all(&download_dir);
+            let _ = remove_dir_all_safe(&download_dir, "temporary download directory");
             return Err(errors);
         }
 
         // ── 6. Verify cooked headers ───────────────────────────────────
-        if let Err(mut header_errors) = Verifier::verify_cooked_headers(&manifest, &download_dir) {
+        if let Err(mut header_errors) =
+            Verifier::verify_cooked_headers(&manifest, &download_dir, &self.platform)
+        {
             errors.append(&mut header_errors);
-            let _ = std::fs::remove_dir_all(&download_dir);
+            let _ = remove_dir_all_safe(&download_dir, "temporary download directory");
             return Err(errors);
         }
 
         // ── 7. Stage ────────────────────────────────────────────────────
-        let pkg = match Installer::stage(&manifest, &download_dir, &self.cache) {
+        let pkg = match Installer::stage(&manifest, &download_dir, &self.cache, &self.platform) {
             Ok(p) => p,
             Err(e) => {
                 errors.push(e);
-                let _ = std::fs::remove_dir_all(&download_dir);
+                let _ = remove_dir_all_safe(&download_dir, "temporary download directory");
                 return Err(errors);
             }
         };
 
         // ── 8. Activate ─────────────────────────────────────────────────
         let mut pkg = pkg;
-        if let Err(e) = Installer::activate(&mut pkg, &self.cache) {
+        if let Err(e) = Installer::activate(&mut pkg, &self.cache, &self.platform) {
             errors.push(e);
             return Err(errors);
         }
@@ -214,7 +302,12 @@ impl PackageManager {
     /// pipeline as [`install_package`](Self::install_package) but uses
     /// `download_local` to copy payloads from the manifest's directory.
     pub fn install_local(&mut self, manifest_path: &Path) -> Result<Package, Vec<UpdateError>> {
+        self.cache
+            .recover_interrupted_transaction()
+            .map_err(|error| vec![error])?;
         let mut errors: Vec<UpdateError> = Vec::new();
+
+        ensure_no_links_in_path(manifest_path, "local manifest").map_err(|error| vec![error])?;
 
         // ── Read and parse manifest ────────────────────────────────────
         let manifest_json = match std::fs::read_to_string(manifest_path) {
@@ -227,7 +320,7 @@ impl PackageManager {
         };
 
         // ── 1. Signature ────────────────────────────────────────────────
-        if let Err(e) = Verifier::verify_signature(&manifest) {
+        if let Err(e) = self.verifier.verify_signature(&manifest) {
             errors.push(e);
         }
 
@@ -245,6 +338,10 @@ impl PackageManager {
             errors.push(e);
         }
 
+        if let Err(mut path_errors) = validate_manifest_paths(&manifest) {
+            errors.append(&mut path_errors);
+        }
+
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -256,9 +353,15 @@ impl PackageManager {
             .to_path_buf();
 
         // ── 4. Local download ──────────────────────────────────────────
-        let download_dir = self.cache.base_dir.join("download_temp");
+        let download_dir = safe_join(
+            &self.cache.base_dir,
+            "download_temp",
+            "temporary download directory",
+        )
+        .map_err(|error| vec![error])?;
         if download_dir.exists() {
-            let _ = std::fs::remove_dir_all(&download_dir);
+            remove_dir_all_safe(&download_dir, "temporary download directory")
+                .map_err(|error| vec![error])?;
         }
         std::fs::create_dir_all(&download_dir).map_err(|e| {
             vec![UpdateError::DownloadFailed(format!(
@@ -267,40 +370,44 @@ impl PackageManager {
         })?;
 
         if let Err(mut dl_errors) =
-            Downloader::download_local(&manifest, &source_dir, &download_dir)
+            Downloader::download_local(&manifest, &source_dir, &download_dir, &self.platform)
         {
             errors.append(&mut dl_errors);
-            let _ = std::fs::remove_dir_all(&download_dir);
+            let _ = remove_dir_all_safe(&download_dir, "temporary download directory");
             return Err(errors);
         }
 
         // ── 5. Verify hashes ────────────────────────────────────────────
-        if let Err(mut hash_errors) = Verifier::verify_payload_hashes(&manifest, &download_dir) {
+        if let Err(mut hash_errors) =
+            Verifier::verify_payload_hashes(&manifest, &download_dir, &self.platform)
+        {
             errors.append(&mut hash_errors);
-            let _ = std::fs::remove_dir_all(&download_dir);
+            let _ = remove_dir_all_safe(&download_dir, "temporary download directory");
             return Err(errors);
         }
 
         // ── 6. Verify cooked headers ───────────────────────────────────
-        if let Err(mut header_errors) = Verifier::verify_cooked_headers(&manifest, &download_dir) {
+        if let Err(mut header_errors) =
+            Verifier::verify_cooked_headers(&manifest, &download_dir, &self.platform)
+        {
             errors.append(&mut header_errors);
-            let _ = std::fs::remove_dir_all(&download_dir);
+            let _ = remove_dir_all_safe(&download_dir, "temporary download directory");
             return Err(errors);
         }
 
         // ── 7. Stage ────────────────────────────────────────────────────
-        let pkg = match Installer::stage(&manifest, &download_dir, &self.cache) {
+        let pkg = match Installer::stage(&manifest, &download_dir, &self.cache, &self.platform) {
             Ok(p) => p,
             Err(e) => {
                 errors.push(e);
-                let _ = std::fs::remove_dir_all(&download_dir);
+                let _ = remove_dir_all_safe(&download_dir, "temporary download directory");
                 return Err(errors);
             }
         };
 
         // ── 8. Activate ─────────────────────────────────────────────────
         let mut pkg = pkg;
-        if let Err(e) = Installer::activate(&mut pkg, &self.cache) {
+        if let Err(e) = Installer::activate(&mut pkg, &self.cache, &self.platform) {
             errors.push(e);
             return Err(errors);
         }
@@ -327,6 +434,7 @@ impl PackageManager {
     /// Returns `Ok(())` if no rollback is needed or if rollback succeeded.
     /// Returns `Err` if rollback was needed but failed.
     pub fn check_boot(&mut self) -> Result<(), UpdateError> {
+        self.cache.recover_interrupted_transaction()?;
         if !RollbackManager::needs_rollback(&self.cache) {
             return Ok(());
         }
@@ -340,25 +448,52 @@ impl PackageManager {
                 );
                 Ok(())
             }
-            Err(e) => {
-                // If rollback failed, remove the boot marker to avoid
-                // repeated rollback attempts.
-                let _ = std::fs::remove_file(self.cache.boot_marker_path());
-                Err(UpdateError::RollbackFailed(format!(
-                    "auto-rollback failed: {e}"
-                )))
-            }
+            Err(e) => Err(UpdateError::RollbackFailed(format!(
+                "auto-rollback failed: {e}"
+            ))),
         }
     }
 
+    /// Confirm that the current activation booted successfully.
+    ///
+    /// This clears both boot markers and prevents a later `check_boot` call
+    /// from rolling back a known-good package.
+    pub fn mark_boot_successful(&mut self) -> Result<(), UpdateError> {
+        Installer::mark_boot_successful(&self.cache)
+    }
+
+    /// Record an explicit boot failure while preserving rollback metadata.
+    pub fn mark_failed_boot(&mut self) -> Result<(), UpdateError> {
+        Installer::mark_failed_boot(&self.cache)
+    }
+
     /// List all known packages.
-    pub fn list_packages(&self) -> Vec<Package> {
-        self.cache.list_packages()
+    pub fn list_packages(&self) -> Result<Vec<Package>, UpdateError> {
+        self.try_list_packages()
+    }
+
+    /// Strict package listing. Interrupted transactions are recovered before
+    /// any cache state is exposed.
+    pub fn try_list_packages(&self) -> Result<Vec<Package>, UpdateError> {
+        self.cache.recover_interrupted_transaction()?;
+        self.cache.try_list_packages()
     }
 
     /// Get the currently active package, if any.
-    pub fn active_package(&self) -> Option<Package> {
-        self.cache.active_package()
+    pub fn active_package(&self) -> Result<Option<Package>, UpdateError> {
+        self.try_active_package()
+    }
+
+    /// Strict active-package lookup with transaction recovery.
+    pub fn try_active_package(&self) -> Result<Option<Package>, UpdateError> {
+        self.cache.recover_interrupted_transaction()?;
+        self.cache.try_active_package()
+    }
+
+    /// Read the latest committed activation/rollback record.
+    pub fn activation_record(&self) -> Result<Option<crate::ActivationRecord>, UpdateError> {
+        self.cache.recover_interrupted_transaction()?;
+        self.cache.activation_record()
     }
 
     /// Apply resource, logic, and assembly updates after activation.
@@ -369,11 +504,30 @@ impl PackageManager {
     /// The `registry` is used for resource reloads.  Diagnostics are
     /// returned for each operation.
     pub fn apply_updates(&mut self, registry: &mut AssetRegistry) -> Vec<Diagnostic> {
+        if let Err(error) = self.cache.recover_interrupted_transaction() {
+            return vec![Diagnostic::new(
+                "HOT_UPDATE_RECOVERY_FAILED",
+                DiagnosticSeverity::Error,
+                "hot-update",
+                format!("cannot apply updates before transaction recovery: {error}"),
+            )
+            .contract("HotUpdate", "0.1")];
+        }
+
         let mut all_diags = Vec::new();
 
-        let active_pkg = match self.cache.active_package() {
-            Some(pkg) => pkg,
-            None => {
+        let active_pkg = match self.cache.try_active_package() {
+            Ok(Some(pkg)) => pkg,
+            Err(error) => {
+                return vec![Diagnostic::new(
+                    "HOT_UPDATE_ACTIVE_PACKAGE_INVALID",
+                    DiagnosticSeverity::Error,
+                    "hot-update",
+                    format!("cannot read active package: {error}"),
+                )
+                .contract("HotUpdate", "0.1")];
+            }
+            Ok(None) => {
                 debug!("no active package to apply");
                 return all_diags;
             }
@@ -391,22 +545,49 @@ impl PackageManager {
             &active_pkg.manifest,
             &active_dir,
             registry,
+            &self.platform,
         ));
 
         // Logic assets.
         all_diags.extend(UpdateApplier::apply_logic_assets(
             &active_pkg.manifest,
             &active_dir,
+            &self.platform,
         ));
 
         // Android assembly (no-op on other platforms).
         all_diags.extend(UpdateApplier::apply_android_assembly(
             &active_pkg.manifest,
             &active_dir,
+            &self.platform,
         ));
 
         all_diags
     }
+}
+
+fn acquire_cache_lock(base_dir: &Path) -> Result<File, UpdateError> {
+    ensure_no_links_in_path(base_dir, "hot-update cache root")?;
+    std::fs::create_dir_all(base_dir)?;
+    ensure_no_links_in_path(base_dir, "hot-update cache root")?;
+
+    let lock_path = safe_join(base_dir, ".engine-hot-update.lock", "cache lock")?;
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    FileExt::try_lock_exclusive(&lock_file).map_err(|error| {
+        UpdateError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "hot-update cache is already owned by another manager ({}): {error}",
+                base_dir.display()
+            ),
+        ))
+    })?;
+    Ok(lock_file)
 }
 
 #[cfg(test)]
@@ -415,6 +596,7 @@ mod tests {
     use engine_serialize::{
         AssetId, PayloadHash, PlatformPayload, RollbackMetadata, SchemaVersion,
     };
+    use ring::signature::KeyPair;
     use sha2::{Digest, Sha256};
 
     fn sample_manifest() -> HotUpdateManifest {
@@ -433,6 +615,7 @@ mod tests {
                 optional_assembly: None,
             }],
             payload_hashes: vec![PayloadHash {
+                platform: PlatformKind::Desktop,
                 path: "data.bin".into(),
                 algorithm: "sha256".into(),
                 hash,
@@ -449,7 +632,9 @@ mod tests {
 
     fn setup_manager() -> (PackageManager, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
-        let manager = PackageManager::new(tmp.path(), PlatformKind::Desktop, "1.5.0", (1, 5));
+        let manager =
+            PackageManager::new_development(tmp.path(), PlatformKind::Desktop, "1.5.0", (1, 5))
+                .unwrap();
         (manager, tmp)
     }
 
@@ -473,6 +658,71 @@ mod tests {
 
         let pkg = result.unwrap();
         assert_eq!(pkg.state, PackageState::Active);
+    }
+
+    #[test]
+    fn default_manager_rejects_unsigned_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut manager =
+            PackageManager::new(tmp.path(), PlatformKind::Desktop, "1.5.0", (1, 5)).unwrap();
+        let manifest = sample_manifest();
+        let pkg_dir = tmp.path().join("unsigned-production");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let errors = manager
+            .install_local(&pkg_dir.join("manifest.json"))
+            .unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| matches!(error, UpdateError::SignatureMissing)));
+        assert!(!tmp.path().join("download_temp").exists());
+    }
+
+    #[test]
+    fn production_manager_uses_configured_verifier_for_signed_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let private_key = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(private_key.as_ref()).unwrap();
+
+        let mut manifest = sample_manifest();
+        crate::verify::sign_manifest_ed25519(
+            &mut manifest,
+            "release-2026",
+            "2026-05-29T12:00:00Z",
+            private_key.as_ref(),
+        )
+        .unwrap();
+        let verifier = Verifier::production()
+            .with_trusted_ed25519_key("release-2026", key_pair.public_key().as_ref())
+            .unwrap();
+        let mut manager = PackageManager::new_with_verifier(
+            tmp.path(),
+            PlatformKind::Desktop,
+            "1.5.0",
+            (1, 5),
+            verifier,
+        )
+        .unwrap();
+
+        let pkg_dir = tmp.path().join("signed-production");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("data.bin"), b"test payload").unwrap();
+
+        let package = manager
+            .install_local(&pkg_dir.join("manifest.json"))
+            .unwrap();
+        assert_eq!(package.state, PackageState::Active);
     }
 
     #[test]
@@ -537,7 +787,13 @@ mod tests {
         std::fs::write(d1.join("manifest.json"), &j1).unwrap();
         std::fs::write(d1.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d1.join("manifest.json")).unwrap();
-        let id1 = manager.active_package().unwrap().package_id().to_string();
+        let id1 = manager
+            .active_package()
+            .unwrap()
+            .unwrap()
+            .package_id()
+            .to_string();
+        manager.mark_boot_successful().unwrap();
 
         // Install second package.
         let mut m2 = sample_manifest();
@@ -551,10 +807,10 @@ mod tests {
 
         // Rollback.
         let rolled = manager.rollback().unwrap();
-        assert_eq!(rolled.state, PackageState::RolledBack);
+        assert_eq!(rolled.state, PackageState::Active);
 
         // Active package should be the first one.
-        let active = manager.active_package().unwrap();
+        let active = manager.active_package().unwrap().unwrap();
         assert_eq!(active.package_id(), id1);
     }
 
@@ -563,6 +819,33 @@ mod tests {
         let (mut manager, _tmp) = setup_manager();
         let result = manager.rollback();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn unsafe_manifest_does_not_delete_existing_download_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let mut manager =
+            PackageManager::new(&cache_root, PlatformKind::Desktop, "1.5.0", (1, 5)).unwrap();
+
+        let download_dir = cache_root.join("download_temp");
+        std::fs::create_dir_all(&download_dir).unwrap();
+        let sentinel = download_dir.join("sentinel.txt");
+        std::fs::write(&sentinel, b"keep").unwrap();
+
+        let mut manifest = sample_manifest();
+        manifest.payload_hashes[0].path = "../escape.bin".into();
+        let package_dir = tmp.path().join("unsafe-package");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        let manifest_path = package_dir.join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let errors = manager.install_local(&manifest_path).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| matches!(error, UpdateError::UnsafePath { .. })));
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+        assert!(!tmp.path().join("escape.bin").exists());
     }
 
     // ── check_boot tests ───────────────────────────────────────────────
@@ -593,6 +876,75 @@ mod tests {
         assert!(RollbackManager::needs_rollback(&manager.cache));
     }
 
+    #[test]
+    fn manager_boot_success_api_prevents_restart_rollback() {
+        let (mut manager, tmp) = setup_manager();
+        let manifest = sample_manifest();
+        let package_dir = tmp.path().join("boot-success");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("data.bin"), b"test payload").unwrap();
+        let installed = manager
+            .install_local(&package_dir.join("manifest.json"))
+            .unwrap();
+        manager.mark_boot_successful().unwrap();
+
+        let cache_dir = manager.cache.base_dir.clone();
+        drop(manager);
+        let mut restarted =
+            PackageManager::try_new_development(&cache_dir, PlatformKind::Desktop, "1.5.0", (1, 5))
+                .unwrap();
+        restarted.check_boot().unwrap();
+        assert_eq!(
+            restarted.active_package().unwrap().unwrap().package_id(),
+            installed.package_id()
+        );
+    }
+
+    #[test]
+    fn manager_failed_boot_api_rolls_back_to_recorded_package() {
+        let (mut manager, tmp) = setup_manager();
+        let first_manifest = sample_manifest();
+        let first_dir = tmp.path().join("boot-failed-first");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::write(
+            first_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&first_manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(first_dir.join("data.bin"), b"test payload").unwrap();
+        let first = manager
+            .install_local(&first_dir.join("manifest.json"))
+            .unwrap();
+        manager.mark_boot_successful().unwrap();
+
+        let mut second_manifest = sample_manifest();
+        second_manifest.created_at = "2026-09-01T00:00:00Z".into();
+        let second_dir = tmp.path().join("boot-failed-second");
+        std::fs::create_dir_all(&second_dir).unwrap();
+        std::fs::write(
+            second_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&second_manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(second_dir.join("data.bin"), b"test payload").unwrap();
+        manager
+            .install_local(&second_dir.join("manifest.json"))
+            .unwrap();
+        manager.mark_failed_boot().unwrap();
+        manager.check_boot().unwrap();
+
+        assert_eq!(
+            manager.active_package().unwrap().unwrap().package_id(),
+            first.package_id()
+        );
+        assert!(!RollbackManager::needs_rollback(&manager.cache));
+    }
+
     // ── list / active tests ────────────────────────────────────────────
 
     #[test]
@@ -607,7 +959,7 @@ mod tests {
         std::fs::write(d.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d.join("manifest.json")).unwrap();
 
-        let packages = manager.list_packages();
+        let packages = manager.list_packages().unwrap();
         assert!(!packages.is_empty());
     }
 
@@ -623,13 +975,13 @@ mod tests {
         std::fs::write(d.join("data.bin"), b"test payload").unwrap();
         manager.install_local(&d.join("manifest.json")).unwrap();
 
-        assert!(manager.active_package().is_some());
+        assert!(manager.active_package().unwrap().is_some());
     }
 
     #[test]
     fn active_package_none_before_install() {
         let (manager, _tmp) = setup_manager();
-        assert!(manager.active_package().is_none());
+        assert!(manager.active_package().unwrap().is_none());
     }
 
     // ── apply_updates tests ────────────────────────────────────────────
@@ -666,12 +1018,79 @@ mod tests {
     #[test]
     fn manager_new_initializes_cache() {
         let tmp = tempfile::tempdir().unwrap();
-        let _manager = PackageManager::new(tmp.path(), PlatformKind::Desktop, "1.5.0", (1, 5));
+        let _manager =
+            PackageManager::new(tmp.path(), PlatformKind::Desktop, "1.5.0", (1, 5)).unwrap();
 
         // Cache directories should exist.
         assert!(tmp.path().join("packages").exists());
         assert!(tmp.path().join("staged").exists());
         assert!(tmp.path().join("active").exists());
+    }
+
+    #[test]
+    fn strict_constructor_fails_when_cache_cannot_be_initialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let invalid_root = tmp.path().join("not-a-directory");
+        std::fs::write(&invalid_root, b"file").unwrap();
+
+        assert!(PackageManager::try_new_development(
+            &invalid_root,
+            PlatformKind::Desktop,
+            "1.5.0",
+            (1, 5),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cache_lock_rejects_second_manager_until_owner_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first =
+            PackageManager::try_new_development(tmp.path(), PlatformKind::Desktop, "1.5.0", (1, 5))
+                .unwrap();
+
+        let error = match PackageManager::try_new_development(
+            tmp.path(),
+            PlatformKind::Desktop,
+            "1.5.0",
+            (1, 5),
+        ) {
+            Ok(_) => panic!("second manager unexpectedly acquired the cache lock"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already owned"));
+
+        drop(first);
+        assert!(PackageManager::try_new_development(
+            tmp.path(),
+            PlatformKind::Desktop,
+            "1.5.0",
+            (1, 5),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn apply_updates_fails_closed_when_transaction_recovery_fails() {
+        let (mut manager, _tmp) = setup_manager();
+        manager
+            .cache
+            .write_transaction(&crate::transaction::ActivationTransaction {
+                version: crate::transaction::ACTIVATION_FORMAT_VERSION,
+                operation: crate::transaction::TransactionOperation::Activate,
+                activated_id: "a".repeat(64),
+                previous_id: Some("b".repeat(64)),
+                moved_staged_to_active: false,
+            })
+            .unwrap();
+
+        let mut registry = AssetRegistry::new();
+        let diagnostics = manager.apply_updates(&mut registry);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "HOT_UPDATE_RECOVERY_FAILED");
+        assert!(registry.cached_ids().is_empty());
+        assert!(manager.try_active_package().is_err());
+        assert!(manager.active_package().is_err());
     }
 
     #[test]
@@ -688,10 +1107,11 @@ mod tests {
             std::fs::write(d.join("data.bin"), b"test payload").unwrap();
             let result = manager.install_local(&d.join("manifest.json"));
             assert!(result.is_ok(), "install {i} failed: {result:?}");
+            manager.mark_boot_successful().unwrap();
         }
 
         // The last installed package should be active.
-        let active = manager.active_package().unwrap();
+        let active = manager.active_package().unwrap().unwrap();
         assert_eq!(active.manifest.created_at, "2026-06-03T00:00:00Z");
     }
 }

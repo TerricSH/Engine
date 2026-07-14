@@ -1,12 +1,13 @@
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use engine_serialize::AssetId;
 use tracing::{debug, info};
 
 use crate::loader::{AssetError, AssetHandle, AssetLoader};
-use crate::path::asset_path;
+use crate::path::{asset_path, asset_path_from_root};
 
 // ---------------------------------------------------------------------------
 // AssetState
@@ -257,14 +258,44 @@ impl AssetRegistry {
         self.cache.remove(id).is_some()
     }
 
-    /// Remove and re-load an asset from disk (raw bytes only).
+    /// Re-load an asset from the process working directory (raw bytes only).
     ///
     /// After a successful reload the raw bytes are cached, but any typed
     /// data is discarded and must be re-requested via
     /// [`load_typed`](Self::load_typed).
     pub fn reload(&mut self, id: &AssetId) -> Result<(), AssetError> {
-        self.cache.remove(id);
-        self.load(id)?;
+        self.reload_from_root(id, Path::new("."))
+    }
+
+    /// Transactionally reload an asset from an explicit content root.
+    ///
+    /// The source path is `<root>/assets/...`, using the same canonical
+    /// [`AssetId`] mapping as ordinary loads. The file is completely read
+    /// before the cache entry is replaced, so a missing, unreadable, or
+    /// invalid path leaves the previous raw and typed cache entry untouched.
+    /// A successful reload replaces raw bytes and invalidates the typed value,
+    /// which will be decoded again on the next [`load_typed`](Self::load_typed).
+    pub fn reload_from_root(&mut self, id: &AssetId, root: &Path) -> Result<(), AssetError> {
+        let path = asset_path_from_root(root, id).map_err(|error| AssetError::LoadFailed {
+            path: error.value.clone(),
+            detail: error.to_string(),
+        })?;
+        let bytes = std::fs::read(&path).map_err(|error| AssetError::LoadFailed {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+
+        let raw_bytes = Arc::new(bytes);
+        let replacement = CachedEntry {
+            _info: AssetInfo {
+                id: id.clone(),
+                path: Some(path.display().to_string()),
+                state: AssetState::Ready,
+            },
+            raw_bytes,
+            typed: None,
+        };
+        self.cache.insert(id.clone(), replacement);
         Ok(())
     }
 

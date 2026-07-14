@@ -1,47 +1,199 @@
+use std::collections::BTreeMap;
+use std::fmt;
 use std::io::Read;
 use std::path::Path;
 
-use engine_serialize::{HotUpdateManifest, PlatformKind};
+use engine_serialize::{HotUpdateManifest, ManifestSignature, PlatformKind};
+use ring::signature;
 use tracing::{debug, warn};
 
 use crate::error::UpdateError;
 use crate::package::sha256_hash;
+use crate::path_safety::{safe_join, validate_manifest_paths};
 
 // ---------------------------------------------------------------------------
 // Verifier
 // ---------------------------------------------------------------------------
 
+/// Domain separator for the v2 manifest signing format.
+///
+/// It prevents a valid manifest signature from being reused for a different
+/// protocol that happens to serialize the same bytes. V2 adds the platform
+/// field to each payload hash; v1 signatures must therefore be reissued.
+const MANIFEST_SIGNATURE_DOMAIN_V2: &[u8] = b"engine-hot-update/manifest-signature/v2\0";
+
+/// Policy governing whether a manifest may omit its signature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignaturePolicy {
+    /// Production-safe default: every manifest must have a valid signature
+    /// from a configured trusted Ed25519 key.
+    #[default]
+    Production,
+    /// Development mode: unsigned manifests are accepted.
+    ///
+    /// Manifests that do contain a signature are still verified strictly.
+    Development,
+    /// Explicitly allow unsigned manifests outside the named development
+    /// mode. Signed manifests are still verified strictly.
+    AllowUnsigned,
+}
+
+impl SignaturePolicy {
+    fn allows_unsigned(self) -> bool {
+        matches!(self, Self::Development | Self::AllowUnsigned)
+    }
+}
+
+/// Return the stable bytes covered by a hot-update manifest signature.
+///
+/// The format is the v2 domain separator followed by compact UTF-8 JSON of a
+/// cloned manifest whose `signature` field is set to `None`. The manifest
+/// schema contains ordered structs and vectors, so serde's struct field order
+/// makes this deterministic. Any future signing-format change must use a new
+/// domain/version instead of silently changing these bytes.
+pub fn canonical_manifest_bytes(manifest: &HotUpdateManifest) -> Result<Vec<u8>, UpdateError> {
+    let mut unsigned = manifest.clone();
+    unsigned.signature = None;
+
+    let json =
+        serde_json::to_vec(&unsigned).map_err(|_| UpdateError::ManifestCanonicalizationFailed)?;
+    let mut canonical = Vec::with_capacity(MANIFEST_SIGNATURE_DOMAIN_V2.len() + json.len());
+    canonical.extend_from_slice(MANIFEST_SIGNATURE_DOMAIN_V2);
+    canonical.extend_from_slice(&json);
+    Ok(canonical)
+}
+
+/// Sign a manifest with an Ed25519 PKCS#8 private key for packaging tools.
+///
+/// The private key is never retained and parse failures intentionally do not
+/// include key material in the returned error.
+pub fn sign_manifest_ed25519(
+    manifest: &mut HotUpdateManifest,
+    key_id: impl Into<String>,
+    signed_at: impl Into<String>,
+    private_key_pkcs8: &[u8],
+) -> Result<(), UpdateError> {
+    let key_id = key_id.into();
+    if key_id.is_empty() {
+        return Err(UpdateError::TrustedKeyInvalid { key_id });
+    }
+
+    let key_pair = signature::Ed25519KeyPair::from_pkcs8(private_key_pkcs8)
+        .map_err(|_| UpdateError::SigningKeyInvalid)?;
+    let canonical = canonical_manifest_bytes(manifest)?;
+    let signature = key_pair.sign(&canonical);
+    manifest.signature = Some(ManifestSignature {
+        algorithm: "ed25519".into(),
+        value: signature.as_ref().to_vec(),
+        key_id,
+        signed_at: signed_at.into(),
+    });
+    Ok(())
+}
+
 /// Verification pipeline for hot-update packages.
 ///
-/// Verify runs after download and before staging.  It checks:
-/// 1. Signature (placeholder — real crypto deferred to Gate 19).
-/// 2. Payload hashes against the manifest.
-/// 3. Engine & script API compatibility.
-/// 4. Platform-specific rules (e.g. iOS → no assemblies).
-/// 5. Cooked-asset header integrity for every `.cooked` payload.
-pub struct Verifier;
+/// Verify runs after download and before staging. It checks the configured
+/// Ed25519 signature policy, then payload integrity and compatibility.
+#[derive(Clone)]
+pub struct Verifier {
+    policy: SignaturePolicy,
+    trusted_ed25519_keys: BTreeMap<String, [u8; 32]>,
+}
+
+impl fmt::Debug for Verifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Verifier")
+            .field("policy", &self.policy)
+            .field(
+                "trusted_key_ids",
+                &self.trusted_ed25519_keys.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl Default for Verifier {
+    fn default() -> Self {
+        Self::production()
+    }
+}
 
 impl Verifier {
+    /// Create a verifier with the production-safe signature policy.
+    pub fn production() -> Self {
+        Self::new(SignaturePolicy::Production)
+    }
+
+    /// Create a verifier that explicitly allows unsigned development packages.
+    pub fn development() -> Self {
+        Self::new(SignaturePolicy::Development)
+    }
+
+    /// Create a verifier with an explicit signature policy.
+    pub fn new(policy: SignaturePolicy) -> Self {
+        Self {
+            policy,
+            trusted_ed25519_keys: BTreeMap::new(),
+        }
+    }
+
+    /// Return the configured signature policy.
+    pub fn signature_policy(&self) -> SignaturePolicy {
+        self.policy
+    }
+
+    /// Add or rotate a trusted Ed25519 public key under `key_id`.
+    pub fn trust_ed25519_key(
+        &mut self,
+        key_id: impl Into<String>,
+        public_key: &[u8],
+    ) -> Result<(), UpdateError> {
+        let key_id = key_id.into();
+        let key = <[u8; 32]>::try_from(public_key).map_err(|_| UpdateError::TrustedKeyInvalid {
+            key_id: key_id.clone(),
+        })?;
+        if key_id.is_empty() {
+            return Err(UpdateError::TrustedKeyInvalid { key_id });
+        }
+        self.trusted_ed25519_keys.insert(key_id, key);
+        Ok(())
+    }
+
+    /// Builder-style trusted-key registration.
+    pub fn with_trusted_ed25519_key(
+        mut self,
+        key_id: impl Into<String>,
+        public_key: &[u8],
+    ) -> Result<Self, UpdateError> {
+        self.trust_ed25519_key(key_id, public_key)?;
+        Ok(self)
+    }
+
     /// Run the full verification suite against a complete package.
     ///
     /// Returns `Ok(())` on success, or `Err(Vec<UpdateError>)` collecting all
     /// failures so the caller can inspect every problem at once.
     pub fn verify(
+        &self,
         manifest: &HotUpdateManifest,
         staged_dir: &Path,
         platform: &PlatformKind,
         engine_ver: &str,
         script_api_ver: (u16, u16),
     ) -> Result<(), Vec<UpdateError>> {
+        // Reject unsafe manifest-controlled paths before any file is opened.
+        validate_manifest_paths(manifest)?;
         let mut errors: Vec<UpdateError> = Vec::new();
 
-        // 1. Signature (placeholder).
-        if let Err(e) = Self::verify_signature(manifest) {
+        // 1. Signature and trust policy.
+        if let Err(e) = self.verify_signature(manifest) {
             errors.push(e);
         }
 
         // 2. Payload hashes.
-        if let Err(mut hash_errors) = Self::verify_payload_hashes(manifest, staged_dir) {
+        if let Err(mut hash_errors) = Self::verify_payload_hashes(manifest, staged_dir, platform) {
             errors.append(&mut hash_errors);
         }
 
@@ -56,7 +208,8 @@ impl Verifier {
         }
 
         // 5. Cooked headers.
-        if let Err(mut header_errors) = Self::verify_cooked_headers(manifest, staged_dir) {
+        if let Err(mut header_errors) = Self::verify_cooked_headers(manifest, staged_dir, platform)
+        {
             errors.append(&mut header_errors);
         }
 
@@ -69,35 +222,36 @@ impl Verifier {
 
     /// Verify the manifest signature.
     ///
-    /// # Placeholder
-    ///
-    /// Real cryptographic signature verification is deferred to Gate 19.
-    /// For v0 this method only blocks manifests that claim to have a
-    /// signature (i.e. `signature.is_some()`) but where the algorithm is
-    /// unrecognised.  Dev-mode manifests with no signature at all are
-    /// accepted.
-    pub fn verify_signature(manifest: &HotUpdateManifest) -> Result<(), UpdateError> {
+    /// Unsigned manifests are rejected unless the verifier was explicitly
+    /// constructed with a policy that permits them. A present signature can
+    /// never bypass cryptographic verification, even in development mode.
+    pub fn verify_signature(&self, manifest: &HotUpdateManifest) -> Result<(), UpdateError> {
         match &manifest.signature {
-            None => {
-                // No signature — dev mode; accept.
-                debug!("manifest has no signature (dev mode, accepted)");
+            None if self.policy.allows_unsigned() => {
+                debug!(policy = ?self.policy, "unsigned manifest accepted by explicit policy");
                 Ok(())
             }
+            None => Err(UpdateError::SignatureMissing),
             Some(sig) => {
-                match sig.algorithm.as_str() {
-                    // Placeholder: accept any key length for now.
-                    "ed25519" | "rsa-sha256" => {
-                        debug!(
-                            algorithm = %sig.algorithm,
-                            key_id = %sig.key_id,
-                            "manifest signature present (placeholder verify)"
-                        );
-                        Ok(())
-                    }
-                    other => Err(UpdateError::SignatureInvalid(format!(
-                        "unrecognised signature algorithm '{other}'"
-                    ))),
+                if sig.algorithm != "ed25519" {
+                    return Err(UpdateError::SignatureUnsupportedAlgorithm {
+                        algorithm: sig.algorithm.clone(),
+                    });
                 }
+
+                let public_key = self.trusted_ed25519_keys.get(&sig.key_id).ok_or_else(|| {
+                    UpdateError::SignatureUnknownKey {
+                        key_id: sig.key_id.clone(),
+                    }
+                })?;
+                let canonical = canonical_manifest_bytes(manifest)?;
+                signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+                    .verify(&canonical, &sig.value)
+                    .map_err(|_| UpdateError::SignatureInvalid {
+                        key_id: sig.key_id.clone(),
+                    })?;
+                debug!(key_id = %sig.key_id, "manifest Ed25519 signature verified");
+                Ok(())
             }
         }
     }
@@ -109,11 +263,27 @@ impl Verifier {
     pub fn verify_payload_hashes(
         manifest: &HotUpdateManifest,
         staged_dir: &Path,
+        platform: &PlatformKind,
     ) -> Result<(), Vec<UpdateError>> {
+        validate_manifest_paths(manifest)?;
+        let selected = manifest.payload_hashes_for_platform(*platform);
+        let mut prepared = Vec::with_capacity(selected.len());
+        for payload in selected {
+            if !payload.algorithm.eq_ignore_ascii_case("sha256") {
+                return Err(vec![UpdateError::ManifestRejected(format!(
+                    "unsupported payload hash algorithm `{}` for {}",
+                    payload.algorithm, payload.path
+                ))]);
+            }
+            match safe_join(staged_dir, &payload.path, "payload hash verification") {
+                Ok(path) => prepared.push((payload, path)),
+                Err(error) => return Err(vec![error]),
+            }
+        }
+
         let mut errors: Vec<UpdateError> = Vec::new();
 
-        for ph in &manifest.payload_hashes {
-            let file_path = staged_dir.join(&ph.path);
+        for (ph, file_path) in prepared {
             let data = match std::fs::read(&file_path) {
                 Ok(d) => d,
                 Err(e) => {
@@ -176,7 +346,7 @@ impl Verifier {
         let result = manifest.check_compatibility(
             &manifest.engine_version,
             manifest.script_api_version,
-            platform.clone(),
+            *platform,
         );
         match result {
             engine_serialize::CompatibilityResult::Compatible => {
@@ -191,6 +361,33 @@ impl Verifier {
                                 "iOS platform payload must not contain optional_assembly".into(),
                             ));
                         }
+                    }
+                }
+                let selected_hashes = manifest.payload_hashes_for_platform(*platform);
+                for payload in manifest.payloads_for_platform(*platform) {
+                    let Some(assembly) = &payload.optional_assembly else {
+                        continue;
+                    };
+                    let Some(payload_hash) = selected_hashes
+                        .iter()
+                        .find(|entry| entry.path == assembly.path)
+                    else {
+                        return Err(UpdateError::PlatformRejected(format!(
+                            "selected assembly `{}` has no selected payload hash",
+                            assembly.path
+                        )));
+                    };
+                    if !payload_hash.algorithm.eq_ignore_ascii_case("sha256") {
+                        return Err(UpdateError::PlatformRejected(format!(
+                            "selected assembly `{}` must use sha256",
+                            assembly.path
+                        )));
+                    }
+                    if payload_hash.hash != assembly.hash {
+                        return Err(UpdateError::PlatformRejected(format!(
+                            "selected assembly `{}` hash disagrees with its payload hash",
+                            assembly.path
+                        )));
                     }
                 }
                 Ok(())
@@ -210,12 +407,21 @@ impl Verifier {
     pub fn verify_cooked_headers(
         manifest: &HotUpdateManifest,
         staged_dir: &Path,
+        platform: &PlatformKind,
     ) -> Result<(), Vec<UpdateError>> {
+        validate_manifest_paths(manifest)?;
+        let selected = manifest.payload_hashes_for_platform(*platform);
+        let mut prepared = Vec::with_capacity(selected.len());
+        for payload in selected {
+            match safe_join(staged_dir, &payload.path, "cooked payload verification") {
+                Ok(path) => prepared.push((payload, path)),
+                Err(error) => return Err(vec![error]),
+            }
+        }
+
         let mut errors: Vec<UpdateError> = Vec::new();
 
-        for ph in &manifest.payload_hashes {
-            let file_path = staged_dir.join(&ph.path);
-
+        for (ph, file_path) in prepared {
             // Only verify .cooked files.
             if file_path.extension().and_then(|e| e.to_str()) != Some("cooked") {
                 continue;
@@ -281,12 +487,22 @@ impl Verifier {
 pub(crate) fn verify_and_collect_payloads(
     manifest: &HotUpdateManifest,
     staged_dir: &Path,
+    platform: &PlatformKind,
 ) -> Result<Vec<String>, Vec<UpdateError>> {
+    validate_manifest_paths(manifest)?;
+    let selected = manifest.payload_hashes_for_platform(*platform);
+    let mut prepared = Vec::with_capacity(selected.len());
+    for payload in selected {
+        match safe_join(staged_dir, &payload.path, "payload collection") {
+            Ok(path) => prepared.push((payload, path)),
+            Err(error) => return Err(vec![error]),
+        }
+    }
+
     let mut errors = Vec::new();
     let mut present = Vec::new();
 
-    for ph in &manifest.payload_hashes {
-        let file_path = staged_dir.join(&ph.path);
+    for (ph, file_path) in prepared {
         if !file_path.exists() {
             errors.push(UpdateError::HashMismatch {
                 path: ph.path.clone(),
@@ -333,6 +549,7 @@ mod tests {
         AssetId, HashDigest, HotUpdateManifest, ManifestSignature, PayloadHash, PlatformPayload,
         RollbackMetadata, SchemaVersion,
     };
+    use ring::signature::KeyPair;
     use sha2::{Digest, Sha256};
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -372,26 +589,100 @@ mod tests {
 
     // ── Signature tests ─────────────────────────────────────────────────
 
-    #[test]
-    fn verify_signature_none_accepted() {
-        let manifest = sample_manifest();
-        assert!(Verifier::verify_signature(&manifest).is_ok());
+    fn signing_key() -> (ring::pkcs8::Document, Vec<u8>) {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        (pkcs8, key_pair.public_key().as_ref().to_vec())
     }
 
-    #[test]
-    fn verify_signature_ed25519_accepted() {
+    fn signed_manifest(key_id: &str) -> (HotUpdateManifest, Verifier) {
+        let (private_key, public_key) = signing_key();
         let mut manifest = sample_manifest();
-        manifest.signature = Some(ManifestSignature {
-            algorithm: "ed25519".into(),
-            value: vec![0u8; 64],
-            key_id: "key-01".into(),
-            signed_at: "2026-05-29T12:00:00Z".into(),
-        });
-        assert!(Verifier::verify_signature(&manifest).is_ok());
+        sign_manifest_ed25519(
+            &mut manifest,
+            key_id,
+            "2026-05-29T12:00:00Z",
+            private_key.as_ref(),
+        )
+        .unwrap();
+        let verifier = Verifier::production()
+            .with_trusted_ed25519_key(key_id, &public_key)
+            .unwrap();
+        (manifest, verifier)
     }
 
     #[test]
-    fn verify_signature_rsa_accepted() {
+    fn unsigned_manifest_is_rejected_in_production() {
+        let error = Verifier::production()
+            .verify_signature(&sample_manifest())
+            .unwrap_err();
+        assert!(matches!(error, UpdateError::SignatureMissing));
+    }
+
+    #[test]
+    fn unsigned_manifest_is_accepted_only_by_explicit_relaxed_policies() {
+        let manifest = sample_manifest();
+        assert!(Verifier::development().verify_signature(&manifest).is_ok());
+        assert!(Verifier::new(SignaturePolicy::AllowUnsigned)
+            .verify_signature(&manifest)
+            .is_ok());
+    }
+
+    #[test]
+    fn valid_ed25519_signature_is_accepted() {
+        let (manifest, verifier) = signed_manifest("release-2026");
+        assert!(verifier.verify_signature(&manifest).is_ok());
+    }
+
+    #[test]
+    fn tampered_manifest_is_rejected() {
+        let (mut manifest, verifier) = signed_manifest("release-2026");
+        manifest.engine_version = "1.5.1".into();
+        let error = verifier.verify_signature(&manifest).unwrap_err();
+        assert!(matches!(error, UpdateError::SignatureInvalid { .. }));
+    }
+
+    #[test]
+    fn signature_from_wrong_key_is_rejected() {
+        let (manifest, _) = signed_manifest("release-2026");
+        let (_, wrong_public_key) = signing_key();
+        let verifier = Verifier::production()
+            .with_trusted_ed25519_key("release-2026", &wrong_public_key)
+            .unwrap();
+        let error = verifier.verify_signature(&manifest).unwrap_err();
+        assert!(matches!(error, UpdateError::SignatureInvalid { .. }));
+    }
+
+    #[test]
+    fn unknown_key_id_is_rejected() {
+        let (manifest, _) = signed_manifest("release-2026");
+        let error = Verifier::production()
+            .verify_signature(&manifest)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UpdateError::SignatureUnknownKey { ref key_id } if key_id == "release-2026"
+        ));
+    }
+
+    #[test]
+    fn bad_signature_is_rejected_even_in_development() {
+        let (mut manifest, production) = signed_manifest("release-2026");
+        manifest.signature.as_mut().unwrap().value[0] ^= 0xff;
+        let mut development = Verifier::development();
+        development
+            .trust_ed25519_key(
+                "release-2026",
+                &production.trusted_ed25519_keys["release-2026"],
+            )
+            .unwrap();
+        let error = development.verify_signature(&manifest).unwrap_err();
+        assert!(matches!(error, UpdateError::SignatureInvalid { .. }));
+    }
+
+    #[test]
+    fn unsupported_algorithm_is_rejected() {
         let mut manifest = sample_manifest();
         manifest.signature = Some(ManifestSignature {
             algorithm: "rsa-sha256".into(),
@@ -399,19 +690,35 @@ mod tests {
             key_id: "key-02".into(),
             signed_at: "2026-05-29T12:00:00Z".into(),
         });
-        assert!(Verifier::verify_signature(&manifest).is_ok());
+        let error = Verifier::development()
+            .verify_signature(&manifest)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UpdateError::SignatureUnsupportedAlgorithm { ref algorithm }
+                if algorithm == "rsa-sha256"
+        ));
     }
 
     #[test]
-    fn verify_signature_unknown_algorithm_rejected() {
+    fn canonical_bytes_are_stable_and_ignore_signature_metadata() {
         let mut manifest = sample_manifest();
+        let first = canonical_manifest_bytes(&manifest).unwrap();
+        let second = canonical_manifest_bytes(&manifest).unwrap();
+        assert_eq!(first, second);
+        assert!(first.starts_with(MANIFEST_SIGNATURE_DOMAIN_V2));
+        assert_eq!(
+            crate::package::hex_encode(&Sha256::digest(&first)),
+            "64de56d94b403f7cd9f15ea686ce47874c09dca033a92877c1d174419ca29d67"
+        );
+
         manifest.signature = Some(ManifestSignature {
-            algorithm: "hmac-sha1".into(),
-            value: vec![0u8; 20],
-            key_id: "key-03".into(),
-            signed_at: "2026-05-29T12:00:00Z".into(),
+            algorithm: "anything".into(),
+            value: vec![1, 2, 3],
+            key_id: "anything".into(),
+            signed_at: "anything".into(),
         });
-        assert!(Verifier::verify_signature(&manifest).is_err());
+        assert_eq!(first, canonical_manifest_bytes(&manifest).unwrap());
     }
 
     // ── Payload hash tests ──────────────────────────────────────────────
@@ -423,6 +730,7 @@ mod tests {
         let hash: HashDigest = Sha256::digest(data).into();
 
         manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "patch.bundle".into(),
             algorithm: "sha256".into(),
             hash,
@@ -433,8 +741,47 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         create_temp_payload(&dir, "patch.bundle", data);
 
-        assert!(Verifier::verify_payload_hashes(&manifest, &dir).is_ok());
+        assert!(Verifier::verify_payload_hashes(&manifest, &dir, &PlatformKind::Desktop).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_payload_hashes_ignores_missing_other_platform_but_checks_all() {
+        let mut manifest = sample_manifest();
+        let desktop_data = b"desktop";
+        let common_data = b"common";
+        manifest.payload_hashes = vec![
+            PayloadHash {
+                platform: PlatformKind::Desktop,
+                path: "desktop.bin".into(),
+                algorithm: "sha256".into(),
+                hash: Sha256::digest(desktop_data).into(),
+            },
+            PayloadHash {
+                platform: PlatformKind::Android,
+                path: "android-missing.bin".into(),
+                algorithm: "sha256".into(),
+                hash: [7; 32],
+            },
+            PayloadHash {
+                platform: PlatformKind::All,
+                path: "common.bin".into(),
+                algorithm: "sha256".into(),
+                hash: Sha256::digest(common_data).into(),
+            },
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        create_temp_payload(temp.path(), "desktop.bin", desktop_data);
+        create_temp_payload(temp.path(), "common.bin", common_data);
+
+        assert!(
+            Verifier::verify_payload_hashes(&manifest, temp.path(), &PlatformKind::Desktop,)
+                .is_ok()
+        );
+        assert!(
+            Verifier::verify_payload_hashes(&manifest, temp.path(), &PlatformKind::Android,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -444,6 +791,7 @@ mod tests {
         let hash: HashDigest = Sha256::digest(data).into();
 
         manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "patch.bundle".into(),
             algorithm: "sha256".into(),
             hash,
@@ -454,7 +802,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         create_temp_payload(&dir, "patch.bundle", b"tampered data");
 
-        let result = Verifier::verify_payload_hashes(&manifest, &dir);
+        let result = Verifier::verify_payload_hashes(&manifest, &dir, &PlatformKind::Desktop);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -463,6 +811,7 @@ mod tests {
     fn verify_payload_hashes_missing_file() {
         let mut manifest = sample_manifest();
         manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "missing.bundle".into(),
             algorithm: "sha256".into(),
             hash: [0u8; 32],
@@ -472,7 +821,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let result = Verifier::verify_payload_hashes(&manifest, &dir);
+        let result = Verifier::verify_payload_hashes(&manifest, &dir, &PlatformKind::Desktop);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -482,11 +831,13 @@ mod tests {
         let mut manifest = sample_manifest();
         manifest.payload_hashes = vec![
             PayloadHash {
+                platform: PlatformKind::Desktop,
                 path: "a.bundle".into(),
                 algorithm: "sha256".into(),
                 hash: [1u8; 32],
             },
             PayloadHash {
+                platform: PlatformKind::Desktop,
                 path: "b.bundle".into(),
                 algorithm: "sha256".into(),
                 hash: [2u8; 32],
@@ -498,11 +849,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         create_temp_payload(&dir, "a.bundle", b"data");
 
-        let result = Verifier::verify_payload_hashes(&manifest, &dir);
+        let result = Verifier::verify_payload_hashes(&manifest, &dir, &PlatformKind::Desktop);
         assert!(result.is_err());
         // Should have at least one error (b.bundle missing)
         assert!(!result.unwrap_err().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_rejects_payload_traversal_before_reading_outside_stage() {
+        let mut manifest = sample_manifest();
+        manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
+            path: "../outside.bin".into(),
+            algorithm: "sha256".into(),
+            hash: [0u8; 32],
+        }];
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(temp.path().join("outside.bin"), b"outside").unwrap();
+
+        let errors = Verifier::verify_payload_hashes(&manifest, &staged, &PlatformKind::Desktop)
+            .unwrap_err();
+        assert!(matches!(errors[0], UpdateError::UnsafePath { .. }));
     }
 
     // ── Compatibility tests ─────────────────────────────────────────────
@@ -570,7 +940,61 @@ mod tests {
                 min_engine_version: "1.5.0".into(),
             }),
         });
+        manifest.payload_hashes.push(PayloadHash {
+            platform: PlatformKind::Android,
+            path: "android/asm.dll".into(),
+            algorithm: "sha256".into(),
+            hash: [0xCC; 32],
+        });
         assert!(Verifier::verify_platform_rules(&manifest, &PlatformKind::Android).is_ok());
+    }
+
+    #[test]
+    fn verify_platform_rules_rejects_selected_assembly_without_selected_hash() {
+        let mut manifest = sample_manifest();
+        manifest.platform_payloads.push(PlatformPayload {
+            platform: PlatformKind::Android,
+            asset_ids: vec![],
+            logic_asset_ids: vec![],
+            optional_assembly: Some(engine_serialize::AssemblyPayload {
+                path: "android/unhashed.dll".into(),
+                size_bytes: 100,
+                hash: [0xDD; 32],
+                min_engine_version: "1.5.0".into(),
+            }),
+        });
+
+        let error = Verifier::verify_platform_rules(&manifest, &PlatformKind::Android).unwrap_err();
+        assert!(
+            matches!(error, UpdateError::PlatformRejected(message) if message.contains("no selected payload hash"))
+        );
+    }
+
+    #[test]
+    fn verify_platform_rules_rejects_assembly_hash_disagreement() {
+        let mut manifest = sample_manifest();
+        manifest.platform_payloads.push(PlatformPayload {
+            platform: PlatformKind::Android,
+            asset_ids: vec![],
+            logic_asset_ids: vec![],
+            optional_assembly: Some(engine_serialize::AssemblyPayload {
+                path: "android/mismatch.dll".into(),
+                size_bytes: 100,
+                hash: [0xDD; 32],
+                min_engine_version: "1.5.0".into(),
+            }),
+        });
+        manifest.payload_hashes.push(PayloadHash {
+            platform: PlatformKind::Android,
+            path: "android/mismatch.dll".into(),
+            algorithm: "sha256".into(),
+            hash: [0xEE; 32],
+        });
+
+        let error = Verifier::verify_platform_rules(&manifest, &PlatformKind::Android).unwrap_err();
+        assert!(
+            matches!(error, UpdateError::PlatformRejected(message) if message.contains("disagrees"))
+        );
     }
 
     #[test]
@@ -585,6 +1009,7 @@ mod tests {
     fn verify_cooked_headers_skips_non_cooked() {
         let mut manifest = sample_manifest();
         manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "data.bin".into(),
             algorithm: "sha256".into(),
             hash: [0u8; 32],
@@ -596,7 +1021,7 @@ mod tests {
         create_temp_payload(&dir, "data.bin", b"not a cooked file");
 
         // Should pass because we skip non-.cooked files.
-        assert!(Verifier::verify_cooked_headers(&manifest, &dir).is_ok());
+        assert!(Verifier::verify_cooked_headers(&manifest, &dir, &PlatformKind::Desktop).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -608,6 +1033,7 @@ mod tests {
         let mut manifest = sample_manifest();
         let hash: HashDigest = Sha256::digest(b"payload data").into();
         manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "asset.cooked".into(),
             algorithm: "sha256".into(),
             hash,
@@ -626,7 +1052,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(Verifier::verify_cooked_headers(&manifest, &dir).is_ok());
+        assert!(Verifier::verify_cooked_headers(&manifest, &dir, &PlatformKind::Desktop).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -635,6 +1061,7 @@ mod tests {
         let mut manifest = sample_manifest();
         let hash: HashDigest = Sha256::digest(b"bad data").into();
         manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "bad.cooked".into(),
             algorithm: "sha256".into(),
             hash,
@@ -646,7 +1073,7 @@ mod tests {
         // Write garbage instead of a valid cooked file.
         create_temp_payload(&dir, "bad.cooked", b"garbage data");
 
-        let result = Verifier::verify_cooked_headers(&manifest, &dir);
+        let result = Verifier::verify_cooked_headers(&manifest, &dir, &PlatformKind::Desktop);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -678,12 +1105,19 @@ mod tests {
         let hash: HashDigest = Sha256::digest(&file_data).into();
 
         manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "mesh.cooked".into(),
             algorithm: "sha256".into(),
             hash,
         }];
 
-        let result = Verifier::verify(&manifest, &dir, &PlatformKind::Desktop, "1.5.0", (1, 5));
+        let result = Verifier::development().verify(
+            &manifest,
+            &dir,
+            &PlatformKind::Desktop,
+            "1.5.0",
+            (1, 5),
+        );
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -692,6 +1126,7 @@ mod tests {
     fn verify_full_pipeline_rejects_bad_hash() {
         let mut manifest = sample_manifest();
         manifest.payload_hashes = vec![PayloadHash {
+            platform: PlatformKind::Desktop,
             path: "data.bin".into(),
             algorithm: "sha256".into(),
             hash: [0xAA; 32],
@@ -702,7 +1137,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         create_temp_payload(&dir, "data.bin", b"does not match");
 
-        let result = Verifier::verify(&manifest, &dir, &PlatformKind::Desktop, "1.5.0", (1, 5));
+        let result = Verifier::development().verify(
+            &manifest,
+            &dir,
+            &PlatformKind::Desktop,
+            "1.5.0",
+            (1, 5),
+        );
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

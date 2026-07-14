@@ -30,15 +30,21 @@ layout(set = 0, binding = 0) uniform UBO {
     mat4 light_vp[3];
 } ubo;
 
+// The model matrix is per draw. Keeping it in push constants avoids sharing
+// one mutable UBO value across every drawable recorded in the frame.
+layout(push_constant) uniform DrawPush {
+    mat4 model;
+} draw;
+
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec2 v_uv;
 
 void main() {
-    vec4 world_pos = ubo.model * vec4(in_position, 1.0);
+    vec4 world_pos = draw.model * vec4(in_position, 1.0);
     v_world_pos = world_pos.xyz;
     // Normal transform — assumes uniform scale (no inverse-transpose needed for MVP).
-    v_normal = normalize(mat3(ubo.model) * in_normal);
+    v_normal = normalize(mat3(draw.model) * in_normal);
     v_uv = in_uv;
     gl_Position = ubo.view_proj * world_pos;
 }

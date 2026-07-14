@@ -9,6 +9,26 @@ use super::{mk_sm, VulkanDevice};
 /// Number of CSM cascades.
 pub(crate) const CSM_CASCADE_COUNT: usize = 3;
 
+/// Validation failures produced while deriving camera or directional-light
+/// data for cascaded shadow maps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum CascadeDataError {
+    #[error("projection matrix contains non-finite values")]
+    NonFiniteProjection,
+    #[error("projection matrix is not a supported right-handed Vulkan zero-to-one projection")]
+    UnsupportedProjection,
+    #[error("projection matrix does not encode finite positive near/far planes")]
+    InvalidClipPlanes,
+    #[error("view matrix contains non-finite values")]
+    NonFiniteView,
+    #[error("view matrix is not invertible")]
+    NonInvertibleView,
+    #[error("directional shadow light direction must be finite and non-zero")]
+    InvalidLightDirection,
+    #[error("camera frustum cannot be converted into finite cascade bounds")]
+    DegenerateFrustum,
+}
+
 impl VulkanDevice {
     /// Ensure shadow mapping resources exist (idempotent).
     pub(crate) fn ensure_shadow(&mut self) -> VkResult<()> {
@@ -365,8 +385,11 @@ impl VulkanDevice {
         self.shadow_desc_pool = Some(pool);
         self.shadow_desc_set = Some(desc_set);
 
-        // ---- 11. Bind-only pipeline layout (set=1 only, for early binding in begin_frame) ----
-        let bind_set_layouts = [ds_layout];
+        // ---- 11. Bind-only layout compatible through set=1 for early binding ----
+        let frame_layout = self.desc_set_layout_0.ok_or(VulkanError::Loader(
+            "frame descriptor layout not initialized".into(),
+        ))?;
+        let bind_set_layouts = [frame_layout, ds_layout];
         let bind_pli = vk::PipelineLayoutCreateInfo::default().set_layouts(&bind_set_layouts);
         // SAFETY: `d` is a valid AshDevice; `bind_pli` describes a valid layout;
         // `None` means no custom allocator.
@@ -455,6 +478,80 @@ impl VulkanDevice {
         }
     }
 
+    /// Derive finite clip distances from a canonical right-handed Vulkan
+    /// zero-to-one projection matrix.
+    ///
+    /// Both perspective and orthographic matrices are supported, including
+    /// reversed-Z variants. Infinite projections are rejected because finite
+    /// CSM partitions require a real far plane.
+    pub(crate) fn derive_rh_zo_clip_planes(
+        projection: &glam::Mat4,
+    ) -> Result<(f32, f32), CascadeDataError> {
+        const MATRIX_EPSILON: f32 = 1.0e-5;
+        const DENOMINATOR_EPSILON: f32 = 1.0e-8;
+
+        if !projection
+            .to_cols_array()
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Err(CascadeDataError::NonFiniteProjection);
+        }
+
+        // Canonical RH projections make clip.w depend only on view-space z
+        // (perspective) or remain one (orthographic). Reject arbitrary/oblique
+        // matrices whose clip distances cannot be recovered by these formulas.
+        if projection.x_axis.w.abs() > MATRIX_EPSILON || projection.y_axis.w.abs() > MATRIX_EPSILON
+        {
+            return Err(CascadeDataError::UnsupportedProjection);
+        }
+
+        let a = projection.z_axis.z;
+        let b = projection.w_axis.z;
+        let (depth_at_zero, depth_at_one) = if (projection.z_axis.w + 1.0).abs() <= MATRIX_EPSILON
+            && projection.w_axis.w.abs() <= MATRIX_EPSILON
+        {
+            // Perspective: ndc_z(d) = -a + b / d, where d = -view_z.
+            if a.abs() <= DENOMINATOR_EPSILON || (a + 1.0).abs() <= DENOMINATOR_EPSILON {
+                return Err(CascadeDataError::InvalidClipPlanes);
+            }
+            (b / a, b / (a + 1.0))
+        } else if projection.z_axis.w.abs() <= MATRIX_EPSILON
+            && (projection.w_axis.w - 1.0).abs() <= MATRIX_EPSILON
+        {
+            // Orthographic: ndc_z(d) = -a*d + b.
+            if a.abs() <= DENOMINATOR_EPSILON {
+                return Err(CascadeDataError::InvalidClipPlanes);
+            }
+            (b / a, (b - 1.0) / a)
+        } else {
+            return Err(CascadeDataError::UnsupportedProjection);
+        };
+
+        let near = depth_at_zero.min(depth_at_one);
+        let far = depth_at_zero.max(depth_at_one);
+        if !near.is_finite()
+            || !far.is_finite()
+            || near <= DENOMINATOR_EPSILON
+            || far <= near + DENOMINATOR_EPSILON
+        {
+            return Err(CascadeDataError::InvalidClipPlanes);
+        }
+
+        Ok((near, far))
+    }
+
+    /// Validate and normalize a directional shadow light vector.
+    pub(crate) fn normalize_shadow_light_direction(
+        direction: glam::Vec3,
+    ) -> Result<glam::Vec3, CascadeDataError> {
+        let length_squared = direction.length_squared();
+        if !direction.is_finite() || !length_squared.is_finite() || length_squared <= 1.0e-12 {
+            return Err(CascadeDataError::InvalidLightDirection);
+        }
+        Ok(direction / length_squared.sqrt())
+    }
+
     /// Compute PSSM cascade split distances in view-space z.
     ///
     /// Returns `[split0, split1, split2]` where `split_i` is the far plane
@@ -491,54 +588,123 @@ impl VulkanDevice {
         proj_matrix: &glam::Mat4,
         near: f32,
         far: f32,
-    ) -> ([f32; 4], [glam::Mat4; 3]) {
+        light_direction: glam::Vec3,
+    ) -> Result<([f32; 4], [glam::Mat4; 3]), CascadeDataError> {
         use glam::Vec3;
+
+        if !view_matrix
+            .to_cols_array()
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Err(CascadeDataError::NonFiniteView);
+        }
+        let view_determinant = view_matrix.determinant();
+        if !view_determinant.is_finite() || view_determinant == 0.0 {
+            return Err(CascadeDataError::NonInvertibleView);
+        }
+        if !proj_matrix
+            .to_cols_array()
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            return Err(CascadeDataError::NonFiniteProjection);
+        }
+        let projection_determinant = proj_matrix.determinant();
+        if !projection_determinant.is_finite() || projection_determinant == 0.0 {
+            return Err(CascadeDataError::UnsupportedProjection);
+        }
+        if !near.is_finite() || !far.is_finite() || near <= 0.0 || far <= near {
+            return Err(CascadeDataError::InvalidClipPlanes);
+        }
+        let light_dir = Self::normalize_shadow_light_direction(light_direction)?;
 
         let splits = Self::compute_cascade_splits(near, far);
         let splits4: [f32; 4] = [splits[0], splits[1], splits[2], far];
 
         let inv_view = view_matrix.inverse();
         let inv_proj = proj_matrix.inverse();
-
-        // 4 corner rays from the near plane in NDC → view-space directions.
-        let ndc_near_corners = [
-            glam::vec4(-1.0, -1.0, 0.0, 1.0),
-            glam::vec4(1.0, -1.0, 0.0, 1.0),
-            glam::vec4(1.0, 1.0, 0.0, 1.0),
-            glam::vec4(-1.0, 1.0, 0.0, 1.0),
-        ];
-
-        // Precompute the 4 view-space ray directions from the inverse projection.
-        // Each ray points from the camera toward a corner of the near plane in view space.
-        let mut rays = [Vec3::ZERO; 4];
-        for (i, &ndc) in ndc_near_corners.iter().enumerate() {
-            let pv_h = inv_proj * ndc;
-            let pv = pv_h.truncate() / pv_h.w;
-            rays[i] = Vec3::new(pv.x, pv.y, -1.0).normalize();
+        if !inv_view
+            .to_cols_array()
+            .iter()
+            .all(|value| value.is_finite())
+            || !inv_proj
+                .to_cols_array()
+                .iter()
+                .all(|value| value.is_finite())
+        {
+            return Err(CascadeDataError::DegenerateFrustum);
         }
 
-        let light_dir = Vec3::new(0.5, -0.707, 0.5).normalize();
+        // Unproject both Vulkan depth endpoints. Sorting by positive view-space
+        // distance makes the same code work for perspective, orthographic and
+        // reversed-Z projections.
+        let ndc_xy = [
+            glam::vec2(-1.0, -1.0),
+            glam::vec2(1.0, -1.0),
+            glam::vec2(1.0, 1.0),
+            glam::vec2(-1.0, 1.0),
+        ];
+        let mut frustum_edges = [(Vec3::ZERO, Vec3::ZERO); 4];
+        for (index, xy) in ndc_xy.iter().copied().enumerate() {
+            let endpoint_zero = inv_proj * glam::vec4(xy.x, xy.y, 0.0, 1.0);
+            let endpoint_one = inv_proj * glam::vec4(xy.x, xy.y, 1.0, 1.0);
+            if !endpoint_zero.is_finite()
+                || !endpoint_one.is_finite()
+                || endpoint_zero.w.abs() <= 1.0e-8
+                || endpoint_one.w.abs() <= 1.0e-8
+            {
+                return Err(CascadeDataError::DegenerateFrustum);
+            }
+            let point_zero = endpoint_zero.truncate() / endpoint_zero.w;
+            let point_one = endpoint_one.truncate() / endpoint_one.w;
+            let distance_zero = -point_zero.z;
+            let distance_one = -point_one.z;
+            if !point_zero.is_finite()
+                || !point_one.is_finite()
+                || !distance_zero.is_finite()
+                || !distance_one.is_finite()
+                || distance_zero <= 0.0
+                || distance_one <= 0.0
+            {
+                return Err(CascadeDataError::DegenerateFrustum);
+            }
+            frustum_edges[index] = if distance_zero <= distance_one {
+                (point_zero, point_one)
+            } else {
+                (point_one, point_zero)
+            };
+        }
 
         let mut light_vps = [glam::Mat4::IDENTITY; 3];
         let mut prev_split_z = near;
 
         for cascade in 0..3 {
             let split_z = splits[cascade];
+            let near_t = (prev_split_z - near) / (far - near);
+            let far_t = (split_z - near) / (far - near);
 
             // Compute world-space AABB of the cascade frustum slice.
             let mut min_ws = Vec3::splat(f32::MAX);
             let mut max_ws = Vec3::splat(f32::MIN);
-            for &ray in &rays {
-                // Scale ray so view-space z = -distance.
-                let inv_nz = 1.0 / (-ray.z).max(1e-8);
-                let d_near = prev_split_z * inv_nz;
-                let d_far = split_z * inv_nz;
-
-                let p_near = inv_view * (ray * d_near).extend(1.0);
-                let p_far = inv_view * (ray * d_far).extend(1.0);
-                // w-divide (should be ~1.0 for affine transforms)
+            let mut world_corners = [Vec3::ZERO; 8];
+            for (edge_index, (near_corner, far_corner)) in frustum_edges.iter().copied().enumerate()
+            {
+                let slice_near = near_corner.lerp(far_corner, near_t);
+                let slice_far = near_corner.lerp(far_corner, far_t);
+                let p_near = inv_view * slice_near.extend(1.0);
+                let p_far = inv_view * slice_far.extend(1.0);
+                if !p_near.is_finite()
+                    || !p_far.is_finite()
+                    || p_near.w.abs() <= 1.0e-8
+                    || p_far.w.abs() <= 1.0e-8
+                {
+                    return Err(CascadeDataError::DegenerateFrustum);
+                }
                 let ws_near = p_near.truncate() / p_near.w;
                 let ws_far = p_far.truncate() / p_far.w;
+                world_corners[edge_index] = ws_near;
+                world_corners[edge_index + 4] = ws_far;
 
                 min_ws = min_ws.min(ws_near).min(ws_far);
                 max_ws = max_ws.max(ws_near).max(ws_far);
@@ -546,61 +712,81 @@ impl VulkanDevice {
 
             // Compute light view at the center of the frustum AABB.
             let center = (min_ws + max_ws) * 0.5;
-            let light_pos = center - light_dir * 20.0;
-            let light_view = glam::Mat4::look_at_rh(light_pos, center, Vec3::Y);
+            let radius = (max_ws - min_ws).length() * 0.5;
+            if !center.is_finite() || !radius.is_finite() || radius <= 1.0e-6 {
+                return Err(CascadeDataError::DegenerateFrustum);
+            }
+            let light_pos = center - light_dir * (radius + 1.0);
+            let up = if light_dir.dot(Vec3::Y).abs() > 0.99 {
+                Vec3::Z
+            } else {
+                Vec3::Y
+            };
+            let light_view = glam::Mat4::look_at_rh(light_pos, center, up);
 
             // Compute tight orthographic bounds in light space.
             let mut ls_min = Vec3::splat(f32::MAX);
             let mut ls_max = Vec3::splat(f32::MIN);
-            for &ray in &rays {
-                let inv_nz = 1.0 / (-ray.z).max(1e-8);
-                let d_near = prev_split_z * inv_nz;
-                let d_far = split_z * inv_nz;
-
-                // World-space points
-                let p_near = inv_view * (ray * d_near).extend(1.0);
-                let ws_near = p_near.truncate() / p_near.w;
-                let p_far = inv_view * (ray * d_far).extend(1.0);
-                let ws_far = p_far.truncate() / p_far.w;
-
-                // Transform to light space
-                let ls_near = (light_view * ws_near.extend(1.0)).truncate();
-                let ls_far = (light_view * ws_far.extend(1.0)).truncate();
-
-                ls_min = ls_min.min(ls_near).min(ls_far);
-                ls_max = ls_max.max(ls_near).max(ls_far);
+            for corner in world_corners {
+                let light_space = (light_view * corner.extend(1.0)).truncate();
+                if !light_space.is_finite() {
+                    return Err(CascadeDataError::DegenerateFrustum);
+                }
+                ls_min = ls_min.min(light_space);
+                ls_max = ls_max.max(light_space);
             }
 
-            // Add padding to avoid shimmering at cascade boundaries
-            let pad = 1.05;
-            let half_w = ((ls_max.x - ls_min.x) * 0.5).abs().max(1.0) * pad;
-            let half_h = ((ls_max.y - ls_min.y) * 0.5).abs().max(1.0) * pad;
-            let depth = ((ls_max.z - ls_min.z).abs()).max(1.0) * pad;
+            // Add a proportional guard band. Light-space Z is negative in
+            // front of the RH light camera, hence the sign conversion below.
+            let width = ls_max.x - ls_min.x;
+            let height = ls_max.y - ls_min.y;
+            let depth = ls_max.z - ls_min.z;
+            if !width.is_finite()
+                || !height.is_finite()
+                || !depth.is_finite()
+                || width <= 1.0e-6
+                || height <= 1.0e-6
+                || depth <= 1.0e-6
+            {
+                return Err(CascadeDataError::DegenerateFrustum);
+            }
+            let pad_x = (width * 0.025).max(1.0e-3);
+            let pad_y = (height * 0.025).max(1.0e-3);
+            let pad_z = (depth * 0.025).max(1.0e-3);
+            let light_near = (-ls_max.z - pad_z).max(1.0e-4);
+            let light_far = (-ls_min.z + pad_z).max(light_near + 1.0e-3);
 
-            let ortho =
-                glam::Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.0, depth * 2.0);
+            let ortho = glam::Mat4::orthographic_rh(
+                ls_min.x - pad_x,
+                ls_max.x + pad_x,
+                ls_min.y - pad_y,
+                ls_max.y + pad_y,
+                light_near,
+                light_far,
+            );
 
             light_vps[cascade] = ortho * light_view;
             prev_split_z = split_z;
         }
 
-        // Fallback: degenerate determinant (e.g. NaN from invalid input).
-        for vp in &mut light_vps {
-            if vp.determinant() == 0.0 || !vp.determinant().is_finite() {
-                let l = glam::Vec3::new(0.5, -0.707, 0.5).normalize();
-                let lp = -l * 10.0;
-                let v = glam::Mat4::look_at_rh(lp, glam::Vec3::ZERO, glam::Vec3::Y);
-                let o = glam::Mat4::orthographic_rh(-5.0, 5.0, -5.0, 5.0, 0.1, 20.0);
-                *vp = o * v;
-            }
+        if light_vps.iter().any(|vp| {
+            let determinant = vp.determinant();
+            !determinant.is_finite()
+                || determinant == 0.0
+                || !vp.to_cols_array().iter().all(|value| value.is_finite())
+        }) {
+            return Err(CascadeDataError::DegenerateFrustum);
         }
 
-        (splits4, light_vps)
+        Ok((splits4, light_vps))
     }
 
     /// Compute a single light view-projection matrix for directional shadow mapping.
-    /// Legacy single-cascade helper (used as fallback or for the first cascade).
-    pub(crate) fn compute_light_mvp(&self) -> [[f32; 4]; 4] {
+    ///
+    /// This is an explicit fixed-camera fallback for the legacy
+    /// `render_model_frame` demo path. Scene rendering must use
+    /// [`Self::compute_cascade_data`] with its actual camera and light.
+    pub(crate) fn compute_legacy_fallback_light_mvp(&self) -> [[f32; 4]; 4] {
         let light_dir = glam::Vec3::new(0.5, -0.707, 0.5).normalize();
         let light_pos = -light_dir * 10.0;
         let view = glam::Mat4::look_at_rh(light_pos, glam::Vec3::ZERO, glam::Vec3::Y);
@@ -734,5 +920,114 @@ impl VulkanDevice {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CascadeDataError, VulkanDevice};
+    use glam::{Mat4, Vec3};
+
+    fn assert_approx(actual: f32, expected: f32) {
+        let tolerance = expected.abs().max(1.0) * 1.0e-4;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {expected}, got {actual} (tolerance {tolerance})"
+        );
+    }
+
+    #[test]
+    fn derives_clip_planes_from_rh_zo_perspective_projection() {
+        let expected_near = 0.25;
+        let expected_far = 750.0;
+        let projection = Mat4::perspective_rh(
+            60.0f32.to_radians(),
+            16.0 / 9.0,
+            expected_near,
+            expected_far,
+        );
+
+        let (near, far) = VulkanDevice::derive_rh_zo_clip_planes(&projection)
+            .expect("finite perspective clip planes should be recoverable");
+
+        assert_approx(near, expected_near);
+        assert_approx(far, expected_far);
+    }
+
+    #[test]
+    fn derives_clip_planes_from_rh_zo_orthographic_projection() {
+        let expected_near = 2.0;
+        let expected_far = 42.0;
+        let projection = Mat4::orthographic_rh(-8.0, 12.0, -5.0, 7.0, expected_near, expected_far);
+
+        let (near, far) = VulkanDevice::derive_rh_zo_clip_planes(&projection)
+            .expect("finite orthographic clip planes should be recoverable");
+
+        assert_approx(near, expected_near);
+        assert_approx(far, expected_far);
+    }
+
+    #[test]
+    fn different_directional_lights_produce_different_cascade_matrices() {
+        let view = Mat4::look_at_rh(Vec3::new(3.0, 4.0, 8.0), Vec3::ZERO, Vec3::Y);
+        let projection = Mat4::perspective_rh(55.0f32.to_radians(), 1.5, 0.2, 80.0);
+        let (near, far) = VulkanDevice::derive_rh_zo_clip_planes(&projection).unwrap();
+
+        let (_, first) = VulkanDevice::compute_cascade_data(
+            &view,
+            &projection,
+            near,
+            far,
+            Vec3::new(1.0, -2.0, 0.5),
+        )
+        .expect("first light direction should produce valid cascades");
+        let (_, second) = VulkanDevice::compute_cascade_data(
+            &view,
+            &projection,
+            near,
+            far,
+            Vec3::new(-0.25, -1.0, -1.5),
+        )
+        .expect("second light direction should produce valid cascades");
+
+        let maximum_difference = first
+            .iter()
+            .zip(second.iter())
+            .flat_map(|(left, right)| {
+                left.to_cols_array()
+                    .into_iter()
+                    .zip(right.to_cols_array())
+                    .map(|(left, right)| (left - right).abs())
+            })
+            .fold(0.0f32, f32::max);
+        assert!(maximum_difference > 1.0e-3);
+    }
+
+    #[test]
+    fn invalid_shadow_inputs_are_rejected_without_a_fixed_fallback() {
+        assert_eq!(
+            VulkanDevice::normalize_shadow_light_direction(Vec3::ZERO),
+            Err(CascadeDataError::InvalidLightDirection)
+        );
+        assert_eq!(
+            VulkanDevice::normalize_shadow_light_direction(Vec3::new(f32::NAN, 0.0, 1.0)),
+            Err(CascadeDataError::InvalidLightDirection)
+        );
+        assert_eq!(
+            VulkanDevice::derive_rh_zo_clip_planes(&Mat4::IDENTITY),
+            Err(CascadeDataError::InvalidClipPlanes)
+        );
+
+        let projection = Mat4::perspective_rh(60.0f32.to_radians(), 1.0, 0.1, 100.0);
+        assert_eq!(
+            VulkanDevice::compute_cascade_data(
+                &Mat4::IDENTITY,
+                &projection,
+                0.1,
+                100.0,
+                Vec3::ZERO,
+            ),
+            Err(CascadeDataError::InvalidLightDirection)
+        );
     }
 }

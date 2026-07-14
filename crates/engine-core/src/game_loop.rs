@@ -59,10 +59,10 @@ impl GameLoop {
     /// Load a scene and build the ECS World from it.
     ///
     /// After this call:
-    /// - `runtime.world()` returns the populated World
+    /// - `runtime.with_world(...)` accesses the populated World
     /// - `runtime.render_frame()` uses World-based extraction (transforms work)
-    pub fn load_scene(&mut self, scene: Scene) {
-        self.runtime.load_scene_to_world(scene);
+    pub fn load_scene(&mut self, scene: Scene) -> Result<(), Vec<Diagnostic>> {
+        self.runtime.load_scene_to_world(scene)
     }
 
     /// Initialise the physics world using gravity from the scene settings
@@ -75,15 +75,12 @@ impl GameLoop {
         {
             let gravity = self
                 .runtime
-                .world()
-                .map(|w| w.scene_settings().gravity)
+                .with_world(|world| world.scene_settings().gravity)
                 .flatten()
                 .map(|g| glam::Vec3::new(g[0], g[1], g[2]))
                 .unwrap_or(glam::Vec3::new(0.0, -9.81, 0.0));
             let mut pw = PhysicsWorld::new(gravity);
-            if let Some(world) = self.runtime.world() {
-                pw.sync_from_ecs(world);
-            }
+            self.runtime.with_world(|world| pw.sync_from_ecs(world));
             self.physics = Some(pw);
         }
     }
@@ -95,7 +92,9 @@ impl GameLoop {
     /// `wish_jump` is true when the player wants to jump this frame.
     /// `dt` is the frame delta time in seconds.
     pub fn update_character(&mut self, direction: Vec3, wish_jump: bool, dt: f32) {
-        let Some(ref mut ctrl) = self.character else { return };
+        let Some(ref mut ctrl) = self.character else {
+            return;
+        };
 
         let input = CharacterMovement {
             direction,
@@ -115,12 +114,12 @@ impl GameLoop {
 
         // Write controller position back to the ECS entity's Transform.
         if let Some(entity) = self.character_entity {
-            if let Some(world) = self.runtime.world_mut() {
+            self.runtime.with_world_mut(|world| {
                 use engine_scene::components::Transform;
                 if let Some(t) = world.get_mut::<Transform>(entity) {
                     t.translation = ctrl.position();
                 }
-            }
+            });
         }
     }
 
@@ -138,9 +137,9 @@ impl GameLoop {
         // Tick physics (ECS → physics → ECS sync) — gameplay feature
         #[cfg(feature = "gameplay")]
         if let Some(ref mut physics) = self.physics {
-            if let Some(ref mut world) = self.runtime.world_mut() {
+            self.runtime.with_world_mut(|world| {
                 physics.step(_dt, world);
-            }
+            });
         }
 
         // Tick scripts (OnUpdate)
@@ -155,12 +154,12 @@ impl GameLoop {
 
     /// Validate that the runtime has a loaded scene ready for rendering.
     pub fn validate_ready(&self) -> Result<(), Vec<Diagnostic>> {
-        if self.runtime.world().is_none() && self.runtime.scene_ref().is_none() {
+        if !self.runtime.has_world() {
             return Err(vec![Diagnostic::new(
                 "GL0001",
                 DiagnosticSeverity::Error,
                 "game_loop",
-                "no scene loaded — call load_scene() first",
+                "no active World is loaded; call load_scene() or set_world() first",
             )]);
         }
         Ok(())

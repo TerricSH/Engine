@@ -28,6 +28,7 @@ pub mod backend;
 pub mod device;
 mod encoder;
 pub mod error;
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 mod handle;
 mod pipeline;
 mod resources;

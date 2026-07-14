@@ -4,7 +4,9 @@ pub(crate) struct HandleTable<T> {
 
 impl<T> HandleTable<T> {
     pub(crate) fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     pub(crate) fn insert(&mut self, value: T) -> u32 {

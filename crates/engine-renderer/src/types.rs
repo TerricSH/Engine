@@ -29,6 +29,11 @@ pub struct RenderFrameInput {
     pub ui_batches: Vec<UiBatch>,
     pub render_options: RenderOptions,
     pub stats_scope: Option<String>,
+    /// Visibility totals produced by the extraction stage. Backends use these
+    /// instead of trying to infer already-culled entities from the visible
+    /// drawable list.
+    #[serde(default)]
+    pub extraction_stats: Option<ExtractionStats>,
 }
 
 impl RenderFrameInput {
@@ -46,8 +51,17 @@ impl RenderFrameInput {
             ui_batches: Vec::new(),
             render_options: RenderOptions::default(),
             stats_scope: None,
+            extraction_stats: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionStats {
+    pub visible_drawables: u32,
+    pub culled_drawables: u32,
+    pub visible_lights: u32,
+    pub culled_lights: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -272,6 +286,182 @@ pub enum VertexAttributeFormat {
 pub enum IndexFormat {
     U16,
     U32,
+}
+
+impl IndexFormat {
+    /// Size of one packed index in bytes.
+    pub const fn byte_size(self) -> usize {
+        match self {
+            Self::U16 => 2,
+            Self::U32 => 4,
+        }
+    }
+}
+
+/// The first portable mesh format supported by the renderer upload contract.
+///
+/// Vertices are tightly packed as position (`float3`), normal (`float3`) and
+/// primary UV (`float2`), in that order. The fixed stride is 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Pbr32Vertex {
+    pub position: Vec3,
+    pub normal: Vec3,
+    pub uv0: Vec2,
+}
+
+pub const PBR32_VERTEX_STRIDE: u32 = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeshVertexFormat {
+    /// [`Pbr32Vertex`]: position, normal, UV0; all components are `f32`.
+    Pbr32,
+}
+
+impl MeshVertexFormat {
+    pub const fn stride_bytes(self) -> u32 {
+        match self {
+            Self::Pbr32 => PBR32_VERTEX_STRIDE,
+        }
+    }
+}
+
+/// Owned, GPU-ready static triangle-list mesh data.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MeshUpload {
+    pub mesh_id: AssetId,
+    pub vertex_format: MeshVertexFormat,
+    pub vertex_count: u32,
+    pub vertex_bytes: Vec<u8>,
+    pub index_format: IndexFormat,
+    pub index_count: u32,
+    pub index_bytes: Vec<u8>,
+    pub bounds: AxisAlignedBox,
+    /// Content hash used by backends to avoid redundant uploads.
+    pub content_hash: HashDigest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextureUploadFormat {
+    /// Four tightly-packed 8-bit channels in RGBA order.
+    Rgba8,
+}
+
+impl TextureUploadFormat {
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgba8 => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SamplerFilter {
+    Nearest,
+    Linear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SamplerAddressMode {
+    Repeat,
+    ClampToEdge,
+    MirroredRepeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplerDescriptor {
+    pub min_filter: SamplerFilter,
+    pub mag_filter: SamplerFilter,
+    pub mip_filter: SamplerFilter,
+    pub address_u: SamplerAddressMode,
+    pub address_v: SamplerAddressMode,
+    pub address_w: SamplerAddressMode,
+}
+
+impl Default for SamplerDescriptor {
+    fn default() -> Self {
+        Self {
+            min_filter: SamplerFilter::Linear,
+            mag_filter: SamplerFilter::Linear,
+            mip_filter: SamplerFilter::Linear,
+            address_u: SamplerAddressMode::Repeat,
+            address_v: SamplerAddressMode::Repeat,
+            address_w: SamplerAddressMode::Repeat,
+        }
+    }
+}
+
+/// One owned mip level. Dimensions are explicit so malformed or truncated
+/// chains can be rejected before a backend allocates GPU memory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextureMipLevel {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Owned 2D texture upload. Mip levels are ordered from largest to smallest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextureUpload {
+    pub texture_id: AssetId,
+    pub width: u32,
+    pub height: u32,
+    pub format: TextureUploadFormat,
+    pub color_space: ColorSpace,
+    pub mip_levels: Vec<TextureMipLevel>,
+    pub sampler: SamplerDescriptor,
+    pub content_hash: HashDigest,
+}
+
+/// Owned parameters for the first portable metallic-roughness material path.
+///
+/// The current renderer contract accepts opaque, single-sided materials. The
+/// other states remain representable so callers receive a structured
+/// unsupported-feature diagnostic instead of silently losing authoring data.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MaterialUpload {
+    pub material_id: AssetId,
+    pub base_color: LinearRgb,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub ambient_occlusion: f32,
+    pub base_color_texture: Option<AssetId>,
+    pub transparency: Transparency,
+    pub double_sided: bool,
+    pub content_hash: HashDigest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceKind {
+    Mesh,
+    Texture,
+    Material,
+}
+
+/// Identifies one backend resource to remove. Ownership of the request is
+/// transferred to the backend just like an upload descriptor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRemoval {
+    pub kind: ResourceKind,
+    pub resource_id: AssetId,
+}
+
+/// Backend acknowledgement for a successful upload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UploadReceipt {
+    /// Monotonic per-resource revision. Zero is reserved for invalid receipts.
+    pub revision: u64,
+    /// Non-fatal compromises or backend-specific notices.
+    pub warnings: Vec<Diagnostic>,
+}
+
+impl UploadReceipt {
+    pub const fn new(revision: u64) -> Self {
+        Self {
+            revision,
+            warnings: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

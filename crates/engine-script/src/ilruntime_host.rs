@@ -267,7 +267,7 @@ impl ScriptInstance for ILRuntimeInstance {
 /// let mut host = ILRuntimeHost::new("ilruntime");
 /// host.load_runtime("path/to/ILRuntime.Bridge.dll")?;
 /// let handle = host.load_assembly("my-scripts", &dll_bytes)?;
-/// let mut instance = host.instantiate(&handle)?;
+/// let mut instance = host.instantiate(&handle, "Game.PlayerController")?;
 /// let result = instance.call("OnUpdate", &[ScriptValue::Float(0.016)])?;
 /// ```
 pub struct ILRuntimeHost {
@@ -354,6 +354,7 @@ impl ScriptHost for ILRuntimeHost {
     fn instantiate(
         &mut self,
         handle: &ScriptHandle,
+        class_name: &str,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
         self.require_runtime()?;
         let rt = self.runtime.as_ref().unwrap();
@@ -361,10 +362,7 @@ impl ScriptHost for ILRuntimeHost {
         let instance_id = format!("inst-{:04x}", self.next_instance_id);
         self.next_instance_id += 1;
 
-        // Use assembly id as both assembly and class for now
-        // (real impl would get class_name from ScriptComponent)
         let assembly_id = handle.id();
-        let class_name = "ScriptType";
 
         let result_code = (rt.instantiate)(
             assembly_id.as_ptr(),
@@ -441,7 +439,7 @@ mod tests {
     fn ilruntime_host_instantiate_before_initialized_fails() {
         let mut host = ILRuntimeHost::new("test");
         let handle = ScriptHandle::new("asm");
-        let result = host.instantiate(&handle);
+        let result = host.instantiate(&handle, "Test.Script");
         assert!(result.is_err());
     }
 

@@ -41,134 +41,23 @@ pub enum MeshError {
 /// Returns the first mesh found in the file.  If the file contains multiple
 /// meshes, use [`load_meshes`] instead.
 pub fn load_mesh_from_gltf(path: &std::path::Path) -> Result<MeshData, MeshError> {
-    let (doc, buffers, _) = gltf::import(path).map_err(|e| MeshError::GltfLoad(e.to_string()))?;
-
-    // Pick the first mesh's first primitive.
-    for mesh in doc.meshes() {
-        if let Some(prim) = mesh.primitives().next() {
-            let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
-
-            let positions: Vec<[f32; 3]> = reader
-                .read_positions()
-                .ok_or(MeshError::NoPositions)?
-                .collect();
-
-            let normals: Vec<[f32; 3]> = reader
-                .read_normals()
-                .map(|iter| iter.collect())
-                .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
-
-            let uvs: Vec<[f32; 2]> = reader
-                .read_tex_coords(0)
-                .map(|iter| iter.into_f32().collect())
-                .unwrap_or_default();
-
-            let indices: Vec<u32> = reader
-                .read_indices()
-                .map(|iter| iter.into_u32().collect())
-                .unwrap_or_else(|| (0..positions.len() as u32).collect());
-
-            if positions.is_empty() {
-                return Err(MeshError::NoPositions);
-            }
-
-            let positions: Vec<Vec3> = positions.into_iter().map(Vec3::from_array).collect();
-            let normals: Vec<Vec3> = normals.into_iter().map(Vec3::from_array).collect();
-            let uvs: Vec<Vec2> = uvs.into_iter().map(Vec2::from_array).collect();
-
-            let joints: Vec<[u16; 4]> = reader
-                .read_joints(0)
-                .map(|iter| iter.into_u16().collect())
-                .unwrap_or_default();
-            let weights: Vec<[f32; 4]> = reader
-                .read_weights(0)
-                .map(|iter| iter.into_f32().collect())
-                .unwrap_or_default();
-            let joints_u32: Vec<[u32; 4]> = joints
-                .iter()
-                .map(|&j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
-                .collect();
-            if !joints_u32.is_empty() && joints_u32.len() != weights.len() {
-                return Err(MeshError::JointsWeightsMismatch);
-            }
-
-            let (min, max) = compute_bounds(&positions);
-
-            return Ok(MeshData {
-                positions,
-                normals,
-                uvs,
-                indices,
-                bounds: (min, max),
-                joints: joints_u32,
-                weights,
-            });
-        }
-    }
-
-    Err(MeshError::UnsupportedFormat("no primitives found".into()))
+    crate::gltf::load_gltf_scene(path)
+        .map_err(|error| MeshError::GltfLoad(error.to_string()))?
+        .primitives
+        .into_iter()
+        .next()
+        .map(|primitive| primitive.mesh)
+        .ok_or_else(|| MeshError::UnsupportedFormat("no primitives found".into()))
 }
 
 /// Load all meshes from a glTF file, returning (name, MeshData) pairs.
 pub fn load_meshes_from_gltf(path: &std::path::Path) -> Result<Vec<(String, MeshData)>, MeshError> {
-    let (doc, buffers, _) = gltf::import(path).map_err(|e| MeshError::GltfLoad(e.to_string()))?;
-
-    let mut out = Vec::new();
-    for mesh in doc.meshes() {
-        for (pi, prim) in mesh.primitives().enumerate() {
-            let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
-
-            let positions: Vec<[f32; 3]> = reader
-                .read_positions()
-                .ok_or(MeshError::NoPositions)?
-                .collect();
-
-            let normals: Vec<[f32; 3]> = reader
-                .read_normals()
-                .map(|iter| iter.collect())
-                .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
-
-            let uvs: Vec<[f32; 2]> = reader
-                .read_tex_coords(0)
-                .map(|iter| iter.into_f32().collect())
-                .unwrap_or_default();
-
-            let indices: Vec<u32> = reader
-                .read_indices()
-                .map(|iter| iter.into_u32().collect())
-                .unwrap_or_else(|| (0..positions.len() as u32).collect());
-
-            if positions.is_empty() {
-                continue;
-            }
-
-            let joints: Vec<[u16; 4]> = reader
-                .read_joints(0)
-                .map(|iter| iter.into_u16().collect())
-                .unwrap_or_default();
-            let weights: Vec<[f32; 4]> = reader
-                .read_weights(0)
-                .map(|iter| iter.into_f32().collect())
-                .unwrap_or_default();
-            let joints_u32: Vec<[u32; 4]> = joints
-                .iter()
-                .map(|&j| [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32])
-                .collect();
-
-            let name = format!("{}_{}", mesh.name().unwrap_or("mesh"), pi);
-            let pos_glam: Vec<Vec3> = positions.iter().map(|&p| Vec3::from_array(p)).collect();
-            let data = MeshData {
-                positions: pos_glam.clone(),
-                normals: normals.iter().map(|&n| Vec3::from_array(n)).collect(),
-                uvs: uvs.iter().map(|&u| Vec2::from_array(u)).collect(),
-                indices,
-                bounds: compute_bounds(&pos_glam),
-                joints: joints_u32,
-                weights,
-            };
-            out.push((name, data));
-        }
-    }
+    let out: Vec<_> = crate::gltf::load_gltf_scene(path)
+        .map_err(|error| MeshError::GltfLoad(error.to_string()))?
+        .primitives
+        .into_iter()
+        .map(|primitive| (primitive.name, primitive.mesh))
+        .collect();
 
     if out.is_empty() {
         Err(MeshError::UnsupportedFormat("no primitives found".into()))
@@ -308,69 +197,6 @@ pub fn mesh_data_to_skinned_bytes(mesh: &MeshData) -> Option<(Vec<u8>, Vec<u8>, 
     Some((vertex_bytes, index_bytes, index_count, false))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn skinned_bytes_returns_none_for_non_skinned_mesh() {
-        let mesh = MeshData {
-            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
-            normals: vec![Vec3::Z, Vec3::Z, Vec3::Z],
-            uvs: vec![],
-            indices: vec![0, 1, 2],
-            bounds: (Vec3::ZERO, Vec3::ONE),
-            joints: vec![],
-            weights: vec![],
-        };
-        assert!(mesh_data_to_skinned_bytes(&mesh).is_none());
-    }
-
-    #[test]
-    fn skinned_bytes_produces_correct_stride() {
-        let mesh = MeshData {
-            positions: vec![Vec3::ZERO; 2],
-            normals: vec![Vec3::Z; 2],
-            uvs: vec![Vec2::ZERO; 2],
-            indices: vec![0, 1],
-            bounds: (Vec3::ZERO, Vec3::ONE),
-            joints: vec![[0, 1, 2, 3]; 2],
-            weights: vec![[1.0, 0.0, 0.0, 0.0]; 2],
-        };
-        let (vb, ib, ic, u16_fmt) = mesh_data_to_skinned_bytes(&mesh).unwrap();
-        // 2 vertices × 64 bytes = 128 bytes
-        assert_eq!(vb.len(), 128);
-        // 2 indices × 4 bytes = 8 bytes
-        assert_eq!(ib.len(), 8);
-        assert_eq!(ic, 2);
-        assert!(!u16_fmt);
-    }
-
-    #[test]
-    fn skinned_bytes_joints_weights_must_match() {
-        let mesh = MeshData {
-            positions: vec![Vec3::ZERO; 3],
-            normals: vec![Vec3::Z; 3],
-            uvs: vec![Vec2::ZERO; 3],
-            indices: vec![0, 1, 2],
-            bounds: (Vec3::ZERO, Vec3::ONE),
-            joints: vec![[0; 4]; 3],
-            weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
-        };
-        assert!(mesh_data_to_skinned_bytes(&mesh).is_some());
-    }
-}
-
-fn compute_bounds(positions: &[Vec3]) -> (Vec3, Vec3) {
-    let mut min = Vec3::splat(f32::MAX);
-    let mut max = Vec3::splat(f32::MIN);
-    for p in positions {
-        min = min.min(*p);
-        max = max.max(*p);
-    }
-    (min, max)
-}
-
 /// Convert [`MeshData`] into interleaved vertex/index bytes suitable for
 /// [`engine_renderer::BackendRenderer::upload_mesh`].
 ///
@@ -454,3 +280,53 @@ pub fn mesh_data_to_color_bytes(mesh: &MeshData) -> (Vec<u8>, Vec<u8>, u32, bool
     (vertex_bytes, index_bytes, index_count, false)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skinned_bytes_returns_none_for_non_skinned_mesh() {
+        let mesh = MeshData {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            normals: vec![Vec3::Z, Vec3::Z, Vec3::Z],
+            uvs: vec![],
+            indices: vec![0, 1, 2],
+            bounds: (Vec3::ZERO, Vec3::ONE),
+            joints: vec![],
+            weights: vec![],
+        };
+        assert!(mesh_data_to_skinned_bytes(&mesh).is_none());
+    }
+
+    #[test]
+    fn skinned_bytes_produces_correct_stride() {
+        let mesh = MeshData {
+            positions: vec![Vec3::ZERO; 2],
+            normals: vec![Vec3::Z; 2],
+            uvs: vec![Vec2::ZERO; 2],
+            indices: vec![0, 1],
+            bounds: (Vec3::ZERO, Vec3::ONE),
+            joints: vec![[0, 1, 2, 3]; 2],
+            weights: vec![[1.0, 0.0, 0.0, 0.0]; 2],
+        };
+        let (vb, ib, ic, u16_fmt) = mesh_data_to_skinned_bytes(&mesh).unwrap();
+        assert_eq!(vb.len(), 128);
+        assert_eq!(ib.len(), 8);
+        assert_eq!(ic, 2);
+        assert!(!u16_fmt);
+    }
+
+    #[test]
+    fn skinned_bytes_joints_weights_must_match() {
+        let mesh = MeshData {
+            positions: vec![Vec3::ZERO; 3],
+            normals: vec![Vec3::Z; 3],
+            uvs: vec![Vec2::ZERO; 3],
+            indices: vec![0, 1, 2],
+            bounds: (Vec3::ZERO, Vec3::ONE),
+            joints: vec![[0; 4]; 3],
+            weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
+        };
+        assert!(mesh_data_to_skinned_bytes(&mesh).is_some());
+    }
+}

@@ -16,10 +16,13 @@ fn main() {
     if let Some(dxc) = dxc_path {
         println!("cargo:warning=dxc found at {:?}, compiling shaders", dxc);
         let status = std::process::Command::new(&dxc)
-            .args(&[
-                "-T", "vs_6_0",
-                "-E", "VSMain",
-                "-Fo", &output_path("scene_vs.dxil"),
+            .args([
+                "-T",
+                "vs_6_0",
+                "-E",
+                "VSMain",
+                "-Fo",
+                &output_path("scene_vs.dxil"),
                 "-nologo",
                 "src/shaders.hlsl",
             ])
@@ -35,10 +38,13 @@ fn main() {
         }
 
         let status = std::process::Command::new(&dxc)
-            .args(&[
-                "-T", "ps_6_0",
-                "-E", "PSMain",
-                "-Fo", &output_path("scene_ps.dxil"),
+            .args([
+                "-T",
+                "ps_6_0",
+                "-E",
+                "PSMain",
+                "-Fo",
+                &output_path("scene_ps.dxil"),
                 "-nologo",
                 "src/shaders.hlsl",
             ])

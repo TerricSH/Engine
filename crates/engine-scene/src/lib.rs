@@ -2,7 +2,6 @@
 
 pub mod archetype;
 pub mod camera_utils;
-pub mod third_person_camera;
 mod component;
 pub mod components;
 mod entity;
@@ -13,8 +12,10 @@ pub mod prefab_instance;
 pub mod prefab_override;
 pub mod registry;
 mod scene;
+pub mod third_person_camera;
 mod validation;
 mod world;
+mod world_slot;
 
 pub use archetype::{Archetype, ArchetypeRegistry};
 pub use component::{Component, ComponentStorageDyn, SparseSet};
@@ -37,6 +38,7 @@ pub use registry::{
 pub use scene::*;
 pub use validation::validate_scene;
 pub use world::World;
+pub use world_slot::{WeakWorldSlot, WorldSlot};
 
 #[cfg(test)]
 mod tests;

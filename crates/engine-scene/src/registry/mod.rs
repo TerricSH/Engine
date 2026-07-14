@@ -124,6 +124,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn component_registry_is_cloneable_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ComponentRegistry>();
+
+        let mut registry = ComponentRegistry::new();
+        registry
+            .register(make_dummy_extension("Dummy"))
+            .expect("register dummy component");
+        let cloned = registry.clone();
+        assert_eq!(cloned.get("test.dummy").unwrap().meta.display_name, "Dummy");
+    }
+
     // ---------------------------------------------------------------
     // AssetTypeRegistry tests
     // ---------------------------------------------------------------

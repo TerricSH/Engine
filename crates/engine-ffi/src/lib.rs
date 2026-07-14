@@ -40,6 +40,7 @@ pub mod coroutine;
 pub mod engine;
 pub mod entity;
 pub mod gameplay;
+pub mod host_bridge;
 pub mod ik;
 pub mod nav_agent;
 pub mod registry;

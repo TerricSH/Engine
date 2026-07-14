@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use tracing::debug;
@@ -117,26 +118,34 @@ impl PhysicsWorld {
     }
 
     /// Drain and execute all queued commands.
-    fn execute_pending_commands(&mut self) {
+    fn execute_pending_commands(&mut self, world: &crate::World) {
         let commands = std::mem::take(&mut self.pending_commands);
         for cmd in commands {
+            let entity = match &cmd {
+                PhysicsCommand::ApplyForce { entity, .. }
+                | PhysicsCommand::ApplyImpulse { entity, .. }
+                | PhysicsCommand::SetBodyPosition { entity, .. }
+                | PhysicsCommand::SetBodyRotation { entity, .. } => *entity,
+            };
+            if !world.is_alive(entity) {
+                continue;
+            }
+
             match cmd {
                 PhysicsCommand::ApplyForce { entity, force } => {
-                    self.backend.apply_force(entity.index(), force);
+                    self.backend.apply_force(entity, force);
                 }
                 PhysicsCommand::ApplyImpulse { entity, impulse } => {
-                    self.backend.apply_impulse(entity.index(), impulse);
+                    self.backend.apply_impulse(entity, impulse);
                 }
                 PhysicsCommand::SetBodyPosition { entity, position } => {
-                    if let Some((_, rot)) = self.backend.sync_body_transform(entity.index()) {
-                        self.backend
-                            .set_body_transform(entity.index(), position, rot);
+                    if let Some((_, rot)) = self.backend.sync_body_transform(entity) {
+                        self.backend.set_body_transform(entity, position, rot);
                     }
                 }
                 PhysicsCommand::SetBodyRotation { entity, rotation } => {
-                    if let Some((pos, _)) = self.backend.sync_body_transform(entity.index()) {
-                        self.backend
-                            .set_body_transform(entity.index(), pos, rotation);
+                    if let Some((pos, _)) = self.backend.sync_body_transform(entity) {
+                        self.backend.set_body_transform(entity, pos, rotation);
                     }
                 }
             }
@@ -152,11 +161,12 @@ impl PhysicsWorld {
     /// simulation the required number of times, and collects collision
     /// events.
     pub fn step(&mut self, dt: f32, world: &mut crate::World) {
-        // 1. Execute pending commands.
-        self.execute_pending_commands();
-
-        // 2. Synchronise ECS → physics (creates/updates bodies and colliders).
+        // 1. Synchronise ECS → physics so stale generations are removed and
+        // the current live generation is installed before commands run.
         self.sync_from_ecs_internal(world);
+
+        // 2. Execute commands only against the current live generation.
+        self.execute_pending_commands(world);
 
         // 3. Fixed timestep accumulator.
         self.accumulator += dt;
@@ -173,6 +183,12 @@ impl PhysicsWorld {
 
             self.accumulator -= self.fixed_timestep;
             steps_taken += 1;
+        }
+
+        // A frame may not advance the fixed-step simulation. Structural ECS
+        // changes must still be visible to every query API immediately.
+        if self.backend.query_pipeline_is_dirty() {
+            self.backend.sync_query_pipeline();
         }
 
         // Clamp accumulator to prevent large catch-up after a pause.
@@ -220,67 +236,72 @@ impl PhysicsWorld {
     }
 
     fn sync_from_ecs_internal(&mut self, world: &crate::World) {
-        // Collect all entity indices that have RigidBody components.
-        let mut seen_bodies: Vec<u32> = Vec::new();
+        // Collect all complete entity handles that have RigidBody components.
+        let mut seen_bodies: HashSet<Entity> = HashSet::new();
 
         for (entity, rigid_body) in world.query::<RigidBody>() {
-            let idx = entity.index();
-            seen_bodies.push(idx);
+            seen_bodies.insert(entity);
 
-            if !self.backend.has_body(idx) {
+            if !self.backend.has_body(entity) {
+                debug_assert!(world.is_alive(entity));
                 // Get the Transform for positioning.
                 let transform = world.get::<Transform>(entity).cloned().unwrap_or_default();
-                self.backend.create_body(idx, rigid_body, &transform);
+                self.backend
+                    .replace_body_for_current_entity(entity, rigid_body, &transform);
             }
         }
 
         // Remove bodies for entities that no longer have RigidBody.
-        let to_remove_bodies: Vec<u32> = self
+        let to_remove_bodies: Vec<Entity> = self
             .backend
             .body_map
             .keys()
             .copied()
-            .filter(|idx| !seen_bodies.contains(idx))
+            .filter(|entity| !seen_bodies.contains(entity))
             .collect();
-        for idx in to_remove_bodies {
-            self.backend.remove_body(idx);
+        for entity in to_remove_bodies {
+            self.backend.remove_body(entity);
         }
 
-        // Collect all entity indices that have Collider components.
-        let mut seen_colliders: Vec<u32> = Vec::new();
+        // Collect all complete entity handles that have Collider components.
+        let mut seen_colliders: HashSet<Entity> = HashSet::new();
 
         for (entity, collider) in world.query::<Collider>() {
-            let idx = entity.index();
-            seen_colliders.push(idx);
+            seen_colliders.insert(entity);
 
-            if !self.backend.has_collider(idx) {
+            if !self.backend.has_collider(entity) {
+                debug_assert!(world.is_alive(entity));
                 // Find the parent body entity. A collider should be attached
                 // to the same entity's rigid body, or we search for the first
                 // ancestor with a RigidBody.
-                let body_entity = if self.backend.has_body(idx) {
-                    idx
+                let body_entity = if self.backend.has_body(entity) {
+                    entity
                 } else {
                     // Search for a parent entity with a RigidBody
                     // (simple: same entity or parent chain — we use same entity for now)
-                    idx
+                    entity
                 };
 
                 let material = world.get::<PhysicsMaterial>(entity);
-                self.backend
-                    .create_collider(idx, collider, body_entity, material);
+                self.backend.replace_collider_for_current_entity(
+                    entity,
+                    collider,
+                    body_entity,
+                    material,
+                );
             }
         }
 
         // Remove colliders for entities that no longer have Collider.
-        let to_remove_colliders: Vec<u32> = self
+        let to_remove_colliders: Vec<Entity> = self
             .backend
             .collider_map
             .keys()
             .copied()
-            .filter(|idx| !seen_colliders.contains(idx))
+            .filter(|entity| !seen_colliders.contains(entity))
             .collect();
-        for idx in to_remove_colliders {
-            self.backend.remove_collider(idx);
+        for entity in to_remove_colliders {
+            self.backend.remove_collider(entity);
         }
     }
 
@@ -293,17 +314,15 @@ impl PhysicsWorld {
     }
 
     fn sync_to_ecs_internal(&mut self, world: &mut crate::World) {
-        let body_indices: Vec<u32> = self.backend.body_map.keys().copied().collect();
+        let body_entities: Vec<Entity> = self.backend.body_map.keys().copied().collect();
 
-        for idx in body_indices {
-            let entity = Entity::new(idx, 0);
-
+        for entity in body_entities {
             // Only sync if the entity is still alive and has a Transform.
             if !world.is_alive(entity) {
                 continue;
             }
 
-            if let Some((pos, rot)) = self.backend.sync_body_transform(idx) {
+            if let Some((pos, rot)) = self.backend.sync_body_transform(entity) {
                 if let Some(transform) = world.get_mut::<Transform>(entity) {
                     transform.translation = pos;
                     transform.rotation = rot;
@@ -390,6 +409,9 @@ impl PhysicsWorld {
         let batcher = std::mem::take(&mut self.query_batcher);
         if batcher.is_empty() {
             return QueryResults::new();
+        }
+        if self.backend.query_pipeline_is_dirty() {
+            self.backend.sync_query_pipeline();
         }
         self.backend.execute_batched_queries(&batcher)
     }

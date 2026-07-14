@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use engine_core::{create_vulkan_backend_renderer, EngineConfig, EngineRuntime};
-use engine_editor::{
-    EditorScene, EditorUi, HierarchyPanel, InspectorPanel, SceneViewPanel,
-};
+use engine_editor::{EditorScene, EditorUi, HierarchyPanel, InspectorPanel, SceneViewPanel};
 use engine_scene::sample_scene;
 use platform::winit::window::Window;
 use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
@@ -43,18 +41,34 @@ impl EditorApp {
     fn init_scene(&mut self) {
         let scene = sample_scene();
         if let Some(ref mut runtime) = self.runtime {
-            runtime.load_scene_to_world(scene.clone());
+            if let Err(diagnostics) = runtime.load_scene_to_world(scene.clone()) {
+                for diagnostic in diagnostics {
+                    tracing::error!(
+                        code = diagnostic.code,
+                        entity = ?diagnostic.entity,
+                        component_type = ?diagnostic.fields.get("component_type_id"),
+                        message = diagnostic.message,
+                        "editor: failed to load sample scene"
+                    );
+                }
+                std::process::exit(1);
+            }
         }
         self.editor_scene = Some(EditorScene::new(scene));
         tracing::info!("editor: sample scene loaded");
     }
 
     fn render_editor_frame(&mut self) {
-        let Some(ref mut editor_scene) = self.editor_scene else { return };
-        let Some(ref mut runtime) = self.runtime else { return };
+        let Some(ref mut editor_scene) = self.editor_scene else {
+            return;
+        };
+        let Some(ref mut runtime) = self.runtime else {
+            return;
+        };
 
         // ── 1. Begin UI frame ──────────────────────────────────────
-        self.ui.set_pointer(self.mouse_x as f32, self.mouse_y as f32);
+        self.ui
+            .set_pointer(self.mouse_x as f32, self.mouse_y as f32);
         self.ui.begin_frame();
 
         // ── 2. Layout and render panels ────────────────────────────
@@ -76,7 +90,8 @@ impl EditorApp {
 
         // ── Scene View (center) ────────────────────────────────────
         self.ui.set_panel_rect(left_w + gap * 2.0, 4.0, center_w);
-        self.scene_view.ui_with_scene(&mut self.ui, &editor_scene.scene);
+        self.scene_view
+            .ui_with_scene(&mut self.ui, &editor_scene.scene);
 
         // ── Inspector (right) ──────────────────────────────────────
         let inspector_left = left_w + center_w + gap * 3.0;
@@ -102,8 +117,9 @@ impl EditorApp {
             ),
             Err(diags) => {
                 for d in &diags {
-                    tracing::warn!(code = d.code, msg = d.message, "editor render");
+                    tracing::error!(code = d.code, msg = d.message, "editor render failed");
                 }
+                std::process::exit(1);
             }
         }
 
@@ -121,14 +137,14 @@ impl WindowApp for EditorApp {
             Ok(h) => h.as_raw(),
             Err(e) => {
                 tracing::error!("display handle: {e}");
-                return;
+                std::process::exit(1);
             }
         };
         let window_handle = match window.window_handle() {
             Ok(h) => h.as_raw(),
             Err(e) => {
                 tracing::error!("window handle: {e}");
-                return;
+                std::process::exit(1);
             }
         };
 
@@ -150,7 +166,7 @@ impl WindowApp for EditorApp {
             }
             Err(e) => {
                 tracing::error!("Vulkan backend creation failed: {e}");
-                return;
+                std::process::exit(1);
             }
         }
 
@@ -178,7 +194,10 @@ impl WindowApp for EditorApp {
                 self.window_w = width as f32;
                 self.window_h = height as f32;
                 if let Some(ref mut runtime) = self.runtime {
-                    let _ = runtime.renderer_mut().resize(width, height);
+                    if let Err(diagnostics) = runtime.renderer_mut().resize(width, height) {
+                        super::log_renderer_diagnostics("editor resize", &diagnostics);
+                        std::process::exit(1);
+                    }
                 }
             }
             PlatformEvent::Redraw => {
@@ -203,5 +222,6 @@ pub fn run_editor() {
         app,
     ) {
         tracing::error!("editor: {e}");
+        std::process::exit(1);
     }
 }

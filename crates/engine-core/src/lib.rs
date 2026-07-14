@@ -4,10 +4,13 @@ pub mod diagnostics;
 pub use diagnostics::*;
 
 use engine_renderer::{FrameStats, Renderer};
-use engine_scene::{extract_renderer_input_from_world, Scene, World};
+use engine_scene::{
+    extract_renderer_input_from_world, validate_scene, ComponentRegistry, Scene,
+    SceneLoadDiagnostic, World, WorldSlot,
+};
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
+use std::sync::Arc;
 
-pub mod coroutine;
 pub mod ffi_init;
 pub mod game_loop;
 
@@ -35,15 +38,63 @@ impl Default for EngineConfig {
     }
 }
 
+/// Configures an [`EngineRuntime`] before its shared component registry is
+/// frozen behind an [`Arc`].
+///
+/// Character-controller components are always registered. Physics components
+/// are additionally registered when the `gameplay` feature is enabled. Other
+/// subsystems can register their extensions through
+/// [`component_registry_mut`](Self::component_registry_mut) before calling
+/// [`build`](Self::build).
+pub struct EngineRuntimeBuilder {
+    config: EngineConfig,
+    component_registry: ComponentRegistry,
+}
+
+impl EngineRuntimeBuilder {
+    pub fn new(config: EngineConfig) -> Self {
+        let mut component_registry = ComponentRegistry::new();
+        component_registry.register_core();
+        engine_character::register_character_extensions(&mut component_registry, None);
+        #[cfg(feature = "gameplay")]
+        engine_physics::register_physics_extensions(&mut component_registry, None);
+
+        Self {
+            config,
+            component_registry,
+        }
+    }
+
+    /// Inspect the component extensions that will be shared by the runtime.
+    pub fn component_registry(&self) -> &ComponentRegistry {
+        &self.component_registry
+    }
+
+    /// Register additional component extensions before building the runtime.
+    pub fn component_registry_mut(&mut self) -> &mut ComponentRegistry {
+        &mut self.component_registry
+    }
+
+    pub fn build(self) -> EngineRuntime {
+        EngineRuntime::from_parts(self.config, Arc::new(self.component_registry))
+    }
+}
+
+impl Default for EngineRuntimeBuilder {
+    fn default() -> Self {
+        Self::new(EngineConfig::default())
+    }
+}
+
 // ── Engine runtime ────────────────────────────────────────────────────────
 
 pub struct EngineRuntime {
     config: EngineConfig,
     renderer: Renderer,
     scene: Option<Scene>,
-    world: Option<World>,
+    world_slot: WorldSlot,
+    component_registry: Arc<ComponentRegistry>,
     collector: DiagnosticsCollector,
-    pub coroutines: coroutine::CoroutineSystem,
     #[cfg(feature = "subsystem-scripting-csharp")]
     script_engine: ScriptEngine,
     /// Name of the script host to use when loading scene scripts.
@@ -53,18 +104,40 @@ pub struct EngineRuntime {
 
 impl EngineRuntime {
     pub fn new(config: EngineConfig) -> Self {
+        Self::builder(config).build()
+    }
+
+    pub fn builder(config: EngineConfig) -> EngineRuntimeBuilder {
+        EngineRuntimeBuilder::new(config)
+    }
+
+    /// Enable direct P/Invoke access for a C# runtime hosted in this process.
+    ///
+    /// This loads the version-matched `engine_ffi` native library, validates
+    /// its callback-table ABI, and binds it to this process's active World
+    /// bridge. Call it before executing managed code in an in-process CLR.
+    /// Out-of-process [`engine_script::ProcessHost`] users must use IPC and
+    /// should not install this bridge.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn install_in_process_csharp_ffi(
+        &self,
+    ) -> Result<(), engine_ffi::host_bridge::HostBridgeError> {
+        ffi_init::install_cdylib_bridge()
+    }
+
+    fn from_parts(config: EngineConfig, component_registry: Arc<ComponentRegistry>) -> Self {
         // Initialise the FFI callback registry so extern "C" entry points
-        // can dispatch to real implementations immediately.  The world
-        // pointer will be set later when a scene is loaded.
-        ffi_init::initialise(std::ptr::null_mut());
+        // can dispatch to real implementations immediately. The active world
+        // slot is selected later when a scene is loaded.
+        ffi_init::initialise();
 
         Self {
             config,
             renderer: Renderer::new(),
             scene: None,
-            world: None,
+            world_slot: WorldSlot::new(),
+            component_registry,
             collector: DiagnosticsCollector::new(),
-            coroutines: coroutine::CoroutineSystem::new(),
             #[cfg(feature = "subsystem-scripting-csharp")]
             script_engine: ScriptEngine::new(),
             #[cfg(feature = "subsystem-scripting-csharp")]
@@ -76,28 +149,84 @@ impl EngineRuntime {
         &self.config
     }
 
-    /// Load a scene and attach any script components found on entities.
-    pub fn load_scene(&mut self, scene: Scene) {
-        // Attach scene scripts (if the script subsystem is enabled)
-        #[cfg(feature = "subsystem-scripting-csharp")]
-        self.attach_scene_scripts(&scene);
+    /// Shared registry used by strict scene loading and registry-less worlds.
+    pub fn component_registry(&self) -> &Arc<ComponentRegistry> {
+        &self.component_registry
+    }
 
-        self.scene = Some(scene);
+    /// Load a scene into the runtime ECS World.
+    ///
+    /// This compatibility name now delegates to the strict transactional
+    /// loader. Keeping a Scene-only fallback produced identity transforms and
+    /// made normal cameras and positioned objects render incorrectly.
+    pub fn load_scene(&mut self, scene: Scene) -> Result<(), Vec<Diagnostic>> {
+        self.load_scene_to_world(scene)
     }
 
     /// Load a scene and also build the ECS World from it.
     ///
     /// This is the recommended entry point for runtime games that need
     /// transforms, physics, and gameplay logic in addition to rendering.
-    pub fn load_scene_to_world(&mut self, scene: Scene) {
-        // Attach scene scripts (if the script subsystem is enabled)
+    pub fn load_scene_to_world(&mut self, scene: Scene) -> Result<(), Vec<Diagnostic>> {
+        let validation_diagnostics = validate_scene(&scene);
+        let validation_failed = validation_diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.severity,
+                DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+            )
+        });
+        if !validation_diagnostics.is_empty() {
+            self.collector
+                .push_scene_diags(validation_diagnostics.clone());
+        }
+        if validation_failed {
+            return Err(validation_diagnostics);
+        }
+
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        let world_scene = {
+            // `engine.script` is scene-only metadata consumed by the script
+            // subsystem. Keep it in the retained Scene, but do not ask the ECS
+            // component registry to materialise it. No other type is ignored.
+            let mut world_scene = scene.clone();
+            for entity in &mut world_scene.entities {
+                entity.components.remove(script::SCRIPT_COMPONENT_TYPE);
+            }
+            world_scene
+        };
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        let world_scene = &world_scene;
+        #[cfg(not(feature = "subsystem-scripting-csharp"))]
+        let world_scene = &scene;
+
+        // Build outside the WorldSlot lock. A failed load leaves the currently
+        // active World, Scene, and FFI binding untouched.
+        let world = match World::try_from_scene_with_registry(
+            world_scene,
+            Arc::clone(&self.component_registry),
+        ) {
+            Ok(world) => world,
+            Err(error) => {
+                let diagnostics = error
+                    .diagnostics
+                    .into_iter()
+                    .map(scene_load_diagnostic)
+                    .collect::<Vec<_>>();
+                self.collector.push_scene_diags(diagnostics.clone());
+                return Err(diagnostics);
+            }
+        };
+
+        self.world_slot.replace(world);
+        engine_ffi::world_bridge::activate_world(&self.world_slot, &self.component_registry);
+
+        // Attach scripts only after activating the new world so managed
+        // OnCreate callbacks cannot observe the previous scene.
         #[cfg(feature = "subsystem-scripting-csharp")]
         self.attach_scene_scripts(&scene);
 
-        let world = World::from_scene(&scene);
-        self.world = Some(world);
         self.scene = Some(scene);
-        self.update_ffi_world_ptr();
+        Ok(())
     }
 
     /// Directly set an existing ECS World as the runtime's active world.
@@ -110,38 +239,50 @@ impl EngineRuntime {
     /// The world must contain at least one enabled [`Camera`] component
     /// and at least one enabled [`Renderable`] component for extraction
     /// to produce a valid frame.
-    pub fn set_world(&mut self, world: World) {
-        // Derive a Scene snapshot from the world for the legacy fallback
-        // path and for script attachment.
+    pub fn set_world(&mut self, mut world: World) {
+        // A caller-provided registry is authoritative. Otherwise install the
+        // runtime registry before serialising so external components survive
+        // the Scene snapshot used by legacy rendering and scripts.
+        let effective_registry = if let Some(registry) = world.component_registry() {
+            Arc::clone(registry)
+        } else {
+            let registry = Arc::clone(&self.component_registry);
+            world.set_shared_component_registry(Arc::clone(&registry));
+            registry
+        };
+
+        // Derive a Scene snapshot for inspection and script attachment. Frame
+        // extraction always reads the active World.
         let scene = world.to_scene();
+
+        self.world_slot.replace(world);
+        engine_ffi::world_bridge::activate_world(&self.world_slot, &effective_registry);
 
         #[cfg(feature = "subsystem-scripting-csharp")]
         self.attach_scene_scripts(&scene);
 
-        self.world = Some(world);
         self.scene = Some(scene);
-        self.update_ffi_world_ptr();
     }
 
-    /// Update the FFI callback registry's world pointer to point to the
-    /// current ECS World so C# scripts can access entity/component data.
-    fn update_ffi_world_ptr(&self) {
-        let ptr = self
-            .world
-            .as_ref()
-            .map(|w| w as *const World as *mut std::ffi::c_void)
-            .unwrap_or(std::ptr::null_mut());
-        ffi_init::initialise(ptr);
+    /// Execute a closure with immutable access to the active ECS world.
+    pub fn with_world<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&World) -> R,
+    {
+        self.world_slot.with_world(f)
     }
 
-    /// Access the ECS world (immutable).
-    pub fn world(&self) -> Option<&World> {
-        self.world.as_ref()
+    /// Execute a closure with mutable access to the active ECS world.
+    pub fn with_world_mut<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut World) -> R,
+    {
+        self.world_slot.with_world_mut(f)
     }
 
-    /// Access the ECS world (mutable).
-    pub fn world_mut(&mut self) -> Option<&mut World> {
-        self.world.as_mut()
+    /// Returns `true` when an ECS world is loaded.
+    pub fn has_world(&self) -> bool {
+        self.world_slot.has_world()
     }
 
     /// Mutable access to the renderer for backend configuration and mesh uploads.
@@ -173,23 +314,34 @@ impl EngineRuntime {
             script_engine_state: format!(
                 "{} coroutines={}",
                 script_engine_state_summary(&self.script_engine),
-                self.coroutines.active_count(),
+                engine_ffi::coroutine::active_managed_coroutine_count(),
             ),
             #[cfg(not(feature = "subsystem-scripting-csharp"))]
-            script_engine_state: format!("coroutines={}", self.coroutines.active_count()),
+            script_engine_state: format!(
+                "coroutines={}",
+                engine_ffi::coroutine::active_managed_coroutine_count()
+            ),
         }
     }
 
     /// Render one frame and record GPU statistics into the diagnostics collector.
     ///
-    /// When a World is loaded (via `load_scene_to_world`), extraction reads
-    /// transforms from ECS components so objects render at their correct
-    /// position. Falls back to Scene-based extraction when no World is present.
+    /// Extraction reads transforms from the active ECS World so objects render
+    /// at their correct position. A retained Scene snapshot without a World is
+    /// rejected instead of silently rendering identity transforms.
     pub fn render_frame(&mut self, frame_index: u64) -> Result<FrameStats, Vec<Diagnostic>> {
-        let input = if let Some(ref world) = self.world {
-            extract_renderer_input_from_world(world, frame_index)?
-        } else if let Some(ref scene) = self.scene {
-            engine_scene::extract_renderer_input(scene, frame_index)?
+        let input = if let Some(result) = self
+            .world_slot
+            .with_world(|world| extract_renderer_input_from_world(world, frame_index))
+        {
+            result?
+        } else if self.scene.is_some() {
+            return Err(vec![Diagnostic::new(
+                "SC0019",
+                DiagnosticSeverity::Error,
+                "engine-core",
+                "a scene snapshot exists without an active World; reload it through load_scene",
+            )]);
         } else {
             return Err(vec![Diagnostic::new(
                 "SC0018",
@@ -247,10 +399,14 @@ impl EngineRuntime {
 
     /// Tick all scripts — call this each frame before `render_frame`.
     ///
-    /// Dispatches `OnStart`/`OnUpdate(dt)` on every active script instance
-    /// and pushes any resulting diagnostics into the collector.
+    /// Dispatches completed async callbacks, advances native coroutine state,
+    /// then calls `OnStart`/`OnUpdate(dt)` on every active script instance.
+    /// Resulting script diagnostics are pushed into the collector.
     #[cfg(feature = "subsystem-scripting-csharp")]
     pub fn tick_scripts(&mut self, dt: f32) {
+        engine_ffi::world_bridge::activate_coroutine_runtime(&self.world_slot);
+        engine_ffi::r#async::dispatch_main_thread_callbacks();
+        engine_ffi::coroutine::tick_managed_coroutines(dt);
         let diags = self.script_engine.update(dt);
         self.collector.push_script_diags(diags);
     }
@@ -292,6 +448,63 @@ impl EngineRuntime {
     }
 }
 
+fn scene_load_diagnostic(diagnostic: SceneLoadDiagnostic) -> Diagnostic {
+    let (code, entity_id, component_type_id, storage_type_id) = match &diagnostic {
+        SceneLoadDiagnostic::UnknownComponent {
+            entity_id,
+            component_type_id,
+        } => ("SC0030", entity_id, component_type_id, None),
+        SceneLoadDiagnostic::MissingDeserializeHook {
+            entity_id,
+            component_type_id,
+        } => ("SC0031", entity_id, component_type_id, None),
+        SceneLoadDiagnostic::StorageFactoryTypeMismatch {
+            entity_id,
+            component_type_id,
+            storage_type_id,
+        } => (
+            "SC0032",
+            entity_id,
+            component_type_id,
+            Some(storage_type_id),
+        ),
+        SceneLoadDiagnostic::StorageInsertTypeMismatch {
+            entity_id,
+            component_type_id,
+        } => ("SC0033", entity_id, component_type_id, None),
+    };
+
+    let mut mapped = Diagnostic::new(
+        code,
+        DiagnosticSeverity::Error,
+        "engine-core.scene-loader",
+        diagnostic.to_string(),
+    )
+    .entity(entity_id.clone())
+    .path(format!(
+        "entities[{entity_id}].components[{component_type_id}]"
+    ));
+    mapped
+        .fields
+        .insert("component_type_id".to_string(), component_type_id.clone());
+    if let Some(storage_type_id) = storage_type_id {
+        mapped
+            .fields
+            .insert("storage_type_id".to_string(), storage_type_id.clone());
+    }
+    mapped
+}
+
+impl Drop for EngineRuntime {
+    fn drop(&mut self) {
+        // Only clear the process-wide binding when this runtime is still the
+        // active one. A newer runtime must remain connected.
+        engine_ffi::world_bridge::deactivate_world(&self.world_slot);
+        engine_ffi::world_bridge::deactivate_coroutine_runtime(&self.world_slot);
+        self.world_slot.clear();
+    }
+}
+
 // ── Backend factory (feature-gated) ─────────────────────────────────────
 
 /// Create a Vulkan backend renderer from raw window handles.
@@ -318,14 +531,107 @@ pub fn create_vulkan_backend_renderer(
         cache_dir,
     )
     .map_err(|e| format!("VulkanDevice creation failed: {e}"))?;
-    Ok(Box::new(
-        render_vulkan::scene_renderer::SceneRenderer::new(device, width, height),
-    ))
+    Ok(Box::new(render_vulkan::scene_renderer::SceneRenderer::new(
+        device, width, height,
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static FFI_WORLD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial_ffi_world_test() -> std::sync::MutexGuard<'static, ()> {
+        FFI_WORLD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn insert_empty_component(scene: &mut Scene, type_id: &str) -> String {
+        let entity = scene.entities.first_mut().expect("sample scene entity");
+        entity.components.insert(
+            type_id.to_string(),
+            engine_scene::ComponentRecord {
+                schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: std::collections::BTreeMap::new(),
+            },
+        );
+        entity.persistent_id.clone()
+    }
+
+    struct AOnlyComponent;
+
+    struct BOnlyComponent;
+
+    impl engine_scene::Component for AOnlyComponent {
+        const TYPE_ID: &'static str = "test.a_only";
+    }
+
+    impl engine_scene::Component for BOnlyComponent {
+        const TYPE_ID: &'static str = "test.b_only";
+    }
+
+    fn a_only_storage() -> Box<dyn engine_scene::ComponentStorageDyn> {
+        Box::new(engine_scene::SparseSet::<AOnlyComponent>::new())
+    }
+
+    fn b_only_storage() -> Box<dyn engine_scene::ComponentStorageDyn> {
+        Box::new(engine_scene::SparseSet::<BOnlyComponent>::new())
+    }
+
+    fn serialize_a_only(
+        _component: &dyn std::any::Any,
+    ) -> std::collections::BTreeMap<String, engine_serialize::Value> {
+        std::collections::BTreeMap::new()
+    }
+
+    fn deserialize_a_only(
+        _fields: &std::collections::BTreeMap<String, engine_serialize::Value>,
+    ) -> Box<dyn std::any::Any> {
+        Box::new(AOnlyComponent)
+    }
+
+    fn deserialize_b_only(
+        _fields: &std::collections::BTreeMap<String, engine_serialize::Value>,
+    ) -> Box<dyn std::any::Any> {
+        Box::new(BOnlyComponent)
+    }
+
+    fn register_a_only(registry: &mut ComponentRegistry) {
+        registry
+            .register(engine_scene::ComponentExtension {
+                meta: engine_scene::ComponentMeta {
+                    type_id: <AOnlyComponent as engine_scene::Component>::TYPE_ID,
+                    display_name: "A Only",
+                    schema_version: (0, 1, 0),
+                    has_editor: false,
+                    has_script_binding: true,
+                },
+                storage_factory: a_only_storage,
+                serialize: Some(serialize_a_only),
+                deserialize: Some(deserialize_a_only),
+            })
+            .expect("register A-only test extension");
+    }
+
+    fn register_b_only(registry: &mut ComponentRegistry) {
+        registry
+            .register(engine_scene::ComponentExtension {
+                meta: engine_scene::ComponentMeta {
+                    type_id: <BOnlyComponent as engine_scene::Component>::TYPE_ID,
+                    display_name: "B Only",
+                    schema_version: (0, 1, 0),
+                    has_editor: false,
+                    has_script_binding: true,
+                },
+                storage_factory: b_only_storage,
+                serialize: Some(serialize_a_only),
+                deserialize: Some(deserialize_b_only),
+            })
+            .expect("register B-only test extension");
+    }
 
     // ── EngineConfig tests ───────────────────────────────────────────────
 
@@ -370,6 +676,122 @@ mod tests {
     }
 
     #[test]
+    fn runtime_builder_registers_character_extensions_by_default() {
+        let builder = EngineRuntimeBuilder::default();
+        assert!(builder
+            .component_registry()
+            .is_registered("engine.character_controller"));
+    }
+
+    #[cfg(feature = "gameplay")]
+    #[test]
+    fn runtime_builder_registers_physics_extensions_with_gameplay() {
+        let builder = EngineRuntimeBuilder::default();
+        assert!(builder
+            .component_registry()
+            .is_registered("engine.physics.rigid_body"));
+        assert!(builder
+            .component_registry()
+            .is_registered("engine.physics.collider"));
+        assert!(builder
+            .component_registry()
+            .is_registered("engine.physics.physics_material"));
+    }
+
+    #[test]
+    fn runtime_builder_exposes_registry_before_build() {
+        let mut builder = EngineRuntimeBuilder::default();
+        register_a_only(builder.component_registry_mut());
+        assert!(builder.component_registry().is_registered("test.a_only"));
+    }
+
+    #[test]
+    fn ffi_component_table_changes_only_when_a_runtime_activates() {
+        let _guard = serial_ffi_world_test();
+        let mut builder = EngineRuntimeBuilder::default();
+        register_a_only(builder.component_registry_mut());
+        let mut runtime_a = builder.build();
+        runtime_a.set_world(World::new());
+
+        let a_only = engine_ffi::component::lookup_component_type("A Only")
+            .expect("A-only extension should be exposed while A is active");
+        assert_eq!(
+            engine_ffi::component::lookup_engine_type_id(a_only),
+            Some("test.a_only")
+        );
+        let character = engine_ffi::component::lookup_component_type("Character Controller")
+            .expect("character extension should be exposed to FFI");
+        assert_eq!(
+            engine_ffi::component::lookup_engine_type_id(character),
+            Some("engine.character_controller")
+        );
+
+        // Merely constructing B must not mutate A's active type table.
+        let mut runtime_b = EngineRuntime::new(EngineConfig::default());
+        assert!(engine_ffi::component::lookup_component_type("A Only").is_some());
+
+        // Activating B atomically replaces both the slot and type table.
+        runtime_b.set_world(World::new());
+        assert!(engine_ffi::component::lookup_component_type("A Only").is_none());
+        assert!(engine_ffi::component::lookup_component_type("Character Controller").is_some());
+
+        // Core metadata currently has no serialise/deserialise hooks, so it
+        // must not be advertised as an FFI-readable component.
+        assert!(engine_ffi::component::lookup_component_type("Transform").is_none());
+    }
+
+    #[test]
+    fn ffi_component_ids_are_stable_across_active_registry_order_and_membership() {
+        let _guard = serial_ffi_world_test();
+        let mut first_builder = EngineRuntimeBuilder::default();
+        register_a_only(first_builder.component_registry_mut());
+        register_b_only(first_builder.component_registry_mut());
+        let mut first = first_builder.build();
+        first.set_world(World::new());
+        let a_id = engine_ffi::component::lookup_component_type("A Only").expect("A ID");
+        let b_id = engine_ffi::component::lookup_component_type("B Only").expect("B ID");
+
+        let mut reordered_builder = EngineRuntimeBuilder::default();
+        register_b_only(reordered_builder.component_registry_mut());
+        register_a_only(reordered_builder.component_registry_mut());
+        let mut reordered = reordered_builder.build();
+        reordered.set_world(World::new());
+        assert_eq!(
+            engine_ffi::component::lookup_component_type("A Only"),
+            Some(a_id)
+        );
+        assert_eq!(
+            engine_ffi::component::lookup_component_type("B Only"),
+            Some(b_id)
+        );
+
+        let mut b_only_builder = EngineRuntimeBuilder::default();
+        register_b_only(b_only_builder.component_registry_mut());
+        let mut b_only = b_only_builder.build();
+        b_only.set_world(World::new());
+        assert!(engine_ffi::component::lookup_component_type("A Only").is_none());
+        assert!(engine_ffi::component::lookup_engine_type_id(a_id).is_none());
+        assert_eq!(
+            engine_ffi::component::lookup_engine_type_id(b_id),
+            Some("test.b_only")
+        );
+    }
+
+    #[cfg(feature = "gameplay")]
+    #[test]
+    fn gameplay_physics_extensions_are_exposed_to_ffi() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::new());
+        let rigid_body = engine_ffi::component::lookup_component_type("RigidBody")
+            .expect("physics extension should be exposed to FFI");
+        assert_eq!(
+            engine_ffi::component::lookup_engine_type_id(rigid_body),
+            Some("engine.physics.rigid_body")
+        );
+    }
+
+    #[test]
     fn engine_runtime_config_accessor() {
         let config = EngineConfig::default();
         let runtime = EngineRuntime::new(config);
@@ -405,7 +827,240 @@ mod tests {
         assert!(rd.reload_queue.is_none());
     }
 
+    #[test]
+    fn strict_scene_load_installs_the_runtime_registry() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        let runtime_registry = std::sync::Arc::clone(runtime.component_registry());
+
+        runtime
+            .load_scene_to_world(engine_scene::sample_scene())
+            .expect("sample scene should load");
+
+        assert_eq!(
+            runtime.with_world(|world| {
+                std::sync::Arc::ptr_eq(
+                    world.component_registry().expect("world registry"),
+                    &runtime_registry,
+                )
+            }),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unknown_component_failure_keeps_active_world_and_scene() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        let mut old_world = World::new();
+        old_world.create_entity();
+        runtime.set_world(old_world);
+        let old_scene = runtime.scene_ref().cloned().expect("old scene snapshot");
+
+        let mut invalid_scene = engine_scene::sample_scene();
+        let entity_id = insert_empty_component(&mut invalid_scene, "third.party.missing");
+        let diagnostics = runtime
+            .load_scene_to_world(invalid_scene)
+            .expect_err("unknown component must fail strict loading");
+
+        assert_eq!(runtime.with_world(World::alive_count), Some(1));
+        assert_eq!(runtime.scene_ref(), Some(&old_scene));
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "SC0030")
+            .expect("mapped unknown-component diagnostic");
+        assert_eq!(diagnostic.entity.as_deref(), Some(entity_id.as_str()));
+        assert_eq!(
+            diagnostic
+                .fields
+                .get("component_type_id")
+                .map(String::as_str),
+            Some("third.party.missing")
+        );
+        assert_eq!(
+            diagnostic.path.as_deref(),
+            Some(format!("entities[{entity_id}].components[third.party.missing]").as_str())
+        );
+
+        // The process-wide FFI bridge must still target the previous World.
+        let spawned = engine_ffi::world_bridge::entity_spawn();
+        assert_ne!(spawned, engine_ffi::types::FfiEntityId::INVALID);
+        assert_eq!(runtime.with_world(World::alive_count), Some(2));
+    }
+
+    #[test]
+    fn validation_failures_keep_active_world_and_scene() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        let mut old_world = World::new();
+        old_world.create_entity();
+        runtime.set_world(old_world);
+        let old_scene = runtime.scene_ref().cloned().expect("old scene snapshot");
+
+        let mut duplicate = engine_scene::sample_scene();
+        duplicate.entities.push(duplicate.entities[0].clone());
+        let duplicate_diagnostics = runtime
+            .load_scene_to_world(duplicate)
+            .expect_err("duplicate entity must fail validation");
+        assert!(duplicate_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SC0015"));
+        assert_eq!(runtime.with_world(World::alive_count), Some(1));
+        assert_eq!(runtime.scene_ref(), Some(&old_scene));
+
+        let mut missing_parent = engine_scene::sample_scene();
+        let mut orphan = missing_parent.entities[0].clone();
+        orphan.persistent_id = "orphan".to_string();
+        orphan.parent = Some("missing-parent".to_string());
+        missing_parent.entities.push(orphan);
+        let parent_diagnostics = runtime
+            .load_scene_to_world(missing_parent)
+            .expect_err("missing parent must fail validation");
+        assert!(parent_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SC0016"));
+        assert_eq!(runtime.with_world(World::alive_count), Some(1));
+        assert_eq!(runtime.scene_ref(), Some(&old_scene));
+    }
+
+    #[test]
+    fn set_world_installs_runtime_registry_when_missing() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        let runtime_registry = std::sync::Arc::clone(runtime.component_registry());
+
+        runtime.set_world(World::new());
+
+        assert_eq!(
+            runtime.with_world(|world| {
+                std::sync::Arc::ptr_eq(
+                    world.component_registry().expect("world registry"),
+                    &runtime_registry,
+                )
+            }),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn set_world_preserves_an_existing_registry() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        let mut custom_registry = ComponentRegistry::new();
+        register_a_only(&mut custom_registry);
+        let custom_registry = std::sync::Arc::new(custom_registry);
+        let mut world = World::new();
+        world.set_shared_component_registry(std::sync::Arc::clone(&custom_registry));
+
+        runtime.set_world(world);
+
+        assert_eq!(
+            runtime.with_world(|world| {
+                std::sync::Arc::ptr_eq(
+                    world.component_registry().expect("world registry"),
+                    &custom_registry,
+                )
+            }),
+            Some(true)
+        );
+        assert!(engine_ffi::component::lookup_component_type("A Only").is_some());
+        assert!(engine_ffi::component::lookup_component_type("Character Controller").is_none());
+    }
+
+    #[test]
+    fn engine_runtime_can_replace_the_active_world_repeatedly() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+
+        let mut first = World::new();
+        first.create_entity();
+        runtime.set_world(first);
+
+        runtime.set_world(World::new());
+        let spawned = engine_ffi::world_bridge::entity_spawn();
+        assert_ne!(spawned, engine_ffi::types::FfiEntityId::INVALID);
+        assert_eq!(runtime.with_world(World::alive_count), Some(1));
+    }
+
+    #[test]
+    fn moving_runtime_keeps_ffi_world_binding_valid() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::new());
+
+        let mut runtimes = vec![runtime];
+        let moved_runtime = runtimes.pop().expect("moved runtime");
+
+        let spawned = engine_ffi::world_bridge::entity_spawn();
+        assert_ne!(spawned, engine_ffi::types::FfiEntityId::INVALID);
+        assert_eq!(moved_runtime.with_world(World::alive_count), Some(1));
+    }
+
+    #[test]
+    fn dropping_runtime_makes_its_ffi_world_unavailable() {
+        let _guard = serial_ffi_world_test();
+        {
+            let mut runtime = EngineRuntime::new(EngineConfig::default());
+            runtime.set_world(World::new());
+        }
+
+        assert_eq!(
+            engine_ffi::world_bridge::entity_spawn(),
+            engine_ffi::types::FfiEntityId::INVALID
+        );
+    }
+
+    #[test]
+    fn dropping_old_runtime_does_not_deactivate_new_runtime() {
+        let _guard = serial_ffi_world_test();
+        let mut old_runtime = EngineRuntime::new(EngineConfig::default());
+        old_runtime.set_world(World::new());
+        let mut current_runtime = EngineRuntime::new(EngineConfig::default());
+        current_runtime.set_world(World::new());
+
+        drop(old_runtime);
+        let spawned = engine_ffi::world_bridge::entity_spawn();
+        assert_ne!(spawned, engine_ffi::types::FfiEntityId::INVALID);
+        assert_eq!(current_runtime.with_world(World::alive_count), Some(1));
+    }
+
+    #[test]
+    fn compatibility_scene_load_replaces_and_activates_the_world() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::new());
+        runtime
+            .load_scene(engine_scene::sample_scene())
+            .expect("sample scene should load into a World");
+
+        assert!(runtime.has_world());
+        assert_ne!(
+            engine_ffi::world_bridge::entity_spawn(),
+            engine_ffi::types::FfiEntityId::INVALID
+        );
+    }
+
     // ── Script subsystem tests ──────────────────────────────────────────
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn in_process_csharp_bridge_installs_the_native_cdylib() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::new());
+
+        runtime
+            .install_in_process_csharp_ffi()
+            .expect("matching engine_ffi cdylib should install");
+
+        let path =
+            engine_ffi::host_bridge::loaded_cdylib_path().expect("installed native library path");
+        assert!(path.exists());
+        assert_eq!(
+            std::env::var("ENGINE_FFI_HOST_PID").ok(),
+            Some(std::process::id().to_string())
+        );
+    }
 
     #[cfg(feature = "subsystem-scripting-csharp")]
     #[test]
@@ -433,6 +1088,7 @@ mod tests {
     #[cfg(feature = "subsystem-scripting-csharp")]
     #[test]
     fn engine_runtime_load_scene_with_scripts() {
+        let _guard = serial_ffi_world_test();
         use engine_scene::ComponentRecord;
         use engine_script::MockHost;
         use engine_serialize::SchemaVersion;
@@ -488,7 +1144,9 @@ mod tests {
             .unwrap();
 
         // Load scene — should attach scripts
-        runtime.load_scene(scene);
+        runtime
+            .load_scene_to_world(scene)
+            .expect("engine.script metadata should be allowed");
 
         // After load_scene, the script engine should have an instance
         assert_eq!(runtime.script_engine.host_count(), 1);
@@ -497,5 +1155,28 @@ mod tests {
 
         // Tick should not produce errors
         runtime.tick_scripts(0.016);
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn script_feature_does_not_ignore_other_unknown_component_types() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        let mut scene = engine_scene::sample_scene();
+        insert_empty_component(&mut scene, "engine.script::assembly");
+
+        let diagnostics = runtime
+            .load_scene_to_world(scene)
+            .expect_err("only the exact engine.script type is scene-only");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "SC0030"
+                && diagnostic
+                    .fields
+                    .get("component_type_id")
+                    .is_some_and(|type_id| type_id == "engine.script::assembly")
+        }));
+        assert!(!runtime.has_world());
+        assert!(runtime.scene_ref().is_none());
     }
 }

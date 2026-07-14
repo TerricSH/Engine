@@ -214,7 +214,14 @@ impl VulkanDevice {
         if let Some(mdl) = self.material_desc_set_layout {
             set_layouts.push(mdl);
         }
-        let pli = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        let push_constant_ranges = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::VERTEX,
+            offset: 0,
+            size: 128,
+        }];
+        let pli = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant_ranges);
         // SAFETY: `d` is a valid AshDevice; `pli` describes a valid layout.
         let pll = unsafe { d.create_pipeline_layout(&pli, None) }
             .map_err(|r| VulkanError::vk("cpl_hdr_forward", r))?;
@@ -347,17 +354,22 @@ impl VulkanDevice {
         if self.tone_rp.is_some() {
             return Ok(());
         }
+        let swapchain_format = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::Loader("no swapchain".into()))?
+            .format;
         let d = &self.logical_device.device;
 
         // ---- Tone-mapping render pass (color = BGRA8 only, no depth) ----
         let at = vk::AttachmentDescription::default()
-            .format(vk::Format::B8G8R8A8_UNORM)
+            .format(swapchain_format)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::LOAD)
+            .load_op(vk::AttachmentLoadOp::DONT_CARE)
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
         let cr = vk::AttachmentReference::default()
             .attachment(0)
@@ -371,7 +383,7 @@ impl VulkanDevice {
         let dep = vk::SubpassDependency::default()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_stage_mask(vk::PipelineStageFlags::TOP_OF_PIPE)
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
         let deps = [dep];

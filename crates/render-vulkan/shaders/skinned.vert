@@ -19,8 +19,13 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 light_dir;
     vec4 light_color;
     vec4 camera_pos;
-    mat4 light_view_proj;
+    vec4 cascade_splits;
+    mat4 light_vp[3];
 } ubo;
+
+layout(push_constant) uniform DrawPush {
+    mat4 model;
+} draw;
 
 // Bone palette — uploaded per skinned drawable (max 64 bones, 64 B each = 4096 B).
 layout(set = 2, binding = 2) uniform BoneUBO {
@@ -39,11 +44,12 @@ void main() {
                   + in_weights.w * bone_ubo.bones[in_joints.w];
 
     // Transform vertex position into world space via the skinning matrix.
-    vec4 world_pos = skin_mat * vec4(in_position, 1.0);
+    mat4 model_skin = draw.model * skin_mat;
+    vec4 world_pos = model_skin * vec4(in_position, 1.0);
     v_world_pos = world_pos.xyz;
 
     // Transform normal (assumes uniform scale — no inverse-transpose needed).
-    v_normal = normalize(mat3(skin_mat) * in_normal);
+    v_normal = normalize(mat3(model_skin) * in_normal);
 
     v_uv = in_uv;
 

@@ -27,6 +27,7 @@ engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
 engine-serialize = { path = "../engine-serialize" }
 glam.workspace = true
+gltf.workspace = true
 render-core = { path = "../render-core" }
 platform = { path = "../platform" }
 raw-window-handle.workspace = true
@@ -35,3 +36,4 @@ render-opengl = { path = "../render-opengl", optional = true }
 render-dx12 = { path = "../render-dx12", optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+sha2.workspace = true

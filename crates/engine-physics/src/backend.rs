@@ -50,6 +50,18 @@ pub(crate) fn to_rapier_shared_shape(shape: &ColliderShape) -> SharedShape {
     }
 }
 
+type EntityPair = (Entity, Entity);
+
+fn canonical_entity_pair(a: Entity, b: Entity) -> EntityPair {
+    let a_key = (a.index(), a.generation());
+    let b_key = (b.index(), b.generation());
+    if a_key <= b_key {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 // ── Internal event handler ──────────────────────────────────────────────────
 
 /// Internal data for a collision (non-trigger) event.
@@ -120,8 +132,9 @@ impl EventHandler for BackendEventHandler {
 
 /// Rapier 3D physics backend adapter.
 ///
-/// Owns all Rapier simulation state and maintains maps from entity indices
-/// to Rapier handles.  Backend handles are NEVER serialised or exposed in
+/// Owns all Rapier simulation state and maintains maps from complete entity
+/// handles (index plus generation) to Rapier handles. Backend handles are
+/// NEVER serialised or exposed in
 /// ECS components — they are purely internal to this adapter.
 pub struct RapierBackend {
     pub(crate) pipeline: PhysicsPipeline,
@@ -136,14 +149,15 @@ pub struct RapierBackend {
     pub(crate) multibody_joints: MultibodyJointSet,
     pub(crate) ccd_solver: CCDSolver,
     pub(crate) query_pipeline: QueryPipeline,
+    query_pipeline_dirty: bool,
 
-    /// Maps entity index → Rapier rigid body handle.
-    pub(crate) body_map: HashMap<u32, RigidBodyHandle>,
-    /// Maps entity index → (Rapier collider handle, original shape).
-    pub(crate) collider_map: HashMap<u32, (ColliderHandle, ColliderShape)>,
+    /// Maps complete entity handles to Rapier rigid body handles.
+    pub(crate) body_map: HashMap<Entity, RigidBodyHandle>,
+    /// Maps complete entity handles to Rapier collider handles and shapes.
+    pub(crate) collider_map: HashMap<Entity, (ColliderHandle, ColliderShape)>,
 
-    /// Maps entity index → joint handle (tracking which entities have joints).
-    pub(crate) joint_entity_map: HashMap<u32, u32>,
+    /// Maps complete entity handles to all attached joint handles.
+    pub(crate) joint_entity_map: HashMap<Entity, HashSet<u32>>,
     /// Maps our JointHandle.0 → full Rapier ImpulseJointHandle (with generation).
     pub(crate) joint_handle_lookup: HashMap<u32, ImpulseJointHandle>,
     /// Auto-incrementing counter for JointHandle IDs.
@@ -151,13 +165,13 @@ pub struct RapierBackend {
 
     /// Active sensor (trigger) overlaps from the previous frame.
     /// Used to derive Entered vs Stay [`TriggerEvent`]s.
-    /// Keys are sorted `(entity_index, entity_index)` — smaller index first.
-    active_sensor_overlaps: HashSet<(u32, u32)>,
+    /// Keys are canonical pairs of complete entity handles.
+    active_sensor_overlaps: HashSet<EntityPair>,
 
     /// Active non‑sensor collision pairs from the previous frame.
     /// Used to derive [`CollisionEventKind::ContactStaying`].
-    /// Keys are sorted `(entity_index, entity_index)`.
-    active_collision_overlaps: HashSet<(u32, u32)>,
+    /// Keys are canonical pairs of complete entity handles.
+    active_collision_overlaps: HashSet<EntityPair>,
 }
 
 impl RapierBackend {
@@ -176,6 +190,7 @@ impl RapierBackend {
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
             query_pipeline: QueryPipeline::new(),
+            query_pipeline_dirty: false,
             body_map: HashMap::new(),
             collider_map: HashMap::new(),
             joint_entity_map: HashMap::new(),
@@ -212,17 +227,13 @@ impl RapierBackend {
 
         // ── Build reverse collider → entity map ──────────────────────────
         let mut collider_to_entity = HashMap::new();
-        for (&entity_idx, &(ch, _)) in &self.collider_map {
-            collider_to_entity.insert(ch, entity_idx);
+        for (&entity, &(ch, _)) in &self.collider_map {
+            collider_to_entity.insert(ch, entity);
         }
 
         // ── Resolve collider handle → entity helper ──────────────────────
-        let resolve = |handle: ColliderHandle| -> Option<Entity> {
-            collider_to_entity
-                .get(&handle)
-                .copied()
-                .map(|i| Entity::new(i, 0))
-        };
+        let resolve =
+            |handle: ColliderHandle| -> Option<Entity> { collider_to_entity.get(&handle).copied() };
 
         // ── 1. Collect collision (non-trigger) events ─────────────────────
         let mut collisions = Vec::new();
@@ -252,13 +263,11 @@ impl RapierBackend {
         //      pairs that were already active last frame.
 
         let mut triggers = Vec::new();
-        let mut event_overlaps: HashSet<(u32, u32)> = HashSet::new();
+        let mut event_overlaps: HashSet<EntityPair> = HashSet::new();
 
-        // Helper: build a canonical entity-index key.
-        let entity_key = |c1: ColliderHandle, c2: ColliderHandle| -> Option<(u32, u32)> {
-            let ea = resolve(c1)?.index();
-            let eb = resolve(c2)?.index();
-            Some(if ea < eb { (ea, eb) } else { (eb, ea) })
+        // Helper: build a canonical complete-entity key.
+        let entity_key = |c1: ColliderHandle, c2: ColliderHandle| -> Option<EntityPair> {
+            Some(canonical_entity_pair(resolve(c1)?, resolve(c2)?))
         };
 
         // ── 2a. Process intersection events from the channel ────────────
@@ -304,8 +313,8 @@ impl RapierBackend {
         // Rapier's NarrowPhase tracks ALL active contact and intersection
         // pairs after a step — read them directly instead of doing O(n)
         // per-collider query pipeline scans.
-        let mut full_overlaps: HashSet<(u32, u32)> = HashSet::new();
-        let mut collision_overlaps: HashSet<(u32, u32)> = HashSet::new();
+        let mut full_overlaps: HashSet<EntityPair> = HashSet::new();
+        let mut collision_overlaps: HashSet<EntityPair> = HashSet::new();
 
         // Read all active intersection (sensor) pairs.
         // Rapier returns (ColliderHandle, ColliderHandle, intersecting: bool).
@@ -316,8 +325,7 @@ impl RapierBackend {
             let Some(&e2) = collider_to_entity.get(&c2) else {
                 continue;
             };
-            let key = if e1 < e2 { (e1, e2) } else { (e2, e1) };
-            full_overlaps.insert(key);
+            full_overlaps.insert(canonical_entity_pair(e1, e2));
         }
 
         // Read all active contact (non-sensor) pairs.
@@ -328,8 +336,7 @@ impl RapierBackend {
             let Some(&e2) = collider_to_entity.get(&pair.collider2) else {
                 continue;
             };
-            let key = if e1 < e2 { (e1, e2) } else { (e2, e1) };
-            collision_overlaps.insert(key);
+            collision_overlaps.insert(canonical_entity_pair(e1, e2));
         }
 
         // Generate Stay for sensor overlaps that persisted from last frame
@@ -338,8 +345,8 @@ impl RapierBackend {
             if self.active_sensor_overlaps.contains(&key) && !event_overlaps.contains(&key) {
                 triggers.push(TriggerEvent {
                     kind: TriggerEventKind::Stay,
-                    entity_a: Entity::new(key.0, 0),
-                    entity_b: Entity::new(key.1, 0),
+                    entity_a: key.0,
+                    entity_b: key.1,
                 });
             }
         }
@@ -351,13 +358,14 @@ impl RapierBackend {
             if self.active_collision_overlaps.contains(&key) {
                 collisions.push(CollisionEvent {
                     kind: CollisionEventKind::ContactStaying,
-                    entity_a: Entity::new(key.0, 0),
-                    entity_b: Entity::new(key.1, 0),
+                    entity_a: key.0,
+                    entity_b: key.1,
                 });
             }
         }
 
         self.active_collision_overlaps = collision_overlaps;
+        self.query_pipeline_dirty = false;
 
         PhysicsEvents {
             collisions,
@@ -370,14 +378,54 @@ impl RapierBackend {
     /// Create a rigid body for the given entity, returning the body count.
     pub fn create_body(
         &mut self,
-        entity_index: u32,
+        entity: Entity,
         body: &RigidBody,
         transform: &Transform,
     ) -> usize {
-        if self.body_map.contains_key(&entity_index) {
+        if self.body_map.contains_key(&entity) {
             return self.bodies.len();
         }
 
+        // This low-level public API has no World from which it can prove which
+        // generation is current. Reject a conflicting slot instead of letting
+        // a delayed stale call replace live state (including across wrapping).
+        if self
+            .body_map
+            .keys()
+            .any(|stored| stored.index() == entity.index())
+        {
+            return self.bodies.len();
+        }
+
+        self.insert_body(entity, body, transform)
+    }
+
+    /// Replace any previous generation in this slot with a World-validated
+    /// current entity.
+    pub(crate) fn replace_body_for_current_entity(
+        &mut self,
+        entity: Entity,
+        body: &RigidBody,
+        transform: &Transform,
+    ) -> usize {
+        if self.body_map.contains_key(&entity) {
+            return self.bodies.len();
+        }
+
+        let stale_entities: Vec<Entity> = self
+            .body_map
+            .keys()
+            .copied()
+            .filter(|stored| stored.index() == entity.index())
+            .collect();
+        for stale in stale_entities {
+            self.remove_body(stale);
+        }
+
+        self.insert_body(entity, body, transform)
+    }
+
+    fn insert_body(&mut self, entity: Entity, body: &RigidBody, transform: &Transform) -> usize {
         let iso = to_rapier_isometry(transform.translation, transform.rotation);
 
         let builder = match body.body_type {
@@ -398,22 +446,68 @@ impl RapierBackend {
             .build();
 
         let handle = self.bodies.insert(rapier_body);
-        self.body_map.insert(entity_index, handle);
+        self.body_map.insert(entity, handle);
         self.bodies.len()
     }
 
     /// Create a collider and attach it to the body of the given entity.
     pub fn create_collider(
         &mut self,
-        entity_index: u32,
+        entity: Entity,
         collider: &Collider,
-        body_entity: u32,
+        body_entity: Entity,
         material: Option<&crate::PhysicsMaterial>,
     ) {
-        if self.collider_map.contains_key(&entity_index) {
+        if self.collider_map.contains_key(&entity) {
             return;
         }
 
+        // As with create_body, only an exact free slot may be populated through
+        // the public API. Replacement requires World validation.
+        if self
+            .collider_map
+            .keys()
+            .any(|stored| stored.index() == entity.index())
+        {
+            return;
+        }
+
+        self.insert_collider(entity, collider, body_entity, material);
+    }
+
+    /// Replace any previous generation in this slot with a World-validated
+    /// current entity collider.
+    pub(crate) fn replace_collider_for_current_entity(
+        &mut self,
+        entity: Entity,
+        collider: &Collider,
+        body_entity: Entity,
+        material: Option<&crate::PhysicsMaterial>,
+    ) {
+        if self.collider_map.contains_key(&entity) {
+            return;
+        }
+
+        let stale_entities: Vec<Entity> = self
+            .collider_map
+            .keys()
+            .copied()
+            .filter(|stored| stored.index() == entity.index())
+            .collect();
+        for stale in stale_entities {
+            self.remove_collider(stale);
+        }
+
+        self.insert_collider(entity, collider, body_entity, material);
+    }
+
+    fn insert_collider(
+        &mut self,
+        entity: Entity,
+        collider: &Collider,
+        body_entity: Entity,
+        material: Option<&crate::PhysicsMaterial>,
+    ) {
         let body_handle = match self.body_map.get(&body_entity) {
             Some(&h) => h,
             None => return,
@@ -444,12 +538,23 @@ impl RapierBackend {
                 .insert_with_parent(rapier_collider, body_handle, &mut self.bodies);
 
         self.collider_map
-            .insert(entity_index, (collider_handle, collider.shape.clone()));
+            .insert(entity, (collider_handle, collider.shape.clone()));
+        self.query_pipeline_dirty = true;
     }
 
     /// Remove a rigid body and all its colliders.
-    pub fn remove_body(&mut self, entity_index: u32) {
-        if let Some(handle) = self.body_map.remove(&entity_index) {
+    pub fn remove_body(&mut self, entity: Entity) {
+        if let Some(handle) = self.body_map.remove(&entity) {
+            let attached_colliders: Vec<Entity> = self
+                .collider_map
+                .iter()
+                .filter_map(|(&collider_entity, &(collider_handle, _))| {
+                    self.colliders.get(collider_handle).and_then(|collider| {
+                        (collider.parent() == Some(handle)).then_some(collider_entity)
+                    })
+                })
+                .collect();
+            let removed_colliders = !attached_colliders.is_empty();
             self.bodies.remove(
                 handle,
                 &mut self.islands,
@@ -458,15 +563,35 @@ impl RapierBackend {
                 &mut self.multibody_joints,
                 true,
             );
+            for collider_entity in attached_colliders {
+                self.collider_map.remove(&collider_entity);
+                self.clear_entity_overlaps(collider_entity);
+            }
+            if removed_colliders {
+                self.query_pipeline_dirty = true;
+            }
         }
-        self.collider_map.remove(&entity_index);
+
+        self.clear_entity_overlaps(entity);
 
         // Clean up joint tracking: Rapier's bodies.remove() already removed
         // any joints attached to this body from impulse_joints, so we clean
         // up our own tracking maps to prevent stale handle entries.
-        self.joint_entity_map.remove(&entity_index);
+        self.joint_entity_map.remove(&entity);
         self.joint_handle_lookup
             .retain(|_, rapier_handle| self.impulse_joints.get(*rapier_handle).is_some());
+        let valid_joint_ids: HashSet<u32> = self.joint_handle_lookup.keys().copied().collect();
+        self.joint_entity_map.retain(|_, joint_ids| {
+            joint_ids.retain(|joint_id| valid_joint_ids.contains(joint_id));
+            !joint_ids.is_empty()
+        });
+    }
+
+    fn clear_entity_overlaps(&mut self, entity: Entity) {
+        self.active_sensor_overlaps
+            .retain(|pair| pair.0 != entity && pair.1 != entity);
+        self.active_collision_overlaps
+            .retain(|pair| pair.0 != entity && pair.1 != entity);
     }
 
     // ── Joint management ────────────────────────────────────────────────
@@ -583,8 +708,14 @@ impl RapierBackend {
         self.joint_handle_lookup.insert(our_id, rapier_handle);
 
         // Track entity → joint mapping.
-        self.joint_entity_map.insert(desc.entity_a, our_id);
-        self.joint_entity_map.insert(desc.entity_b, our_id);
+        self.joint_entity_map
+            .entry(desc.entity_a)
+            .or_default()
+            .insert(our_id);
+        self.joint_entity_map
+            .entry(desc.entity_b)
+            .or_default()
+            .insert(our_id);
 
         Some(JointHandle(our_id))
     }
@@ -595,7 +726,10 @@ impl RapierBackend {
             self.impulse_joints.remove(rapier_handle, true);
         }
         // Clean up entity tracking.
-        self.joint_entity_map.retain(|_, v| *v != handle.0);
+        self.joint_entity_map.retain(|_, handles| {
+            handles.remove(&handle.0);
+            !handles.is_empty()
+        });
     }
 
     /// Number of active impulse joints.
@@ -604,25 +738,27 @@ impl RapierBackend {
     }
 
     /// Remove a collider but keep the body.
-    pub fn remove_collider(&mut self, entity_index: u32) {
-        if let Some((handle, _)) = self.collider_map.remove(&entity_index) {
+    pub fn remove_collider(&mut self, entity: Entity) {
+        if let Some((handle, _)) = self.collider_map.remove(&entity) {
             self.colliders
                 .remove(handle, &mut self.islands, &mut self.bodies, true);
+            self.query_pipeline_dirty = true;
         }
+        self.clear_entity_overlaps(entity);
     }
 
     // ── Transform synchronisation ───────────────────────────────────────
 
     /// Read back the world-space transform of a body.
-    pub fn sync_body_transform(&self, entity_index: u32) -> Option<(glam::Vec3, glam::Quat)> {
-        let handle = self.body_map.get(&entity_index)?;
+    pub fn sync_body_transform(&self, entity: Entity) -> Option<(glam::Vec3, glam::Quat)> {
+        let handle = self.body_map.get(&entity)?;
         let body = self.bodies.get(*handle)?;
         Some(from_rapier_isometry(body.position()))
     }
 
     /// Set the world-space transform of a body.
-    pub fn set_body_transform(&mut self, entity_index: u32, pos: glam::Vec3, rot: glam::Quat) {
-        if let Some(&handle) = self.body_map.get(&entity_index) {
+    pub fn set_body_transform(&mut self, entity: Entity, pos: glam::Vec3, rot: glam::Quat) {
+        if let Some(&handle) = self.body_map.get(&entity) {
             if let Some(body) = self.bodies.get_mut(handle) {
                 body.set_position(to_rapier_isometry(pos, rot), true);
             }
@@ -632,8 +768,8 @@ impl RapierBackend {
     // ── Force / impulse ─────────────────────────────────────────────────
 
     /// Apply a force at the centre of mass.
-    pub fn apply_force(&mut self, entity_index: u32, force: glam::Vec3) {
-        if let Some(&handle) = self.body_map.get(&entity_index) {
+    pub fn apply_force(&mut self, entity: Entity, force: glam::Vec3) {
+        if let Some(&handle) = self.body_map.get(&entity) {
             if let Some(body) = self.bodies.get_mut(handle) {
                 body.add_force(to_rapier_vec(force), true);
             }
@@ -641,8 +777,8 @@ impl RapierBackend {
     }
 
     /// Apply an impulse at the centre of mass.
-    pub fn apply_impulse(&mut self, entity_index: u32, impulse: glam::Vec3) {
-        if let Some(&handle) = self.body_map.get(&entity_index) {
+    pub fn apply_impulse(&mut self, entity: Entity, impulse: glam::Vec3) {
+        if let Some(&handle) = self.body_map.get(&entity) {
             if let Some(body) = self.bodies.get_mut(handle) {
                 body.apply_impulse(to_rapier_vec(impulse), true);
             }
@@ -673,17 +809,14 @@ impl RapierBackend {
             filter,
         )?;
 
-        let collider = self.colliders.get(collider_handle)?;
-        let body_handle = collider.parent()?;
-
-        let entity_index = self
-            .body_map
+        let entity = self
+            .collider_map
             .iter()
-            .find(|(_, &h)| h == body_handle)
-            .map(|(&idx, _)| idx)?;
+            .find(|(_, &(handle, _))| handle == collider_handle)
+            .map(|(&entity, _)| entity)?;
 
         Some(RaycastHit {
-            entity: Entity::new(entity_index, 0),
+            entity,
             point: origin + dir * intersection.time_of_impact,
             normal: from_rapier_vec(intersection.normal),
             distance: intersection.time_of_impact,
@@ -707,17 +840,13 @@ impl RapierBackend {
             &*rapier_shape,
             filter,
             |collider_handle| {
-                if let Some(collider) = self.colliders.get(collider_handle) {
-                    if let Some(parent) = collider.parent() {
-                        if let Some(entity_index) = self
-                            .body_map
-                            .iter()
-                            .find(|(_, &h)| h == parent)
-                            .map(|(&i, _)| i)
-                        {
-                            entities.push(Entity::new(entity_index, 0));
-                        }
-                    }
+                if let Some(entity) = self
+                    .collider_map
+                    .iter()
+                    .find(|(_, &(handle, _))| handle == collider_handle)
+                    .map(|(&entity, _)| entity)
+                {
+                    entities.push(entity);
                 }
                 true
             },
@@ -733,10 +862,10 @@ impl RapierBackend {
     pub fn execute_batched_queries(&self, batcher: &QueryBatcher) -> QueryResults {
         use rapier3d::parry::query::details::ShapeCastOptions;
 
-        // Build reverse map: collider handle → entity index for O(1) lookup.
-        let mut col_handle_to_entity: HashMap<ColliderHandle, u32> = HashMap::new();
-        for (&entity_idx, &(ch, _)) in &self.collider_map {
-            col_handle_to_entity.insert(ch, entity_idx);
+        // Build reverse map: collider handle → complete entity for O(1) lookup.
+        let mut col_handle_to_entity: HashMap<ColliderHandle, Entity> = HashMap::new();
+        for (&entity, &(ch, _)) in &self.collider_map {
+            col_handle_to_entity.insert(ch, entity);
         }
 
         let mut all_hits: Vec<Entity> = Vec::new();
@@ -760,8 +889,7 @@ impl RapierBackend {
                 true, // solid
                 filter,
                 |handle, intersection| {
-                    if let Some(&entity_idx) = col_handle_to_entity.get(&handle) {
-                        let entity = Entity::new(entity_idx, 0);
+                    if let Some(&entity) = col_handle_to_entity.get(&handle) {
                         // `RayIntersection` has `time_of_impact`, `normal`, `feature`
                         let toi = intersection.time_of_impact;
                         hits.push(RaycastHitResult {
@@ -799,8 +927,7 @@ impl RapierBackend {
                 &*shape,
                 filter,
                 |handle| {
-                    if let Some(&entity_idx) = col_handle_to_entity.get(&handle) {
-                        let entity = Entity::new(entity_idx, 0);
+                    if let Some(&entity) = col_handle_to_entity.get(&handle) {
                         hits.push(OverlapHitResult { entity });
                         all_hits.push(entity);
                     }
@@ -848,8 +975,7 @@ impl RapierBackend {
                 options,
                 filter,
             ) {
-                if let Some(&entity_idx) = col_handle_to_entity.get(&handle) {
-                    let entity = Entity::new(entity_idx, 0);
+                if let Some(&entity) = col_handle_to_entity.get(&handle) {
                     let point = q.from + glam::Vec3::new(dir.x, dir.y, dir.z) * hit.time_of_impact;
                     hits.push(SweepHitResult {
                         entity,
@@ -873,17 +999,24 @@ impl RapierBackend {
 
     /// Update the query pipeline after structural changes.
     pub fn sync_query_pipeline(&mut self) {
-        self.query_pipeline.update(&self.colliders);
+        if self.query_pipeline_dirty {
+            self.query_pipeline.update(&self.colliders);
+            self.query_pipeline_dirty = false;
+        }
+    }
+
+    pub(crate) fn query_pipeline_is_dirty(&self) -> bool {
+        self.query_pipeline_dirty
     }
 
     /// Check whether an entity has a body registered.
-    pub fn has_body(&self, entity_index: u32) -> bool {
-        self.body_map.contains_key(&entity_index)
+    pub fn has_body(&self, entity: Entity) -> bool {
+        self.body_map.contains_key(&entity)
     }
 
     /// Check whether an entity has a collider registered.
-    pub fn has_collider(&self, entity_index: u32) -> bool {
-        self.collider_map.contains_key(&entity_index)
+    pub fn has_collider(&self, entity: Entity) -> bool {
+        self.collider_map.contains_key(&entity)
     }
 
     /// Return a reference to the bodies set.
@@ -896,8 +1029,8 @@ impl RapierBackend {
         &self.colliders
     }
 
-    /// Return an iterator over all (entity_index, body_handle) pairs.
-    pub fn body_entries(&self) -> impl Iterator<Item = (u32, RigidBodyHandle)> + '_ {
+    /// Return an iterator over all (entity, body_handle) pairs.
+    pub fn body_entries(&self) -> impl Iterator<Item = (Entity, RigidBodyHandle)> + '_ {
         self.body_map.iter().map(|(&k, &v)| (k, v))
     }
 
