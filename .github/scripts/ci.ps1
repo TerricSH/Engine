@@ -10,7 +10,12 @@ param(
         "Fixture",
         "Managed",
         "Shaders",
-        "Release"
+        "Release",
+        "Package",
+        "Repro",
+        "AssetCook",
+        "ProjectWorkflow",
+        "Qa"
     )]
     [string]$Task = "All"
 )
@@ -63,6 +68,18 @@ function Invoke-Clippy {
 }
 
 function Invoke-FeatureCheck {
+    Invoke-Native "engine-core device-free runtime subsystem strict check" "cargo" @(
+        "clippy",
+        "--locked",
+        "-p",
+        "engine-core",
+        "--features",
+        "runtime-subsystems",
+        "--lib",
+        "--",
+        "-D",
+        "warnings"
+    )
     Invoke-Native "sandbox desktop backend feature check" "cargo" @(
         "check",
         "--locked",
@@ -347,6 +364,102 @@ function Invoke-ReleaseBuild {
     )
 }
 
+function Invoke-Package {
+    $packageScript = Join-Path $PSScriptRoot "package-windows.ps1"
+    & $packageScript
+    if (-not $?) {
+        throw "Windows release packaging failed"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Windows release packaging failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-AssetCook {
+    $cookReport = Join-Path $repoRoot "target\ci-asset-cook\report.json"
+    Invoke-Native "strict asset cook and report" "cargo" @(
+        "run",
+        "--locked",
+        "-p",
+        "engine-asset",
+        "--bin",
+        "asset-cook",
+        "--",
+        "--source",
+        (Join-Path $repoRoot "examples\minimal-game\assets\source"),
+        "--output",
+        (Join-Path $repoRoot "target\ci-asset-cook\cooked"),
+        "--report",
+        $cookReport
+    )
+    $report = Get-Content -LiteralPath $cookReport -Raw | ConvertFrom-Json
+    if ($report.schema -ne "AssetCookReport-v0") {
+        throw "Asset cooker emitted an unexpected report schema: $($report.schema)"
+    }
+    if ($report.declared_asset_count -lt 1) {
+        throw "Release cook fixture manifest must declare at least one asset"
+    }
+    if ($report.succeeded_asset_count -ne $report.declared_asset_count) {
+        throw "Asset cook did not produce every declared asset"
+    }
+}
+
+function Invoke-ProjectWorkflow {
+    $workflowRoot = Join-Path $repoRoot ("target\ci-project-workflow\" + [Guid]::NewGuid().ToString("N"))
+    $checkReport = Join-Path $workflowRoot "build\project-check.json"
+    $runReport = Join-Path $workflowRoot "build\project-run.json"
+    Invoke-Native "create game project from an empty path" "cargo" @(
+        "run", "--locked", "-p", "sandbox", "--",
+        "project", "new", $workflowRoot, "--name", "CI Project"
+    )
+    Invoke-Native "validate created game project" "cargo" @(
+        "run", "--locked", "-p", "sandbox", "--",
+        "project", "check", $workflowRoot, "--report", $checkReport
+    )
+    Invoke-Native "run created game project headlessly" "cargo" @(
+        "run", "--locked", "-p", "sandbox", "--",
+        "game", $workflowRoot, "--headless", "--frames", "3", "--report", $runReport
+    )
+    Invoke-Native "cook created game project assets" "cargo" @(
+        "run", "--locked", "-p", "sandbox", "--",
+        "project", "cook", $workflowRoot
+    )
+    $check = Get-Content -LiteralPath $checkReport -Raw | ConvertFrom-Json
+    $run = Get-Content -LiteralPath $runReport -Raw | ConvertFrom-Json
+    if ($check.schema -ne "ProjectCheckReport-v0" -or -not $check.passed) {
+        throw "Created game project did not pass validation"
+    }
+    if (
+        $run.schema -ne "ProjectRunReport-v0" -or
+        -not $run.passed -or
+        [long]$run.total_draw_calls -lt 1
+    ) {
+        throw "Created game project did not produce a valid runtime frame"
+    }
+}
+
+function Invoke-Reproducibility {
+    $reproScript = Join-Path $PSScriptRoot "verify-package-reproducibility.ps1"
+    & $reproScript -Version "ci-reproducibility"
+    if (-not $?) {
+        throw "Independent package reproducibility verification failed"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Independent package reproducibility verification failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Invoke-Qa {
+    $qaScript = Join-Path $PSScriptRoot "qa.ps1"
+    & $qaScript -Configuration Debug
+    if (-not $?) {
+        throw "Headless scene QA failed"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Headless scene QA failed with exit code $LASTEXITCODE"
+    }
+}
+
 Push-Location $repoRoot
 try {
     switch ($Task) {
@@ -358,12 +471,20 @@ try {
         "Managed" { Invoke-ManagedChecks }
         "Shaders" { Invoke-ShaderChecks }
         "Release" { Invoke-ReleaseBuild }
+        "Package" { Invoke-Package }
+        "Repro" { Invoke-Reproducibility }
+        "AssetCook" { Invoke-AssetCook }
+        "ProjectWorkflow" { Invoke-ProjectWorkflow }
+        "Qa" { Invoke-Qa }
         "Rust" {
             Invoke-Format
             Invoke-Clippy
             Invoke-FeatureCheck
             Invoke-WorkspaceTests
             Invoke-FixtureTest
+            Invoke-ProjectWorkflow
+            Invoke-AssetCook
+            Invoke-Qa
         }
         "All" {
             Invoke-Format
@@ -371,6 +492,9 @@ try {
             Invoke-FeatureCheck
             Invoke-WorkspaceTests
             Invoke-FixtureTest
+            Invoke-ProjectWorkflow
+            Invoke-AssetCook
+            Invoke-Qa
             Invoke-ManagedChecks
             Invoke-ShaderChecks
             Invoke-ReleaseBuild

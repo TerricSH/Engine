@@ -1,10 +1,11 @@
-use glam::Quat;
+use glam::{Quat, Vec3};
 
 use crate::assets::{AnimationClip, JointTransform, Keyframe, Skeleton};
 use crate::blend_space::BlendSpace1D;
 use crate::components::AnimationPlayer;
 use crate::components::IkTargetComponent;
 use crate::ik::solve_pose_multi;
+use crate::layers::{AnimLayer, LayerBlendMode};
 use crate::pose::Pose;
 use crate::skeleton;
 use crate::state_machine::{AnimParamValue, AnimStateMachineInstance};
@@ -57,16 +58,17 @@ impl AnimationEvaluator {
                 continue;
             }
 
-            let t = Self::sample_channel(&channel.translations, time, lerp_f32x3);
-            let r = Self::sample_channel(&channel.rotations, time, slerp_f32x4);
-            let s = Self::sample_channel(&channel.scales, time, lerp_f32x3);
-
-            let jt = JointTransform {
-                translation: t.unwrap_or([0.0, 0.0, 0.0]),
-                rotation: r.unwrap_or([0.0, 0.0, 0.0, 1.0]),
-                scale: s.unwrap_or([1.0, 1.0, 1.0]),
-            };
-            pose.local[joint_idx] = jt.into();
+            let transform = &mut pose.local[joint_idx];
+            if let Some(translation) = Self::sample_channel(&channel.translations, time, lerp_f32x3)
+            {
+                transform.translation = Vec3::from(translation);
+            }
+            if let Some(rotation) = Self::sample_channel(&channel.rotations, time, slerp_f32x4) {
+                transform.rotation = quat_or_identity(rotation);
+            }
+            if let Some(scale) = Self::sample_channel(&channel.scales, time, lerp_f32x3) {
+                transform.scale = Vec3::from(scale);
+            }
         }
         pose
     }
@@ -147,9 +149,19 @@ fn lerp_f32x3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 
 /// Spherical linear interpolation for quaternion [f32; 4] (rotations).
 fn slerp_f32x4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
-    let qa = Quat::from_array(a).normalize();
-    let qb = Quat::from_array(b).normalize();
+    let qa = quat_or_identity(a);
+    let qb = quat_or_identity(b);
     qa.slerp(qb, t).to_array()
+}
+
+fn quat_or_identity(value: [f32; 4]) -> Quat {
+    let quat = Quat::from_array(value);
+    let length_squared = quat.length_squared();
+    if quat.is_finite() && length_squared.is_finite() && length_squared > f32::EPSILON {
+        quat / length_squared.sqrt()
+    } else {
+        Quat::IDENTITY
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +184,8 @@ pub fn update_animation_sm(
     skel: &skeleton::Skeleton,
     dt: f32,
 ) -> Vec<[[f32; 4]; 4]> {
+    let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+
     match evaluate_sm_to_pose(player, sm, clips, skel, dt) {
         Some(pose) => {
             let matrices = pose.skin_matrices(skel);
@@ -194,30 +208,37 @@ fn evaluate_sm_to_pose(
     skel: &skeleton::Skeleton,
     dt: f32,
 ) -> Option<Pose> {
-    if !player.playing || sm.state_machine.states.is_empty() {
+    if sm.state_machine.states.is_empty() {
         return None;
     }
 
     // Advance the state machine and get the active state + blend weight.
-    let (_state_name, blend_weight) = sm.update(dt);
+    let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+    let speed = if player.speed.is_finite() {
+        player.speed
+    } else {
+        1.0
+    };
+    let blend_weight = if player.playing {
+        sm.update(dt * speed).1
+    } else if sm.transitioning {
+        sm.transition_progress
+    } else {
+        1.0
+    };
 
     // Resolve the current state.
     let state = sm.state_machine.find_state(&sm.current_state)?;
 
     // Evaluate the current pose: either via blend space or single clip.
     let current_pose = if let Some(ref bs) = state.blend_space_1d {
-        evaluate_blend_space_1d(bs, sm, clips, skel, sm.current_time)
+        evaluate_blend_space_1d(bs, sm, clips, skel, sm.current_time, state.looping)
     } else {
         let clip = match clips.iter().find(|(id, _)| *id == state.clip_asset) {
             Some((_, c)) => c,
             None => return None,
         };
-        let clip_time = if state.looping && clip.duration() > 0.0 {
-            sm.current_time % clip.duration()
-        } else {
-            sm.current_time.min(clip.duration())
-        };
-        AnimationEvaluator::evaluate_pose(clip, clip_time, skel)
+        evaluate_clip_at(clip, sm.current_time, state.looping, skel)
     };
 
     let final_pose = if sm.transitioning && blend_weight < 1.0 {
@@ -227,10 +248,19 @@ fn evaluate_sm_to_pose(
             None => return Some(current_pose),
         };
         let from_pose = if let Some(ref bs) = from_state.blend_space_1d {
-            evaluate_blend_space_1d(bs, sm, clips, skel, sm.current_time)
+            evaluate_blend_space_1d(
+                bs,
+                sm,
+                clips,
+                skel,
+                sm.transition_from_time,
+                from_state.looping,
+            )
         } else {
             match clips.iter().find(|(id, _)| *id == from_state.clip_asset) {
-                Some((_, c)) => AnimationEvaluator::evaluate_pose(c, sm.current_time, skel),
+                Some((_, clip)) => {
+                    evaluate_clip_at(clip, sm.transition_from_time, from_state.looping, skel)
+                }
                 None => return Some(current_pose),
             }
         };
@@ -242,6 +272,23 @@ fn evaluate_sm_to_pose(
     };
 
     Some(final_pose)
+}
+
+fn evaluate_clip_at(
+    clip: &AnimationClip,
+    time: f32,
+    looping: bool,
+    skel: &skeleton::Skeleton,
+) -> Pose {
+    let duration = clip.duration();
+    let time = if !time.is_finite() || !duration.is_finite() || duration <= 0.0 {
+        0.0
+    } else if looping {
+        time.rem_euclid(duration)
+    } else {
+        time.clamp(0.0, duration)
+    };
+    AnimationEvaluator::evaluate_pose(clip, time, skel)
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +304,7 @@ fn evaluate_blend_space_1d(
     clips: &[(&str, AnimationClip)],
     skel: &skeleton::Skeleton,
     time: f32,
+    looping: bool,
 ) -> Pose {
     // Get the parameter value that drives the blend.
     let param = match sm.get_param(&bs.parameter_name) {
@@ -267,7 +315,7 @@ fn evaluate_blend_space_1d(
             } else if let Some((_, clip)) =
                 clips.iter().find(|(id, _)| *id == bs.clips[0].clip_asset)
             {
-                AnimationEvaluator::evaluate_pose(clip, time, skel)
+                evaluate_clip_at(clip, time, looping, skel)
             } else {
                 skel.rest_pose()
             };
@@ -282,7 +330,7 @@ fn evaluate_blend_space_1d(
     // Single sample → evaluate it directly.
     if bs.clips.len() == 1 {
         return if let Some((_, clip)) = clips.iter().find(|(id, _)| *id == bs.clips[0].clip_asset) {
-            AnimationEvaluator::evaluate_pose(clip, time, skel)
+            evaluate_clip_at(clip, time, looping, skel)
         } else {
             skel.rest_pose()
         };
@@ -294,7 +342,7 @@ fn evaluate_blend_space_1d(
     if param <= first.threshold {
         // Below range → sample first clip.
         return if let Some((_, clip)) = clips.iter().find(|(id, _)| *id == first.clip_asset) {
-            AnimationEvaluator::evaluate_pose(clip, time, skel)
+            evaluate_clip_at(clip, time, looping, skel)
         } else {
             skel.rest_pose()
         };
@@ -303,7 +351,7 @@ fn evaluate_blend_space_1d(
     if param >= last.threshold {
         // Above range → sample last clip.
         return if let Some((_, clip)) = clips.iter().find(|(id, _)| *id == last.clip_asset) {
-            AnimationEvaluator::evaluate_pose(clip, time, skel)
+            evaluate_clip_at(clip, time, looping, skel)
         } else {
             skel.rest_pose()
         };
@@ -332,13 +380,13 @@ fn evaluate_blend_space_1d(
     let lower_pose = clips
         .iter()
         .find(|(id, _)| *id == lower.clip_asset)
-        .map(|(_, clip)| AnimationEvaluator::evaluate_pose(clip, time, skel))
+        .map(|(_, clip)| evaluate_clip_at(clip, time, looping, skel))
         .unwrap_or_else(|| skel.rest_pose());
 
     let upper_pose = clips
         .iter()
         .find(|(id, _)| *id == upper.clip_asset)
-        .map(|(_, clip)| AnimationEvaluator::evaluate_pose(clip, time, skel))
+        .map(|(_, clip)| evaluate_clip_at(clip, time, looping, skel))
         .unwrap_or_else(|| skel.rest_pose());
 
     Pose::blend(&lower_pose, &upper_pose, t)
@@ -353,24 +401,128 @@ fn evaluate_blend_space_1d(
 /// Advances time using `player.current_time + dt * player.speed` locally and
 /// applies looping/clamping logic, then evaluates the clip at the resulting time.
 fn evaluate_clip_to_pose(
-    player: &AnimationPlayer,
+    player: &mut AnimationPlayer,
     clip: &AnimationClip,
     skel: &skeleton::Skeleton,
     dt: f32,
 ) -> Pose {
-    // Advance time locally (same logic as update_animation).
-    let mut effective_time = player.current_time + dt * player.speed;
-
-    // Handle looping / clamping.
-    if clip.duration > 0.0 {
-        if player.looping {
-            effective_time = effective_time.rem_euclid(clip.duration);
+    let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+    if !player.current_time.is_finite() {
+        player.current_time = 0.0;
+    }
+    if player.playing {
+        let speed = if player.speed.is_finite() {
+            player.speed
         } else {
-            effective_time = effective_time.clamp(0.0, clip.duration);
+            1.0
+        };
+        player.current_time += dt * speed;
+        if clip.duration.is_finite() && clip.duration > 0.0 {
+            if player.looping {
+                player.current_time = player.current_time.rem_euclid(clip.duration);
+            } else {
+                player.current_time = player.current_time.clamp(0.0, clip.duration);
+                if (speed >= 0.0 && player.current_time >= clip.duration)
+                    || (speed < 0.0 && player.current_time <= 0.0)
+                {
+                    player.playing = false;
+                }
+            }
+        } else {
+            player.current_time = 0.0;
         }
     }
 
-    AnimationEvaluator::evaluate_pose(clip, effective_time, skel)
+    AnimationEvaluator::evaluate_pose(clip, player.current_time, skel)
+}
+
+fn advance_layer_time(layer: &mut AnimLayer, clip: &AnimationClip, dt: f32, playing: bool) {
+    if !layer.current_time.is_finite() {
+        layer.current_time = 0.0;
+    }
+    if !playing {
+        return;
+    }
+
+    let speed = if layer.speed.is_finite() {
+        layer.speed
+    } else {
+        1.0
+    };
+    layer.current_time += dt * speed;
+
+    if clip.duration.is_finite() && clip.duration > 0.0 {
+        if layer.looping {
+            layer.current_time = layer.current_time.rem_euclid(clip.duration);
+        } else {
+            layer.current_time = layer.current_time.clamp(0.0, clip.duration);
+        }
+    } else {
+        layer.current_time = 0.0;
+    }
+}
+
+fn blend_animation_layer(base: &mut Pose, layer_pose: &Pose, rest_pose: &Pose, layer: &AnimLayer) {
+    let weight = if layer.weight.is_finite() {
+        layer.weight.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if weight <= 0.0 {
+        return;
+    }
+
+    let count = base
+        .local_transforms()
+        .len()
+        .min(layer_pose.local_transforms().len())
+        .min(rest_pose.local_transforms().len());
+    let base_local = base.local_transforms_mut();
+    let layer_local = layer_pose.local_transforms();
+    let rest_local = rest_pose.local_transforms();
+
+    for bone_index in 0..count {
+        let selected = layer.bone_mask.is_empty()
+            || u16::try_from(bone_index)
+                .ok()
+                .is_some_and(|index| layer.bone_mask.contains(&index));
+        if !selected {
+            continue;
+        }
+
+        let current = &mut base_local[bone_index];
+        let sampled = layer_local[bone_index];
+        let rest = rest_local[bone_index];
+        match layer.blend_mode {
+            LayerBlendMode::Overwrite => {
+                current.translation = current.translation.lerp(sampled.translation, weight);
+                current.rotation = current.rotation.slerp(sampled.rotation, weight);
+                current.scale = current.scale.lerp(sampled.scale, weight);
+            }
+            LayerBlendMode::Additive => {
+                current.translation += (sampled.translation - rest.translation) * weight;
+
+                let rotation_delta = rest.rotation.inverse() * sampled.rotation;
+                let weighted_delta = Quat::IDENTITY.slerp(rotation_delta, weight);
+                current.rotation = (current.rotation * weighted_delta).normalize();
+
+                let scale_ratio = Vec3::new(
+                    safe_scale_ratio(sampled.scale.x, rest.scale.x),
+                    safe_scale_ratio(sampled.scale.y, rest.scale.y),
+                    safe_scale_ratio(sampled.scale.z, rest.scale.z),
+                );
+                current.scale *= Vec3::ONE.lerp(scale_ratio, weight);
+            }
+        }
+    }
+}
+
+fn safe_scale_ratio(sampled: f32, rest: f32) -> f32 {
+    if sampled.is_finite() && rest.is_finite() && rest.abs() > f32::EPSILON {
+        sampled / rest
+    } else {
+        1.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,43 +551,42 @@ pub fn update_animation_pipeline(
     ik: Option<&IkTargetComponent>,
     dt: f32,
 ) -> Vec<[[f32; 4]; 4]> {
+    let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+    let direct_clip_asset = player.clip_asset.clone();
+
     // ── 1. Evaluate base pose ────────────────────────────────────────────
-    let pose = if let Some(ref mut sm_inner) = sm {
-        if !sm_inner.state_machine.states.is_empty() {
-            match evaluate_sm_to_pose(player, sm_inner, clips, skel, dt) {
-                Some(p) => p,
-                None => skel.rest_pose(),
-            }
-        } else if let Some(ref clip_asset) = player.clip_asset {
-            match clips.iter().find(|(id, _)| *id == clip_asset.as_str()) {
-                Some((_, clip)) => evaluate_clip_to_pose(player, clip, skel, dt),
-                None => skel.rest_pose(),
-            }
-        } else {
-            skel.rest_pose()
-        }
-    } else if let Some(ref clip_asset) = player.clip_asset {
-        match clips.iter().find(|(id, _)| *id == clip_asset.as_str()) {
-            Some((_, clip)) => evaluate_clip_to_pose(player, clip, skel, dt),
-            None => skel.rest_pose(),
-        }
+    let mut pose = if let Some(sm_inner) = sm
+        .as_mut()
+        .filter(|instance| !instance.state_machine.states.is_empty())
+    {
+        evaluate_sm_to_pose(player, sm_inner, clips, skel, dt).unwrap_or_else(|| skel.rest_pose())
+    } else if let Some(clip_asset) = direct_clip_asset.as_deref() {
+        clips
+            .iter()
+            .find(|(id, _)| *id == clip_asset)
+            .map(|(_, clip)| evaluate_clip_to_pose(player, clip, skel, dt))
+            .unwrap_or_else(|| skel.rest_pose())
     } else {
         skel.rest_pose()
     };
 
     // ── 2. Apply animation layers (simple blend for v1) ──────────────────
-    // The base layer is already evaluated above.  Additional layers are
-    // blended on top.  For now layers don't carry clip references, so this
-    // is a structural placeholder for future multi-layer support.
-    let pose = if player.layers.len() <= 1 {
-        pose
-    } else {
-        // Accumulate layers on top of the base pose.
-        // For v1: skip the "base" layer (already evaluated) and blend any
-        // additional layers.  Since AnimLayer has no clip_asset, this is
-        // a future extension point.
-        pose
-    };
+    if player.layers.len() > 1 {
+        let rest_pose = skel.rest_pose();
+        let playing = player.playing;
+        for layer in player.layers.iter_mut().skip(1) {
+            let Some(clip_asset) = layer.clip_asset.clone() else {
+                continue;
+            };
+            let Some((_, clip)) = clips.iter().find(|(id, _)| *id == clip_asset) else {
+                continue;
+            };
+
+            advance_layer_time(layer, clip, dt, playing);
+            let layer_pose = AnimationEvaluator::evaluate_pose(clip, layer.current_time, skel);
+            blend_animation_layer(&mut pose, &layer_pose, &rest_pose, layer);
+        }
+    }
 
     // ── 3. Apply IK post-processing ──────────────────────────────────────
     let pre_ik = pose.clone();
@@ -491,45 +642,15 @@ pub fn update_animation(
     skel: Option<&skeleton::Skeleton>,
     dt: f32,
 ) -> Vec<[[f32; 4]; 4]> {
-    if !player.playing {
-        // Still evaluate at current_time if there's a clip and skeleton.
-        if let (Some(clip), Some(skel)) = (clip, skel) {
-            let pose = AnimationEvaluator::evaluate_pose(clip, player.current_time, skel);
-            return pose
-                .skin_matrices(skel)
-                .iter()
-                .map(|m| m.to_cols_array_2d())
-                .collect();
-        }
+    let (Some(clip), Some(skel)) = (clip, skel) else {
         return Vec::new();
-    }
+    };
 
-    // Advance time.
-    player.current_time += dt * player.speed;
-
-    // Handle looping / clamping.
-    if let Some(clip) = clip {
-        if clip.duration > 0.0 {
-            if player.looping {
-                player.current_time = player.current_time.rem_euclid(clip.duration);
-            } else {
-                player.current_time = player.current_time.clamp(0.0, clip.duration);
-                if player.current_time >= clip.duration {
-                    player.playing = false;
-                }
-            }
-        }
-    }
-
-    // Evaluate and solve.
-    match (clip, skel) {
-        (Some(clip), Some(skel)) => {
-            let pose = AnimationEvaluator::evaluate_pose(clip, player.current_time, skel);
-            pose.skin_matrices(skel)
-                .iter()
-                .map(|m| m.to_cols_array_2d())
-                .collect()
-        }
-        _ => Vec::new(),
-    }
+    let pose = evaluate_clip_to_pose(player, clip, skel, dt);
+    let global = pose.global_transforms(skel);
+    player.set_cached_bone_positions(&global);
+    pose.skin_matrices(skel)
+        .iter()
+        .map(|m| m.to_cols_array_2d())
+        .collect()
 }

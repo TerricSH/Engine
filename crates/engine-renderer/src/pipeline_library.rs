@@ -191,24 +191,39 @@ mod tests {
     use render_core::{RenderPassHandle, VertexAttribute, VertexLayout};
 
     struct MockDevice {
+        info: render_core::AdapterInfo,
         next_index: u32,
         fail: bool,
         destroyed: Vec<PipelineHandle>,
+        unused_destroy_calls: usize,
     }
 
     impl MockDevice {
         fn new() -> Self {
             Self {
+                info: render_core::AdapterInfo {
+                    backend: render_core::BackendKind::Vulkan,
+                    name: "pipeline-library-mock".into(),
+                    vendor_id: None,
+                    device_id: None,
+                    driver_version: None,
+                    capabilities: render_core::BackendCapabilities::default(),
+                },
                 next_index: 1,
                 fail: false,
                 destroyed: Vec::new(),
+                unused_destroy_calls: 0,
             }
+        }
+
+        fn record_unused_destroy<T>(&mut self, _handle: T) {
+            self.unused_destroy_calls += 1;
         }
     }
 
     impl Device for MockDevice {
         fn adapter_info(&self) -> &render_core::AdapterInfo {
-            unimplemented!("not needed in tests")
+            &self.info
         }
 
         fn create_pipeline(
@@ -227,6 +242,42 @@ mod tests {
 
         fn destroy_pipeline(&mut self, handle: PipelineHandle) {
             self.destroyed.push(handle);
+        }
+
+        fn destroy_buffer(&mut self, handle: render_core::BufferHandle) {
+            self.record_unused_destroy(handle);
+        }
+
+        fn destroy_texture(&mut self, handle: render_core::TextureHandle) {
+            self.record_unused_destroy(handle);
+        }
+
+        fn destroy_shader_module(&mut self, handle: render_core::ShaderModuleHandle) {
+            self.record_unused_destroy(handle);
+        }
+
+        fn destroy_render_pass(&mut self, handle: render_core::RenderPassHandle) {
+            self.record_unused_destroy(handle);
+        }
+
+        fn destroy_framebuffer(&mut self, handle: render_core::FramebufferHandle) {
+            self.record_unused_destroy(handle);
+        }
+
+        fn destroy_pipeline_layout(&mut self, handle: render_core::PipelineLayoutHandle) {
+            self.record_unused_destroy(handle);
+        }
+
+        fn destroy_swapchain(&mut self, handle: render_core::SwapchainHandle) {
+            self.record_unused_destroy(handle);
+        }
+
+        fn destroy_surface(&mut self, handle: render_core::SurfaceHandle) {
+            self.record_unused_destroy(handle);
+        }
+
+        fn wait_idle(&self) {
+            assert!(self.next_index >= 1, "mock handle sequence is invalid");
         }
     }
 

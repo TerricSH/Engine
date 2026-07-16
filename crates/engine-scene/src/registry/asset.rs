@@ -20,7 +20,12 @@ pub struct AssetTypeMeta {
 pub type CookerFn = fn(source: &[u8], output: &mut Vec<u8>) -> Result<(), String>;
 
 /// Asset loader: loads cooked data into a runtime asset.
-pub type LoaderFn = fn(cooked: &[u8]) -> Result<Box<dyn std::any::Any>, String>;
+///
+/// Runtime assets must be safe to retain in the shared asset cache. Keeping
+/// this requirement in the extension contract prevents a
+/// subsystem loader from succeeding during cook validation but becoming
+/// impossible to install at runtime.
+pub type LoaderFn = fn(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String>;
 
 // ---------------------------------------------------------------------------
 // AssetTypeExtension

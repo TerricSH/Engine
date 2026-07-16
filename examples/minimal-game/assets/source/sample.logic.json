@@ -1,0 +1,26 @@
+{
+  "schema_version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "asset_id": "sample-logic",
+  "kind": "BehaviorTree",
+  "nodes": [
+    {
+      "id": "root",
+      "node_type": "sequence",
+      "label": "Minimal game root",
+      "transitions": [],
+      "properties": {},
+      "children": []
+    }
+  ],
+  "parameters": {},
+  "metadata": {
+    "author": "Engine Team",
+    "description": "Minimal logic asset used by the project workflow sample",
+    "tags": ["example", "smoke"],
+    "version": "1.0.0"
+  }
+}

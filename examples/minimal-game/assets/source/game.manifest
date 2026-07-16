@@ -1,0 +1,45 @@
+{
+  "schema_version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "assets": [
+    {
+      "id": { "id": "sample-mesh", "logical_path": null },
+      "asset_type": "Mesh",
+      "source_path": "sample-triangle.gltf",
+      "cook_rules": { "variant_keys": [], "platform_overrides": [], "compression": null }
+    },
+    {
+      "id": { "id": "sample-texture", "logical_path": null },
+      "asset_type": "Texture",
+      "source_path": "sample-checker.ppm",
+      "cook_rules": { "variant_keys": [], "platform_overrides": [], "compression": null }
+    },
+    {
+      "id": { "id": "sample-material", "logical_path": null },
+      "asset_type": "Material",
+      "source_path": "sample.material.json",
+      "cook_rules": { "variant_keys": [], "platform_overrides": [], "compression": null }
+    },
+    {
+      "id": { "id": "sample-shader", "logical_path": null },
+      "asset_type": "Shader",
+      "source_path": "sample.vert",
+      "cook_rules": { "variant_keys": [], "platform_overrides": [], "compression": null }
+    },
+    {
+      "id": { "id": "sample-scene", "logical_path": null },
+      "asset_type": "Scene",
+      "source_path": "sample.scene.json",
+      "cook_rules": { "variant_keys": [], "platform_overrides": [], "compression": null }
+    },
+    {
+      "id": { "id": "sample-logic", "logical_path": null },
+      "asset_type": "Logic",
+      "source_path": "sample.logic.json",
+      "cook_rules": { "variant_keys": [], "platform_overrides": [], "compression": null }
+    }
+  ]
+}

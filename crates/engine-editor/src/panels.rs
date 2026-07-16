@@ -3,10 +3,9 @@ use std::collections::BTreeMap;
 use engine_asset::AssetRegistry;
 use engine_scene::Scene;
 use engine_serialize::{AssetId, PersistentId, Value};
-use tracing;
 
 use crate::commands::{Command, SetComponentField};
-use crate::editor_ui::EditorUi;
+use crate::editor_ui::{EditorUi, UiInteractionStamp};
 use crate::scene_view;
 use crate::EditorError;
 
@@ -38,6 +37,39 @@ pub trait EditorPanel {
 // -------------------------------------------------------------------
 // SceneViewPanel
 // -------------------------------------------------------------------
+
+/// One independently replayable Scene View setting change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SceneViewAction {
+    SetPitch(f32),
+    SetYaw(f32),
+    SetDistance(f32),
+    SetShowGrid(bool),
+}
+
+impl SceneViewAction {
+    /// Whether this setting changes the editor camera matrices used by
+    /// viewport tools. Visual-only settings such as the reference grid do not.
+    pub fn affects_camera(self) -> bool {
+        matches!(
+            self,
+            Self::SetPitch(_) | Self::SetYaw(_) | Self::SetDistance(_)
+        )
+    }
+}
+
+/// Scene-view setting paired with the platform event that produced it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SequencedSceneViewAction {
+    pub stamp: UiInteractionStamp,
+    pub action: SceneViewAction,
+}
+
+impl SequencedSceneViewAction {
+    pub fn new(stamp: UiInteractionStamp, action: SceneViewAction) -> Self {
+        Self { stamp, action }
+    }
+}
 
 /// Editor panel that renders a 3D scene view with camera controls.
 ///
@@ -114,42 +146,98 @@ impl SceneViewPanel {
         self.render_target_label.as_deref()
     }
 
-    /// Render the scene view with real scene data and compute camera matrices.
-    ///
-    /// Displays the orbit camera controls and the computed view/projection
-    /// matrices.  Returns the view and projection matrices as a tuple.
-    pub fn ui_with_scene(&mut self, ui: &mut EditorUi, _scene: &Scene) -> (glam::Mat4, glam::Mat4) {
+    /// Apply one setting at its exact position in the host's shared input
+    /// stream.
+    pub fn apply_action(&mut self, action: SceneViewAction) {
+        match action {
+            SceneViewAction::SetPitch(pitch) => self.pitch = pitch.clamp(-89.0, 89.0),
+            SceneViewAction::SetYaw(yaw) => self.yaw = yaw.clamp(-180.0, 180.0),
+            SceneViewAction::SetDistance(distance) => self.distance = distance.clamp(0.1, 100.0),
+            SceneViewAction::SetShowGrid(show_grid) => self.show_grid = show_grid,
+        }
+    }
+
+    fn draw_controls_ordered(
+        &self,
+        ui: &mut EditorUi,
+    ) -> (f32, f32, f32, Vec<SequencedSceneViewAction>) {
         let _ = ui.collapsing_header("Transform", true);
         ui.text_field("Name", &self.name);
 
-        let _ = ui.separator();
+        ui.separator();
         let _ = ui.collapsing_header("Camera", true);
 
-        if let Some(v) = ui.slider_f32("Pitch", self.pitch, -89.0, 89.0) {
-            self.pitch = v;
+        let mut pitch = self.pitch;
+        let mut yaw = self.yaw;
+        let mut distance = self.distance;
+        let mut actions = Vec::new();
+
+        for (stamp, value) in ui.ordered_slider_f32("Pitch", pitch, -89.0, 89.0) {
+            pitch = value;
+            actions.push(SequencedSceneViewAction::new(
+                stamp,
+                SceneViewAction::SetPitch(value),
+            ));
         }
-        if let Some(v) = ui.slider_f32("Yaw", self.yaw, -180.0, 180.0) {
-            self.yaw = v;
+        for (stamp, value) in ui.ordered_slider_f32("Yaw", yaw, -180.0, 180.0) {
+            yaw = value;
+            actions.push(SequencedSceneViewAction::new(
+                stamp,
+                SceneViewAction::SetYaw(value),
+            ));
         }
-        if let Some(v) = ui.slider_f32("Distance", self.distance, 0.1, 100.0) {
-            self.distance = v;
+        for (stamp, value) in ui.ordered_slider_f32("Distance", distance, 0.1, 100.0) {
+            distance = value;
+            actions.push(SequencedSceneViewAction::new(
+                stamp,
+                SceneViewAction::SetDistance(value),
+            ));
         }
 
-        let _ = ui.separator();
-        self.show_grid = ui.checkbox("Show Grid", self.show_grid);
+        ui.separator();
+        for (stamp, show_grid) in ui.ordered_checkbox_changes("Show Grid", self.show_grid) {
+            actions.push(SequencedSceneViewAction::new(
+                stamp,
+                SceneViewAction::SetShowGrid(show_grid),
+            ));
+        }
 
-        // ── Compute camera matrices ──────────────────────────────
-        let view = scene_view::orbit_view_matrix(self.pitch, self.yaw, self.distance, self.target);
+        (pitch, yaw, distance, actions)
+    }
+
+    /// Draw controls without immediately mutating panel state. Every returned
+    /// setting carries the same platform sequence as raw viewport input, so a
+    /// host can merge and replay both streams deterministically.
+    pub fn ui_with_scene_ordered(
+        &self,
+        ui: &mut EditorUi,
+        _scene: &Scene,
+    ) -> (glam::Mat4, glam::Mat4, Vec<SequencedSceneViewAction>) {
+        let (pitch, yaw, distance, actions) = self.draw_controls_ordered(ui);
+
+        let view = scene_view::orbit_view_matrix(pitch, yaw, distance, self.target);
         let proj = scene_view::orbit_projection_matrix(60.0, 16.0 / 9.0, 0.1, 100.0);
 
-        let _ = ui.separator();
+        ui.separator();
         let cam_open = ui.collapsing_header("Camera Matrices", false);
         if cam_open {
             ui.text_field("View", &format!("{:?}", view.to_cols_array_2d()));
             ui.text_field("Proj", &format!("{:?}", proj.to_cols_array_2d()));
         }
 
-        tracing::debug!(panel = %self.name, "SceneViewPanel.ui_with_scene");
+        tracing::debug!(panel = %self.name, "SceneViewPanel.ui_with_scene_ordered");
+        (view, proj, actions)
+    }
+
+    /// Render the scene view with real scene data and compute camera matrices.
+    ///
+    /// Displays the orbit camera controls and the computed view/projection
+    /// matrices.  Returns the view and projection matrices as a tuple.
+    pub fn ui_with_scene(&mut self, ui: &mut EditorUi, _scene: &Scene) -> (glam::Mat4, glam::Mat4) {
+        let (view, proj, actions) = self.ui_with_scene_ordered(ui, _scene);
+        for action in actions {
+            self.apply_action(action.action);
+        }
         (view, proj)
     }
 }
@@ -160,24 +248,10 @@ impl EditorPanel for SceneViewPanel {
     }
 
     fn ui(&mut self, ui: &mut EditorUi) {
-        let _ = ui.collapsing_header("Transform", true);
-        ui.text_field("Name", &self.name);
-
-        let _ = ui.separator();
-        let _ = ui.collapsing_header("Camera", true);
-
-        if let Some(v) = ui.slider_f32("Pitch", self.pitch, -89.0, 89.0) {
-            self.pitch = v;
+        let (_, _, _, actions) = self.draw_controls_ordered(ui);
+        for action in actions {
+            self.apply_action(action.action);
         }
-        if let Some(v) = ui.slider_f32("Yaw", self.yaw, -180.0, 180.0) {
-            self.yaw = v;
-        }
-        if let Some(v) = ui.slider_f32("Distance", self.distance, 0.1, 100.0) {
-            self.distance = v;
-        }
-
-        let _ = ui.separator();
-        self.show_grid = ui.checkbox("Show Grid", self.show_grid);
 
         tracing::debug!(panel = %self.name, "SceneViewPanel.ui");
     }
@@ -241,7 +315,7 @@ impl EditorPanel for InspectorPanel {
             Some(entity_id) => {
                 ui.text_field("ID", entity_id);
 
-                let _ = ui.separator();
+                ui.separator();
                 let _ = ui.collapsing_header("Components", true);
 
                 for comp in &self.expanded_components {
@@ -477,13 +551,13 @@ impl EditorPanel for AssetBrowserPanel {
             let _ = ui.button(entry);
         }
 
-        let _ = ui.separator();
+        ui.separator();
 
         if ui.button("Refresh") {
             self.refresh();
         }
 
-        let _ = ui.separator();
+        ui.separator();
 
         if let Some(asset) = &self.preview_asset {
             let _ = ui.collapsing_header("Preview", true);
@@ -500,5 +574,59 @@ impl EditorPanel for AssetBrowserPanel {
 
     fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{UiEvent, UiInteractionPhase};
+
+    #[test]
+    fn ordered_scene_view_controls_defer_state_until_replay() {
+        let mut panel = SceneViewPanel::new("Scene View");
+        let mut ui = EditorUi::new();
+        ui.begin_frame();
+        ui.inject_event(UiEvent::SliderDrag("Pitch".into(), 30.0));
+        ui.inject_event(UiEvent::SliderDrag("Yaw".into(), 45.0));
+        ui.inject_event(UiEvent::SliderDrag("Distance".into(), 25.0));
+        ui.inject_event(UiEvent::CheckboxToggle("Show Grid".into(), false));
+
+        let (_, _, actions) = panel.ui_with_scene_ordered(&mut ui, &engine_scene::sample_scene());
+        ui.end_frame();
+
+        assert_eq!(panel.camera_orbit(), (0.0, 0.0, 10.0));
+        assert!(panel.show_grid());
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| action.action)
+                .collect::<Vec<_>>(),
+            [
+                SceneViewAction::SetPitch(30.0),
+                SceneViewAction::SetYaw(45.0),
+                SceneViewAction::SetDistance(25.0),
+                SceneViewAction::SetShowGrid(false),
+            ]
+        );
+        assert!(actions
+            .iter()
+            .all(|action| { action.stamp.phase == UiInteractionPhase::AfterRawPointer }));
+
+        let mut actions = actions;
+        actions.sort_by_key(|action| action.stamp.sequence);
+        for action in actions {
+            panel.apply_action(action.action);
+        }
+        assert_eq!(panel.camera_orbit(), (30.0, 45.0, 25.0));
+        assert!(!panel.show_grid());
+    }
+
+    #[test]
+    fn grid_setting_is_visual_only_while_orbit_settings_affect_camera() {
+        assert!(!SceneViewAction::SetShowGrid(false).affects_camera());
+        assert!(SceneViewAction::SetPitch(1.0).affects_camera());
+        assert!(SceneViewAction::SetYaw(1.0).affects_camera());
+        assert!(SceneViewAction::SetDistance(1.0).affects_camera());
     }
 }

@@ -316,15 +316,21 @@ pub const PBR32_VERTEX_STRIDE: u32 = 32;
 pub enum MeshVertexFormat {
     /// [`Pbr32Vertex`]: position, normal, UV0; all components are `f32`.
     Pbr32,
+    /// 64-byte skinned vertex: PBR32 prefix, four `u32` joint indices and
+    /// four `f32` weights.
+    Skinned64,
 }
 
 impl MeshVertexFormat {
     pub const fn stride_bytes(self) -> u32 {
         match self {
             Self::Pbr32 => PBR32_VERTEX_STRIDE,
+            Self::Skinned64 => SKINNED64_VERTEX_STRIDE,
         }
     }
 }
+
+pub const SKINNED64_VERTEX_STRIDE: u32 = 64;
 
 /// Owned, GPU-ready static triangle-list mesh data.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

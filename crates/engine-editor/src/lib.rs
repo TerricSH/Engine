@@ -33,6 +33,10 @@ pub enum EditorError {
     #[error("component not found: {0}")]
     ComponentNotFound(String),
 
+    /// The entity already owns a component of the requested type.
+    #[error("component already exists: {0}")]
+    ComponentAlreadyExists(String),
+
     /// An I/O operation (read, write, create directory, …) failed.
     #[error("I/O error: {0}")]
     IoFailed(String),
@@ -72,7 +76,7 @@ pub mod build;
 #[cfg(feature = "tooling-editor")]
 pub mod commands;
 #[cfg(feature = "tooling-editor")]
-mod debug_views;
+pub mod debug_views;
 #[cfg(feature = "tooling-editor")]
 pub mod diagnostics;
 #[cfg(feature = "tooling-editor")]
@@ -80,7 +84,9 @@ mod editor_core;
 #[cfg(feature = "tooling-editor")]
 mod editor_ui;
 #[cfg(feature = "tooling-editor")]
-mod gizmo;
+pub mod gizmo;
+#[cfg(feature = "tooling-editor")]
+pub mod gizmo_overlay;
 #[cfg(feature = "tooling-editor")]
 pub mod hierarchy;
 #[cfg(feature = "tooling-editor")]
@@ -95,6 +101,8 @@ pub mod material_editor;
 mod panels;
 #[cfg(feature = "tooling-editor")]
 pub mod performance;
+#[cfg(feature = "tooling-editor")]
+mod play_mode;
 #[cfg(feature = "tooling-editor")]
 pub mod plugin;
 #[cfg(feature = "tooling-editor")]
@@ -111,24 +119,27 @@ pub use build::{build_csharp_project, BuildError};
 #[cfg(feature = "tooling-editor")]
 pub use commands::{
     AddComponent, AddEntity, Command, CommandHistory, RemoveComponent, RemoveEntity,
-    SetComponentField, SetEntityName,
+    SequencedCommand, SetComponentEnabled, SetComponentField, SetEntityEnabled, SetEntityName,
 };
 #[cfg(feature = "tooling-editor")]
 pub use diagnostics::{DiagnosticEntry, DiagnosticsPanel};
 #[cfg(feature = "tooling-editor")]
 pub use editor_core::Editor;
 #[cfg(feature = "tooling-editor")]
-pub use editor_ui::EditorUi;
+pub use editor_ui::{EditorUi, UiEvent, UiInteractionPhase, UiInteractionStamp, UiKey};
 #[cfg(feature = "tooling-editor")]
 pub use hierarchy::HierarchyPanel;
 #[cfg(feature = "tooling-editor")]
-pub use inspector::InspectorPanel;
+pub use inspector::{InspectorContext, InspectorPanel};
 #[cfg(feature = "tooling-editor")]
 pub use io::{default_scene_path, load_scene, save_scene};
 #[cfg(feature = "tooling-editor")]
 pub use panels::{
-    AssetBrowserPanel, EditorPanel, InspectorPanel as LegacyInspectorPanel, SceneViewPanel,
+    AssetBrowserPanel, EditorPanel, InspectorPanel as LegacyInspectorPanel, SceneViewAction,
+    SceneViewPanel, SequencedSceneViewAction,
 };
+#[cfg(feature = "tooling-editor")]
+pub use play_mode::{EditorPlayMode, EditorPlaySession};
 #[cfg(feature = "tooling-editor")]
 pub use plugin::{
     ComponentInspector, EditorPlugin, EditorPluginMeta, EditorPluginRegistry, PanelFactory,
@@ -163,6 +174,9 @@ pub struct EditorScene {
     pub selected_entity: Option<PersistentId>,
     /// Diagnostics panel for displaying scene/asset/script errors.
     pub diagnostics: DiagnosticsPanel,
+    /// Active scene-level Transform gizmo gesture, if any. Preview edits are
+    /// deliberately kept out of command history until the gesture commits.
+    gizmo_drag: Option<gizmo::SceneGizmoDrag>,
 }
 
 #[cfg(feature = "tooling-editor")]
@@ -174,6 +188,7 @@ impl EditorScene {
             history: CommandHistory::new(),
             selected_entity: None,
             diagnostics: DiagnosticsPanel::new("Diagnostics"),
+            gizmo_drag: None,
         }
     }
 
@@ -189,11 +204,19 @@ impl EditorScene {
 
     /// Undo the last command.
     pub fn undo(&mut self) -> Result<(), EditorError> {
+        if self.is_transform_gizmo_drag_active() {
+            self.cancel_transform_gizmo_drag();
+            return Ok(());
+        }
         self.history.undo(&mut self.scene)
     }
 
     /// Redo the last-undone command.
     pub fn redo(&mut self) -> Result<(), EditorError> {
+        if self.is_transform_gizmo_drag_active() {
+            self.cancel_transform_gizmo_drag();
+            return Ok(());
+        }
         self.history.redo(&mut self.scene)
     }
 
@@ -205,12 +228,13 @@ impl EditorScene {
 
     /// Save the scene to the given path (defaults to
     /// `assets/scenes/{scene_id}.scene.ron`).
-    pub fn save(&self, path: Option<&std::path::Path>) -> Result<(), EditorError> {
+    pub fn save(&mut self, path: Option<&std::path::Path>) -> Result<(), EditorError> {
         let p = match path {
             Some(p) => p.to_path_buf(),
             None => std::path::PathBuf::from(io::default_scene_path(&self.scene)),
         };
         io::save_scene(&self.scene, &p)?;
+        self.history.mark_clean();
         Ok(())
     }
 }

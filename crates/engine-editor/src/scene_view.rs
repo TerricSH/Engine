@@ -34,7 +34,7 @@ pub fn orbit_projection_matrix(fov_y_deg: f32, aspect: f32, near: f32, far: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::{Mat4, Vec3};
+    use glam::Vec3;
 
     #[test]
     fn orbit_view_matrix_looks_at_target() {

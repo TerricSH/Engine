@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod clip;
+mod component_serde;
 mod convert;
 pub(crate) mod pose;
 pub mod skeleton;
@@ -50,12 +51,23 @@ pub use state_machine::{
     ConditionOp, StateTransition, TransitionCondition,
 };
 
+/// Shared handles for animation extensions registered with the renderer.
+///
+/// The update loop writes animation and debug data through these handles;
+/// the registries own clones that consume the same queues during extraction.
+#[derive(Clone)]
+pub struct AnimationExtensionHandles {
+    pub skinned_extract: SkinnedExtractProducer,
+    pub skeleton_debug: SkeletonDebugDraw,
+    pub ik_debug: IkDebugDraw,
+}
+
 pub fn register_animation_extensions(
     component_reg: &mut engine_scene::registry::ComponentRegistry,
     asset_type_reg: &mut engine_scene::registry::AssetTypeRegistry,
     render_ext_reg: &mut engine_renderer::RenderExtensionRegistry,
     debug_draw_reg: &mut engine_renderer::DebugDrawRegistry,
-) {
+) -> AnimationExtensionHandles {
     use engine_scene::{Component, ComponentStorageDyn, SparseSet};
     use engine_scene::{ComponentExtension, ComponentMeta};
 
@@ -78,8 +90,8 @@ pub fn register_animation_extensions(
             has_script_binding: false,
         },
         storage_factory: anim_player_storage,
-        serialize: None,
-        deserialize: None,
+        serialize: Some(component_serde::serialize_animation_player),
+        deserialize: Some(component_serde::deserialize_animation_player),
     });
     let _ = component_reg.register(ComponentExtension {
         meta: ComponentMeta {
@@ -90,8 +102,8 @@ pub fn register_animation_extensions(
             has_script_binding: false,
         },
         storage_factory: skeleton_comp_storage,
-        serialize: None,
-        deserialize: None,
+        serialize: Some(component_serde::serialize_skeleton_component),
+        deserialize: Some(component_serde::deserialize_skeleton_component),
     });
     let _ = component_reg.register(ComponentExtension {
         meta: ComponentMeta {
@@ -102,19 +114,23 @@ pub fn register_animation_extensions(
             has_script_binding: false,
         },
         storage_factory: ik_target_storage,
-        serialize: None,
-        deserialize: None,
+        serialize: Some(component_serde::serialize_ik_target),
+        deserialize: Some(component_serde::deserialize_ik_target),
     });
 
     loader::register_asset_types(asset_type_reg);
-    let skinned_producer: Box<dyn engine_renderer::RenderExtensionProducer> =
-        Box::new(SkinnedExtractProducer::new());
-    render_ext_reg.register(skinned_producer);
-    let skeleton_draw: Box<dyn engine_renderer::DebugDrawProvider> =
-        Box::new(SkeletonDebugDraw::new());
-    debug_draw_reg.register(skeleton_draw);
-    let ik_draw: Box<dyn engine_renderer::DebugDrawProvider> = Box::new(IkDebugDraw::new());
-    debug_draw_reg.register(ik_draw);
+    let skinned_extract = SkinnedExtractProducer::new();
+    render_ext_reg.register(Box::new(skinned_extract.clone()));
+    let skeleton_debug = SkeletonDebugDraw::new();
+    debug_draw_reg.register(Box::new(skeleton_debug.clone()));
+    let ik_debug = IkDebugDraw::new();
+    debug_draw_reg.register(Box::new(ik_debug.clone()));
+
+    AnimationExtensionHandles {
+        skinned_extract,
+        skeleton_debug,
+        ik_debug,
+    }
 }
 
 #[cfg(test)]

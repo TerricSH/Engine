@@ -7,7 +7,7 @@ use windows::{
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use render_core::{
     BufferHandle, CommandEncoder, FramebufferHandle, IndexFormat, PipelineHandle,
-    PipelineLayoutHandle, RenderPassHandle,
+    PipelineLayoutHandle, RenderPassHandle, TextureHandle,
 };
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
@@ -17,6 +17,9 @@ use crate::device::Dx12Device;
 pub(crate) struct Dx12CommandEncoder {
     pub(crate) cmd_list: ID3D12GraphicsCommandList,
     device: *const Dx12Device,
+    main_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    main_dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    active_depth_attachment: Option<ID3D12Resource>,
     pub(crate) draws: u32,
     pub(crate) triangles: u64,
 }
@@ -30,10 +33,18 @@ unsafe impl Send for Dx12CommandEncoder {}
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 impl Dx12CommandEncoder {
-    pub(crate) fn new(cmd_list: ID3D12GraphicsCommandList, device: *const Dx12Device) -> Self {
+    pub(crate) fn new(
+        cmd_list: ID3D12GraphicsCommandList,
+        device: *const Dx12Device,
+        main_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        main_dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Self {
         Self {
             cmd_list,
             device,
+            main_rtv,
+            main_dsv,
+            active_depth_attachment: None,
             draws: 0,
             triangles: 0,
         }
@@ -45,14 +56,59 @@ impl CommandEncoder for Dx12CommandEncoder {
     fn begin_render_pass(
         &mut self,
         _render_pass: RenderPassHandle,
-        _framebuffer: FramebufferHandle,
-        _area: (u32, u32, u32, u32),
-        _clear_color: [f32; 4],
-        _clear_depth: Option<f32>,
+        framebuffer: FramebufferHandle,
+        area: (u32, u32, u32, u32),
+        clear_color: [f32; 4],
+        clear_depth: Option<f32>,
     ) {
-        // D3D12 render pass: the device's begin_frame sets the RTV via
-        // OMSetRenderTargets and clears. This method is called for API
-        // compatibility with the Vulkan path but is a no-op here.
+        unsafe {
+            let device = &*self.device;
+            let (_, framebuffer_index) = Dx12Device::decode_handle(framebuffer.index);
+            let Some(framebuffer) = device.framebuffers.get(framebuffer_index) else {
+                return;
+            };
+            if let Some(depth) = framebuffer.depth_resource.as_ref() {
+                if framebuffer.depth_is_sampled {
+                    Dx12Device::transition_resource(
+                        &self.cmd_list,
+                        depth,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    );
+                }
+                self.active_depth_attachment = Some(depth.clone());
+            }
+            for rtv in &framebuffer.rtv_descriptors {
+                self.cmd_list
+                    .ClearRenderTargetView(*rtv, &clear_color, None);
+            }
+            if let (Some(dsv), Some(depth)) = (framebuffer.dsv_descriptor, clear_depth) {
+                self.cmd_list
+                    .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, depth, 0, &[]);
+            }
+            self.cmd_list.OMSetRenderTargets(
+                framebuffer.rtv_descriptors.len() as u32,
+                if framebuffer.rtv_descriptors.is_empty() {
+                    None
+                } else {
+                    Some(framebuffer.rtv_descriptors.as_ptr())
+                },
+                false,
+                framebuffer
+                    .dsv_descriptor
+                    .as_ref()
+                    .map(|handle| handle as *const D3D12_CPU_DESCRIPTOR_HANDLE),
+            );
+            self.set_viewport(
+                area.0 as f32,
+                area.1 as f32,
+                area.2 as f32,
+                area.3 as f32,
+                0.0,
+                1.0,
+            );
+            self.set_scissor(area.0 as i32, area.1 as i32, area.2, area.3);
+        }
     }
 
     fn bind_pipeline(&mut self, pipeline: PipelineHandle) {
@@ -80,7 +136,7 @@ impl CommandEncoder for Dx12CommandEncoder {
                         D3D12_VERTEX_BUFFER_VIEW {
                             BufferLocation: gpu_addr,
                             SizeInBytes: (inner.size - off) as u32,
-                            StrideInBytes: 32,
+                            StrideInBytes: inner.vertex_stride,
                         }
                     })
                 })
@@ -115,18 +171,197 @@ impl CommandEncoder for Dx12CommandEncoder {
         &mut self,
         _pipeline_layout: PipelineLayoutHandle,
         _first_set: u32,
-        _sets: &[render_core::DescriptorSetHandle],
+        sets: &[render_core::DescriptorSetHandle],
         _dynamic_offsets: &[u32],
-    ) {
-        // D3D12 root descriptor / descriptor table binding requires:
-        // 1. ID3D12DescriptorHeap for CBV/SRV/UAV
-        // 2. SetDescriptorHeaps on the command list
-        // 3. SetGraphicsRootDescriptorTable for each root parameter
-        //
-        // A complete implementation requires mapping the engine's descriptor
-        // set abstraction to D3D12 descriptor heaps. For now this is a
-        // placeholder — the MVP path in Dx12SceneRenderer uses root
-        // constants for material data instead of descriptor tables.
+    ) -> Result<(), render_core::RhiError> {
+        if sets.is_empty() {
+            // Binding zero sets is a valid no-op. Scene data uses the
+            // explicit root-CBV and sampled-texture bridge methods below.
+            return Ok(());
+        }
+        Err(render_core::RhiError::UnsupportedFeature {
+            feature: "portable descriptor-set handles on the DX12 backend".to_owned(),
+        })
+    }
+
+    fn bind_sampled_texture(
+        &mut self,
+        pipeline_layout: PipelineLayoutHandle,
+        texture: TextureHandle,
+    ) -> bool {
+        unsafe {
+            let device = &*self.device;
+            let (_, layout_index) = Dx12Device::decode_handle(pipeline_layout.index);
+            let Some(layout) = device.pipeline_layouts.get(layout_index) else {
+                return false;
+            };
+            let (_, texture_index) = Dx12Device::decode_handle(texture.index);
+            let Some(texture) = device.textures.get(texture_index) else {
+                return false;
+            };
+            let (Some(srv_parameter), Some(sampler_parameter)) =
+                (layout.sampled_texture_parameter, layout.sampler_parameter)
+            else {
+                return false;
+            };
+            let (Some(srv_heap), Some(sampler_heap)) = (
+                texture.sampled_srv_heap.as_ref(),
+                texture.sampled_sampler_heap.as_ref(),
+            ) else {
+                return false;
+            };
+            let heaps = [Some(srv_heap.clone()), Some(sampler_heap.clone())];
+            self.cmd_list.SetDescriptorHeaps(&heaps);
+            self.cmd_list.SetGraphicsRootDescriptorTable(
+                srv_parameter,
+                srv_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            self.cmd_list.SetGraphicsRootDescriptorTable(
+                sampler_parameter,
+                sampler_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            true
+        }
+    }
+
+    fn bind_sampled_texture_pair(
+        &mut self,
+        pipeline_layout: PipelineLayoutHandle,
+        base_color: TextureHandle,
+        shadow_map: TextureHandle,
+    ) -> bool {
+        unsafe {
+            let device = &*self.device;
+            let (_, layout_index) = Dx12Device::decode_handle(pipeline_layout.index);
+            let Some(layout) = device.pipeline_layouts.get(layout_index) else {
+                return false;
+            };
+            let Some(srv_parameter) = layout.sampled_texture_parameter else {
+                return false;
+            };
+            let Some(sampler_parameter) = layout.sampler_parameter else {
+                return false;
+            };
+            let texture = |handle: TextureHandle| {
+                let (_, index) = Dx12Device::decode_handle(handle.index);
+                device.textures.get(index)
+            };
+            let (Some(base), Some(shadow)) = (texture(base_color), texture(shadow_map)) else {
+                return false;
+            };
+            let (Some(base_srv), Some(base_sampler), Some(shadow_srv), Some(shadow_sampler)) = (
+                base.sampled_srv_heap.as_ref(),
+                base.sampled_sampler_heap.as_ref(),
+                shadow.sampled_srv_heap.as_ref(),
+                shadow.sampled_sampler_heap.as_ref(),
+            ) else {
+                return false;
+            };
+            let srv_heap: ID3D12DescriptorHeap =
+                match device
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 2,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    }) {
+                    Ok(heap) => heap,
+                    Err(_) => return false,
+                };
+            let sampler_heap: ID3D12DescriptorHeap =
+                match device
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                        NumDescriptors: 2,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    }) {
+                    Ok(heap) => heap,
+                    Err(_) => return false,
+                };
+            let srv_size = device
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let sampler_size = device
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+                as usize;
+            let srv_start = srv_heap.GetCPUDescriptorHandleForHeapStart();
+            let sampler_start = sampler_heap.GetCPUDescriptorHandleForHeapStart();
+            device.device.CopyDescriptorsSimple(
+                1,
+                srv_start,
+                base_srv.GetCPUDescriptorHandleForHeapStart(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            device.device.CopyDescriptorsSimple(
+                1,
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: srv_start.ptr + srv_size,
+                },
+                shadow_srv.GetCPUDescriptorHandleForHeapStart(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            device.device.CopyDescriptorsSimple(
+                1,
+                sampler_start,
+                base_sampler.GetCPUDescriptorHandleForHeapStart(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            );
+            device.device.CopyDescriptorsSimple(
+                1,
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: sampler_start.ptr + sampler_size,
+                },
+                shadow_sampler.GetCPUDescriptorHandleForHeapStart(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            );
+            self.cmd_list
+                .SetDescriptorHeaps(&[Some(srv_heap.clone()), Some(sampler_heap.clone())]);
+            self.cmd_list.SetGraphicsRootDescriptorTable(
+                srv_parameter,
+                srv_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            self.cmd_list.SetGraphicsRootDescriptorTable(
+                sampler_parameter,
+                sampler_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            let Ok(mut in_flight) = device.descriptor_heaps_in_flight.lock() else {
+                return false;
+            };
+            in_flight.push(srv_heap);
+            in_flight.push(sampler_heap);
+            true
+        }
+    }
+
+    fn bind_uniform_buffer(
+        &mut self,
+        pipeline_layout: PipelineLayoutHandle,
+        buffer: BufferHandle,
+    ) -> bool {
+        unsafe {
+            let device = &*self.device;
+            let (_, layout_index) = Dx12Device::decode_handle(pipeline_layout.index);
+            let Some(layout) = device.pipeline_layouts.get(layout_index) else {
+                return false;
+            };
+            let Some(parameter) = layout.uniform_buffer_parameter else {
+                return false;
+            };
+            let (_, buffer_index) = Dx12Device::decode_handle(buffer.index);
+            let Some(buffer) = device.buffers.get(buffer_index) else {
+                return false;
+            };
+            self.cmd_list.SetGraphicsRootConstantBufferView(
+                parameter,
+                buffer.resource.GetGPUVirtualAddress(),
+            );
+            true
+        }
     }
 
     fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min_depth: f32, max_depth: f32) {
@@ -192,31 +427,51 @@ impl CommandEncoder for Dx12CommandEncoder {
     }
 
     fn end_render_pass(&mut self) {
-        // D3D12 does not have an explicit end-render-pass concept like Vulkan.
+        unsafe {
+            if let Some(depth) = self.active_depth_attachment.take() {
+                Dx12Device::transition_resource(
+                    &self.cmd_list,
+                    &depth,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                );
+                self.cmd_list.OMSetRenderTargets(
+                    1,
+                    Some(&self.main_rtv as *const _ as *const _),
+                    false,
+                    Some(&self.main_dsv),
+                );
+            }
+        }
     }
 
     fn push_constants(
         &mut self,
-        _pipeline_layout: PipelineLayoutHandle,
+        pipeline_layout: PipelineLayoutHandle,
         _stage_flags: u32,
-        _offset: u32,
-        _data: &[u8],
+        offset: u32,
+        data: &[u8],
     ) {
         unsafe {
             let device = &*self.device;
-            let (_, table_idx) = Dx12Device::decode_handle(_pipeline_layout.index);
-            let _inner = device.pipeline_layouts.get(table_idx);
-            let num_constants = (_data.len() / 4) as u32;
+            let (_, table_idx) = Dx12Device::decode_handle(pipeline_layout.index);
+            let Some(inner) = device.pipeline_layouts.get(table_idx) else {
+                return;
+            };
+            let Some(root_parameter) = inner.root_constants_parameter else {
+                return;
+            };
+            let num_constants = (data.len() / 4) as u32;
             if num_constants > 0 {
-                let u32_data: Vec<u32> = _data
+                let u32_data: Vec<u32> = data
                     .chunks_exact(4)
                     .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 self.cmd_list.SetGraphicsRoot32BitConstants(
-                    0,
+                    root_parameter,
                     num_constants,
                     u32_data.as_ptr() as *const _,
-                    0,
+                    offset / 4,
                 );
             }
         }

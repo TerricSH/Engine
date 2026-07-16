@@ -68,7 +68,7 @@ Every gate folder uses the same eight-file layout:
 
 The canonical `-v0` contract names live in the compatibility matrix and the schema doc. Use those exact names in gate documents and code. The current set is:
 
-`RHI-v0`, `RendererInput-v0`, `ECSScene-v0`, `AssetRegistry-v0`, `ScriptAPI-v0`, `MobileHotUpdate-v0`, `PackageInstallState-v0`, `SubsystemExtension-v0`, `Physics/Animation-v0`, `CharacterController-v0`, `NavAI-v0`, `Prefab-v0`, `RuntimeUI-v0`, `Audio-v0`, `ReleaseMetadata-v0`.
+`RHI-v0`, `RendererInput-v0`, `ECSScene-v0`, `GameProject-v0`, `AssetRegistry-v0`, `ScriptAPI-v0`, `MobileHotUpdate-v0`, `PackageInstallState-v0`, `SubsystemExtension-v0`, `Physics/Animation-v0`, `CharacterController-v0`, `NavAI-v0`, `Prefab-v0`, `RuntimeUI-v0`, `Audio-v0`, `ReleaseMetadata-v0`.
 
 Gate documents must not invent new `-v0` names without first adding them to the matrix and the schema doc.
 

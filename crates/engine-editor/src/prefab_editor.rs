@@ -74,10 +74,9 @@ pub fn draw_prefab_editor(ui: &mut EditorUi, panel: &mut PrefabEditorPanel, worl
     }
 
     // ── Instance selector ───────────────────────────────────────────────
-    let current = panel.selected_instance.as_deref().unwrap_or("");
     if ui.collapsing_header("Prefab Instance", true) {
         for id in &instance_ids {
-            let is_sel = panel.selected_instance.as_ref().map_or(false, |s| s == id);
+            let is_sel = panel.selected_instance.as_ref() == Some(id);
             let label = if is_sel {
                 format!("▶ {id}")
             } else {
@@ -95,7 +94,7 @@ pub fn draw_prefab_editor(ui: &mut EditorUi, panel: &mut PrefabEditorPanel, worl
     };
 
     // ── Override diff view ──────────────────────────────────────────────
-    draw_override_diff(ui, panel, world, &inst_id);
+    draw_override_diff(ui, world, &inst_id);
 
     // ── Variant tree ────────────────────────────────────────────────────
     draw_variant_tree(ui, panel, world, &inst_id);
@@ -127,12 +126,7 @@ pub fn draw_prefab_editor(ui: &mut EditorUi, panel: &mut PrefabEditorPanel, worl
 /// Show the list of override records for the selected instance.
 /// Each override shows (entity, component, property, value) and has
 /// apply/revert buttons.
-fn draw_override_diff(
-    ui: &mut EditorUi,
-    panel: &mut PrefabEditorPanel,
-    world: &World,
-    instance_id: &str,
-) {
+fn draw_override_diff(ui: &mut EditorUi, world: &World, instance_id: &str) {
     let open = ui.collapsing_header("Overrides", true);
     if !open {
         return;

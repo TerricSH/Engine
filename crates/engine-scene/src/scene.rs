@@ -242,7 +242,8 @@ impl Scene {
 
     /// Collect all asset dependencies referenced by components in this scene.
     ///
-    /// Scans every entity's component fields for `Value::Asset` entries and
+    /// Recursively scans every entity's component fields for `Value::Asset`
+    /// entries, including assets nested in `Value::List` and `Value::Map`, and
     /// returns a deduplicated list of [`AssetId`] values.
     pub fn collect_asset_dependencies(&self) -> Vec<AssetId> {
         let mut deps: BTreeSet<AssetId> = BTreeSet::new();
@@ -250,14 +251,31 @@ impl Scene {
         for entity in &self.entities {
             for component in entity.components.values() {
                 for value in component.fields.values() {
-                    if let Value::Asset(asset) = value {
-                        deps.insert(asset.clone());
-                    }
+                    collect_value_asset_dependencies(value, &mut deps);
                 }
             }
         }
 
         deps.into_iter().collect()
+    }
+}
+
+fn collect_value_asset_dependencies(value: &Value, dependencies: &mut BTreeSet<AssetId>) {
+    match value {
+        Value::Asset(asset) => {
+            dependencies.insert(asset.clone());
+        }
+        Value::List(values) => {
+            for value in values {
+                collect_value_asset_dependencies(value, dependencies);
+            }
+        }
+        Value::Map(values) => {
+            for value in values.values() {
+                collect_value_asset_dependencies(value, dependencies);
+            }
+        }
+        _ => {}
     }
 }
 

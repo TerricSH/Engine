@@ -118,6 +118,8 @@ public class ScriptMessage
     public string? Message { get; set; }
     public string? Name { get; set; }
     public ScriptValue? Value { get; set; }
+    public string? ContextJson { get; set; }
+    public string? CommandsJson { get; set; }
 }
 
 /// <summary>
@@ -154,6 +156,8 @@ public class ScriptMessageConverter : JsonConverter<ScriptMessage>
                 case "message": msg.Message = prop.Value.GetString(); break;
                 case "name": msg.Name = prop.Value.GetString(); break;
                 case "value": msg.Value = JsonSerializer.Deserialize<ScriptValue>(prop.Value.GetRawText(), options); break;
+                case "context_json": msg.ContextJson = prop.Value.GetString(); break;
+                case "commands_json": msg.CommandsJson = prop.Value.GetString(); break;
             }
         }
         return msg;
@@ -172,6 +176,8 @@ public class ScriptMessageConverter : JsonConverter<ScriptMessage>
         WriteProp(writer, "method", value.Method);
         WriteProp(writer, "message", value.Message);
         WriteProp(writer, "name", value.Name);
+        WriteProp(writer, "context_json", value.ContextJson);
+        WriteProp(writer, "commands_json", value.CommandsJson);
 
         if (value.Types != null)
         {
@@ -278,7 +284,36 @@ class ScriptInstance
         if (prop != null)
         {
             prop.SetValue(Instance, ConvertScriptValueToObject(value, prop.PropertyType));
+            return;
         }
+
+        throw new MissingMemberException(Type.FullName, name);
+    }
+
+    public void SetGameplayContext(string contextJson)
+    {
+        var method = Type.GetMethod(
+            "__EngineSetGameplayContext",
+            BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        // Legacy scripts remain lifecycle-compatible but simply do not expose
+        // the first-phase gameplay API.
+        if (method == null)
+            return;
+        method.Invoke(Instance, new object?[] { contextJson });
+    }
+
+    public string DrainGameplayCommands()
+    {
+        var method = Type.GetMethod(
+            "__EngineDrainGameplayCommands",
+            BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        if (method == null)
+            return "[]";
+        var result = method.Invoke(Instance, Array.Empty<object?>());
+        if (result is not string json)
+            throw new InvalidOperationException(
+                $"{Type.FullName}.__EngineDrainGameplayCommands must return a JSON string");
+        return json;
     }
 
     // ── Value conversion helpers ──────────────────────────────────────────
@@ -329,10 +364,16 @@ class ScriptInstance
 /// </summary>
 class ScriptProtocolHost
 {
+    private readonly TextWriter _protocolOutput;
     /// Loaded assemblies: assembly_id → Assembly
     private readonly Dictionary<string, Assembly> _assemblies = new();
     /// Runtime instances: instance_id → ScriptInstance
     private readonly Dictionary<string, ScriptInstance> _instances = new();
+
+    public ScriptProtocolHost(TextWriter protocolOutput)
+    {
+        _protocolOutput = protocolOutput;
+    }
 
     public void Run()
     {
@@ -346,6 +387,8 @@ class ScriptProtocolHost
 
                 var response = ProcessMessage(msg);
                 Respond(response);
+                if (msg.Type == "Shutdown")
+                    return;
             }
             catch (Exception ex)
             {
@@ -363,6 +406,8 @@ class ScriptProtocolHost
             "CallMethod" => HandleCallMethod(msg),
             "SetField" => HandleSetField(msg),
             "GetField" => HandleGetField(msg),
+            "SetGameplayContext" => HandleSetGameplayContext(msg),
+            "DrainGameplayCommands" => HandleDrainGameplayCommands(msg),
             "Shutdown" => HandleShutdown(),
             _ => MakeError($"Unknown message type: {msg.Type}")
         };
@@ -463,7 +508,7 @@ class ScriptProtocolHost
         }
         catch (Exception ex)
         {
-            return MakeError($"Method '{method}' failed: {ex.Message}");
+            return MakeError($"Method '{method}' failed: {DescribeException(ex)}");
         }
     }
 
@@ -489,7 +534,7 @@ class ScriptProtocolHost
         }
         catch (Exception ex)
         {
-            return MakeError($"SetField '{name}' failed: {ex.Message}");
+            return MakeError($"SetField '{name}' failed: {DescribeException(ex)}");
         }
     }
 
@@ -514,7 +559,53 @@ class ScriptProtocolHost
         }
         catch (Exception ex)
         {
-            return MakeError($"GetField '{name}' failed: {ex.Message}");
+            return MakeError($"GetField '{name}' failed: {DescribeException(ex)}");
+        }
+    }
+
+    ScriptMessage HandleSetGameplayContext(ScriptMessage msg)
+    {
+        var instanceId = msg.InstanceId ?? "";
+        var contextJson = msg.ContextJson
+            ?? throw new InvalidOperationException("SetGameplayContext requires context_json");
+        if (!_instances.TryGetValue(instanceId, out var instance))
+            return MakeError($"SetGameplayContext instance not found: {instanceId}");
+
+        try
+        {
+            instance.SetGameplayContext(contextJson);
+            return new ScriptMessage
+            {
+                Type = "GameplayContextSet",
+                InstanceId = instanceId
+            };
+        }
+        catch (Exception ex)
+        {
+            return MakeError(
+                $"SetGameplayContext failed for instance '{instanceId}': {DescribeException(ex)}");
+        }
+    }
+
+    ScriptMessage HandleDrainGameplayCommands(ScriptMessage msg)
+    {
+        var instanceId = msg.InstanceId ?? "";
+        if (!_instances.TryGetValue(instanceId, out var instance))
+            return MakeError($"DrainGameplayCommands instance not found: {instanceId}");
+
+        try
+        {
+            return new ScriptMessage
+            {
+                Type = "GameplayCommands",
+                InstanceId = instanceId,
+                CommandsJson = instance.DrainGameplayCommands()
+            };
+        }
+        catch (Exception ex)
+        {
+            return MakeError(
+                $"DrainGameplayCommands failed for instance '{instanceId}': {DescribeException(ex)}");
         }
     }
 
@@ -533,6 +624,13 @@ class ScriptProtocolHost
         };
     }
 
+    internal static string DescribeException(Exception exception)
+    {
+        while (exception is TargetInvocationException { InnerException: not null })
+            exception = exception.InnerException;
+        return $"{exception.GetType().Name}: {exception.Message}";
+    }
+
     void Respond(ScriptMessage response)
     {
         var json = JsonSerializer.Serialize(response, new JsonSerializerOptions
@@ -540,8 +638,8 @@ class ScriptProtocolHost
             WriteIndented = false,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         });
-        Console.WriteLine(json);
-        Console.Out.Flush();
+        _protocolOutput.WriteLine(json);
+        _protocolOutput.Flush();
     }
 
     void RespondError(string message)
@@ -555,9 +653,111 @@ class ScriptProtocolHost
 /// </summary>
 class Program
 {
-    static void Main()
+    static int Main(string[] args)
     {
-        var host = new ScriptProtocolHost();
+        if (args.Contains("--self-test", StringComparer.Ordinal))
+            return GameplayBridgeSelfTest.Run();
+
+        var protocolOutput = Console.Out;
+        Console.SetOut(Console.Error);
+        var host = new ScriptProtocolHost(protocolOutput);
         host.Run();
+        return 0;
+    }
+}
+
+sealed class GameplayBridgeProbe
+{
+    public string ContextJson { get; private set; } = "";
+
+    public void __EngineSetGameplayContext(string contextJson) => ContextJson = contextJson;
+
+    public string __EngineDrainGameplayCommands() =>
+        "[{\"type\":\"set_transform\",\"transform\":{\"translation\":[1,2,3],\"rotation\":[0,0,0,1],\"scale\":[1,1,1]}}," +
+        "{\"type\":\"set_entity_transform\",\"entity_id\":\"enemy-01\",\"transform\":{\"translation\":[4,5,6],\"rotation\":[0,0,0,1],\"scale\":[2,2,2]}}," +
+        "{\"type\":\"destroy_entity\",\"entity_id\":\"enemy-01\"}," +
+        "{\"type\":\"destroy_self\"}," +
+        "{\"type\":\"load_scene\",\"scene_id\":\"level_two\"}]";
+
+    public void ThrowBridgeError() => throw new InvalidOperationException("bridge boom");
+}
+
+static class GameplayBridgeSelfTest
+{
+    public static int Run()
+    {
+        try
+        {
+            const string contextJson =
+                "{\"entity_id\":\"player\",\"transform\":null,\"input_actions\":{\"jump\":{\"type\":\"Bool\",\"value\":true}},\"ui_events\":[{\"canvas_id\":\"hud\",\"element_id\":7,\"callback_id\":\"start-game\"}],\"entities\":{\"player\":{\"transform\":null}}}";
+            var probeObject = new GameplayBridgeProbe();
+            var probe = new ScriptInstance("self-test", typeof(GameplayBridgeProbe), probeObject);
+            probe.SetGameplayContext(contextJson);
+            Require(probeObject.ContextJson == contextJson, "context reflection hook did not run");
+            using (var contextDocument = JsonDocument.Parse(probeObject.ContextJson))
+            {
+                var uiEvent = contextDocument.RootElement.GetProperty("ui_events")[0];
+                Require(
+                    uiEvent.GetProperty("canvas_id").GetString() == "hud" &&
+                    uiEvent.GetProperty("element_id").GetUInt32() == 7 &&
+                    uiEvent.GetProperty("callback_id").GetString() == "start-game",
+                    "context reflection hook did not preserve the gameplay UI event");
+            }
+
+            var commands = probe.DrainGameplayCommands();
+            using (var document = JsonDocument.Parse(commands))
+            {
+                Require(document.RootElement.GetArrayLength() == 5, "command hook returned commands incorrectly");
+                Require(
+                    document.RootElement[0].GetProperty("type").GetString() == "set_transform",
+                    "command hook did not preserve set_transform");
+                Require(
+                    document.RootElement[1].GetProperty("type").GetString() == "set_entity_transform" &&
+                    document.RootElement[1].GetProperty("entity_id").GetString() == "enemy-01",
+                    "command hook did not preserve set_entity_transform");
+                Require(
+                    document.RootElement[2].GetProperty("type").GetString() == "destroy_entity" &&
+                    document.RootElement[2].GetProperty("entity_id").GetString() == "enemy-01",
+                    "command hook did not preserve destroy_entity");
+                Require(
+                    document.RootElement[3].GetProperty("type").GetString() == "destroy_self",
+                    "command hook did not preserve destroy_self");
+                Require(
+                    document.RootElement[4].GetProperty("type").GetString() == "load_scene" &&
+                    document.RootElement[4].GetProperty("scene_id").GetString() == "level_two",
+                    "command hook did not preserve load_scene");
+            }
+
+            var wire = JsonSerializer.Deserialize<ScriptMessage>(
+                "{\"type\":\"SetGameplayContext\",\"instance_id\":\"self-test\",\"context_json\":\"{}\"}");
+            Require(wire?.ContextJson == "{}", "protocol did not decode context_json");
+
+            try
+            {
+                probe.CallMethod("ThrowBridgeError", new List<ScriptValue>());
+                throw new InvalidOperationException("throwing probe method unexpectedly succeeded");
+            }
+            catch (Exception exception)
+            {
+                Require(
+                    ScriptProtocolHost.DescribeException(exception) ==
+                        "InvalidOperationException: bridge boom",
+                    "reflection error did not preserve the inner script diagnostic");
+            }
+
+            Console.WriteLine("EngineSample gameplay bridge self-test passed.");
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"EngineSample gameplay bridge self-test failed: {exception}");
+            return 1;
+        }
+    }
+
+    static void Require(bool condition, string message)
+    {
+        if (!condition)
+            throw new InvalidOperationException(message);
     }
 }

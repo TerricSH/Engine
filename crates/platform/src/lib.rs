@@ -48,9 +48,6 @@ impl Default for WindowDescriptor {
     }
 }
 
-/// A keyboard key identifier (scancode-based, layout-independent).
-pub type KeyCode = u32;
-
 /// Mouse button identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseButton {
@@ -67,6 +64,7 @@ pub enum PlatformEvent {
     Resumed,
     Suspended,
     Resized { width: u32, height: u32 },
+    Focused(bool),
     Redraw,
     CloseRequested,
 
@@ -104,7 +102,7 @@ impl Modifiers {
     }
 }
 
-pub use self::input_types::*;
+pub use self::input_types::KeyCode;
 mod input_types {
     /// Key codes (subset of winit's VirtualKeyCode for engine use).
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -230,7 +228,9 @@ mod input_types {
                 winit::keyboard::KeyCode::KeyY => Self::Y,
                 winit::keyboard::KeyCode::KeyZ => Self::Z,
                 winit::keyboard::KeyCode::Space => Self::Space,
-                winit::keyboard::KeyCode::Enter => Self::Enter,
+                winit::keyboard::KeyCode::Enter | winit::keyboard::KeyCode::NumpadEnter => {
+                    Self::Enter
+                }
                 winit::keyboard::KeyCode::Backspace => Self::Backspace,
                 winit::keyboard::KeyCode::Tab => Self::Tab,
                 winit::keyboard::KeyCode::Delete => Self::Delete,
@@ -245,34 +245,6 @@ mod input_types {
                 winit::keyboard::KeyCode::AltLeft => Self::LAlt,
                 winit::keyboard::KeyCode::AltRight => Self::RAlt,
                 other => Self::Other(other as u32),
-            }
-        }
-    }
-
-    /// Pressed or released.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum ElementState {
-        Pressed,
-        Released,
-    }
-
-    /// Mouse button identifiers.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    #[allow(dead_code)]
-    pub enum MouseButton {
-        Left,
-        Right,
-        Middle,
-        Other(u16),
-    }
-
-    impl From<winit::event::MouseButton> for MouseButton {
-        fn from(b: winit::event::MouseButton) -> Self {
-            match b {
-                winit::event::MouseButton::Left => Self::Left,
-                winit::event::MouseButton::Right => Self::Right,
-                winit::event::MouseButton::Middle => Self::Middle,
-                _ => Self::Other(0),
             }
         }
     }
@@ -311,6 +283,8 @@ pub fn run<A: WindowApp>(descriptor: WindowDescriptor, app: A) -> Result<(), Pla
         app,
         window: None,
         created: false,
+        modifiers: Modifiers::default(),
+        cursor_position: (0.0, 0.0),
     };
     event_loop
         .run_app(&mut wrapper)
@@ -322,6 +296,15 @@ struct Wrapper<A: WindowApp> {
     app: A,
     window: Option<Arc<Window>>,
     created: bool,
+    modifiers: Modifiers,
+    cursor_position: (f64, f64),
+}
+
+fn character_events(text: &str) -> Vec<PlatformEvent> {
+    text.chars()
+        .filter(|character| !character.is_control())
+        .map(|character| PlatformEvent::CharacterTyped { character })
+        .collect()
 }
 
 impl<A: WindowApp> ApplicationHandler for Wrapper<A> {
@@ -336,6 +319,7 @@ impl<A: WindowApp> ApplicationHandler for Wrapper<A> {
             match event_loop.create_window(attrs) {
                 Ok(window) => {
                     let window = Arc::new(window);
+                    window.set_ime_allowed(true);
                     self.window = Some(window.clone());
                     if !self.created {
                         self.app.on_create(window);
@@ -371,10 +355,11 @@ impl<A: WindowApp> ApplicationHandler for Wrapper<A> {
         let Some(window) = self.window.clone() else {
             return;
         };
-        if let Some(ev) = self.translate_event(&event) {
+        for ev in self.translate_events(&event) {
             let flow = self.app.on_event(&window, ev);
             if matches!(flow, EventFlow::Exit) {
                 event_loop.exit();
+                break;
             }
         }
         window.request_redraw();
@@ -382,40 +367,57 @@ impl<A: WindowApp> ApplicationHandler for Wrapper<A> {
 }
 
 impl<A: WindowApp> Wrapper<A> {
-    fn translate_event(&self, event: &WinitWindowEvent) -> Option<PlatformEvent> {
+    fn translate_events(&mut self, event: &WinitWindowEvent) -> Vec<PlatformEvent> {
         use winit::event::ElementState as WinitState;
         use winit::event::MouseScrollDelta;
         match event {
-            WinitWindowEvent::Resized(size) => Some(PlatformEvent::Resized {
+            WinitWindowEvent::Resized(size) => vec![PlatformEvent::Resized {
                 width: size.width,
                 height: size.height,
-            }),
-            WinitWindowEvent::CloseRequested => Some(PlatformEvent::CloseRequested),
-            WinitWindowEvent::RedrawRequested => Some(PlatformEvent::Redraw),
+            }],
+            WinitWindowEvent::Focused(focused) => vec![PlatformEvent::Focused(*focused)],
+            WinitWindowEvent::CloseRequested => vec![PlatformEvent::CloseRequested],
+            WinitWindowEvent::RedrawRequested => vec![PlatformEvent::Redraw],
+            WinitWindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = Modifiers::from_winit(&modifiers.state());
+                Vec::new()
+            }
 
             // ── Keyboard ──────────────────────────────────────────────
             WinitWindowEvent::KeyboardInput { event: ke, .. } => {
-                let modifiers = Modifiers {
-                    shift: false,
-                    ctrl: false,
-                    alt: false,
-                    logo: false,
-                };
                 let key = match ke.physical_key {
-                    winit::keyboard::PhysicalKey::Code(c) => c as u32,
-                    _ => 0,
+                    winit::keyboard::PhysicalKey::Code(code) => KeyCode::from(code),
+                    winit::keyboard::PhysicalKey::Unidentified(_) => KeyCode::Other(u32::MAX),
                 };
                 match ke.state {
-                    WinitState::Pressed => Some(PlatformEvent::KeyPressed { key, modifiers }),
-                    WinitState::Released => Some(PlatformEvent::KeyReleased { key, modifiers }),
+                    WinitState::Pressed => {
+                        let mut events = vec![PlatformEvent::KeyPressed {
+                            key,
+                            modifiers: self.modifiers,
+                        }];
+                        if !self.modifiers.ctrl && !self.modifiers.logo {
+                            if let Some(text) = &ke.text {
+                                events.extend(character_events(text));
+                            }
+                        }
+                        events
+                    }
+                    WinitState::Released => vec![PlatformEvent::KeyReleased {
+                        key,
+                        modifiers: self.modifiers,
+                    }],
                 }
             }
+            WinitWindowEvent::Ime(winit::event::Ime::Commit(text)) => character_events(text),
 
             // ── Mouse ─────────────────────────────────────────────────
-            WinitWindowEvent::CursorMoved { position, .. } => Some(PlatformEvent::MouseMoved {
-                x: position.x,
-                y: position.y,
-            }),
+            WinitWindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = (position.x, position.y);
+                vec![PlatformEvent::MouseMoved {
+                    x: position.x,
+                    y: position.y,
+                }]
+            }
             WinitWindowEvent::MouseInput { state, button, .. } => {
                 let btn = match button {
                     winit::event::MouseButton::Left => MouseButton::Left,
@@ -424,16 +426,16 @@ impl<A: WindowApp> Wrapper<A> {
                     _ => MouseButton::Other(0),
                 };
                 match state {
-                    WinitState::Pressed => Some(PlatformEvent::MousePressed {
+                    WinitState::Pressed => vec![PlatformEvent::MousePressed {
                         button: btn,
-                        x: 0.0,
-                        y: 0.0,
-                    }),
-                    WinitState::Released => Some(PlatformEvent::MouseReleased {
+                        x: self.cursor_position.0,
+                        y: self.cursor_position.1,
+                    }],
+                    WinitState::Released => vec![PlatformEvent::MouseReleased {
                         button: btn,
-                        x: 0.0,
-                        y: 0.0,
-                    }),
+                        x: self.cursor_position.0,
+                        y: self.cursor_position.1,
+                    }],
                 }
             }
             WinitWindowEvent::MouseWheel { delta, .. } => {
@@ -441,10 +443,10 @@ impl<A: WindowApp> Wrapper<A> {
                     MouseScrollDelta::LineDelta(x, y) => (*x, *y),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
-                Some(PlatformEvent::MouseWheelScrolled { delta: (dx, dy) })
+                vec![PlatformEvent::MouseWheelScrolled { delta: (dx, dy) }]
             }
 
-            _ => None,
+            _ => Vec::new(),
         }
     }
 }
@@ -452,6 +454,28 @@ impl<A: WindowApp> Wrapper<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_translation_keeps_unicode_and_filters_control_characters() {
+        assert_eq!(
+            character_events("é中\r\n"),
+            vec![
+                PlatformEvent::CharacterTyped { character: 'é' },
+                PlatformEvent::CharacterTyped { character: '中' },
+            ]
+        );
+    }
+
+    #[test]
+    fn winit_keys_map_to_stable_platform_keys() {
+        use winit::keyboard::KeyCode as WinitKey;
+
+        assert_eq!(KeyCode::from(WinitKey::KeyW), KeyCode::W);
+        assert_eq!(KeyCode::from(WinitKey::Digit0), KeyCode::Key0);
+        assert_eq!(KeyCode::from(WinitKey::Space), KeyCode::Space);
+        assert_eq!(KeyCode::from(WinitKey::ArrowLeft), KeyCode::Left);
+        assert_eq!(KeyCode::from(WinitKey::ShiftRight), KeyCode::RShift);
+    }
 
     // ── WindowDescriptor tests ───────────────────────────────────────────
 

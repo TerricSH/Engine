@@ -9,7 +9,7 @@ use tracing;
 use engine_animation::components::AnimationPlayer;
 use engine_nav::components::AiAgent;
 use engine_physics::components::RigidBody;
-use engine_renderer::{FrameStats as RendererFrameStats, Renderer};
+use engine_renderer::FrameStats as RendererFrameStats;
 use engine_scene::World;
 
 use crate::editor_ui::EditorUi;
@@ -265,7 +265,7 @@ pub fn draw_performance(ui: &mut EditorUi, panel: &mut PerformancePanel) {
     ui.text_field("Draw Calls", &stats.draw_calls.to_string());
     ui.text_field("Triangles", &stats.triangles.to_string());
 
-    let _ = ui.separator();
+    ui.separator();
 
     // ── Rendering section ────────────────────────────────────────────
     panel.visible_sections.rendering =
@@ -360,8 +360,8 @@ pub fn draw_frame_time_graph(ui: &mut EditorUi, history: &[FrameStats]) {
         let empty = bar_width - filled;
 
         let (_tag, _color) = stats.frame_time_color();
-        let bar: String = std::iter::repeat('#').take(filled).collect();
-        let space: String = std::iter::repeat('.').take(empty).collect();
+        let bar = "#".repeat(filled);
+        let space = ".".repeat(empty);
         let label = format!(
             "[{:>3}] ▕{}{}▏ {:.1} ms",
             i + 1,
@@ -542,8 +542,7 @@ mod tests {
     // ── renderer parameter accepted (no-op) ─────────────────────────────
 
     #[test]
-    fn record_frame_accepts_renderer() {
-        let renderer = Renderer::new();
+    fn record_frame_accepts_missing_renderer_stats() {
         let world = World::new();
         let mut stats = FrameStats::ZERO;
 
@@ -558,8 +557,6 @@ mod tests {
 
     #[test]
     fn record_frame_counts_world_components() {
-        use engine_scene::Component;
-
         let mut world = World::new();
 
         // Add a few rigid bodies.

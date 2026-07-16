@@ -11,6 +11,7 @@ impl Drop for VulkanDevice {
         unsafe {
             let _ = self.logical_device.device.device_wait_idle();
         };
+        self.destroy_ui_overlay_resources();
         self.drain_all_retired_pipelines();
         let d = &self.logical_device.device;
         for fb in self.mvp_framebuffers.drain(..) {
@@ -81,16 +82,19 @@ impl Drop for VulkanDevice {
         for entry in self.buffers.drain_values() {
             entry.destroy(d);
         }
+        for (_, fb) in self.framebuffers.slots.drain(..).flatten() {
+            // SAFETY: `fb` was created by this device.
+            unsafe {
+                d.destroy_framebuffer(fb.framebuffer, None);
+            }
+        }
+        for texture in self.rhi_textures.drain_values() {
+            texture.destroy(d);
+        }
         for (_, rp) in self.render_passes.slots.drain(..).flatten() {
             // SAFETY: `rp` was created by this device.
             unsafe {
                 d.destroy_render_pass(rp, None);
-            }
-        }
-        for (_, fb) in self.framebuffers.slots.drain(..).flatten() {
-            // SAFETY: `fb` was created by this device.
-            unsafe {
-                d.destroy_framebuffer(fb, None);
             }
         }
         for (_, e) in self.pipeline_layouts.slots.drain(..).flatten() {

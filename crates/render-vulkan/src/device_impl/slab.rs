@@ -20,6 +20,55 @@ pub(crate) struct BufEntry {
     pub(crate) allocation: Option<Allocation>,
 }
 
+pub(crate) struct TexEntry {
+    pub(crate) image: vk::Image,
+    pub(crate) view: vk::ImageView,
+    pub(crate) sampler: Option<vk::Sampler>,
+    pub(crate) format: vk::Format,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) sample_count: u8,
+    pub(crate) allocator: SharedAllocator,
+    pub(crate) allocation: Option<Allocation>,
+}
+
+impl TexEntry {
+    fn free_allocation(&mut self) {
+        let Some(mut allocation) = self.allocation.take() else {
+            return;
+        };
+        match self.allocator.lock() {
+            Ok(mut allocator) => allocator.free(&mut allocation),
+            Err(poisoned) => {
+                tracing::error!(
+                    target: "vulkan::resources",
+                    "allocator mutex was poisoned while freeing a texture allocation"
+                );
+                poisoned.into_inner().free(&mut allocation);
+            }
+        }
+    }
+
+    pub(crate) fn destroy(mut self, device: &AshDevice) {
+        unsafe {
+            if let Some(sampler) = self.sampler.take() {
+                device.destroy_sampler(sampler, None);
+            }
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+        }
+        self.view = vk::ImageView::null();
+        self.image = vk::Image::null();
+        self.free_allocation();
+    }
+}
+
+impl Drop for TexEntry {
+    fn drop(&mut self) {
+        self.free_allocation();
+    }
+}
+
 impl BufEntry {
     fn free_allocation(&mut self) {
         let Some(mut allocation) = self.allocation.take() else {
@@ -129,6 +178,12 @@ impl<T> Slab<T> {
 
 pub(crate) struct PipeEntry {
     pub(crate) pipeline: vk::Pipeline,
+}
+
+pub(crate) struct FbEntry {
+    pub(crate) framebuffer: vk::Framebuffer,
+    pub(crate) color_attachment_count: u32,
+    pub(crate) has_depth: bool,
 }
 
 pub(crate) struct PlEntry {

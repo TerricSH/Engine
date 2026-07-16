@@ -21,20 +21,73 @@ pub const DIAG_INVALID_TEXTURE_MIPS: &str = "RV0121";
 pub const DIAG_INVALID_MATERIAL_VALUES: &str = "RV0130";
 pub const DIAG_UNSUPPORTED_MATERIAL_STATE: &str = "RV0131";
 pub const DIAG_INVALID_RESIZE: &str = "RV0140";
+pub const DIAG_BARRIERS_UNSUPPORTED: &str = "RV0141";
+pub const DIAG_RENDER_GRAPH_UNSUPPORTED: &str = "RV0142";
+pub const DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED: &str = "RV0143";
+
+/// Selects whether [`Renderer`] invokes the legacy whole-frame entry point or
+/// the explicit render-graph lifecycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendFrameMode {
+    /// Call `render_frame` exactly once. This keeps small/headless backends
+    /// correct without pretending they implement individual graph passes.
+    #[default]
+    LegacySinglePass,
+    /// Execute begin/barrier/pass/end callbacks for the compiled graph.
+    RenderGraph,
+}
 
 /// Backend renderer trait implemented by concrete GPU backends.
 pub trait BackendRenderer: Send {
     /// Render one frame from the given scene input (legacy single-pass path).
     fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>>;
 
+    fn frame_mode(&self) -> BackendFrameMode {
+        BackendFrameMode::LegacySinglePass
+    }
+
+    /// Let a graph-capable backend replace frontend placeholder declarations
+    /// for its registered custom passes before dependency compilation.
+    ///
+    /// Built-in-only graphs need no backend participation. A custom node is
+    /// rejected by default so its declared resources cannot be silently
+    /// treated as empty by a backend that has no pass registry.
+    fn configure_render_graph(
+        &mut self,
+        _input: &RenderFrameInput,
+        graph: &mut crate::render_graph2::RenderGraph,
+    ) -> Result<(), Vec<Diagnostic>> {
+        if let Some(custom) = graph.passes.iter().find_map(|pass| match &pass.kind {
+            crate::render_graph2::PassKind::Custom(name) => Some(*name),
+            _ => None,
+        }) {
+            Err(vec![Diagnostic::new(
+                DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED,
+                DiagnosticSeverity::Error,
+                "renderer.render_graph",
+                format!(
+                    "backend does not provide a resource declaration for custom render pass '{custom}'"
+                ),
+            )])
+        } else {
+            Ok(())
+        }
+    }
+
     /// Begin a new frame. Called once before [`execute_pass`](Self::execute_pass).
     fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
-        Ok(())
+        Err(unsupported_backend_operation(
+            DIAG_RENDER_GRAPH_UNSUPPORTED,
+            "render-graph begin_frame",
+        ))
     }
 
     /// End the current frame after every compiled pass succeeds.
     fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
-        Ok(())
+        Err(unsupported_backend_operation(
+            DIAG_RENDER_GRAPH_UNSUPPORTED,
+            "render-graph end_frame",
+        ))
     }
 
     /// Abandon a frame that began successfully but subsequently failed.
@@ -54,20 +107,29 @@ pub trait BackendRenderer: Send {
         &mut self,
         _input: &RenderFrameInput,
         _pass: &render_graph::PassNode,
-        _barriers: &[CompiledBarrier],
+        barriers: &[CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
-        Ok(())
+        if barriers.is_empty() {
+            Ok(())
+        } else {
+            Err(unsupported_backend_operation(
+                DIAG_BARRIERS_UNSUPPORTED,
+                "render-graph resource barriers",
+            ))
+        }
     }
 
-    /// Execute a single render-graph pass. The default implementation
-    /// delegates to [`render_frame`](Self::render_frame) for compatibility.
+    /// Execute a single render-graph pass.
     fn execute_pass(
         &mut self,
-        input: &RenderFrameInput,
+        _input: &RenderFrameInput,
         _pass: &render_graph::PassNode,
         _frame_stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
-        self.render_frame(input).map(|_| ())
+        Err(unsupported_backend_operation(
+            DIAG_RENDER_GRAPH_UNSUPPORTED,
+            "render-graph pass execution",
+        ))
     }
 
     /// Upload one owned static mesh and return its backend revision.
@@ -219,10 +281,15 @@ impl Renderer {
             .as_mut()
             .ok_or_else(|| missing_backend("draw"))?;
 
-        let graph = crate::render_graph2::RenderGraph::build_with_config(
+        if backend.frame_mode() == BackendFrameMode::LegacySinglePass {
+            return backend.render_frame(input);
+        }
+
+        let mut graph = crate::render_graph2::RenderGraph::build_with_config(
             input,
             &input.render_options.pass_graph_config,
         );
+        backend.configure_render_graph(input, &mut graph)?;
         let compiled = graph.compile_v2().map_err(|error| {
             vec![Diagnostic::new(
                 "RV0020",
@@ -347,7 +414,7 @@ fn validate_mesh_upload(upload: &MeshUpload) -> Vec<Diagnostic> {
     let index_size = upload.index_format.byte_size();
     let expected_index_bytes = (upload.index_count as usize).checked_mul(index_size);
     if upload.index_count == 0
-        || upload.index_count % 3 != 0
+        || !upload.index_count.is_multiple_of(3)
         || expected_index_bytes.is_none()
         || expected_index_bytes != Some(upload.index_bytes.len())
     {
@@ -520,5 +587,10 @@ mod contract_layout_tests {
             std::mem::size_of::<crate::Pbr32Vertex>(),
             crate::PBR32_VERTEX_STRIDE as usize
         );
+        assert_eq!(
+            crate::MeshVertexFormat::Skinned64.stride_bytes(),
+            crate::SKINNED64_VERTEX_STRIDE
+        );
+        assert_eq!(crate::SKINNED64_VERTEX_STRIDE, 64);
     }
 }

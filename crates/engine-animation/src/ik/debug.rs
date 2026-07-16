@@ -6,7 +6,7 @@
 //! The [`IkDebugDraw`] struct collects IK debug info each frame and renders
 //! it through the engine's [`DebugDrawProvider`] trait.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use engine_renderer::{DebugDrawBuffer, DebugDrawProvider};
 use glam::{Mat4, Quat, Vec3};
@@ -34,15 +34,16 @@ pub struct IkDebugInfo {
 /// - Target markers (sphere + axis) at each effector position.
 /// - Chain lines showing the bone chain from base to tip.
 /// - Labels with effector names.
+#[derive(Clone)]
 pub struct IkDebugDraw {
-    infos: Mutex<Vec<IkDebugInfo>>,
+    infos: Arc<Mutex<Vec<IkDebugInfo>>>,
 }
 
 impl IkDebugDraw {
     /// Create a new empty IK debug drawer.
     pub fn new() -> Self {
         Self {
-            infos: Mutex::new(Vec::new()),
+            infos: Arc::new(Mutex::new(Vec::new())),
         }
     }
 

@@ -1,0 +1,67 @@
+name: Release package
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release identifier used for a manual dry run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  windows-package:
+    name: Tested Windows package
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Rust quality gates
+        run: ./.github/scripts/ci.ps1 -Task Rust
+      - name: Release-profile headless QA report
+        run: >-
+          ./.github/scripts/qa.ps1 -Configuration Release
+          -ProjectPath ./examples/minimal-game/game.project.json
+      - name: Build and package Vulkan desktop runtime
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+        run: >-
+          ./.github/scripts/package-windows.ps1
+          -ProjectPath ./examples/minimal-game/game.project.json
+      - name: Verify two independent Release builds are reproducible
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+        run: >-
+          ./.github/scripts/verify-package-reproducibility.ps1
+          -Version $env:RELEASE_VERSION
+          -ProjectPath ./examples/minimal-game/game.project.json
+      - name: Upload package, symbols, metadata, and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+          path: |
+            artifacts/release/${{ github.event_name == 'push' && github.ref_name || inputs.version }}/
+            artifacts/qa/
+            artifacts/reproducibility/${{ github.event_name == 'push' && github.ref_name || inputs.version }}/report.json
+          if-no-files-found: error
+          retention-days: 30

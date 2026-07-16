@@ -17,3 +17,6 @@ render-core = { path = "../render-core" }
 thiserror.workspace = true
 tracing.workspace = true
 windows = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.build-dependencies]
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D_Fxc"] }

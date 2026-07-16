@@ -1,0 +1,67 @@
+(
+    schema_version: (
+        major: 0,
+        minor: 1,
+        patch: 0,
+    ),
+    engine_version: "0.1.0",
+    scene_id: "minimal-game-main",
+    name: "Minimal Game Main",
+    entities: [
+        (
+            persistent_id: "camera-main",
+            parent: None,
+            name: Some("Main Camera"),
+            enabled: true,
+            components: {
+                "engine.camera": (
+                    schema_version: (major: 0, minor: 1, patch: 0),
+                    enabled: true,
+                    fields: {},
+                ),
+            },
+        ),
+        (
+            persistent_id: "triangle-01",
+            parent: None,
+            name: Some("Cooked Triangle"),
+            enabled: true,
+            components: {
+                "engine.renderable": (
+                    schema_version: (major: 0, minor: 1, patch: 0),
+                    enabled: true,
+                    fields: {
+                        "cast_shadows": Bool(true),
+                        "material": Asset((id: "sample-material", logical_path: None)),
+                        "mesh": Asset((id: "sample-mesh", logical_path: None)),
+                        "render_layer": Str("Default"),
+                        "visible": Bool(true),
+                    },
+                ),
+            },
+        ),
+    ],
+    scene_settings: (
+        active_camera: Some("camera-main"),
+        default_render_layer: "Default",
+        fixed_timestep_seconds: 0.016666668,
+        gravity: Some((0.0, -9.81, 0.0)),
+        ambient: (0.03, 0.03, 0.03, 1.0),
+        environment_map: None,
+        tone_mapping: Aces,
+        pass_graph_config: (
+            passes: [
+                (kind: "DirectionalShadow", enabled: true),
+                (kind: "OpaquePbrForward", enabled: true),
+                (kind: "ToneMap", enabled: true),
+                (kind: "Present", enabled: true),
+            ],
+            enabled: true,
+        ),
+    ),
+    dependencies: [
+        (id: "sample-mesh", logical_path: None),
+        (id: "sample-material", logical_path: None),
+    ],
+    diagnostics_policy: Strict,
+)

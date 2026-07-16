@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use engine_renderer::{
     AxisAlignedBox, BonePaletteLayout, RenderExtensionProducer, RenderFrameInput, SkinnedItem,
@@ -50,15 +50,16 @@ pub struct PendingSkinnedItem {
 /// The animation system pushes [`PendingSkinnedItem`]s into the shared queue,
 /// and [`produce`](Self::produce) drains them into
 /// [`RenderFrameInput::skinned_items`].
+#[derive(Clone)]
 pub struct SkinnedExtractProducer {
-    items: Mutex<Vec<PendingSkinnedItem>>,
+    items: Arc<Mutex<Vec<PendingSkinnedItem>>>,
 }
 
 impl SkinnedExtractProducer {
     /// Create a new empty producer.
     pub fn new() -> Self {
         Self {
-            items: Mutex::new(Vec::new()),
+            items: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -99,6 +100,16 @@ impl RenderExtensionProducer for SkinnedExtractProducer {
 
     fn produce(&self, input: &mut RenderFrameInput, _frame_index: u64) {
         let pending = self.drain();
+        // Core ECS extraction sees every Renderable as a static drawable. A
+        // successfully prepared skinned item replaces that representation;
+        // retaining both would draw the same entity twice, once frozen in its
+        // bind pose and once with the evaluated bone palette.
+        input.drawables.retain(|drawable| {
+            !pending.iter().any(|item| {
+                item.entity.as_deref().is_some()
+                    && item.entity.as_deref() == drawable.entity.as_deref()
+            })
+        });
         for item in pending {
             let bone_count = item.bone_palette.len() as u32;
 
@@ -140,7 +151,12 @@ pub fn bridge_skinned_items(
     producer: &SkinnedExtractProducer,
     dt: f32,
 ) {
-    use crate::SkeletonComponent;
+    use crate::{AnimationPlayer, IkTargetComponent, SkeletonComponent};
+
+    let clip_list: Vec<(&str, crate::AnimationClip)> = clips
+        .iter()
+        .map(|(id, clip)| (id.as_str(), clip.clone()))
+        .collect();
 
     // Collect entities first to avoid borrow conflicts with get_mut
     let entities: Vec<Entity> = world
@@ -154,9 +170,10 @@ pub fn bridge_skinned_items(
         let Some(renderable) = world.get::<Renderable>(entity).cloned() else {
             continue;
         };
-        let skel_asset_id = world
-            .get::<SkeletonComponent>(entity)
-            .and_then(|s| s.skeleton_asset.clone());
+        let skeleton_component = world.get::<SkeletonComponent>(entity).cloned();
+        let skel_asset_id = skeleton_component
+            .as_ref()
+            .and_then(|component| component.skeleton_asset.clone());
         let Some(skel_asset_id) = skel_asset_id else {
             continue;
         };
@@ -164,40 +181,70 @@ pub fn bridge_skinned_items(
             continue;
         };
         let transform = world.get::<Transform>(entity).cloned().unwrap_or_default();
+        let ik = world.get::<IkTargetComponent>(entity).cloned();
 
         // Convert to runtime skeleton for animation evaluation
         let runtime_skel = crate::skeleton::Skeleton::from_asset(asset_skel);
 
         // Advance animation player (mutable borrow) and compute bone palette
-        let bone_palette = if let Some(player) = world.get_mut::<crate::AnimationPlayer>(entity) {
-            let clip = player.clip_asset.as_ref().and_then(|id| clips.get(id));
-            crate::player::update_animation(player, clip, Some(&runtime_skel), dt)
-        } else {
-            runtime_skel
-                .rest_pose()
-                .skin_matrices(&runtime_skel)
-                .iter()
-                .map(|m| m.to_cols_array_2d())
-                .collect()
-        };
+        let (bone_palette, bone_positions) =
+            if let Some(player) = world.get_mut::<AnimationPlayer>(entity) {
+                let mut state_machine = player.state_machine.take();
+                let palette = crate::player::update_animation_pipeline(
+                    player,
+                    &mut state_machine,
+                    &clip_list,
+                    &runtime_skel,
+                    ik.as_ref(),
+                    dt,
+                );
+                player.state_machine = state_machine;
+                (palette, player.cached_bone_positions.clone())
+            } else {
+                let pose = runtime_skel.rest_pose();
+                let positions = pose
+                    .global_transforms(&runtime_skel)
+                    .iter()
+                    .map(|transform| transform.translation.to_array())
+                    .collect();
+                let palette = pose
+                    .skin_matrices(&runtime_skel)
+                    .iter()
+                    .map(|matrix| matrix.to_cols_array_2d())
+                    .collect();
+                (palette, positions)
+            };
 
         let world_mat = glam::Mat4::from_translation(transform.translation)
             * glam::Mat4::from_quat(transform.rotation)
             * glam::Mat4::from_scale(transform.scale);
 
-        // Compute AABB from bone palette positions
+        // Compute a conservative local-space AABB from animated joint
+        // positions. Skin matrices include inverse-bind transforms and are not
+        // valid joint positions (at rest they are commonly all identity).
         let (bounds_min, bounds_max) = {
             let mut min = Vec3::splat(f32::MAX);
             let mut max = Vec3::splat(f32::MIN);
-            for m in &bone_palette {
-                let t = Vec3::new(m[0][3], m[1][3], m[2][3]);
-                min = min.min(t);
-                max = max.max(t);
+            for position in &bone_positions {
+                let position = Vec3::from(*position);
+                if position.is_finite() {
+                    min = min.min(position);
+                    max = max.max(position);
+                }
             }
+            let half_extents = skeleton_component
+                .as_ref()
+                .map(|component| Vec3::from(component.bind_shape).abs())
+                .filter(|extents| extents.is_finite())
+                .unwrap_or(Vec3::splat(0.5))
+                .max(Vec3::splat(0.01));
             if min.x == f32::MAX {
-                ([-0.5; 3], [0.5; 3])
+                ((-half_extents).to_array(), half_extents.to_array())
             } else {
-                (min.to_array(), max.to_array())
+                (
+                    (min - half_extents).to_array(),
+                    (max + half_extents).to_array(),
+                )
             }
         };
 

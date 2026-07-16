@@ -70,7 +70,7 @@ pub fn solve_pose_multi(
     for (chain_idx, chain) in chains.iter().enumerate() {
         let effector = match effectors.iter().find(|e| {
             e.is_active()
-                && e.influence_chain.map_or(true, |ic| ic == chain_idx)
+                && e.influence_chain.is_none_or(|ic| ic == chain_idx)
                 && chain.contains(e.bone)
         }) {
             Some(e) => e,

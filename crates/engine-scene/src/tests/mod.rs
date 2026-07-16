@@ -1,5 +1,5 @@
 use super::{extract_renderer_input, sample_scene, validate_scene, EntityRecord, Scene};
-use engine_serialize::SchemaVersion;
+use engine_serialize::{AssetId, SchemaVersion, Value};
 use std::collections::BTreeMap;
 
 // ============================================================================
@@ -300,4 +300,43 @@ fn scene_collect_asset_dependencies_includes_mesh_and_material() {
     );
     // Should not have duplicates
     assert_eq!(deps.len(), 2, "expected exactly 2 unique dependencies");
+}
+
+#[test]
+fn scene_collect_asset_dependencies_recurses_through_lists_and_maps_and_deduplicates() {
+    let mut scene = sample_scene();
+    let nested_asset = AssetId::with_path("ui-atlas", "ui/atlas.png");
+    let deeply_nested = Value::List(vec![Value::Map(BTreeMap::from([(
+        "kind".into(),
+        Value::Map(BTreeMap::from([(
+            "texture".into(),
+            Value::List(vec![
+                Value::Str("not-an-asset".into()),
+                Value::Asset(nested_asset.clone()),
+                Value::Map(BTreeMap::from([(
+                    "duplicate".into(),
+                    Value::Asset(nested_asset.clone()),
+                )])),
+            ]),
+        )])),
+    )]))]);
+    scene.entities[0]
+        .components
+        .get_mut("engine.camera")
+        .expect("sample camera component must exist")
+        .fields
+        .insert("nested_ui".into(), deeply_nested);
+
+    let dependencies = scene.collect_asset_dependencies();
+
+    assert!(dependencies.contains(&AssetId::new("mesh-cube")));
+    assert!(dependencies.contains(&AssetId::new("mat-default")));
+    assert_eq!(
+        dependencies
+            .iter()
+            .filter(|dependency| **dependency == nested_asset)
+            .count(),
+        1
+    );
+    assert_eq!(dependencies.len(), 3);
 }

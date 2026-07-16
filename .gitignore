@@ -1,4 +1,7 @@
 /target/
+/artifacts/
+/assets/cooked/
+/pso_cache/
 **/*.rs.bk
 
 # Project memory

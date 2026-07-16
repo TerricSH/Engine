@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::host::{ScriptError, ScriptHandle, ScriptHost, ScriptInstance};
 use crate::lifecycle;
 use crate::value::ScriptValue;
+use crate::{GameplayContext, OwnedGameplayCommand};
 
 // ---------------------------------------------------------------------------
 // ScriptComponent — serialisable scene component
@@ -205,6 +206,36 @@ impl ScriptManager {
         self.instances.remove(entity_id);
     }
 
+    /// Call `OnDestroy` and detach every script instance owned by one entity.
+    ///
+    /// Runtime entity destruction uses this targeted path so unrelated scene
+    /// scripts remain alive and the removed instances cannot be ticked again.
+    pub fn destroy_entity_instances(&mut self, entity_id: &str) -> Vec<Diagnostic> {
+        let Some(mut scripts) = self.instances.remove(entity_id) else {
+            return Vec::new();
+        };
+        let mut diagnostics = Vec::new();
+        for (_class_name, state) in &mut scripts {
+            if !state.created {
+                continue;
+            }
+            if let Err(error) = state.instance.call(lifecycle::ON_DESTROY, &[]) {
+                let mut diagnostic = Diagnostic::new(
+                    "SCRIPT_DESTROY_FAILED",
+                    engine_serialize::DiagnosticSeverity::Error,
+                    "script",
+                    format!(
+                        "OnDestroy failed for '{}' on entity '{}': {error}",
+                        state.component.class_name, entity_id
+                    ),
+                );
+                diagnostic.entity = Some(entity_id.to_owned());
+                diagnostics.push(diagnostic);
+            }
+        }
+        diagnostics
+    }
+
     /// Detach a specific script class from an entity.
     pub fn detach_class(&mut self, entity_id: &str, class_name: &str) {
         if let Some(scripts) = self.instances.get_mut(entity_id) {
@@ -238,6 +269,46 @@ impl ScriptManager {
                             diagnostics.push(diag);
                         }
                     }
+                }
+            }
+        }
+        diagnostics
+    }
+
+    /// Push a frame snapshot into each instance, matched by owning entity id.
+    pub fn set_gameplay_contexts(
+        &mut self,
+        contexts: &BTreeMap<String, GameplayContext>,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        for (entity_id, scripts) in &mut self.instances {
+            let Some(context) = contexts.get(entity_id) else {
+                let mut diagnostic = Diagnostic::new(
+                    "SCRIPT_CONTEXT_MISSING",
+                    engine_serialize::DiagnosticSeverity::Error,
+                    "script",
+                    format!("no gameplay context was provided for entity '{entity_id}'"),
+                );
+                diagnostic.entity = Some(entity_id.clone());
+                diagnostics.push(diagnostic);
+                continue;
+            };
+            for (_class_name, state) in scripts {
+                if !state.component.enabled {
+                    continue;
+                }
+                if let Err(error) = state.instance.set_gameplay_context(context) {
+                    let mut diagnostic = Diagnostic::new(
+                        "SCRIPT_CONTEXT_FAILED",
+                        engine_serialize::DiagnosticSeverity::Error,
+                        "script",
+                        format!(
+                            "could not set gameplay context for '{}' on entity '{}': {error}",
+                            state.component.class_name, entity_id
+                        ),
+                    );
+                    diagnostic.entity = Some(entity_id.clone());
+                    diagnostics.push(diagnostic);
                 }
             }
         }
@@ -302,6 +373,41 @@ impl ScriptManager {
         }
 
         diagnostics
+    }
+
+    /// Drain gameplay mutations and bind them to each instance's owner.
+    pub fn drain_gameplay_commands(&mut self) -> (Vec<OwnedGameplayCommand>, Vec<Diagnostic>) {
+        let mut commands = Vec::new();
+        let mut diagnostics = Vec::new();
+        for (entity_id, scripts) in &mut self.instances {
+            for (_class_name, state) in scripts {
+                if !state.component.enabled {
+                    continue;
+                }
+                match state.instance.drain_gameplay_commands() {
+                    Ok(drained) => {
+                        commands.extend(drained.into_iter().map(|command| OwnedGameplayCommand {
+                            entity_id: entity_id.clone(),
+                            command,
+                        }))
+                    }
+                    Err(error) => {
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_COMMAND_DRAIN_FAILED",
+                            engine_serialize::DiagnosticSeverity::Error,
+                            "script",
+                            format!(
+                                "could not drain gameplay commands for '{}' on entity '{}': {error}",
+                                state.component.class_name, entity_id
+                            ),
+                        );
+                        diagnostic.entity = Some(entity_id.clone());
+                        diagnostics.push(diagnostic);
+                    }
+                }
+            }
+        }
+        (commands, diagnostics)
     }
 
     /// Call `OnDestroy` on every instance.
@@ -496,6 +602,25 @@ mod tests {
         m.create_instances();
         let diags = m.destroy();
         assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn targeted_destroy_detaches_only_the_requested_entity() {
+        let mut manager = make_manager();
+        manager.load_assembly("asm", b"data").unwrap();
+        for entity_id in ["entity_1", "entity_2"] {
+            manager
+                .attach(entity_id, &ScriptComponent::new("asm", "MyScript"))
+                .unwrap();
+        }
+        manager.create_instances();
+
+        let diagnostics = manager.destroy_entity_instances("entity_1");
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(manager.instance_count(), 1);
+        assert_eq!(manager.iter_instances().next().unwrap().0, "entity_2");
+        assert!(manager.destroy_entity_instances("missing").is_empty());
     }
 
     #[test]

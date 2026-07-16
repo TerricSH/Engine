@@ -74,6 +74,15 @@ impl<T> AssetHandle<T> {
         &self.inner
     }
 
+    /// Clone the shared ownership pointer backing this handle.
+    ///
+    /// Runtime systems such as the audio mixer retain assets beyond a single
+    /// registry lookup and therefore need shared ownership rather than a
+    /// borrowed reference.
+    pub fn shared(&self) -> Arc<T> {
+        Arc::clone(&self.inner)
+    }
+
     /// The [`AssetId`] of this asset.
     pub fn id(&self) -> &AssetId {
         &self.id

@@ -6,6 +6,12 @@ use engine_core::{EngineConfig, EngineRuntime};
 mod diagnostics;
 #[cfg(feature = "backend-vulkan")]
 mod model_viewer;
+mod project_app;
+mod project_cli;
+mod project_input;
+mod project_scripts;
+mod qa;
+mod release_diagnostics;
 
 #[cfg(feature = "backend-vulkan")]
 fn hash_upload_parts(parts: &[&[u8]]) -> engine_renderer::HashDigest {
@@ -27,12 +33,30 @@ fn mesh_upload_from_data(
     use engine_renderer::{AssetId, AxisAlignedBox, IndexFormat, MeshUpload, MeshVertexFormat};
 
     let mesh_id = AssetId::new(mesh_id);
-    let (vertex_bytes, index_bytes, index_count, _) =
-        engine_asset::mesh::mesh_data_to_upload_bytes(mesh);
+    let (vertex_format, vertex_bytes, index_bytes, index_count) =
+        if let Some((vertex_bytes, index_bytes, index_count, _)) =
+            engine_asset::mesh::mesh_data_to_skinned_bytes(mesh)
+        {
+            (
+                MeshVertexFormat::Skinned64,
+                vertex_bytes,
+                index_bytes,
+                index_count,
+            )
+        } else {
+            let (vertex_bytes, index_bytes, index_count, _) =
+                engine_asset::mesh::mesh_data_to_upload_bytes(mesh);
+            (
+                MeshVertexFormat::Pbr32,
+                vertex_bytes,
+                index_bytes,
+                index_count,
+            )
+        };
     let content_hash = hash_upload_parts(&[&vertex_bytes, &index_bytes]);
     MeshUpload {
         mesh_id,
-        vertex_format: MeshVertexFormat::Pbr32,
+        vertex_format,
         vertex_count: mesh.positions.len() as u32,
         vertex_bytes,
         index_format: IndexFormat::U32,
@@ -75,6 +99,230 @@ fn log_upload_receipt(operation: &str, receipt: &engine_renderer::UploadReceipt)
             "renderer upload warning"
         );
     }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn frame_input_with_default_view(frame_index: u64) -> engine_renderer::RenderFrameInput {
+    use engine_renderer::{
+        ClearFlags, Rect, RenderFrameInput, RenderView, ViewCompose, IDENTITY_MAT4,
+    };
+
+    let mut input = RenderFrameInput::empty(frame_index);
+    input.views.push(RenderView {
+        view_id: 0,
+        camera_entity: None,
+        viewport: Rect::FULL,
+        viewport_rect_normalized: Rect::FULL,
+        view_matrix: IDENTITY_MAT4,
+        projection_matrix: IDENTITY_MAT4,
+        clear_flags: ClearFlags::ColorAndDepth,
+        clear_color: [0.02, 0.02, 0.06, 1.0],
+        render_layer_mask: u32::MAX,
+        msaa_samples: 1,
+        compose: ViewCompose::Base {
+            clear: ClearFlags::ColorAndDepth,
+            clear_color: [0.02, 0.02, 0.06, 1.0],
+        },
+        stack_order: 0,
+        frustum: None,
+    });
+    input
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn direct_to_swapchain_frame_input(frame_index: u64) -> engine_renderer::RenderFrameInput {
+    use engine_renderer::{PassConfigEntry, PassGraphConfig, PassGraphOutputMode, ToneMapping};
+
+    let mut input = frame_input_with_default_view(frame_index);
+    input.render_options.tone_mapping = ToneMapping::None;
+    input.render_options.pass_graph_config = PassGraphConfig {
+        enabled: true,
+        passes: vec![
+            PassConfigEntry {
+                kind: "OpaquePbrForward".into(),
+                enabled: true,
+            },
+            PassConfigEntry {
+                kind: "Present".into(),
+                enabled: true,
+            },
+        ],
+        output_mode: PassGraphOutputMode::DirectToSwapchain,
+    };
+    input
+}
+
+#[cfg(feature = "backend-vulkan")]
+const DIAG_STATIC_LIT_UNSUPPORTED_PASS: &str = "RV0190";
+
+#[cfg(feature = "backend-vulkan")]
+const DIAG_STATIC_LIT_FRAME_STATE: &str = "RV0191";
+
+#[cfg(feature = "backend-vulkan")]
+fn static_lit_frame_input(frame_index: u64) -> engine_renderer::RenderFrameInput {
+    direct_to_swapchain_frame_input(frame_index)
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn static_lit_unsupported_pass_diagnostic(
+    pass: &engine_renderer::render_graph::PassKind,
+) -> engine_renderer::Diagnostic {
+    engine_renderer::Diagnostic::new(
+        DIAG_STATIC_LIT_UNSUPPORTED_PASS,
+        engine_renderer::DiagnosticSeverity::Error,
+        "sandbox.static-lit-scene",
+        format!(
+            "static-lit-scene received unsupported pass '{}'; its direct-to-swapchain graph supports only OpaquePbrForward and Present",
+            pass.name()
+        ),
+    )
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn static_lit_frame_state_diagnostic(message: impl Into<String>) -> engine_renderer::Diagnostic {
+    engine_renderer::Diagnostic::new(
+        DIAG_STATIC_LIT_FRAME_STATE,
+        engine_renderer::DiagnosticSeverity::Error,
+        "sandbox.static-lit-scene",
+        message,
+    )
+}
+
+#[cfg(all(test, feature = "backend-vulkan"))]
+mod static_lit_scene_tests {
+    use super::{
+        static_lit_frame_input, static_lit_unsupported_pass_diagnostic,
+        DIAG_STATIC_LIT_UNSUPPORTED_PASS,
+    };
+    use engine_renderer::{
+        render_graph, render_graph2, validate_frame_input, DiagnosticSeverity, PassGraphOutputMode,
+        ToneMapping,
+    };
+
+    #[test]
+    fn frame_graph_declares_only_passes_the_demo_executes() {
+        let input = static_lit_frame_input(7);
+
+        assert_eq!(input.render_options.tone_mapping, ToneMapping::None);
+        assert_eq!(
+            input.render_options.pass_graph_config.output_mode,
+            PassGraphOutputMode::DirectToSwapchain
+        );
+        let configured = input
+            .render_options
+            .pass_graph_config
+            .passes
+            .iter()
+            .filter(|pass| pass.enabled)
+            .map(|pass| pass.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(configured, ["OpaquePbrForward", "Present"]);
+
+        let diagnostics = validate_frame_input(&input);
+        assert!(
+            diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic.severity,
+                DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+            )),
+            "static-lit-scene frame input must satisfy renderer validation: {diagnostics:?}"
+        );
+
+        let graph = render_graph2::RenderGraph::build_with_config(
+            &input,
+            &input.render_options.pass_graph_config,
+        );
+        let built = graph
+            .passes
+            .iter()
+            .map(|pass| pass.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(built, ["OpaquePbrForward", "Present"]);
+    }
+
+    #[test]
+    fn unsupported_passes_have_a_stable_error_diagnostic() {
+        let unsupported = [
+            render_graph::PassKind::DirectionalShadow,
+            render_graph::PassKind::ToneMap,
+            render_graph::PassKind::Custom("Bloom"),
+        ];
+
+        for pass in unsupported {
+            let diagnostic = static_lit_unsupported_pass_diagnostic(&pass);
+            assert_eq!(diagnostic.code, DIAG_STATIC_LIT_UNSUPPORTED_PASS);
+            assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+            assert!(diagnostic.message.contains(pass.name()));
+        }
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn smoke_generic_vulkan_rhi(
+    device: &mut render_vulkan::device_impl::VulkanDevice,
+) -> Result<(), render_core::RhiError> {
+    use render_core::{
+        Device, FramebufferDescriptor, RenderPassDescriptor, ShaderFormat, ShaderModuleDescriptor,
+        ShaderStage, TextureDescriptor, TextureFormat, TextureUsage,
+    };
+
+    let vertex_shader = device.create_shader_module(&ShaderModuleDescriptor {
+        format: ShaderFormat::SpirV,
+        stage: ShaderStage::Vertex,
+        source_bytes: render_vulkan::shaders_embedded::TRIANGLE_VERT_SPV.to_vec(),
+        entry_points: vec!["main".into()],
+        source_hash: [0x51; 32],
+        debug_label: Some("generic-rhi-smoke-vs".into()),
+    })?;
+    let fragment_shader = device.create_shader_module(&ShaderModuleDescriptor {
+        format: ShaderFormat::SpirV,
+        stage: ShaderStage::Fragment,
+        source_bytes: render_vulkan::shaders_embedded::TRIANGLE_FRAG_SPV.to_vec(),
+        entry_points: vec!["main".into()],
+        source_hash: [0x52; 32],
+        debug_label: Some("generic-rhi-smoke-fs".into()),
+    })?;
+    let color = device.create_texture(&TextureDescriptor {
+        width: 16,
+        height: 16,
+        depth_or_layers: 1,
+        mip_levels: 1,
+        format: TextureFormat::Rgba8Unorm,
+        usage_flags: TextureUsage::COLOR_ATTACHMENT,
+        sample_count: 1,
+        debug_label: Some("generic-rhi-smoke-color".into()),
+    })?;
+    let depth = device.create_texture(&TextureDescriptor {
+        width: 16,
+        height: 16,
+        depth_or_layers: 1,
+        mip_levels: 1,
+        format: TextureFormat::Depth32Float,
+        usage_flags: TextureUsage::DEPTH_ATTACHMENT,
+        sample_count: 1,
+        debug_label: Some("generic-rhi-smoke-depth".into()),
+    })?;
+    let pass = device.create_render_pass(&RenderPassDescriptor {
+        color_attachments: vec![TextureFormat::Rgba8Unorm],
+        depth_stencil_format: Some(TextureFormat::Depth32Float),
+        sample_count: 1,
+        present_after: false,
+        debug_label: Some("generic-rhi-smoke-pass".into()),
+    })?;
+    let framebuffer = device.create_framebuffer(&FramebufferDescriptor {
+        render_pass: pass,
+        color_attachments: vec![color],
+        depth_stencil_attachment: Some(depth),
+        width: 16,
+        height: 16,
+        debug_label: Some("generic-rhi-smoke-framebuffer".into()),
+    })?;
+    device.destroy_framebuffer(framebuffer);
+    device.destroy_render_pass(pass);
+    device.destroy_texture(depth);
+    device.destroy_texture(color);
+    device.destroy_shader_module(fragment_shader);
+    device.destroy_shader_module(vertex_shader);
+    Ok(())
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -226,12 +474,22 @@ fn rgba8_mip_chain(
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    release_diagnostics::init();
     let command = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "workspace".to_string());
+        .unwrap_or_else(|| "help".to_string());
     match command.as_str() {
-        "workspace" => tracing::info!("engine workspace initialized"),
+        "help" | "--help" | "-h" => project_cli::print_global_help(),
+        "project" => run_project_command(),
+        "game" => run_game_project(),
+        "workspace" => {
+            tracing::error!(
+                "`workspace` was a placeholder and is no longer a valid launch target; use `project new`, `project run`, or `editor`"
+            );
+            project_cli::print_global_help();
+            std::process::exit(2);
+        }
+        "qa-headless" => qa::run_from_args(),
         "gate04-scene" => run_gate04_scene(),
         "engine-character-demo" => run_engine_character_demo(),
         "contract-triangle" => run_contract_triangle(),
@@ -240,12 +498,50 @@ fn main() {
         "model-viewer" | "engine-model-viewer" => run_engine_model_viewer(),
         "textured-object" => run_textured_object(),
         "resize-smoke" => run_resize_smoke(),
-        "editor" => run_editor(),
+        "editor" => run_editor_command(),
         other => {
             tracing::error!(command = other, "unknown sandbox command");
             std::process::exit(2);
         }
     }
+}
+
+fn run_project_command() {
+    let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+    match project_cli::dispatch(&arguments) {
+        Ok(project_cli::ProjectAction::Complete) => {}
+        Ok(project_cli::ProjectAction::Run(request)) => run_game_request(request),
+        Ok(project_cli::ProjectAction::Edit(project)) => run_editor(project),
+        Err(error) => command_failed(error),
+    }
+}
+
+fn run_game_project() {
+    let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+    match project_cli::parse_run_request(&arguments) {
+        Ok(request) => run_game_request(request),
+        Err(error) => command_failed(error),
+    }
+}
+
+fn run_game_request(request: project_cli::ProjectRunRequest) {
+    if let Err(error) = project_app::run_project(request) {
+        command_failed(error);
+    }
+}
+
+fn run_editor_command() {
+    let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [project] if !project.starts_with('-') => run_editor(project.into()),
+        _ => command_failed("usage: sandbox editor <project-directory-or-manifest>"),
+    }
+}
+
+fn command_failed(error: impl std::fmt::Display) -> ! {
+    tracing::error!(%error, "command failed");
+    eprintln!("error: {error}");
+    std::process::exit(2);
 }
 
 #[cfg(all(feature = "tooling-editor", feature = "backend-vulkan"))]
@@ -254,7 +550,7 @@ mod editor_app;
 use editor_app::run_editor;
 
 #[cfg(not(all(feature = "tooling-editor", feature = "backend-vulkan")))]
-fn run_editor() {
+fn run_editor(_project: std::path::PathBuf) {
     tracing::error!("editor requires `tooling-editor` and `backend-vulkan` features");
     std::process::exit(2);
 }
@@ -339,9 +635,14 @@ fn run_contract_triangle() {
 
     struct ContractBackend {
         device: VulkanDevice,
+        frame_rendered: bool,
     }
 
     impl BackendRenderer for ContractBackend {
+        fn frame_mode(&self) -> engine_renderer::BackendFrameMode {
+            engine_renderer::BackendFrameMode::RenderGraph
+        }
+
         fn render_frame(
             &mut self,
             _input: &RenderFrameInput,
@@ -360,6 +661,78 @@ fn run_contract_triangle() {
                     format!("triangle frame failed: {e}"),
                 )]),
             }
+        }
+
+        fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+            self.frame_rendered = false;
+            Ok(())
+        }
+
+        fn apply_pass_barriers(
+            &mut self,
+            _input: &RenderFrameInput,
+            _pass: &engine_renderer::render_graph::PassNode,
+            barriers: &[engine_renderer::render_graph::CompiledBarrier],
+        ) -> Result<(), Vec<Diagnostic>> {
+            if let Some(unsupported) = barriers.iter().find(|barrier| {
+                !matches!(
+                    barrier.resource_name.as_str(),
+                    "swapchain" | "depth" | "depth_stencil"
+                )
+            }) {
+                return Err(vec![Diagnostic::new(
+                    "RV0097",
+                    DiagnosticSeverity::Error,
+                    "sandbox.contract-triangle",
+                    format!(
+                        "contract triangle cannot apply barrier for '{}'",
+                        unsupported.resource_name
+                    ),
+                )]);
+            }
+            // The monolithic triangle helper owns its render-pass and present
+            // transitions for the accepted direct-output resources.
+            Ok(())
+        }
+
+        fn execute_pass(
+            &mut self,
+            input: &RenderFrameInput,
+            pass: &engine_renderer::render_graph::PassNode,
+            stats: &mut FrameStats,
+        ) -> Result<(), Vec<Diagnostic>> {
+            match pass.kind {
+                engine_renderer::render_graph::PassKind::OpaquePbrForward => {
+                    *stats = self.render_frame(input)?;
+                    self.frame_rendered = true;
+                    Ok(())
+                }
+                engine_renderer::render_graph::PassKind::Present if self.frame_rendered => Ok(()),
+                _ => Err(vec![Diagnostic::new(
+                    "RV0098",
+                    DiagnosticSeverity::Error,
+                    "sandbox.contract-triangle",
+                    format!("unexpected or out-of-order pass '{}'", pass.kind.name()),
+                )]),
+            }
+        }
+
+        fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
+            if !self.frame_rendered {
+                return Err(vec![Diagnostic::new(
+                    "RV0098",
+                    DiagnosticSeverity::Error,
+                    "sandbox.contract-triangle",
+                    "frame ended before the triangle was rendered",
+                )]);
+            }
+            self.frame_rendered = false;
+            Ok(())
+        }
+
+        fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+            self.frame_rendered = false;
+            Ok(())
         }
     }
 
@@ -402,6 +775,10 @@ fn run_contract_triangle() {
                     std::process::exit(1);
                 }
             };
+            if let Err(error) = smoke_generic_vulkan_rhi(&mut vk_device) {
+                tracing::error!(?error, "generic Vulkan RHI smoke failed");
+                std::process::exit(1);
+            }
 
             // Set the embedded triangle shaders.
             vk_device.set_mvp_shaders(
@@ -409,7 +786,10 @@ fn run_contract_triangle() {
                 render_vulkan::shaders_embedded::TRIANGLE_FRAG_SPV,
             );
 
-            let backend = ContractBackend { device: vk_device };
+            let backend = ContractBackend {
+                device: vk_device,
+                frame_rendered: false,
+            };
             let mut renderer = Renderer::new();
             renderer.set_backend(Box::new(backend));
 
@@ -422,7 +802,7 @@ fn run_contract_triangle() {
                 PlatformEvent::Resized { .. } => EventFlow::Continue,
                 PlatformEvent::Redraw => {
                     if let Some(ref mut renderer) = self.renderer {
-                        let input = RenderFrameInput::empty(self.frames);
+                        let input = direct_to_swapchain_frame_input(self.frames);
                         match renderer.draw_scene(&input) {
                             Ok(stats) => {
                                 tracing::info!(
@@ -499,8 +879,9 @@ fn run_static_lit_scene() {
     use render_core::CommandEncoder;
     use render_core::{
         self, BufferDescriptor, BufferHandle, Device, MemoryHint, PipelineDescriptor,
-        PipelineLayoutDescriptor, PushConstantRange, RenderPassDescriptor, SwapchainDescriptor,
-        TextureFormat, VertexAttribute, VertexLayout,
+        PipelineLayoutDescriptor, PushConstantRange, RenderPassDescriptor, ShaderFormat,
+        ShaderModuleDescriptor, ShaderStage, SwapchainDescriptor, TextureFormat, VertexAttribute,
+        VertexLayout,
     };
     use render_vulkan::device_impl::VulkanDevice;
     use std::sync::Arc;
@@ -522,13 +903,15 @@ fn run_static_lit_scene() {
         initialized: bool,
         vertex_buf: Option<BufferHandle>,
         rp: Option<render_core::RenderPassHandle>,
-        fb: Option<render_core::FramebufferHandle>,
+        framebuffers: Vec<render_core::FramebufferHandle>,
         pl: Option<render_core::PipelineHandle>,
         pll: Option<render_core::PipelineLayoutHandle>,
         // Frame lifecycle state (for multi-pass dispatch)
         cur_sc: Option<render_core::SwapchainHandle>,
         cur_ii: Option<u32>,
         cur_enc: Option<Box<dyn CommandEncoder>>,
+        forward_recorded: bool,
+        present_requested: bool,
     }
 
     impl SceneBackend {
@@ -546,7 +929,7 @@ fn run_static_lit_scene() {
             })?;
             let vb_desc = BufferDescriptor {
                 size_bytes: VERTEX_DATA.len() as u64,
-                usage_flags: render_core::BufferUsage(0),
+                usage_flags: render_core::BufferUsage::VERTEX,
                 memory_hint: MemoryHint::CpuToGpu,
                 debug_label: Some("quad-vertices".into()),
             };
@@ -570,6 +953,7 @@ fn run_static_lit_scene() {
                 color_attachments: vec![TextureFormat::Bgra8Unorm],
                 depth_stencil_format: Some(TextureFormat::Depth32Float),
                 sample_count: 1,
+                present_after: true,
                 debug_label: Some("scene-rp".into()),
             };
             let rp = self.device.create_render_pass(&rp_desc).map_err(|e| {
@@ -597,8 +981,44 @@ fn run_static_lit_scene() {
                     format!("{e:?}"),
                 )]
             })?;
+            let vertex_shader = self
+                .device
+                .create_shader_module(&ShaderModuleDescriptor {
+                    format: ShaderFormat::SpirV,
+                    stage: ShaderStage::Vertex,
+                    source_bytes: render_vulkan::shaders_embedded::FORWARD_VERT_SPV.to_vec(),
+                    entry_points: vec!["main".into()],
+                    source_hash: [0x61; 32],
+                    debug_label: Some("static-lit-scene-vs".into()),
+                })
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0108",
+                        DiagnosticSeverity::Error,
+                        "sandbox",
+                        format!("{error:?}"),
+                    )]
+                })?;
+            let fragment_shader = self
+                .device
+                .create_shader_module(&ShaderModuleDescriptor {
+                    format: ShaderFormat::SpirV,
+                    stage: ShaderStage::Fragment,
+                    source_bytes: render_vulkan::shaders_embedded::FORWARD_FRAG_SPV.to_vec(),
+                    entry_points: vec!["main".into()],
+                    source_hash: [0x62; 32],
+                    debug_label: Some("static-lit-scene-fs".into()),
+                })
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0109",
+                        DiagnosticSeverity::Error,
+                        "sandbox",
+                        format!("{error:?}"),
+                    )]
+                })?;
             let pl_desc = PipelineDescriptor {
-                shader_modules: vec![],
+                shader_modules: vec![vertex_shader, fragment_shader],
                 vertex_layout: VertexLayout {
                     stride_bytes: 28,
                     attributes: vec![
@@ -631,20 +1051,35 @@ fn run_static_lit_scene() {
                 topology: Some("triangle_list".into()),
                 polygon_mode: Some("fill".into()),
                 sample_count: Some(1),
-                render_pass: None,
+                render_pass: Some(rp),
                 specialization: Vec::new(),
             };
-            let pl = self.device.create_pipeline(&pl_desc).map_err(|e| {
+            let pl = match self.device.create_pipeline(&pl_desc) {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    self.device.destroy_shader_module(fragment_shader);
+                    self.device.destroy_shader_module(vertex_shader);
+                    return Err(vec![Diagnostic::new(
+                        "RV0103",
+                        DiagnosticSeverity::Error,
+                        "sandbox",
+                        format!("{error:?}"),
+                    )]);
+                }
+            };
+            self.device.destroy_shader_module(fragment_shader);
+            self.device.destroy_shader_module(vertex_shader);
+            let framebuffers = self.device.create_scene_framebuffers(rp).map_err(|error| {
                 vec![Diagnostic::new(
-                    "RV0103",
+                    "RV0110",
                     DiagnosticSeverity::Error,
                     "sandbox",
-                    format!("{e:?}"),
+                    format!("{error:?}"),
                 )]
             })?;
             self.vertex_buf = Some(vb);
             self.rp = Some(rp);
-            self.fb = Some(render_core::FramebufferHandle::new(0, 0));
+            self.framebuffers = framebuffers;
             self.pll = Some(pll);
             self.pl = Some(pl);
             self.initialized = true;
@@ -654,6 +1089,10 @@ fn run_static_lit_scene() {
     }
 
     impl BackendRenderer for SceneBackend {
+        fn frame_mode(&self) -> engine_renderer::BackendFrameMode {
+            engine_renderer::BackendFrameMode::RenderGraph
+        }
+
         fn render_frame(
             &mut self,
             _input: &RenderFrameInput,
@@ -677,7 +1116,7 @@ fn run_static_lit_scene() {
                     format!("{e:?}"),
                 )]
             })?;
-            if let (Some(rp), Some(fb)) = (self.rp, self.fb) {
+            if let (Some(rp), Some(fb)) = (self.rp, self.framebuffers.get(ii as usize).copied()) {
                 encoder.begin_render_pass(rp, fb, (0, 0, 1280, 720), [0.02, 0.02, 0.06, 1.0], None);
             }
             encoder.set_viewport(0.0, 0.0, 1280.0, 720.0, 0.0, 1.0);
@@ -686,12 +1125,18 @@ fn run_static_lit_scene() {
                 encoder.bind_pipeline(pl);
             }
             if let Some(pll) = self.pll {
-                encoder.bind_descriptor_sets(pll, 0, &[], &[]);
+                encoder
+                    .bind_descriptor_sets(pll, 0, &[], &[])
+                    .map_err(|error| {
+                        vec![static_lit_frame_state_diagnostic(format!(
+                            "failed to bind frame descriptors: {error}"
+                        ))]
+                    })?;
             }
             if let Some(pll) = self.pll {
                 let mut pc = Vec::with_capacity(128);
-                for i in 0..16 {
-                    let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
+                for i in 0usize..16 {
+                    let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
                     pc.extend_from_slice(&v.to_ne_bytes());
                 }
                 for v in &[0.5f32, -1.0, 0.5, 0.0] {
@@ -748,6 +1193,30 @@ fn run_static_lit_scene() {
             self.cur_sc = Some(sc_h);
             self.cur_ii = Some(ii);
             self.cur_enc = Some(enc);
+            self.forward_recorded = false;
+            self.present_requested = false;
+            Ok(())
+        }
+
+        fn apply_pass_barriers(
+            &mut self,
+            _input: &RenderFrameInput,
+            _pass: &engine_renderer::render_graph::PassNode,
+            barriers: &[engine_renderer::render_graph::CompiledBarrier],
+        ) -> Result<(), Vec<Diagnostic>> {
+            if let Some(unsupported) = barriers.iter().find(|barrier| {
+                !matches!(
+                    barrier.resource_name.as_str(),
+                    "swapchain" | "depth" | "depth_stencil"
+                )
+            }) {
+                return Err(vec![static_lit_frame_state_diagnostic(format!(
+                    "static-lit-scene cannot apply barrier for '{}'",
+                    unsupported.resource_name
+                ))]);
+            }
+            // Vulkan render-pass attachment transitions cover the accepted
+            // direct-to-swapchain graph resources.
             Ok(())
         }
 
@@ -757,83 +1226,153 @@ fn run_static_lit_scene() {
             pass: &engine_renderer::render_graph::PassNode,
             _stats: &mut FrameStats,
         ) -> Result<(), Vec<Diagnostic>> {
-            let Some(ref mut encoder) = self.cur_enc else {
-                return Ok(());
-            };
-
-            match pass.kind {
-                engine_renderer::render_graph::PassKind::DirectionalShadow => {
-                    // Shadow pass: no-op for MVP (no shadow-casting objects)
+            match &pass.kind {
+                engine_renderer::render_graph::PassKind::DirectionalShadow
+                | engine_renderer::render_graph::PassKind::ToneMap
+                | engine_renderer::render_graph::PassKind::Custom(_) => {
+                    Err(vec![static_lit_unsupported_pass_diagnostic(&pass.kind)])
                 }
                 engine_renderer::render_graph::PassKind::OpaquePbrForward => {
-                    if let (Some(rp), Some(fb)) = (self.rp, self.fb) {
-                        encoder.begin_render_pass(
-                            rp,
-                            fb,
-                            (0, 0, 1280, 720),
-                            [0.02, 0.02, 0.06, 1.0],
-                            None,
-                        );
-                    }
+                    let rp = self.rp.ok_or_else(|| {
+                        vec![static_lit_frame_state_diagnostic(
+                            "OpaquePbrForward cannot execute without a render pass",
+                        )]
+                    })?;
+                    let framebuffer = self
+                        .cur_ii
+                        .and_then(|index| self.framebuffers.get(index as usize).copied())
+                        .ok_or_else(|| {
+                            vec![static_lit_frame_state_diagnostic(
+                                "OpaquePbrForward cannot execute without an acquired framebuffer",
+                            )]
+                        })?;
+                    let pipeline = self.pl.ok_or_else(|| {
+                        vec![static_lit_frame_state_diagnostic(
+                            "OpaquePbrForward cannot execute without a graphics pipeline",
+                        )]
+                    })?;
+                    let pipeline_layout = self.pll.ok_or_else(|| {
+                        vec![static_lit_frame_state_diagnostic(
+                            "OpaquePbrForward cannot execute without a pipeline layout",
+                        )]
+                    })?;
+                    let vertex_buffer = self.vertex_buf.ok_or_else(|| {
+                        vec![static_lit_frame_state_diagnostic(
+                            "OpaquePbrForward cannot execute without a vertex buffer",
+                        )]
+                    })?;
+                    let encoder = self.cur_enc.as_mut().ok_or_else(|| {
+                        vec![static_lit_frame_state_diagnostic(
+                            "OpaquePbrForward cannot execute outside an active frame",
+                        )]
+                    })?;
+
+                    encoder.begin_render_pass(
+                        rp,
+                        framebuffer,
+                        (0, 0, 1280, 720),
+                        [0.02, 0.02, 0.06, 1.0],
+                        None,
+                    );
                     encoder.set_viewport(0.0, 0.0, 1280.0, 720.0, 0.0, 1.0);
                     encoder.set_scissor(0, 0, 1280, 720);
-                    if let Some(pl) = self.pl {
-                        encoder.bind_pipeline(pl);
+                    encoder.bind_pipeline(pipeline);
+                    encoder
+                        .bind_descriptor_sets(pipeline_layout, 0, &[], &[])
+                        .map_err(|error| {
+                            vec![static_lit_frame_state_diagnostic(format!(
+                                "failed to bind frame descriptors: {error}"
+                            ))]
+                        })?;
+                    let mut pc = Vec::with_capacity(128);
+                    for i in 0usize..16 {
+                        let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
+                        pc.extend_from_slice(&v.to_ne_bytes());
                     }
-                    if let Some(pll) = self.pll {
-                        encoder.bind_descriptor_sets(pll, 0, &[], &[]);
+                    for v in &[0.5f32, -1.0, 0.5, 0.0] {
+                        pc.extend_from_slice(&v.to_ne_bytes());
                     }
-                    if let Some(pll) = self.pll {
-                        let mut pc = Vec::with_capacity(128);
-                        for i in 0..16 {
-                            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
-                            pc.extend_from_slice(&v.to_ne_bytes());
-                        }
-                        for v in &[0.5f32, -1.0, 0.5, 0.0] {
-                            pc.extend_from_slice(&v.to_ne_bytes());
-                        }
-                        for v in &[1.5f32, 1.5, 1.5, 1.5] {
-                            pc.extend_from_slice(&v.to_ne_bytes());
-                        }
-                        for v in &[0.15f32, 0.15, 0.15, 0.15] {
-                            pc.extend_from_slice(&v.to_ne_bytes());
-                        }
-                        encoder.push_constants(pll, 3, 0, &pc);
+                    for v in &[1.5f32, 1.5, 1.5, 1.5] {
+                        pc.extend_from_slice(&v.to_ne_bytes());
                     }
-                    if let Some(vb) = self.vertex_buf {
-                        encoder.bind_vertex_buffers(&[vb], &[0]);
+                    for v in &[0.15f32, 0.15, 0.15, 0.15] {
+                        pc.extend_from_slice(&v.to_ne_bytes());
                     }
+                    encoder.push_constants(pipeline_layout, 3, 0, &pc);
+                    encoder.bind_vertex_buffers(&[vertex_buffer], &[0]);
                     encoder.draw(4, 1, 0, 0);
                     encoder.end_render_pass();
-                }
-                engine_renderer::render_graph::PassKind::ToneMap => {
-                    // Tone-mapping: no-op for MVP (forward pass renders directly to swapchain)
+                    self.forward_recorded = true;
+                    Ok(())
                 }
                 engine_renderer::render_graph::PassKind::Present => {
-                    // Present is handled by end_frame
-                }
-                engine_renderer::render_graph::PassKind::Custom(_) => {
-                    // Custom passes are no-ops until explicitly wired.
+                    if self.cur_enc.is_none() {
+                        return Err(vec![static_lit_frame_state_diagnostic(
+                            "Present cannot execute outside an active frame",
+                        )]);
+                    }
+                    if !self.forward_recorded {
+                        return Err(vec![static_lit_frame_state_diagnostic(
+                            "Present requires OpaquePbrForward to be recorded first",
+                        )]);
+                    }
+                    self.present_requested = true;
+                    Ok(())
                 }
             }
-            Ok(())
         }
 
         fn end_frame(&mut self, stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
-            if let (Some(sc_h), Some(ii)) = (self.cur_sc.take(), self.cur_ii.take()) {
-                let enc = self.cur_enc.take().unwrap();
-                let s = self.device.end_frame(sc_h, enc, ii).map_err(|e| {
-                    vec![Diagnostic::new(
-                        "RV0106",
-                        DiagnosticSeverity::Error,
-                        "sandbox",
-                        format!("{e:?}"),
-                    )]
-                })?;
-                stats.draw_calls = s.draw_calls;
-                stats.triangles = s.triangles;
+            if !self.present_requested {
+                return Err(vec![static_lit_frame_state_diagnostic(
+                    "frame ended without an executed Present pass",
+                )]);
             }
+            let (Some(sc_h), Some(ii), Some(enc)) =
+                (self.cur_sc.take(), self.cur_ii.take(), self.cur_enc.take())
+            else {
+                return Err(vec![static_lit_frame_state_diagnostic(
+                    "Present cannot complete because the active frame state is incomplete",
+                )]);
+            };
+            let result = self.device.end_frame(sc_h, enc, ii).map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0106",
+                    DiagnosticSeverity::Error,
+                    "sandbox",
+                    format!("{e:?}"),
+                )]
+            });
+            self.forward_recorded = false;
+            self.present_requested = false;
+            let s = result?;
+            stats.draw_calls = s.draw_calls;
+            stats.triangles = s.triangles;
             Ok(())
+        }
+
+        fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+            if self.cur_enc.is_none() && self.cur_sc.is_none() && self.cur_ii.is_none() {
+                self.forward_recorded = false;
+                self.present_requested = false;
+                return Ok(());
+            }
+
+            // Dropping the encoder alone is insufficient: acquiring a Vulkan
+            // image has already changed fence/semaphore state. Repair that
+            // state before allowing the next frame to begin.
+            self.cur_enc.take();
+            self.cur_sc.take();
+            self.cur_ii.take();
+            self.forward_recorded = false;
+            self.present_requested = false;
+            self.device
+                .abort_current_frame_recording()
+                .map_err(|error| {
+                    vec![static_lit_frame_state_diagnostic(format!(
+                        "failed to abort Vulkan frame recording: {error}"
+                    ))]
+                })
         }
     }
 
@@ -886,12 +1425,14 @@ fn run_static_lit_scene() {
                 initialized: false,
                 vertex_buf: None,
                 rp: None,
-                fb: None,
+                framebuffers: Vec::new(),
                 pl: None,
                 pll: None,
                 cur_sc: None,
                 cur_ii: None,
                 cur_enc: None,
+                forward_recorded: false,
+                present_requested: false,
             };
             let mut renderer = Renderer::new();
             renderer.set_backend(Box::new(backend));
@@ -904,12 +1445,12 @@ fn run_static_lit_scene() {
                 PlatformEvent::Resized { .. } => EventFlow::Continue,
                 PlatformEvent::Redraw => {
                     if let Some(ref mut renderer) = self.renderer {
-                        let input = RenderFrameInput::empty(self.frames);
+                        let input = static_lit_frame_input(self.frames);
                         match renderer.draw_scene(&input) {
                             Ok(stats) => tracing::info!(
                                 draw_calls = stats.draw_calls,
                                 triangles = stats.triangles,
-                                "model-viewer frame"
+                                "static-lit-scene frame"
                             ),
                             Err(diags) => {
                                 log_renderer_diagnostics("static-lit-scene draw", &diags);
@@ -984,14 +1525,16 @@ fn run_engine_character_demo() {
     use glam::Quat;
     use glam::Vec3;
     use platform::winit::window::Window;
-    use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
+    use platform::{
+        EventFlow, KeyCode as PlatformKeyCode, PlatformEvent, WindowApp, WindowDescriptor,
+    };
     use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
     struct EngineCharacterApp {
         game_loop: Option<GameLoop>,
         controller: Option<CharacterController>,
         physics: Option<PhysicsWorld>,
-        held_keys: HashSet<u32>,
+        held_keys: HashSet<PlatformKeyCode>,
         input_map: InputActionMap,
         frames: u64,
         max_frames: Option<u64>,
@@ -1002,13 +1545,13 @@ fn run_engine_character_demo() {
     }
 
     // ── Map winit PhysicalKey scancodes → engine-gameplay KeyCodes ──
-    fn scancode_to_keycode(scancode: u32) -> Option<KeyCode> {
-        match scancode {
-            26 => Some(KeyCode::W),     // HID Keyboard W
-            4 => Some(KeyCode::A),      // HID Keyboard A
-            22 => Some(KeyCode::S),     // HID Keyboard S
-            7 => Some(KeyCode::D),      // HID Keyboard D
-            44 => Some(KeyCode::Space), // HID Keyboard Space
+    fn platform_to_gameplay_key(key: PlatformKeyCode) -> Option<KeyCode> {
+        match key {
+            PlatformKeyCode::W => Some(KeyCode::W),
+            PlatformKeyCode::A => Some(KeyCode::A),
+            PlatformKeyCode::S => Some(KeyCode::S),
+            PlatformKeyCode::D => Some(KeyCode::D),
+            PlatformKeyCode::Space => Some(KeyCode::Space),
             _ => None,
         }
     }
@@ -1301,7 +1844,7 @@ fn run_engine_character_demo() {
             match event {
                 PlatformEvent::KeyPressed { key, .. } => {
                     self.held_keys.insert(key);
-                    if let Some(gk) = scancode_to_keycode(key) {
+                    if let Some(gk) = platform_to_gameplay_key(key) {
                         gameplay_input::set_current_value(
                             &mut self.input_map,
                             action_name_for(gk),
@@ -1311,7 +1854,7 @@ fn run_engine_character_demo() {
                 }
                 PlatformEvent::KeyReleased { key, .. } => {
                     self.held_keys.remove(&key);
-                    if let Some(gk) = scancode_to_keycode(key) {
+                    if let Some(gk) = platform_to_gameplay_key(key) {
                         gameplay_input::set_current_value(
                             &mut self.input_map,
                             action_name_for(gk),

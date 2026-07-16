@@ -221,6 +221,35 @@ Core component fields:
 | `engine.light` | `kind: LightKind = Directional \| Point \| Spot`, `color: LinearRgb`, `intensity: f32` (lux for `Directional`, lumens for `Point`/`Spot`), `range: f32`, `spot_angles: Option<{inner: f32, outer: f32}>`, `shadow_mode: ShadowMode = Off \| Hard \| Soft` |
 | `engine.bounds` | `local_min: Vec3`, `local_max: Vec3`, `update_policy` |
 
+## GameProject-v0
+
+Owner: Gate 19. Consumers: project CLI, editor, player, asset cooker, release packaging, and QA.
+
+```text
+GameProject {
+  schema: "GameProject-v0",
+  name: String,
+  startup_scene: RelativePath,       // must end in .scene.ron
+  asset_source: RelativePath,        // default assets/source
+  cooked_assets: RelativePath,       // default build/cooked
+  backend: Vulkan,
+  window: {
+    title: String,
+    width: u32,
+    height: u32
+  },
+  script_project: Option<RelativePath>
+}
+```
+
+Rules:
+
+- Every path is relative to `game.project.json`, non-empty, non-absolute, and contains no parent-directory traversal. Existing symlink targets must remain inside the project root.
+- Authoring load requires the startup scene, `asset_source`, and optional `script_project`. Runtime load requires the startup scene but deliberately does not require source assets or a source script project.
+- `name` contains 1 through 128 non-whitespace characters; the window title contains 1 through 256; window dimensions are each in `1..=16384`.
+- Startup scene validation and strict ECS restoration complete before the editor or player mutates an active World.
+- Packaging rewrites `cooked_assets` to its deployable relative path, preserves the startup-scene path, and verifies the staged project through `ProjectRunReport-v0`.
+
 ## AssetRegistry-v0
 
 Owner: Gate 5. Consumers: ECS scenes, renderer extraction, scripts, editor, hot update, prefabs, audio, UI, release pipeline.

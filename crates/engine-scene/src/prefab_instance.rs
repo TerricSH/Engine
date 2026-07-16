@@ -54,10 +54,7 @@ pub enum PrefabInstantiateError {
         persistent_id: String,
     },
     #[error("prefab '{asset_id}' must have exactly one root entity, found {root_count}")]
-    InvalidRootCount {
-        asset_id: String,
-        root_count: usize,
-    },
+    InvalidRootCount { asset_id: String, root_count: usize },
     #[error(
         "prefab '{asset_id}' entity '{entity_persistent_id}' references missing parent '{parent_persistent_id}'"
     )]
@@ -92,13 +89,8 @@ pub enum PrefabInstantiateError {
     },
     #[error("prefab dependency cycle detected: {cycle:?}")]
     DependencyCycle { cycle: Vec<String> },
-    #[error(
-        "prefab nesting exceeds maximum depth {max_depth} while processing '{asset_id}'"
-    )]
-    MaximumDepthExceeded {
-        asset_id: String,
-        max_depth: usize,
-    },
+    #[error("prefab nesting exceeds maximum depth {max_depth} while processing '{asset_id}'")]
+    MaximumDepthExceeded { asset_id: String, max_depth: usize },
     #[error(
         "component '{component_type_id}' on prefab '{asset_id}' entity '{entity_persistent_id}' is not constructible: {reason}"
     )]
@@ -219,12 +211,7 @@ pub(crate) fn validate_prefab_for_instantiation(
     prefab: &Prefab,
     resolver: Option<&dyn PrefabLoad>,
 ) -> Result<(), PrefabInstantiateError> {
-    validate_prefab_for_instantiation_with_root_id(
-        world,
-        &prefab.source_asset.id,
-        prefab,
-        resolver,
-    )
+    validate_prefab_for_instantiation_with_root_id(world, &prefab.source_asset.id, prefab, resolver)
 }
 
 fn validate_prefab_for_instantiation_with_root_id(
@@ -281,12 +268,7 @@ impl GraphValidator<'_> {
 
         self.visiting.insert(asset_id.to_string());
         self.path.push(asset_id.to_string());
-        let result = self.validate_node(
-            asset_id,
-            prefab,
-            depth,
-            requires_attachment_transform,
-        );
+        let result = self.validate_node(asset_id, prefab, depth, requires_attachment_transform);
         self.path.pop();
         self.visiting.remove(asset_id);
         if result.is_ok() {
@@ -374,13 +356,13 @@ impl GraphValidator<'_> {
                     entity_persistent_id: child_ref.entity_persistent_id.clone(),
                 });
             }
-            let resolver = self.resolver.ok_or_else(|| {
-                PrefabInstantiateError::MissingChildResolver {
-                    asset_id: asset_id.to_string(),
-                    child_asset_id: child_ref.prefab_asset.id.clone(),
-                    entity_persistent_id: child_ref.entity_persistent_id.clone(),
-                }
-            })?;
+            let resolver =
+                self.resolver
+                    .ok_or_else(|| PrefabInstantiateError::MissingChildResolver {
+                        asset_id: asset_id.to_string(),
+                        child_asset_id: child_ref.prefab_asset.id.clone(),
+                        entity_persistent_id: child_ref.entity_persistent_id.clone(),
+                    })?;
             let child = resolver
                 .load_prefab(&child_ref.prefab_asset.id)
                 .ok_or_else(|| PrefabInstantiateError::MissingChildPrefab {
@@ -388,12 +370,7 @@ impl GraphValidator<'_> {
                     child_asset_id: child_ref.prefab_asset.id.clone(),
                     entity_persistent_id: child_ref.entity_persistent_id.clone(),
                 })?;
-            self.visit(
-                &child_ref.prefab_asset.id,
-                child,
-                depth + 1,
-                true,
-            )?;
+            self.visit(&child_ref.prefab_asset.id, child, depth + 1, true)?;
         }
 
         Ok(())
@@ -457,16 +434,26 @@ fn validate_component_constructible(
         .deserialize
         .ok_or_else(|| fail("component type has no deserialize hook".to_string()))?;
 
-    let mut storage = catch_unwind(AssertUnwindSafe(|| (extension.storage_factory)()))
-        .map_err(|payload| fail(format!("storage factory panicked: {}", panic_message(payload))))?;
-    if storage.type_id() != extension.meta.type_id {
+    let mut storage =
+        catch_unwind(AssertUnwindSafe(|| (extension.storage_factory)())).map_err(|payload| {
+            fail(format!(
+                "storage factory panicked: {}",
+                panic_message(payload)
+            ))
+        })?;
+    let storage_type_id = crate::ComponentStorageDyn::type_id(storage.as_ref());
+    if storage_type_id != extension.meta.type_id {
         return Err(fail(format!(
             "storage factory returned type '{}'",
-            storage.type_id()
+            storage_type_id
         )));
     }
-    let component = catch_unwind(AssertUnwindSafe(|| deserialize(fields)))
-        .map_err(|payload| fail(format!("deserialize hook panicked: {}", panic_message(payload))))?;
+    let component = catch_unwind(AssertUnwindSafe(|| deserialize(fields))).map_err(|payload| {
+        fail(format!(
+            "deserialize hook panicked: {}",
+            panic_message(payload)
+        ))
+    })?;
     let probe = Entity::new(0, 1);
     storage
         .insert_any(probe, component)
@@ -562,12 +549,16 @@ impl Instantiator<'_> {
         }
 
         for record in &prefab.hierarchy {
-            let entity = entity_map.get(&record.persistent_id).copied().ok_or_else(|| {
-                PrefabInstantiateError::InternalInvariant {
+            let entity = entity_map
+                .get(&record.persistent_id)
+                .copied()
+                .ok_or_else(|| PrefabInstantiateError::InternalInvariant {
                     asset_id: asset_id.to_string(),
-                    reason: format!("entity '{}' is absent from allocation map", record.persistent_id),
-                }
-            })?;
+                    reason: format!(
+                        "entity '{}' is absent from allocation map",
+                        record.persistent_id
+                    ),
+                })?;
             world.set_enabled(entity, record.enabled);
             if let Some(name) = &record.name {
                 world.add_component(entity, Name(name.clone()));
@@ -660,13 +651,13 @@ impl Instantiator<'_> {
                     child_asset_id: child_ref.prefab_asset.id.clone(),
                     entity_persistent_id: child_ref.entity_persistent_id.clone(),
                 })?;
-            let resolver = self.resolver.ok_or_else(|| {
-                PrefabInstantiateError::MissingChildResolver {
-                    asset_id: asset_id.to_string(),
-                    child_asset_id: child_ref.prefab_asset.id.clone(),
-                    entity_persistent_id: child_ref.entity_persistent_id.clone(),
-                }
-            })?;
+            let resolver =
+                self.resolver
+                    .ok_or_else(|| PrefabInstantiateError::MissingChildResolver {
+                        asset_id: asset_id.to_string(),
+                        child_asset_id: child_ref.prefab_asset.id.clone(),
+                        entity_persistent_id: child_ref.entity_persistent_id.clone(),
+                    })?;
             let child = resolver
                 .load_prefab(&child_ref.prefab_asset.id)
                 .ok_or_else(|| PrefabInstantiateError::MissingChildPrefab {
@@ -674,12 +665,8 @@ impl Instantiator<'_> {
                     child_asset_id: child_ref.prefab_asset.id.clone(),
                     entity_persistent_id: child_ref.entity_persistent_id.clone(),
                 })?;
-            let child_result = self.instantiate_node(
-                world,
-                &child_ref.prefab_asset.id,
-                child,
-                depth + 1,
-            )?;
+            let child_result =
+                self.instantiate_node(world, &child_ref.prefab_asset.id, child, depth + 1)?;
             let child_transform = world
                 .get_mut::<Transform>(child_result.root_entity)
                 .ok_or_else(|| PrefabInstantiateError::MissingParentingTransform {
@@ -760,7 +747,10 @@ mod tests {
         let mut world = World::new();
         let prefab = Prefab::new(AssetId::new("prefabs/empty.prefab"));
         let error = instantiate_prefab(&mut world, &prefab, None).unwrap_err();
-        assert!(matches!(error, PrefabInstantiateError::EmptyHierarchy { .. }));
+        assert!(matches!(
+            error,
+            PrefabInstantiateError::EmptyHierarchy { .. }
+        ));
         assert_eq!(world.alive_count(), 0);
     }
 
@@ -801,12 +791,8 @@ mod tests {
         registry.register("prefabs/child.prefab", child);
 
         let mut world = World::new();
-        let result = instantiate_prefab_from_asset(
-            &mut world,
-            &registry,
-            "prefabs/parent.prefab",
-        )
-        .unwrap();
+        let result =
+            instantiate_prefab_from_asset(&mut world, &registry, "prefabs/parent.prefab").unwrap();
         assert_eq!(result.all_entities.len(), 2);
         let child_entity = result
             .all_entities
@@ -835,12 +821,8 @@ mod tests {
         registry.register("prefabs/self.prefab", root);
         let mut world = World::new();
 
-        let error = instantiate_prefab_from_asset(
-            &mut world,
-            &registry,
-            "prefabs/self.prefab",
-        )
-        .unwrap_err();
+        let error = instantiate_prefab_from_asset(&mut world, &registry, "prefabs/self.prefab")
+            .unwrap_err();
         assert!(matches!(
             error,
             PrefabInstantiateError::DependencyCycle { .. }
@@ -865,12 +847,8 @@ mod tests {
         registry.register("prefabs/b.prefab", b);
         let mut world = World::new();
 
-        let error = instantiate_prefab_from_asset(
-            &mut world,
-            &registry,
-            "prefabs/a.prefab",
-        )
-        .unwrap_err();
+        let error =
+            instantiate_prefab_from_asset(&mut world, &registry, "prefabs/a.prefab").unwrap_err();
         assert!(matches!(
             error,
             PrefabInstantiateError::DependencyCycle { .. }
@@ -994,12 +972,8 @@ mod tests {
             registry.register(asset_id, current);
         }
         let mut world = World::new();
-        let error = instantiate_prefab_from_asset(
-            &mut world,
-            &registry,
-            "prefabs/depth-0.prefab",
-        )
-        .unwrap_err();
+        let error = instantiate_prefab_from_asset(&mut world, &registry, "prefabs/depth-0.prefab")
+            .unwrap_err();
         assert!(matches!(
             error,
             PrefabInstantiateError::MaximumDepthExceeded { .. }

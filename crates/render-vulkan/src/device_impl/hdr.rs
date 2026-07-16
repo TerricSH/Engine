@@ -428,11 +428,12 @@ impl VulkanDevice {
             .map_err(|r| VulkanError::vk("alloc_tone_ds", r))?;
         let desc_set = desc_sets[0];
 
-        // ---- Pipeline layout: set=0 (HDR sampler) + push constants 128 B ----
+        // ---- Pipeline layout: set=0 (HDR sampler) + tone-map parameters ----
+        // GLSL layout: uint mode, float exposure, uint output_is_srgb, uint padding.
         let pc_range = [vk::PushConstantRange {
-            stage_flags: vk::ShaderStageFlags::VERTEX,
+            stage_flags: vk::ShaderStageFlags::FRAGMENT,
             offset: 0,
-            size: 128,
+            size: 16,
         }];
         let tone_set_layouts = [ds_layout];
         let pll_info = vk::PipelineLayoutCreateInfo::default()

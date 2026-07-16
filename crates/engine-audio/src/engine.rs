@@ -9,7 +9,7 @@ use crate::mixer::MixerState;
 use crate::{AudioCommand, AudioEmitter, AudioError, AudioListener, MixerGroup};
 
 #[cfg(feature = "subsystem-audio-cpal")]
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 // ---------------------------------------------------------------------------
 // AudioEngine
@@ -61,6 +61,9 @@ impl AudioEngine {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AudioCommand>();
 
         let stream = Self::build_stream(cmd_rx)?;
+        stream
+            .play()
+            .map_err(|error| AudioError::StreamError(error.to_string()))?;
 
         tracing::info!("audio engine initialized");
 
@@ -277,6 +280,22 @@ impl AudioEngine {
     pub fn set_listener(&mut self, listener: AudioListener) {
         self.listener = listener.clone();
         let _ = self.cmd_tx.send(AudioCommand::SetListener(listener));
+    }
+
+    /// Replace the spatial-emitter configuration of an active sound.
+    ///
+    /// Passing `None` disables spatialisation without restarting playback.
+    /// Returns `false` when the handle is no longer active.
+    pub fn set_emitter(&mut self, handle_id: u64, emitter: Option<AudioEmitter>) -> bool {
+        if !self.active_handles.contains_key(&handle_id) {
+            return false;
+        }
+        self.cmd_tx
+            .send(AudioCommand::SetEmitter {
+                id: handle_id,
+                emitter,
+            })
+            .is_ok()
     }
 
     /// Per-frame update.  Synchronises ECS-driven positional data with the

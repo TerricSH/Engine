@@ -28,7 +28,7 @@ use engine_scene::Component;
 /// `playing = true` to start playback.
 #[derive(Clone, Debug)]
 pub struct AudioSourceComponent {
-    /// Asset path of the audio clip to play (e.g. `"sounds/explosion.wav"`).
+    /// Cooked audio asset ID to play (e.g. `"audio.explosion"`).
     pub clip_asset: Option<String>,
     /// Playback volume in the range `[0, 1]`.
     pub volume: f32,
@@ -313,7 +313,7 @@ fn audio_clip_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> 
     Ok(())
 }
 
-fn audio_clip_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any>, String> {
+fn audio_clip_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String> {
     // Determine header size so we can skip to the source bytes.
     let header_size: usize = match bincode::deserialize::<CookedAudioHeader>(cooked) {
         Ok(hdr) => {

@@ -1,0 +1,10 @@
+{
+  "schema": "MinimalGameCookedScene-v0",
+  "entities": [
+    {
+      "id": "sample-triangle",
+      "mesh": "sample-mesh",
+      "material": "sample-material"
+    }
+  ]
+}

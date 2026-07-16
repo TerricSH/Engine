@@ -265,7 +265,7 @@ impl Drop for Pipeline {
 
 unsafe fn create_shader_module(device: &AshDevice, spv: &[u8]) -> VkResult<vk::ShaderModule> {
     // SPIR-V words are 32-bit; ensure alignment by copying.
-    if spv.len() % 4 != 0 {
+    if !spv.len().is_multiple_of(4) {
         return Err(VulkanError::Loader(format!(
             "shader byte length {} is not a multiple of 4",
             spv.len()

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::value::ScriptValue;
+use crate::{GameplayCommand, GameplayContext};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -105,6 +106,20 @@ pub trait ScriptInstance {
     ///
     /// Returns `None` if the field does not exist.
     fn get_field(&self, name: &str) -> Option<ScriptValue>;
+
+    /// Replace the frame-local gameplay snapshot visible to this instance.
+    ///
+    /// Hosts that do not expose gameplay APIs may keep the default no-op. This
+    /// preserves compatibility with native/mobile hosts while ProcessHost uses
+    /// the snapshot to avoid cross-process callback re-entry.
+    fn set_gameplay_context(&mut self, _context: &GameplayContext) -> Result<(), ScriptError> {
+        Ok(())
+    }
+
+    /// Return and clear gameplay mutations queued by this instance.
+    fn drain_gameplay_commands(&mut self) -> Result<Vec<GameplayCommand>, ScriptError> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------------------------------------------------------------------------

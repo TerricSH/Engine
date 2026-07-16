@@ -20,8 +20,8 @@ pub use pipeline_library::{hash_vertex_layout, PipelineCacheKey, PipelineLibrary
 pub use render_extension::{RenderExtensionProducer, RenderExtensionRegistry};
 pub use render_graph::PassKind;
 pub use render_graph2::{
-    AliasSlot, AliasingPlan, PassConfigEntry, PassGraphConfig, PassKind as PassKind2,
-    ResourceAccess, TransientResourcePool,
+    AliasSlot, AliasingPlan, PassConfigEntry, PassGraphConfig, PassGraphOutputMode,
+    PassKind as PassKind2, ResourceAccess, TransientResourcePool,
 };
 pub use render_pass::{PassRegistry, RenderPass};
 pub use traits::*;

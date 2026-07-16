@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use engine_serialize::PersistentId;
 use serde::{Deserialize, Serialize};
-use tracing;
 
 use crate::editor_ui::EditorUi;
 use crate::panels::EditorPanel;
@@ -31,8 +30,6 @@ pub struct Editor {
     selected_entity: Option<PersistentId>,
     /// Persisted layout state keyed by panel name.
     layout_state: BTreeMap<String, PanelLayoutState>,
-    /// Optional path for saving/loading layout.
-    layout_path: Option<PathBuf>,
 }
 
 impl Editor {
@@ -42,7 +39,6 @@ impl Editor {
             panels: Vec::new(),
             selected_entity: None,
             layout_state: BTreeMap::new(),
-            layout_path: None,
         }
     }
 

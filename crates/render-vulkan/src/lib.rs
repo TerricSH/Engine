@@ -31,6 +31,9 @@ pub mod shaders_embedded {
     include!(concat!(env!("OUT_DIR"), "/shaders_embedded.rs"));
 }
 
+use std::path::Path;
+
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use render_core::{AdapterInfo, Backend, BackendKind, Device, DeviceDescriptor, RhiError};
 
 pub use error::VulkanError;
@@ -43,6 +46,40 @@ impl VulkanBackend {
     pub const fn new() -> Self {
         Self
     }
+
+    /// Create a Vulkan device for a concrete native window surface.
+    ///
+    /// RHI-v0's [`DeviceDescriptor`] intentionally contains adapter and
+    /// capability requirements only; it cannot carry the native display and
+    /// window handles Vulkan needs to select a present-capable queue.  This
+    /// surface-aware entry point is therefore the supported Vulkan device
+    /// construction path until that contract grows a native-surface context.
+    /// The selected adapter is available through [`Device::adapter_info`].
+    pub fn create_device_for_surface(
+        &self,
+        display_handle: RawDisplayHandle,
+        window_handle: RawWindowHandle,
+        width: u32,
+        height: u32,
+        enable_validation: bool,
+        cache_dir: Option<&Path>,
+    ) -> Result<device_impl::VulkanDevice, VulkanError> {
+        device_impl::VulkanDevice::new(
+            display_handle,
+            window_handle,
+            width,
+            height,
+            enable_validation,
+            cache_dir,
+        )
+    }
+}
+
+fn surface_aware_rhi_required() -> RhiError {
+    RhiError::UnsupportedFeature {
+        feature: "surface-aware Vulkan adapter/device creation; use VulkanBackend::create_device_for_surface"
+            .to_string(),
+    }
 }
 
 impl Backend for VulkanBackend {
@@ -51,19 +88,71 @@ impl Backend for VulkanBackend {
     }
 
     fn enumerate_adapters(&self) -> Result<Vec<AdapterInfo>, RhiError> {
-        // Adapter enumeration over RHI-v0 still requires a surface, which
-        // is owned by [`VulkanRenderer`]. Gate 2 keeps the contract path
-        // empty and surfaces real adapters through the renderer itself.
-        Ok(Vec::new())
+        // Vulkan queue suitability includes presentation support for a
+        // concrete surface. Returning an empty list here used to conflate
+        // "the contract has no surface" with "the machine has no adapters".
+        Err(surface_aware_rhi_required())
     }
 
     fn create_device(&self, _descriptor: &DeviceDescriptor) -> Result<Box<dyn Device>, RhiError> {
-        // RHI-v0 has no frame/present API yet (see Gate 2 design notes);
-        // the runtime path goes through `VulkanRenderer` for now.
-        Err(RhiError::UnsupportedBackend)
+        Err(surface_aware_rhi_required())
     }
 }
 
 pub fn backend() -> VulkanBackend {
     VulkanBackend::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use render_core::{BackendCapabilities, ResourceLimits, ValidationMode};
+
+    fn descriptor() -> DeviceDescriptor {
+        DeviceDescriptor {
+            adapter: AdapterInfo {
+                backend: BackendKind::Vulkan,
+                name: "surface-selected adapter".to_string(),
+                vendor_id: None,
+                device_id: None,
+                driver_version: None,
+                capabilities: BackendCapabilities::default(),
+            },
+            required_features: Vec::new(),
+            required_limits: ResourceLimits::default(),
+            debug_label: None,
+            validation_mode: ValidationMode::Disabled,
+        }
+    }
+
+    fn assert_surface_aware_error(error: RhiError) {
+        match error {
+            RhiError::UnsupportedFeature { feature } => {
+                assert!(feature.contains("create_device_for_surface"));
+            }
+            other => panic!("expected an explicit surface-aware error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backend_kind_is_vulkan() {
+        assert_eq!(VulkanBackend::new().kind(), BackendKind::Vulkan);
+    }
+
+    #[test]
+    fn surface_less_adapter_enumeration_is_not_reported_as_an_empty_machine() {
+        let error = VulkanBackend::new()
+            .enumerate_adapters()
+            .expect_err("RHI-v0 has no surface context");
+        assert_surface_aware_error(error);
+    }
+
+    #[test]
+    fn surface_less_device_creation_is_not_reported_as_an_unsupported_backend() {
+        let error = match VulkanBackend::new().create_device(&descriptor()) {
+            Ok(_) => panic!("RHI-v0 has no surface context"),
+            Err(error) => error,
+        };
+        assert_surface_aware_error(error);
+    }
 }

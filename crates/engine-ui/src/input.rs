@@ -1,13 +1,44 @@
 //! UI input handling — hit testing, hover detection, and click dispatch.
 //!
-//! The entry point is [`update_input`], which should be called once per frame
-//! with the current pointer state.  It updates [`UiInputState`] and fires
-//! callbacks for button clicks.
+//! The preferred entry point is [`UiInputState::process_event`]. The legacy
+//! [`update_input`] adapter remains available for callback-based callers.
 
 use tracing::debug;
 
 use crate::types::{ElementId, UiElementKind};
 use crate::Canvas;
+
+// ---------------------------------------------------------------------------
+// Platform-independent pointer and click events
+// ---------------------------------------------------------------------------
+
+/// A primary-pointer event expressed in canvas pixel coordinates.
+///
+/// Platform integrations translate mouse, pen, or single-touch input into
+/// this type. [`UiInputState::process_event`] performs layout before using the
+/// coordinates, so callers do not need to keep computed rectangles current.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UiPointerEvent {
+    /// The pointer moved without changing its pressed state.
+    Move { x: f32, y: f32 },
+    /// The primary pointer button was pressed.
+    Press { x: f32, y: f32 },
+    /// The primary pointer button was released.
+    Release { x: f32, y: f32 },
+    /// The current pointer interaction was interrupted.
+    Cancel,
+}
+
+/// A completed click on an interactive retained-mode element.
+///
+/// `callback_id` mirrors the element's optional callback identifier. The
+/// event is still emitted when that identifier is absent so native gameplay
+/// code can route the click by [`ElementId`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiClickEvent {
+    pub element_id: ElementId,
+    pub callback_id: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // CallbackRegistry
@@ -108,6 +139,8 @@ impl UiInputState {
     /// Release any active capture without firing a click.
     pub fn release_capture(&mut self) {
         self.capture = None;
+        self.pressed = None;
+        self.clicked = None;
     }
 
     /// Drain the "clicked" event — returns the element ID that was clicked
@@ -121,6 +154,83 @@ impl UiInputState {
         self.hovered = None;
         self.pressed = None;
         self.clicked = None;
+        self.capture = None;
+        self.touch_slots.clear();
+    }
+
+    /// Process one platform-independent pointer event.
+    ///
+    /// Layout is recomputed before every event. A press on an interactive
+    /// element captures the pointer until release or cancellation. A click is
+    /// produced only when release occurs inside the captured element while it
+    /// remains enabled and interactive.
+    ///
+    /// Buttons, toggles, checkboxes, and sliders all produce the same click
+    /// event. This method deliberately does not mutate toggle, checkbox, or
+    /// slider values; gameplay or script code owns those state changes.
+    pub fn process_event(
+        &mut self,
+        canvas: &mut Canvas,
+        event: UiPointerEvent,
+    ) -> Option<UiClickEvent> {
+        canvas.layout_all();
+        self.process_laid_out_event(canvas, event)
+    }
+
+    fn process_laid_out_event(
+        &mut self,
+        canvas: &Canvas,
+        event: UiPointerEvent,
+    ) -> Option<UiClickEvent> {
+        // `clicked` describes only the event just processed. Clearing it here
+        // prevents a later release/cancel from exposing a stale click.
+        self.clicked = None;
+
+        match event {
+            UiPointerEvent::Move { x, y } => {
+                self.hovered = match self.capture {
+                    Some(captured) => {
+                        interactive_element_at(canvas, captured, x, y).then_some(captured)
+                    }
+                    None => hit_test_interactive(canvas, x, y),
+                };
+                None
+            }
+            UiPointerEvent::Press { x, y } => {
+                let target = hit_test_interactive(canvas, x, y);
+                self.hovered = target;
+                self.pressed = target;
+                self.capture = target;
+                self.focused = target;
+                if let Some(element_id) = target {
+                    debug!(?element_id, "UI element pressed and captured");
+                }
+                None
+            }
+            UiPointerEvent::Release { x, y } => {
+                let captured = self.capture.take();
+                let pressed = self.pressed.take();
+                self.hovered = hit_test_interactive(canvas, x, y);
+
+                let clicked = captured.filter(|element_id| {
+                    pressed == Some(*element_id)
+                        && interactive_element_at(canvas, *element_id, x, y)
+                });
+                let event = clicked.and_then(|element_id| click_event(canvas, element_id));
+                if let Some(event) = &event {
+                    self.clicked = Some(event.element_id);
+                    debug!(element_id = ?event.element_id, "UI element clicked");
+                }
+                event
+            }
+            UiPointerEvent::Cancel => {
+                self.hovered = None;
+                self.pressed = None;
+                self.capture = None;
+                self.touch_slots.clear();
+                None
+            }
+        }
     }
 }
 
@@ -136,44 +246,79 @@ impl Default for UiInputState {
 
 /// Find the topmost enabled element at the given pointer position.
 ///
-/// Elements are tested in reverse draw order (highest `z_order` first),
-/// so the topmost visible element under the cursor is returned.
+/// Draw order is deterministic: higher `z_order` wins, and for equal
+/// `z_order` the element inserted later in [`Canvas::elements`] wins because
+/// it is drawn later.
 ///
 /// Returns `None` when no element contains the point.
 pub fn hit_test(canvas: &Canvas, pointer_x: f32, pointer_y: f32) -> Option<ElementId> {
-    // Collect enabled elements, sorted by z_order descending.
-    let mut candidates: Vec<&crate::types::UiElement> =
-        canvas.elements.iter().filter(|e| e.enabled).collect();
-    candidates.sort_by(|a, b| b.z_order.cmp(&a.z_order));
-
-    for el in &candidates {
-        if el.rect.contains(pointer_x, pointer_y) {
-            return Some(el.id);
-        }
-    }
-
-    None
+    topmost_element(canvas, pointer_x, pointer_y, |_| true)
 }
 
-/// Find the topmost enabled button element at the given pointer position.
-fn hit_test_button(canvas: &Canvas, pointer_x: f32, pointer_y: f32) -> Option<ElementId> {
-    let mut candidates: Vec<&crate::types::UiElement> =
-        canvas.elements.iter().filter(|e| e.enabled).collect();
-    candidates.sort_by(|a, b| b.z_order.cmp(&a.z_order));
+/// Find the topmost enabled interactive element at a canvas position.
+///
+/// Interactive elements are buttons, toggles, checkboxes, and sliders. The
+/// ordering exactly matches [`hit_test`]: higher z first, then later insertion
+/// for equal z. Computed rectangles must already be current; use
+/// [`UiInputState::process_event`] when handling an event because it performs
+/// layout automatically.
+pub fn hit_test_interactive(canvas: &Canvas, pointer_x: f32, pointer_y: f32) -> Option<ElementId> {
+    topmost_element(canvas, pointer_x, pointer_y, is_interactive)
+}
 
-    for el in &candidates {
-        if el.rect.contains(pointer_x, pointer_y) {
-            match &el.kind {
-                UiElementKind::Button { .. }
-                | UiElementKind::Toggle { .. }
-                | UiElementKind::Checkbox { .. }
-                | UiElementKind::Slider { .. } => return Some(el.id),
-                _ => {}
-            }
-        }
-    }
+fn topmost_element(
+    canvas: &Canvas,
+    pointer_x: f32,
+    pointer_y: f32,
+    accepts: impl Fn(&UiElementKind) -> bool,
+) -> Option<ElementId> {
+    canvas
+        .elements
+        .iter()
+        .enumerate()
+        .filter(|(_, element)| {
+            element.enabled && accepts(&element.kind) && element.rect.contains(pointer_x, pointer_y)
+        })
+        .max_by_key(|(draw_index, element)| (element.z_order, *draw_index))
+        .map(|(_, element)| element.id)
+}
 
-    None
+fn is_interactive(kind: &UiElementKind) -> bool {
+    matches!(
+        kind,
+        UiElementKind::Button { .. }
+            | UiElementKind::Toggle { .. }
+            | UiElementKind::Checkbox { .. }
+            | UiElementKind::Slider { .. }
+    )
+}
+
+fn interactive_element_at(
+    canvas: &Canvas,
+    element_id: ElementId,
+    pointer_x: f32,
+    pointer_y: f32,
+) -> bool {
+    canvas.get_element(element_id).is_some_and(|element| {
+        element.enabled
+            && is_interactive(&element.kind)
+            && element.rect.contains(pointer_x, pointer_y)
+    })
+}
+
+fn click_event(canvas: &Canvas, element_id: ElementId) -> Option<UiClickEvent> {
+    let element = canvas.get_element(element_id)?;
+    let callback_id = match &element.kind {
+        UiElementKind::Button { callback_id, .. }
+        | UiElementKind::Toggle { callback_id, .. }
+        | UiElementKind::Checkbox { callback_id, .. }
+        | UiElementKind::Slider { callback_id, .. } => callback_id.clone(),
+        _ => return None,
+    };
+    Some(UiClickEvent {
+        element_id,
+        callback_id,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -192,8 +337,12 @@ fn hit_test_button(canvas: &Canvas, pointer_x: f32, pointer_y: f32) -> Option<El
 /// * `pointer_up` — `true` when the pointer button was released this frame.
 /// * `callbacks` — optional callback registry for dispatching button clicks.
 ///
-/// When a button is clicked (pressed + released on the same element), the
-/// associated callback (if any) is dispatched through the [`CallbackRegistry`].
+/// When an interactive element is clicked (pressed + released on the same
+/// element), its callback (if any) is dispatched through the
+/// [`CallbackRegistry`].
+/// Unlike [`UiInputState::process_event`], this compatibility adapter cannot
+/// recompute layout because it accepts an immutable canvas; callers must run
+/// [`Canvas::layout_all`] after changing layout data.
 pub fn update_input(
     state: &mut UiInputState,
     canvas: &Canvas,
@@ -203,77 +352,38 @@ pub fn update_input(
     pointer_up: bool,
     callbacks: Option<&mut CallbackRegistry>,
 ) {
-    // Capture ownership: when an element has captured input, route all
-    // pointer events exclusively to it until release.
-    if let Some(captured) = state.capture {
-        if pointer_up {
-            // Release capture on pointer-up and fire click/callback.
-            state.clicked = Some(captured);
-            if let Some(registry) = callbacks {
-                fire_button_callback(registry, canvas, captured);
-            }
-            state.capture = None;
-            state.pressed = None;
+    let press = UiPointerEvent::Press {
+        x: pointer_x,
+        y: pointer_y,
+    };
+    let release = UiPointerEvent::Release {
+        x: pointer_x,
+        y: pointer_y,
+    };
+    let click = match (pointer_down, pointer_up) {
+        (true, true) => {
+            state.process_laid_out_event(canvas, press);
+            state.process_laid_out_event(canvas, release)
         }
-        return; // All other events go to the capturing element
-    }
+        (true, false) => state.process_laid_out_event(canvas, press),
+        (false, true) => state.process_laid_out_event(canvas, release),
+        (false, false) => state.process_laid_out_event(
+            canvas,
+            UiPointerEvent::Move {
+                x: pointer_x,
+                y: pointer_y,
+            },
+        ),
+    };
 
-    // Update hover (skip when capture is active)
-    state.hovered = hit_test(canvas, pointer_x, pointer_y);
-
-    // Press detection: interact with any interactive element
-    if pointer_down {
-        let pressed = hit_test_button(canvas, pointer_x, pointer_y);
-        if let Some(id) = pressed {
-            state.pressed = pressed;
-            state.focused = Some(id); // Clicking gives focus
-            debug!(element_id = ?id, "UI element pressed, focus set");
-        } else {
-            // Clicking outside clears focus
-            state.focused = None;
-        }
-    }
-
-    // Release detection
-    if pointer_up {
-        if let Some(pressed_id) = state.pressed {
-            // Check if the pointer is still over the same element
-            let released_on = hit_test(canvas, pointer_x, pointer_y);
-            if released_on == Some(pressed_id) {
-                // This is a click!
-                state.clicked = Some(pressed_id);
-                debug!(element_id = ?pressed_id, "UI element clicked");
-
-                // Fire callback if registry is available
-                if let Some(registry) = callbacks {
-                    fire_button_callback(registry, canvas, pressed_id);
-                }
-            }
-        }
-        state.pressed = None;
-    }
-}
-
-/// Look up the button element and fire its callback if a `callback_id` is set.
-fn fire_button_callback(registry: &mut CallbackRegistry, canvas: &Canvas, element_id: ElementId) {
-    if let Some(el) = canvas.get_element(element_id) {
-        match &el.kind {
-            UiElementKind::Button { callback_id, .. }
-            | UiElementKind::Toggle { callback_id, .. }
-            | UiElementKind::Checkbox { callback_id, .. }
-            | UiElementKind::Slider { callback_id, .. } => {
-                if let Some(cid) = callback_id {
-                    if !cid.is_empty() {
-                        registry.invoke(cid);
-                        debug!(
-                            element_id = ?element_id,
-                            callback_id = %cid,
-                            "Interactive element callback fired"
-                        );
-                    }
-                }
-            }
-            _ => {}
+    if let (Some(click), Some(registry)) = (click, callbacks) {
+        if let Some(callback_id) = click.callback_id.filter(|id| !id.is_empty()) {
+            registry.invoke(&callback_id);
+            debug!(
+                element_id = ?click.element_id,
+                %callback_id,
+                "Interactive element callback fired"
+            );
         }
     }
 }
@@ -317,6 +427,49 @@ mod tests {
             layout,
         )
         .with_z_order(z)
+    }
+
+    fn interactive_kinds(callback_id: Option<&str>) -> Vec<UiElementKind> {
+        let callback_id = || callback_id.map(str::to_owned);
+        vec![
+            UiElementKind::Button {
+                label: "Button".into(),
+                normal_color: Color::WHITE,
+                hover_color: Color::WHITE,
+                pressed_color: Color::WHITE,
+                callback_id: callback_id(),
+            },
+            UiElementKind::Toggle {
+                label: "Toggle".into(),
+                is_on: false,
+                color_on: Color::WHITE,
+                color_off: Color::BLACK,
+                callback_id: callback_id(),
+            },
+            UiElementKind::Checkbox {
+                label: "Checkbox".into(),
+                checked: false,
+                color: Color::WHITE,
+                callback_id: callback_id(),
+            },
+            UiElementKind::Slider {
+                label: "Slider".into(),
+                value: 0.25,
+                min: 0.0,
+                max: 1.0,
+                callback_id: callback_id(),
+            },
+        ]
+    }
+
+    fn click(state: &mut UiInputState, canvas: &mut Canvas, x: f32, y: f32) -> UiClickEvent {
+        assert_eq!(
+            state.process_event(canvas, UiPointerEvent::Press { x, y }),
+            None
+        );
+        state
+            .process_event(canvas, UiPointerEvent::Release { x, y })
+            .expect("press and release on the same interactive element must click")
     }
 
     fn setup_canvas() -> Canvas {
@@ -373,6 +526,43 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_elements_use_z_then_later_draw_order() {
+        let mut canvas = Canvas::new(100.0, 100.0);
+        let layout = Layout::FILL;
+        let high_z = canvas.add_element(button_element(layout, 2, "high_z"));
+        canvas.add_element(button_element(layout, 1, "later_but_lower"));
+        canvas.layout_all();
+        assert_eq!(hit_test_interactive(&canvas, 50.0, 50.0), Some(high_z));
+
+        let same_z_later = canvas.add_element(button_element(layout, 2, "same_z_later"));
+        canvas.layout_all();
+        assert_eq!(
+            hit_test_interactive(&canvas, 50.0, 50.0),
+            Some(same_z_later)
+        );
+
+        let mut state = UiInputState::new();
+        assert_eq!(
+            click(&mut state, &mut canvas, 50.0, 50.0),
+            UiClickEvent {
+                element_id: same_z_later,
+                callback_id: Some("same_z_later".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn interactive_hit_test_ignores_visual_only_elements() {
+        let mut canvas = Canvas::new(100.0, 100.0);
+        let button = canvas.add_element(button_element(Layout::FILL, 0, "button"));
+        let panel = canvas.add_element(panel_element(Layout::FILL, 10));
+        canvas.layout_all();
+
+        assert_eq!(hit_test(&canvas, 50.0, 50.0), Some(panel));
+        assert_eq!(hit_test_interactive(&canvas, 50.0, 50.0), Some(button));
+    }
+
+    #[test]
     fn hit_test_skips_disabled() {
         let mut canvas = setup_canvas();
         let id = canvas.add_element(
@@ -395,6 +585,85 @@ mod tests {
         let result = hit_test(&canvas, 400.0, 300.0);
         assert!(result.is_some());
         assert_ne!(result, Some(id));
+    }
+
+    #[test]
+    fn process_event_layouts_before_every_pointer_event() {
+        let mut canvas = Canvas::new(200.0, 100.0);
+        let id = canvas.add_element(button_element(
+            Layout::new(
+                Vec2::ZERO,
+                Vec2::ZERO,
+                Vec2::new(10.0, 10.0),
+                Vec2::new(60.0, 40.0),
+            ),
+            0,
+            "button",
+        ));
+        assert_eq!(canvas.get_element(id).unwrap().rect, crate::UiRect::ZERO);
+
+        let mut state = UiInputState::new();
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Press { x: 20.0, y: 20.0 }),
+            None
+        );
+        assert_eq!(state.capture, Some(id));
+        assert_ne!(canvas.get_element(id).unwrap().rect, crate::UiRect::ZERO);
+
+        canvas.get_element_mut(id).unwrap().layout = Layout::new(
+            Vec2::ZERO,
+            Vec2::ZERO,
+            Vec2::new(100.0, 10.0),
+            Vec2::new(150.0, 40.0),
+        );
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 20.0, y: 20.0 }),
+            None,
+            "release must use the newly laid-out rectangle"
+        );
+        assert_eq!(state.capture, None);
+        assert_eq!(state.pressed, None);
+    }
+
+    #[test]
+    fn every_interactive_kind_emits_callback_and_element_id_without_mutating_value() {
+        for (index, kind) in interactive_kinds(Some("gameplay_callback"))
+            .into_iter()
+            .enumerate()
+        {
+            let expected_kind = kind.clone();
+            let mut canvas = Canvas::new(100.0, 100.0);
+            let id = canvas.add_element(UiElement::new(kind, Layout::FILL));
+            let mut state = UiInputState::new();
+
+            assert_eq!(
+                click(&mut state, &mut canvas, 50.0, 50.0),
+                UiClickEvent {
+                    element_id: id,
+                    callback_id: Some("gameplay_callback".into()),
+                },
+                "interactive kind {index} must emit a routed click"
+            );
+            assert_eq!(canvas.get_element(id).unwrap().kind, expected_kind);
+        }
+    }
+
+    #[test]
+    fn every_interactive_kind_without_callback_still_emits_element_id() {
+        for (index, kind) in interactive_kinds(None).into_iter().enumerate() {
+            let mut canvas = Canvas::new(100.0, 100.0);
+            let id = canvas.add_element(UiElement::new(kind, Layout::FILL));
+            let mut state = UiInputState::new();
+
+            assert_eq!(
+                click(&mut state, &mut canvas, 50.0, 50.0),
+                UiClickEvent {
+                    element_id: id,
+                    callback_id: None,
+                },
+                "interactive kind {index} must retain its element ID"
+            );
+        }
     }
 
     #[test]
@@ -435,6 +704,120 @@ mod tests {
         update_input(&mut state, &canvas, 400.0, 400.0, false, true, None);
         assert!(state.pressed.is_none());
         assert!(state.clicked.is_none());
+    }
+
+    #[test]
+    fn press_capture_does_not_retarget_or_click_on_release_outside() {
+        let mut canvas = Canvas::new(200.0, 100.0);
+        let left = canvas.add_element(button_element(
+            Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(80.0, 100.0)),
+            0,
+            "left",
+        ));
+        let right = canvas.add_element(button_element(
+            Layout::new(
+                Vec2::ZERO,
+                Vec2::ZERO,
+                Vec2::new(120.0, 0.0),
+                Vec2::new(200.0, 100.0),
+            ),
+            0,
+            "right",
+        ));
+        let mut state = UiInputState::new();
+
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Press { x: 40.0, y: 50.0 }),
+            None
+        );
+        assert_eq!(state.pressed, Some(left));
+        assert_eq!(state.capture, Some(left));
+
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Move { x: 160.0, y: 50.0 }),
+            None
+        );
+        assert_eq!(state.capture, Some(left));
+        assert_eq!(state.hovered, None, "captured movement cannot retarget");
+        assert_eq!(hit_test_interactive(&canvas, 160.0, 50.0), Some(right));
+
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 160.0, y: 50.0 }),
+            None
+        );
+        assert_eq!(state.capture, None);
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.clicked, None);
+        assert_eq!(state.hovered, Some(right));
+    }
+
+    #[test]
+    fn press_outside_then_release_inside_does_not_click() {
+        let mut canvas = setup_canvas();
+        let mut state = UiInputState::new();
+
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Press { x: -1.0, y: -1.0 }),
+            None
+        );
+        assert_eq!(state.capture, None);
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 150.0, y: 125.0 }),
+            None
+        );
+        assert_eq!(state.clicked, None);
+    }
+
+    #[test]
+    fn cancel_clears_capture_and_prevents_a_later_ghost_click() {
+        let mut canvas = setup_canvas();
+        let mut state = UiInputState::new();
+
+        state.process_event(&mut canvas, UiPointerEvent::Press { x: 150.0, y: 125.0 });
+        assert!(state.capture.is_some());
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Cancel),
+            None
+        );
+        assert_eq!(state.capture, None);
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.clicked, None);
+
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 150.0, y: 125.0 }),
+            None
+        );
+        assert_eq!(state.clicked, None);
+    }
+
+    #[test]
+    fn stray_release_clears_the_previous_transient_click() {
+        let mut canvas = setup_canvas();
+        let mut state = UiInputState::new();
+
+        let first = click(&mut state, &mut canvas, 150.0, 125.0);
+        assert_eq!(state.clicked, Some(first.element_id));
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 150.0, y: 125.0 }),
+            None
+        );
+        assert_eq!(state.clicked, None);
+    }
+
+    #[test]
+    fn disabling_captured_element_before_release_prevents_click() {
+        let mut canvas = setup_canvas();
+        let mut state = UiInputState::new();
+        state.process_event(&mut canvas, UiPointerEvent::Press { x: 150.0, y: 125.0 });
+        let captured = state.capture.expect("button must capture the press");
+        canvas.get_element_mut(captured).unwrap().enabled = false;
+
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 150.0, y: 125.0 }),
+            None
+        );
+        assert_eq!(state.capture, None);
+        assert_eq!(state.clicked, None);
     }
 
     #[test]
@@ -590,10 +973,28 @@ mod tests {
         state.hovered = Some(ElementId(1));
         state.pressed = Some(ElementId(1));
         state.clicked = Some(ElementId(1));
+        state.capture = Some(ElementId(1));
+        state.touch_slots.insert(7, ElementId(1));
 
         state.reset();
         assert!(state.hovered.is_none());
         assert!(state.pressed.is_none());
         assert!(state.clicked.is_none());
+        assert!(state.capture.is_none());
+        assert!(state.touch_slots.is_empty());
+    }
+
+    #[test]
+    fn releasing_capture_cannot_leave_a_pending_click() {
+        let mut state = UiInputState::new();
+        state.pressed = Some(ElementId(1));
+        state.capture = Some(ElementId(1));
+        state.clicked = Some(ElementId(1));
+
+        state.release_capture();
+
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.capture, None);
+        assert_eq!(state.clicked, None);
     }
 }

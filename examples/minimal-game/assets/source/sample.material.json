@@ -1,0 +1,10 @@
+{
+  "schema": "MaterialSource-v0",
+  "base_color": [1.0, 1.0, 1.0, 1.0],
+  "metallic": 0.0,
+  "roughness": 0.65,
+  "ambient_occlusion": 1.0,
+  "base_color_texture": "sample-texture",
+  "transparency": "Opaque",
+  "double_sided": false
+}

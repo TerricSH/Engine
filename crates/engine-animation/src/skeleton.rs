@@ -121,7 +121,23 @@ impl Skeleton {
         name: String,
         rest_transform: BoneTransform,
     ) -> BoneIndex {
+        assert!(
+            self.bones.len() <= u16::MAX as usize,
+            "skeleton exceeds BoneIndex capacity"
+        );
         let idx = BoneIndex(self.bones.len() as u16);
+        let parent = parent.filter(|parent_index| {
+            let valid = (parent_index.0 as usize) < self.bones.len();
+            if !valid {
+                tracing::warn!(
+                    skeleton = %self.name,
+                    bone = idx.0,
+                    parent = parent_index.0,
+                    "ignoring invalid bone parent; parents must be added before children"
+                );
+            }
+            valid
+        });
 
         // Register this bone as a child of its parent.
         if let Some(p) = parent {
@@ -179,23 +195,6 @@ impl Skeleton {
     /// Create a runtime `Skeleton` from an `assets::Skeleton` by converting
     /// each joint into a bone with the correct parent hierarchy.
     pub fn from_asset(asset: &crate::assets::Skeleton) -> Self {
-        use glam::{Quat, Vec3};
-        let mut skel = Self::new("imported".into());
-        for joint in &asset.joints {
-            let parent = joint.parent_index.map(|p| BoneIndex(p as u16));
-            let t = joint.local_transform.translation;
-            let r = joint.local_transform.rotation;
-            let s = joint.local_transform.scale;
-            skel.add_bone(
-                parent,
-                joint.name.clone(),
-                BoneTransform {
-                    translation: Vec3::from(t),
-                    rotation: Quat::from_array(r),
-                    scale: Vec3::from(s),
-                },
-            );
-        }
-        skel
+        crate::convert::skeleton_asset_to_runtime(asset).0
     }
 }

@@ -94,15 +94,7 @@ impl ScriptInspector {
         if fields_open {
             for (field_name, sv) in &script.fields {
                 let label = format!("{}/{}", script.class_name, field_name);
-                Self::edit_script_value(
-                    ui,
-                    &label,
-                    sv,
-                    entity_id,
-                    &script.assembly_id,
-                    field_name,
-                    commands,
-                );
+                Self::edit_script_value(ui, &label, sv, entity_id, field_name, commands);
             }
         }
     }
@@ -110,19 +102,17 @@ impl ScriptInspector {
     /// Render an editable widget for a [`ScriptValue`] and push a
     /// [`SetComponentField`] command on edit.
     ///
-    /// The `comp_type` used for the command is
-    /// `"engine.script::{assembly_id}"` so that edits can be round-tripped
-    /// through the scene's component store.
+    /// Script records use the one canonical `engine.script` component type;
+    /// assembly identity lives in the record's `assembly_id` field.
     fn edit_script_value(
         ui: &mut EditorUi,
         label: &str,
         value: &ScriptValue,
         entity_id: &str,
-        assembly_id: &str,
         field_name: &str,
         commands: &mut Vec<Box<dyn Command>>,
     ) {
-        let comp_type = format!("engine.script::{assembly_id}");
+        let comp_type = "engine.script";
 
         match value {
             ScriptValue::Null => {
@@ -133,7 +123,7 @@ impl ScriptInspector {
                 if new_val != *b {
                     commands.push(Box::new(SetComponentField::new(
                         entity_id.to_string(),
-                        comp_type.clone(),
+                        comp_type.to_string(),
                         field_name.to_string(),
                         Value::Bool(new_val),
                     )));
@@ -145,7 +135,7 @@ impl ScriptInspector {
                     if let Ok(parsed) = edited.parse::<i64>() {
                         commands.push(Box::new(SetComponentField::new(
                             entity_id.to_string(),
-                            comp_type.clone(),
+                            comp_type.to_string(),
                             field_name.to_string(),
                             Value::Int(parsed),
                         )));
@@ -158,7 +148,7 @@ impl ScriptInspector {
                     if (new_f - as_f32).abs() > f32::EPSILON {
                         commands.push(Box::new(SetComponentField::new(
                             entity_id.to_string(),
-                            comp_type.clone(),
+                            comp_type.to_string(),
                             field_name.to_string(),
                             Value::Float64(new_f as f64),
                         )));
@@ -169,7 +159,7 @@ impl ScriptInspector {
                 if let Some(edited) = ui.text_field(label, s) {
                     commands.push(Box::new(SetComponentField::new(
                         entity_id.to_string(),
-                        comp_type.clone(),
+                        comp_type.to_string(),
                         field_name.to_string(),
                         Value::Str(edited),
                     )));
@@ -183,7 +173,7 @@ impl ScriptInspector {
                     new_arr[0] = new_x;
                     commands.push(Box::new(SetComponentField::new(
                         entity_id.to_string(),
-                        comp_type.clone(),
+                        comp_type.to_string(),
                         field_name.to_string(),
                         Value::Vec3(new_arr),
                     )));
@@ -195,7 +185,7 @@ impl ScriptInspector {
                     new_arr[1] = new_y;
                     commands.push(Box::new(SetComponentField::new(
                         entity_id.to_string(),
-                        comp_type.clone(),
+                        comp_type.to_string(),
                         field_name.to_string(),
                         Value::Vec3(new_arr),
                     )));
@@ -207,7 +197,7 @@ impl ScriptInspector {
                     new_arr[2] = new_z;
                     commands.push(Box::new(SetComponentField::new(
                         entity_id.to_string(),
-                        comp_type.clone(),
+                        comp_type.to_string(),
                         field_name.to_string(),
                         Value::Vec3(new_arr),
                     )));
@@ -238,7 +228,6 @@ impl ScriptInspector {
                             &item_label,
                             item,
                             entity_id,
-                            assembly_id,
                             field_name,
                             commands,
                         );
@@ -255,7 +244,6 @@ impl ScriptInspector {
                             &entry_label,
                             val,
                             entity_id,
-                            assembly_id,
                             field_name,
                             commands,
                         );
@@ -278,13 +266,20 @@ impl Default for ScriptInspector {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use engine_scene::{ComponentRecord, EntityRecord};
+    use engine_serialize::SchemaVersion;
+
     use super::*;
     use crate::editor_ui::UiEvent;
     use crate::EditorUi;
 
     #[test]
     fn script_inspector_constructors_render_empty_scripts() {
-        for mut inspector in [ScriptInspector::new(), ScriptInspector::default()] {
+        // `ScriptInspector` is a unit struct, so construct the Default-shaped
+        // case directly instead of calling `default()` on a unit value.
+        for mut inspector in [ScriptInspector::new(), ScriptInspector] {
             let mut ui = EditorUi::new();
             let cmds = inspector.ui(&mut ui, "entity-001", &[]);
             assert!(cmds.is_empty());
@@ -318,6 +313,38 @@ mod tests {
         let cmds = inspector.ui(&mut ui, "entity-001", &scripts);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].name(), "Set Component Field");
+
+        let mut scene = engine_scene::sample_scene();
+        scene.entities.push(EntityRecord {
+            persistent_id: "entity-001".into(),
+            parent: None,
+            name: None,
+            enabled: true,
+            components: BTreeMap::from([(
+                "engine.script".into(),
+                ComponentRecord {
+                    schema_version: SchemaVersion::new(0, 1, 0),
+                    enabled: true,
+                    fields: BTreeMap::from([
+                        ("assembly_id".into(), Value::Str("asm-01".into())),
+                        ("class_name".into(), Value::Str("MyScript".into())),
+                        ("speed".into(), Value::Float64(100.0)),
+                    ]),
+                },
+            )]),
+        });
+        let mut command = cmds.into_iter().next().unwrap();
+        command.execute(&mut scene).unwrap();
+        assert_eq!(
+            scene
+                .entities
+                .iter()
+                .find(|entity| entity.persistent_id == "entity-001")
+                .unwrap()
+                .components["engine.script"]
+                .fields["speed"],
+            Value::Float64(250.0)
+        );
     }
 
     #[test]

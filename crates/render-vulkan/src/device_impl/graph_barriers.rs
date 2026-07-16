@@ -4,9 +4,13 @@ use engine_renderer::render_graph::{CompiledBarrier, PipeStage, ResourceState};
 use super::VulkanDevice;
 
 impl VulkanDevice {
-    pub(crate) fn apply_render_graph_barriers(&self, fi: usize, barriers: &[CompiledBarrier]) {
+    pub(crate) fn apply_render_graph_barriers(
+        &self,
+        fi: usize,
+        barriers: &[CompiledBarrier],
+    ) -> Result<(), String> {
         if barriers.is_empty() {
-            return;
+            return Ok(());
         }
 
         let mut image_barriers: Vec<vk::ImageMemoryBarrier<'static>> = Vec::new();
@@ -14,7 +18,7 @@ impl VulkanDevice {
         let mut dst_stage = vk::PipelineStageFlags::empty();
 
         for barrier in barriers {
-            let Some(image_barrier) = self.image_barrier_from_graph_barrier(barrier) else {
+            let Some(image_barrier) = self.image_barrier_from_graph_barrier(barrier)? else {
                 continue;
             };
 
@@ -24,11 +28,15 @@ impl VulkanDevice {
         }
 
         if image_barriers.is_empty() {
-            return;
+            return Ok(());
         }
 
         let d = &self.logical_device.device;
-        let cmd = self.frame_sync[fi].command_buffer;
+        let cmd = self
+            .frame_sync
+            .get(fi)
+            .ok_or_else(|| format!("render-graph frame index {fi} is out of range"))?
+            .command_buffer;
 
         // SAFETY: command buffer is in recording state; barriers reference
         // valid images with the declared stage/access masks; device is alive.
@@ -43,24 +51,38 @@ impl VulkanDevice {
                 &image_barriers,
             );
         }
+        Ok(())
     }
 
     fn image_barrier_from_graph_barrier(
         &self,
         barrier: &CompiledBarrier,
-    ) -> Option<vk::ImageMemoryBarrier<'static>> {
+    ) -> Result<Option<vk::ImageMemoryBarrier<'static>>, String> {
+        // These logical resources are transitioned by the concrete render
+        // passes that create/use them. They are still named explicitly here
+        // so a typo or an undeclared custom resource fails closed.
+        if matches!(
+            barrier.resource_name.as_str(),
+            "depth" | "shadow_map" | "shadow_depth" | "swapchain"
+        ) {
+            return Ok(None);
+        }
+
         // Skip transitions FROM Undefined (no layout to preserve) and
         // PresentSrc (swapchain images managed externally).
         if matches!(
             barrier.old_state,
             ResourceState::Undefined | ResourceState::PresentSrc
         ) {
-            return None;
+            // Validate the resource name even when no Vulkan command is
+            // required, otherwise a custom typo would disappear silently.
+            self.graph_resource_image(&barrier.resource_name)?;
+            return Ok(None);
         }
 
         let (image, aspect_mask, layer_count) =
             self.graph_resource_image(&barrier.resource_name)?;
-        Some(
+        Ok(Some(
             vk::ImageMemoryBarrier::default()
                 .image(image)
                 .subresource_range(vk::ImageSubresourceRange {
@@ -74,25 +96,40 @@ impl VulkanDevice {
                 .dst_access_mask(access_mask(barrier.new_state))
                 .old_layout(image_layout(barrier.old_state))
                 .new_layout(image_layout(barrier.new_state)),
-        )
+        ))
     }
 
     fn graph_resource_image(
         &self,
         resource_name: &str,
-    ) -> Option<(vk::Image, vk::ImageAspectFlags, u32)> {
+    ) -> Result<(vk::Image, vk::ImageAspectFlags, u32), String> {
         let (image, aspect_mask, layer_count) = match resource_name {
-            "hdr_color" => (self.hdr_color_image?, vk::ImageAspectFlags::COLOR, 1),
-            "depth_stencil" => (self.depth_image?, vk::ImageAspectFlags::DEPTH, 1),
-
-            _ => return None,
+            "hdr_color" => (
+                self.hdr_color_image
+                    .ok_or_else(|| "HDR graph resource is not initialized".to_owned())?,
+                vk::ImageAspectFlags::COLOR,
+                1,
+            ),
+            "depth_stencil" => (
+                self.depth_image
+                    .ok_or_else(|| "depth graph resource is not initialized".to_owned())?,
+                vk::ImageAspectFlags::DEPTH,
+                1,
+            ),
+            _ => {
+                return Err(format!(
+                "Vulkan backend has no image binding for render-graph resource '{resource_name}'"
+            ))
+            }
         };
 
         if image == vk::Image::null() {
-            return None;
+            return Err(format!(
+                "render-graph resource '{resource_name}' resolved to a null Vulkan image"
+            ));
         }
 
-        Some((image, aspect_mask, layer_count))
+        Ok((image, aspect_mask, layer_count))
     }
 }
 

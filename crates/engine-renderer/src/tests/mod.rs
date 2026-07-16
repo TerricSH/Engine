@@ -1,12 +1,13 @@
 use super::{
-    validate_frame_input, AssetId, AxisAlignedBox, BackendRenderer, BlendMode, ClearFlags,
-    Diagnostic, DiagnosticSeverity, FrameStats, IndexFormat, LightItem, LightKind, MaterialUpload,
-    MeshUpload, MeshVertexFormat, RenderFrameInput, RenderView, Renderer, ResourceKind,
-    ResourceRemoval, SamplerDescriptor, ShadowMode, TextureMipLevel, TextureUpload,
-    TextureUploadFormat, Transparency, UploadReceipt, ViewCompose, DIAG_ABORT_UNSUPPORTED,
-    DIAG_BACKEND_MISSING, DIAG_INVALID_MATERIAL_VALUES, DIAG_INVALID_MESH_VERTICES,
-    DIAG_INVALID_TEXTURE_MIPS, DIAG_MATERIAL_UPLOAD_UNSUPPORTED, DIAG_MESH_UPLOAD_UNSUPPORTED,
-    DIAG_TEXTURE_UPLOAD_UNSUPPORTED, IDENTITY_MAT4,
+    validate_frame_input, AssetId, AxisAlignedBox, BackendFrameMode, BackendRenderer, BlendMode,
+    BonePaletteLayout, ClearFlags, Diagnostic, DiagnosticSeverity, FrameStats, IndexFormat,
+    LightItem, LightKind, MaterialUpload, MeshUpload, MeshVertexFormat, PassGraphOutputMode,
+    RenderFrameInput, RenderView, Renderer, ResourceKind, ResourceRemoval, SamplerDescriptor,
+    ShadowMode, SkinnedItem, TextureMipLevel, TextureUpload, TextureUploadFormat, ToneMapping,
+    Transparency, UploadReceipt, ViewCompose, DIAG_ABORT_UNSUPPORTED, DIAG_BACKEND_MISSING,
+    DIAG_BARRIERS_UNSUPPORTED, DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED, DIAG_INVALID_MATERIAL_VALUES,
+    DIAG_INVALID_MESH_VERTICES, DIAG_INVALID_TEXTURE_MIPS, DIAG_MATERIAL_UPLOAD_UNSUPPORTED,
+    DIAG_MESH_UPLOAD_UNSUPPORTED, DIAG_TEXTURE_UPLOAD_UNSUPPORTED, IDENTITY_MAT4,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -83,6 +84,33 @@ fn valid_frame_with_view_succeeds() {
     assert!(renderer.draw_scene(&input).is_ok());
 }
 
+struct LegacyCountingBackend {
+    calls: Arc<AtomicUsize>,
+}
+
+impl BackendRenderer for LegacyCountingBackend {
+    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(FrameStats {
+            draw_calls: 7,
+            ..FrameStats::default()
+        })
+    }
+}
+
+#[test]
+fn legacy_backend_renders_exactly_once_instead_of_once_per_pass() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut renderer = Renderer::new_with_backend(Box::new(LegacyCountingBackend {
+        calls: Arc::clone(&calls),
+    }));
+
+    let stats = renderer.draw_scene(&valid_frame()).unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.draw_calls, 7);
+}
+
 #[test]
 fn draw_scene_with_error_diagnostics_fails() {
     let input = RenderFrameInput::empty(0); // empty views → RV0013 error
@@ -90,6 +118,19 @@ fn draw_scene_with_error_diagnostics_fails() {
     assert!(result.is_err());
     let diagnostics = result.unwrap_err();
     assert!(diagnostics.iter().any(|d| d.code == "RV0013"));
+}
+
+#[test]
+fn non_finite_exposure_override_is_rejected_before_backend_execution() {
+    let mut input = valid_frame();
+    input.render_options.exposure_ev100 = Some(f32::NAN);
+
+    let diagnostics = validate_frame_input(&input);
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "RV0022"
+            && diagnostic.path.as_deref() == Some("render_options.exposure_ev100")
+    }));
 }
 
 // ============================================================================
@@ -154,6 +195,29 @@ fn validate_duplicate_view_ids_produces_rv0014() {
         "expected RV0014 for duplicate views, got: {:?}",
         diagnostics
     );
+}
+
+#[test]
+fn validate_invalid_bone_palette_produces_rv0020() {
+    let mut input = valid_frame();
+    input.skinned_items.push(SkinnedItem {
+        entity: None,
+        mesh: AssetId::new("mesh.skinned"),
+        material: AssetId::new("material.skin"),
+        skeleton: AssetId::new("skeleton.humanoid"),
+        bone_palette: vec![IDENTITY_MAT4],
+        bone_palette_layout: BonePaletteLayout::Full4x4 { count: 2 },
+        world_transform: IDENTITY_MAT4,
+        bounds: AxisAlignedBox::UNIT,
+        render_layer: "default".into(),
+        cast_shadows: true,
+        sort_key: 0,
+    });
+
+    let diagnostics = validate_frame_input(&input);
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "RV0020"));
 }
 
 #[test]
@@ -491,6 +555,88 @@ fn render_graph_requires_all_terminal_passes() {
 }
 
 #[test]
+fn render_graph_allows_direct_to_swapchain_without_tone_map() {
+    let mut input = valid_frame();
+    input.render_options.tone_mapping = ToneMapping::None;
+    input.render_options.pass_graph_config.output_mode = PassGraphOutputMode::DirectToSwapchain;
+    input
+        .render_options
+        .pass_graph_config
+        .passes
+        .retain(|pass| pass.kind != "ToneMap");
+
+    let diagnostics = validate_frame_input(&input);
+    assert!(
+        diagnostics.iter().all(|diagnostic| !matches!(
+            diagnostic.severity,
+            DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+        )),
+        "direct-to-swapchain graph should be valid when tone mapping is disabled: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn direct_to_swapchain_rejects_tone_map_pass() {
+    let mut input = valid_frame();
+    input.render_options.tone_mapping = ToneMapping::None;
+    input.render_options.pass_graph_config.output_mode = PassGraphOutputMode::DirectToSwapchain;
+
+    let diagnostics = validate_frame_input(&input);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "RV0017"
+            && diagnostic.message.contains("DirectToSwapchain")
+            && diagnostic.message.contains("found 1")
+    }));
+}
+
+#[test]
+fn hdr_output_keeps_identity_composite_when_tone_mapping_is_none() {
+    let mut input = valid_frame();
+    input.render_options.tone_mapping = ToneMapping::None;
+
+    let diagnostics = validate_frame_input(&input);
+    assert!(diagnostics.iter().all(|diagnostic| !matches!(
+        diagnostic.severity,
+        DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+    )));
+}
+
+#[test]
+fn direct_to_swapchain_rejects_unapplied_tone_mapping() {
+    let mut input = valid_frame();
+    input.render_options.pass_graph_config.output_mode = PassGraphOutputMode::DirectToSwapchain;
+    input
+        .render_options
+        .pass_graph_config
+        .passes
+        .retain(|pass| pass.kind != "ToneMap");
+
+    let diagnostics = validate_frame_input(&input);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "RV0017"
+            && diagnostic.message.contains("DirectToSwapchain")
+            && diagnostic.message.contains("ToneMapping::Aces")
+    }));
+}
+
+#[test]
+fn render_graph_requires_tone_map_when_tone_mapping_is_enabled() {
+    let mut input = valid_frame();
+    input
+        .render_options
+        .pass_graph_config
+        .passes
+        .retain(|pass| pass.kind != "ToneMap");
+
+    let diagnostics = validate_frame_input(&input);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "RV0017"
+            && diagnostic.message.contains("HdrThenToneMap")
+            && diagnostic.message.contains("found 0")
+    }));
+}
+
+#[test]
 fn render_graph_rejects_terminal_pass_reordering() {
     let mut input = valid_frame();
     let passes = &mut input.render_options.pass_graph_config.passes;
@@ -617,6 +763,59 @@ fn backend_default_uploads_report_stable_unsupported_diagnostics() {
         .any(|diagnostic| diagnostic.code == DIAG_MATERIAL_UPLOAD_UNSUPPORTED));
 }
 
+#[test]
+fn backend_default_barriers_fail_closed_when_work_is_required() {
+    use crate::render_graph::{CompiledBarrier, PassKind, PassNode, PipeStage, ResourceState};
+
+    let mut backend = UnsupportedBackend;
+    let input = valid_frame();
+    let pass = PassNode {
+        kind: PassKind::ToneMap,
+        name: "tone_map_pass",
+        view_id: 0,
+        reads_depth: false,
+        writes_swapchain: true,
+    };
+    let barrier = CompiledBarrier {
+        resource_name: "hdr_color".into(),
+        src_stage: PipeStage::ColorAttachmentOutput,
+        dst_stage: PipeStage::FragmentShader,
+        old_state: ResourceState::ColorAttachmentOptimal,
+        new_state: ResourceState::ShaderReadOnlyOptimal,
+    };
+
+    assert!(backend.apply_pass_barriers(&input, &pass, &[]).is_ok());
+    let diagnostics = backend
+        .apply_pass_barriers(&input, &pass, &[barrier])
+        .expect_err("non-empty barriers must not be dropped");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DIAG_BARRIERS_UNSUPPORTED));
+}
+
+#[test]
+fn backend_default_rejects_undeclared_custom_graph_passes() {
+    let mut input = valid_frame();
+    input.render_options.pass_graph_config.passes.insert(
+        2,
+        crate::PassConfigEntry {
+            kind: "custom_bloom".into(),
+            enabled: true,
+        },
+    );
+    let mut graph = crate::render_graph2::RenderGraph::build_with_config(
+        &input,
+        &input.render_options.pass_graph_config,
+    );
+    let diagnostics = UnsupportedBackend
+        .configure_render_graph(&input, &mut graph)
+        .expect_err("custom resource declarations must not be silently empty");
+
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED));
+}
+
 struct CountingBackend {
     upload_calls: Arc<AtomicUsize>,
 }
@@ -701,8 +900,16 @@ impl FailingFrameBackend {
 }
 
 impl BackendRenderer for FailingFrameBackend {
+    fn frame_mode(&self) -> BackendFrameMode {
+        BackendFrameMode::RenderGraph
+    }
+
     fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
         Ok(FrameStats::default())
+    }
+
+    fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
     }
 
     fn apply_pass_barriers(

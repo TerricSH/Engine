@@ -19,15 +19,16 @@ use glam::Mat4;
 use engine_renderer::{
     render_graph, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, LightItem,
     LightKind, MaterialBinding, MaterialPipelineContext, MaterialResolver, MaterialUpload,
-    MeshUpload, ParamBlock, PassRegistry, RenderFrameInput, RenderableItem, ResourceKind,
-    ResourceRemoval, SamplerAddressMode, SamplerFilter, ShadowMode, SkinnedItem, TextureSlot,
-    TextureUpload, Transparency, UiBatch, UploadReceipt,
+    MeshUpload, MeshVertexFormat, ParamBlock, PassRegistry, RenderFrameInput, RenderPass,
+    RenderableItem, ResourceKind, ResourceRemoval, SamplerAddressMode, SamplerFilter, ShadowMode,
+    SkinnedItem, TextureSlot, TextureUpload, Transparency, UiBatch, UploadReceipt,
 };
 use render_core::{
     self, BindGroupLayoutBinding, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
     CommandEncoder, Device, FramebufferHandle, IndexFormat, MemoryHint, PipelineHandle,
     PipelineLayoutDescriptor, PipelineLayoutHandle, PipelineVariantKey, PushConstantRange,
-    RenderPassDescriptor, RenderPassHandle, SwapchainDescriptor, SwapchainHandle, TextureFormat,
+    RenderPassDescriptor, RenderPassHandle, ShaderFormat, ShaderModuleDescriptor,
+    ShaderModuleHandle, ShaderStage, SwapchainDescriptor, SwapchainHandle, TextureFormat,
     VertexAttribute, VertexLayout,
 };
 
@@ -35,9 +36,7 @@ use render_core::{
 use render_core::PipelineDescriptor;
 
 use crate::device_impl::VulkanDevice;
-use crate::shaders_embedded::{
-    FORWARD_FRAG_SPV, FORWARD_VERT_SPV, SKINNED_VERT_SPV, UI_OVERLAY_FRAG_SPV, UI_OVERLAY_VERT_SPV,
-};
+use crate::shaders_embedded::{FORWARD_FRAG_SPV, FORWARD_VERT_SPV, SKINNED_VERT_SPV};
 
 // ============================================================================
 // GpuMesh
@@ -51,6 +50,7 @@ pub struct GpuMesh {
     pub index_buffer: BufferHandle,
     pub index_count: u32,
     pub index_format: IndexFormat,
+    pub vertex_format: MeshVertexFormat,
     pub content_hash: [u8; 32],
     pub revision: u64,
 }
@@ -166,6 +166,139 @@ fn fallback_index_bytes() -> Vec<u8> {
 }
 
 const SCENE_FORWARD_PIPELINE_ID: &str = "scene-forward";
+const BUILTIN_PASS_KINDS: [&str; 4] = [
+    "directional_shadow_pass",
+    "opaque_pbr_forward_pass",
+    "tone_map_pass",
+    "present",
+];
+
+fn prepare_and_register_custom_pass(
+    registry: &mut PassRegistry,
+    device: &mut dyn Device,
+    mut pass: Box<dyn RenderPass>,
+) -> Result<(), Vec<Diagnostic>> {
+    let kind = pass.kind();
+    if kind.trim().is_empty() || kind.trim() != kind {
+        return Err(vec![Diagnostic::new(
+            "RV0298",
+            DiagnosticSeverity::Error,
+            "scene_renderer",
+            format!("custom render pass kind '{kind}' must be a non-empty, trimmed identifier"),
+        )]);
+    }
+    if BUILTIN_PASS_KINDS.contains(&kind) {
+        return Err(vec![Diagnostic::new(
+            "RV0298",
+            DiagnosticSeverity::Error,
+            "scene_renderer",
+            format!("custom render pass kind '{kind}' is reserved for Vulkan's built-in pass"),
+        )]);
+    }
+    if registry.find(kind).is_some() {
+        return Err(vec![Diagnostic::new(
+            "RV0299",
+            DiagnosticSeverity::Error,
+            "scene_renderer",
+            format!("custom render pass kind '{kind}' is already registered"),
+        )]);
+    }
+
+    // Preparation happens before the pass is made visible to graph execution.
+    // If it fails, callers may fix the issue and retry without a half-registered
+    // entry shadowing the new pass.
+    pass.prepare(device)?;
+    registry.register(pass);
+    Ok(())
+}
+
+fn execute_registered_custom_pass(
+    registry: &mut PassRegistry,
+    name: &str,
+    input: &RenderFrameInput,
+    encoder: &mut dyn CommandEncoder,
+    stats: &mut FrameStats,
+) -> Result<(), Vec<Diagnostic>> {
+    let Some(pass) = registry.find_mut(name) else {
+        return Err(vec![Diagnostic::new(
+            "RV0291",
+            DiagnosticSeverity::Error,
+            "scene_renderer",
+            format!("render graph references unregistered custom pass '{name}'"),
+        )]);
+    };
+    if pass.is_enabled(input) {
+        pass.execute(input, encoder, stats)?;
+    }
+    Ok(())
+}
+
+fn apply_registered_custom_pass_declarations(
+    registry: &PassRegistry,
+    graph: &mut engine_renderer::render_graph2::RenderGraph,
+) -> Result<(), Vec<Diagnostic>> {
+    for node in &mut graph.passes {
+        let engine_renderer::render_graph2::PassKind::Custom(name) = &node.kind else {
+            continue;
+        };
+        let name = *name;
+        let pass = registry.find(name).ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0291",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("render graph references unregistered custom pass '{name}'"),
+            )]
+        })?;
+        let declaration = pass.declare(node.view_id);
+        let declared_kind_matches = matches!(
+            declaration.kind,
+            render_graph::PassKind::Custom(declared) if declared == name
+        );
+        if !declared_kind_matches
+            || declaration.view_id != node.view_id
+            || declaration.name.trim().is_empty()
+        {
+            return Err(vec![Diagnostic::new(
+                "RV0315",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!(
+                    "custom pass '{name}' returned an inconsistent declaration for view {}",
+                    node.view_id
+                ),
+            )]);
+        }
+
+        node.name = declaration.name;
+        node.inputs.clear();
+        node.outputs.clear();
+        node.depth_stencil = None;
+        if declaration.reads_depth {
+            node.inputs
+                .push(engine_renderer::render_graph2::PassAttachment {
+                    name: "depth_stencil".into(),
+                    format: Some("D32".into()),
+                    clear: false,
+                    load_op: "load".into(),
+                    size_source: engine_renderer::render_graph2::SizeSource::Swapchain,
+                    access: engine_renderer::render_graph2::ResourceAccess::Read,
+                });
+        }
+        if declaration.writes_swapchain {
+            node.outputs
+                .push(engine_renderer::render_graph2::PassAttachment {
+                    name: "swapchain".into(),
+                    format: None,
+                    clear: false,
+                    load_op: "load".into(),
+                    size_source: engine_renderer::render_graph2::SizeSource::Swapchain,
+                    access: engine_renderer::render_graph2::ResourceAccess::Write,
+                });
+        }
+    }
+    Ok(())
+}
 
 fn scene_forward_vertex_layout() -> VertexLayout {
     VertexLayout {
@@ -226,12 +359,13 @@ fn scene_skinned_vertex_layout() -> VertexLayout {
 }
 
 fn scene_skinned_pipeline_context(
+    shader_modules: &[ShaderModuleHandle],
     pll: PipelineLayoutHandle,
     rp: RenderPassHandle,
     sample_count: u8,
 ) -> MaterialPipelineContext {
     MaterialPipelineContext {
-        shader_modules: vec![],
+        shader_modules: shader_modules.to_vec(),
         vertex_layout: scene_skinned_vertex_layout(),
         bind_layouts: vec![
             // Material UBO at set=2, binding=0
@@ -257,12 +391,13 @@ fn scene_skinned_pipeline_context(
 }
 
 fn scene_forward_pipeline_context(
+    shader_modules: &[ShaderModuleHandle],
     pll: PipelineLayoutHandle,
     rp: RenderPassHandle,
     sample_count: u8,
 ) -> MaterialPipelineContext {
     MaterialPipelineContext {
-        shader_modules: vec![],
+        shader_modules: shader_modules.to_vec(),
         vertex_layout: scene_forward_vertex_layout(),
         bind_layouts: vec![
             // Material UBO at set=2
@@ -285,6 +420,14 @@ fn scene_forward_pipeline_context(
         polygon_mode: Some("fill".into()),
         sample_count,
     }
+}
+
+#[derive(Clone, Copy)]
+struct ScenePipelineResources<'a> {
+    shader_modules: &'a [ShaderModuleHandle],
+    pipeline_layout: PipelineLayoutHandle,
+    render_pass: RenderPassHandle,
+    sample_count: u8,
 }
 
 fn fallback_material_binding(material_id: &AssetId) -> MaterialBinding {
@@ -396,12 +539,15 @@ fn get_or_create_scene_forward_pipeline(
     material_resolver: &mut MaterialResolver,
     device: &mut dyn Device,
     material: &MaterialBinding,
-    pll: PipelineLayoutHandle,
-    rp: RenderPassHandle,
+    resources: ScenePipelineResources<'_>,
     variant_key: PipelineVariantKey,
-    sample_count: u8,
 ) -> Result<PipelineHandle, render_core::RhiError> {
-    let context = scene_forward_pipeline_context(pll, rp, sample_count);
+    let context = scene_forward_pipeline_context(
+        resources.shader_modules,
+        resources.pipeline_layout,
+        resources.render_pass,
+        resources.sample_count,
+    );
     let (pipeline_key, pipeline_desc) = material_resolver.resolve(material, &context, variant_key);
     material_resolver
         .library_mut()
@@ -412,11 +558,14 @@ fn get_or_create_scene_skinned_pipeline(
     material_resolver: &mut MaterialResolver,
     device: &mut dyn Device,
     material: &MaterialBinding,
-    pll: PipelineLayoutHandle,
-    rp: RenderPassHandle,
-    sample_count: u8,
+    resources: ScenePipelineResources<'_>,
 ) -> Result<PipelineHandle, render_core::RhiError> {
-    let context = scene_skinned_pipeline_context(pll, rp, sample_count);
+    let context = scene_skinned_pipeline_context(
+        resources.shader_modules,
+        resources.pipeline_layout,
+        resources.render_pass,
+        resources.sample_count,
+    );
     let (pipeline_key, pipeline_desc) =
         material_resolver.resolve(material, &context, PipelineVariantKey::SKINNED);
     material_resolver
@@ -515,6 +664,267 @@ pub struct IndirectDrawCommand {
 /// Maximum number of indirect draw commands we can issue per frame.
 pub(crate) const MAX_INDIRECT_DRAWS: u32 = 1024;
 
+const UI_VERTEX_STRIDE: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UiScissor {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedUiDraw {
+    first_vertex: u32,
+    vertex_count: u32,
+    texture_id: Option<String>,
+    scissor: UiScissor,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PreparedUiOverlay {
+    vertex_bytes: Vec<u8>,
+    draws: Vec<PreparedUiDraw>,
+}
+
+fn first_missing_ui_texture(
+    batches: &[UiBatch],
+    mut texture_exists: impl FnMut(&str) -> bool,
+) -> Option<&str> {
+    batches
+        .iter()
+        .filter_map(|batch| batch.texture.as_ref())
+        .map(|asset_id| asset_id.id.as_str())
+        .find(|texture_id| !texture_exists(texture_id))
+}
+
+fn validate_vulkan_output_mode(
+    output_mode: engine_renderer::PassGraphOutputMode,
+) -> Result<(), Vec<Diagnostic>> {
+    if output_mode == engine_renderer::PassGraphOutputMode::DirectToSwapchain {
+        return Err(vec![Diagnostic::new(
+            "RV0310",
+            DiagnosticSeverity::Error,
+            "scene_renderer",
+            "Vulkan SceneRenderer does not support DirectToSwapchain; use HdrThenToneMap",
+        )]);
+    }
+    Ok(())
+}
+
+fn validate_vulkan_frame_contract(input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+    validate_vulkan_output_mode(input.render_options.pass_graph_config.output_mode)?;
+
+    if input.render_options.msaa_samples != 1
+        || input.views.iter().any(|view| view.msaa_samples != 1)
+    {
+        return Err(vec![Diagnostic::new(
+            "RV0317",
+            DiagnosticSeverity::Error,
+            "scene_renderer",
+            "Vulkan SceneRenderer does not yet implement multisample resolve; use 1x MSAA",
+        )]);
+    }
+    if input.views.iter().any(|view| {
+        view.viewport != engine_renderer::Rect::FULL
+            || view.viewport_rect_normalized != engine_renderer::Rect::FULL
+    }) {
+        return Err(vec![Diagnostic::new(
+            "RV0318",
+            DiagnosticSeverity::Error,
+            "scene_renderer",
+            "Vulkan SceneRenderer currently supports only a full-surface viewport",
+        )]);
+    }
+    if input
+        .views
+        .iter()
+        .any(|view| view.clear_flags != engine_renderer::ClearFlags::ColorAndDepth)
+    {
+        return Err(vec![Diagnostic::new(
+            "RV0319",
+            DiagnosticSeverity::Error,
+            "scene_renderer",
+            "Vulkan SceneRenderer currently supports only ColorAndDepth clear mode",
+        )]);
+    }
+    Ok(())
+}
+
+const TONE_MAP_MODE_ACES: u32 = 0;
+const TONE_MAP_MODE_REINHARD: u32 = 1;
+const TONE_MAP_MODE_NONE: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ToneMapPushConstants {
+    mode: u32,
+    exposure: f32,
+    output_is_srgb: u32,
+    padding: u32,
+}
+
+impl ToneMapPushConstants {
+    const SIZE: usize = 16;
+
+    fn to_bytes(self) -> [u8; Self::SIZE] {
+        let mut bytes = [0; Self::SIZE];
+        bytes[0..4].copy_from_slice(&self.mode.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&self.exposure.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&self.output_is_srgb.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.padding.to_ne_bytes());
+        bytes
+    }
+}
+
+fn swapchain_format_is_srgb(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB | vk::Format::A8B8G8R8_SRGB_PACK32
+    )
+}
+
+fn tone_map_push_constants(
+    tone_mapping: engine_renderer::ToneMapping,
+    exposure_ev100: Option<f32>,
+    swapchain_format: vk::Format,
+) -> Result<ToneMapPushConstants, String> {
+    let mode = match tone_mapping {
+        engine_renderer::ToneMapping::Aces => TONE_MAP_MODE_ACES,
+        engine_renderer::ToneMapping::Reinhard => TONE_MAP_MODE_REINHARD,
+        engine_renderer::ToneMapping::None => TONE_MAP_MODE_NONE,
+    };
+
+    // `exposure_ev100` is an absolute EV100 override, not an EV compensation.
+    // A missing override is neutral exposure; an override uses exp2(-EV100).
+    let exposure = match exposure_ev100 {
+        None => 1.0,
+        Some(ev100) if ev100.is_finite() => (-ev100).exp2(),
+        Some(ev100) => {
+            return Err(format!("exposure_ev100 must be finite, received {ev100}"));
+        }
+    };
+    if !exposure.is_finite() {
+        return Err(format!(
+            "exposure_ev100 {exposure_ev100:?} produces a non-finite exposure multiplier"
+        ));
+    }
+
+    Ok(ToneMapPushConstants {
+        mode,
+        exposure,
+        output_is_srgb: u32::from(swapchain_format_is_srgb(swapchain_format)),
+        padding: 0,
+    })
+}
+
+fn ui_scissor(
+    batch: usize,
+    rect: engine_renderer::Rect,
+    width: u32,
+    height: u32,
+) -> Result<Option<UiScissor>, String> {
+    if rect
+        .min
+        .into_iter()
+        .chain(rect.max)
+        .any(|value| !value.is_finite())
+    {
+        return Err(format!("UI batch {batch} has a non-finite clip rectangle"));
+    }
+    if rect.max[0] < rect.min[0] || rect.max[1] < rect.min[1] {
+        return Err(format!("UI batch {batch} has an inverted clip rectangle"));
+    }
+
+    let max_x = width.min(i32::MAX as u32) as f32;
+    let max_y = height.min(i32::MAX as u32) as f32;
+    let x0 = rect.min[0].floor().clamp(0.0, max_x) as i32;
+    let y0 = rect.min[1].floor().clamp(0.0, max_y) as i32;
+    let x1 = rect.max[0].ceil().clamp(0.0, max_x) as i32;
+    let y1 = rect.max[1].ceil().clamp(0.0, max_y) as i32;
+    if x1 <= x0 || y1 <= y0 {
+        return Ok(None);
+    }
+    Ok(Some(UiScissor {
+        x: x0,
+        y: y0,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
+    }))
+}
+
+/// Expand each UI batch's indices into a shared non-indexed vertex stream,
+/// retaining one draw record per input batch.  Draw records are deliberately
+/// not sorted or merged: batch order, texture selection and clip state are
+/// observable parts of the UI contract.
+fn prepare_ui_overlay(
+    batches: &[UiBatch],
+    width: u32,
+    height: u32,
+) -> Result<PreparedUiOverlay, String> {
+    let mut prepared = PreparedUiOverlay::default();
+    for (batch_index, batch) in batches.iter().enumerate() {
+        if batch.indices.len() % 3 != 0 {
+            return Err(format!(
+                "UI batch {batch_index} index count {} is not a triangle-list multiple",
+                batch.indices.len()
+            ));
+        }
+        let Some(scissor) = ui_scissor(batch_index, batch.clip_rect, width, height)? else {
+            continue;
+        };
+        if batch.indices.is_empty() {
+            continue;
+        }
+        let first_vertex = u32::try_from(prepared.vertex_bytes.len() / UI_VERTEX_STRIDE)
+            .map_err(|_| "UI vertex offset exceeds u32".to_owned())?;
+        for &index in &batch.indices {
+            let vertex = batch.vertices.get(index as usize).ok_or_else(|| {
+                format!(
+                    "UI batch {batch_index} index {index} is outside {} vertices",
+                    batch.vertices.len()
+                )
+            })?;
+            if vertex
+                .position
+                .into_iter()
+                .chain(vertex.uv)
+                .any(|value| !value.is_finite())
+            {
+                return Err(format!(
+                    "UI batch {batch_index} vertex {index} contains non-finite data"
+                ));
+            }
+            prepared
+                .vertex_bytes
+                .extend_from_slice(&vertex.position[0].to_ne_bytes());
+            prepared
+                .vertex_bytes
+                .extend_from_slice(&vertex.position[1].to_ne_bytes());
+            prepared
+                .vertex_bytes
+                .extend_from_slice(&vertex.uv[0].to_ne_bytes());
+            prepared
+                .vertex_bytes
+                .extend_from_slice(&vertex.uv[1].to_ne_bytes());
+            for channel in vertex.color {
+                prepared
+                    .vertex_bytes
+                    .extend_from_slice(&(f32::from(channel) / 255.0).to_ne_bytes());
+            }
+        }
+        let vertex_count = u32::try_from(batch.indices.len())
+            .map_err(|_| format!("UI batch {batch_index} has too many indices"))?;
+        prepared.draws.push(PreparedUiDraw {
+            first_vertex,
+            vertex_count,
+            texture_id: batch.texture.as_ref().map(|asset_id| asset_id.id.clone()),
+            scissor,
+        });
+    }
+    Ok(prepared)
+}
+
 // ============================================================================
 // SceneRenderer
 // ============================================================================
@@ -555,10 +965,8 @@ pub struct SceneRenderer {
 
     rp: Option<RenderPassHandle>,
     pll: Option<PipelineLayoutHandle>,
-
-    /// UI overlay pipeline (no depth, alpha blend, 2D positions).
-    ui_pl: Option<PipelineHandle>,
-    ui_pll: Option<PipelineLayoutHandle>,
+    forward_shader_modules: Vec<ShaderModuleHandle>,
+    skinned_shader_modules: Vec<ShaderModuleHandle>,
 
     /// Per-swapchain-image framebuffer handles (color + depth).
     framebuffers: Vec<FramebufferHandle>,
@@ -575,11 +983,12 @@ pub struct SceneRenderer {
     height: u32,
 
     /// Registry of pluggable render passes.
-    pub(crate) pass_registry: PassRegistry,
+    pass_registry: PassRegistry,
 
-    /// UI overlay vertex/index buffer cache.
-    ui_vb: Option<BufferHandle>,
-    ui_vb_capacity: u64,
+    /// One CPU-visible UI vertex buffer per in-flight frame. Reusing a single
+    /// buffer would race the other frame slot while the GPU is reading it.
+    ui_vbs: [Option<BufferHandle>; 2],
+    ui_vb_capacities: [u64; 2],
 }
 
 impl SceneRenderer {
@@ -603,10 +1012,10 @@ impl SceneRenderer {
             skinned_desc_cache_order: Vec::new(),
             rp: None,
             pll: None,
-            ui_pl: None,
-            ui_pll: None,
-            ui_vb: None,
-            ui_vb_capacity: 0,
+            forward_shader_modules: Vec::new(),
+            skinned_shader_modules: Vec::new(),
+            ui_vbs: [None; 2],
+            ui_vb_capacities: [0; 2],
             framebuffers: Vec::new(),
             cur_fb_index: 0,
             cur_sc: None,
@@ -616,6 +1025,24 @@ impl SceneRenderer {
             height: height.max(1),
             pass_registry: PassRegistry::new(),
         }
+    }
+
+    /// Register and prepare a custom render pass.
+    ///
+    /// Registration is allowed whenever no frame is active. Preparation is
+    /// performed exactly once before the pass is inserted into the registry,
+    /// so a failing pass cannot become visible to graph execution. Built-in
+    /// pass names are reserved because Vulkan dispatches those passes directly.
+    pub fn register_pass(&mut self, pass: Box<dyn RenderPass>) -> Result<(), Vec<Diagnostic>> {
+        if self.cur_enc.is_some() || self.cur_sc.is_some() || self.cur_ii.is_some() {
+            return Err(vec![Diagnostic::new(
+                "RV0297",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "cannot register a custom render pass while a frame is active",
+            )]);
+        }
+        prepare_and_register_custom_pass(&mut self.pass_registry, &mut self.device, pass)
     }
 
     /// Forward a resize notification to the underlying device.
@@ -642,6 +1069,85 @@ impl SceneRenderer {
         if !SKINNED_VERT_SPV.is_empty() {
             self.device.set_skinned_vertex_shader(SKINNED_VERT_SPV);
         }
+    }
+
+    fn create_scene_shader_modules(&mut self) -> Result<(), Vec<Diagnostic>> {
+        if !self.forward_shader_modules.is_empty() && !self.skinned_shader_modules.is_empty() {
+            return Ok(());
+        }
+        if FORWARD_VERT_SPV.is_empty() || FORWARD_FRAG_SPV.is_empty() || SKINNED_VERT_SPV.is_empty()
+        {
+            return Err(vec![Diagnostic::new(
+                "RV0293",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "embedded forward or skinned SPIR-V is unavailable",
+            )]);
+        }
+
+        let forward_vertex = self
+            .device
+            .create_shader_module(&ShaderModuleDescriptor {
+                format: ShaderFormat::SpirV,
+                stage: ShaderStage::Vertex,
+                source_bytes: FORWARD_VERT_SPV.to_vec(),
+                entry_points: vec!["main".into()],
+                source_hash: [0x61; 32],
+                debug_label: Some("scene-forward-vs".into()),
+            })
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0294",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create forward vertex shader: {error:?}"),
+                )]
+            })?;
+
+        let fragment = match self.device.create_shader_module(&ShaderModuleDescriptor {
+            format: ShaderFormat::SpirV,
+            stage: ShaderStage::Fragment,
+            source_bytes: FORWARD_FRAG_SPV.to_vec(),
+            entry_points: vec!["main".into()],
+            source_hash: [0x62; 32],
+            debug_label: Some("scene-forward-fs".into()),
+        }) {
+            Ok(shader) => shader,
+            Err(error) => {
+                self.device.destroy_shader_module(forward_vertex);
+                return Err(vec![Diagnostic::new(
+                    "RV0295",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create forward fragment shader: {error:?}"),
+                )]);
+            }
+        };
+
+        let skinned_vertex = match self.device.create_shader_module(&ShaderModuleDescriptor {
+            format: ShaderFormat::SpirV,
+            stage: ShaderStage::Vertex,
+            source_bytes: SKINNED_VERT_SPV.to_vec(),
+            entry_points: vec!["main".into()],
+            source_hash: [0x63; 32],
+            debug_label: Some("scene-skinned-vs".into()),
+        }) {
+            Ok(shader) => shader,
+            Err(error) => {
+                self.device.destroy_shader_module(fragment);
+                self.device.destroy_shader_module(forward_vertex);
+                return Err(vec![Diagnostic::new(
+                    "RV0296",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create skinned vertex shader: {error:?}"),
+                )]);
+            }
+        };
+
+        self.forward_shader_modules = vec![forward_vertex, fragment];
+        self.skinned_shader_modules = vec![skinned_vertex, fragment];
+        Ok(())
     }
 
     /// Create the render pass and pipeline layout used by scene-forward draws.
@@ -674,6 +1180,7 @@ impl SceneRenderer {
             color_attachments: vec![TextureFormat::Bgra8Unorm],
             depth_stencil_format: Some(TextureFormat::Depth32Float),
             sample_count: 1,
+            present_after: true,
             debug_label: Some("scene-rp".into()),
         };
         let rp = self.device.create_render_pass(&rp_desc).map_err(|e| {
@@ -704,6 +1211,8 @@ impl SceneRenderer {
                 format!("create_pipeline_layout: {e:?}"),
             )]
         })?;
+
+        self.create_scene_shader_modules()?;
 
         // ── Material descriptor infrastructure (set=2: UBO + texture) ─
         self.device
@@ -764,117 +1273,16 @@ impl SceneRenderer {
         self.pll = Some(pll);
 
         // ── Framebuffers (per swapchain image, color + depth) ─────────
-        let vk_rp = self
-            .device
-            .render_passes
-            .get(rp.index, rp.generation)
-            .copied();
-        if let Some(vk_rp) = vk_rp {
-            let fbs = self.device.create_scene_framebuffers(vk_rp).map_err(|e| {
-                vec![Diagnostic::new(
-                    "RV0213",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!("create_scene_framebuffers: {e:?}"),
-                )]
-            })?;
-            self.framebuffers = fbs;
-        }
+        self.framebuffers = self.device.create_scene_framebuffers(rp).map_err(|e| {
+            vec![Diagnostic::new(
+                "RV0213",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("create_scene_framebuffers: {e:?}"),
+            )]
+        })?;
 
         // ── UI overlay pipeline ────────────────────────────────────
-        let ui_vert_spv = UI_OVERLAY_VERT_SPV;
-        let ui_frag_spv = UI_OVERLAY_FRAG_SPV;
-        if !ui_vert_spv.is_empty() && !ui_frag_spv.is_empty() {
-            // Temporarily set UI shaders to create the pipeline
-            let old_vert = self.device.mvp_vert_spv.clone();
-            let old_frag = self.device.mvp_frag_spv.clone();
-            self.device.set_mvp_shaders(ui_vert_spv, ui_frag_spv);
-
-            // Create UI pipeline layout: push constants for screen_size (vec2 = 8 bytes)
-            let ui_pll_desc = PipelineLayoutDescriptor {
-                bind_group_layouts: vec![],
-                push_constant_ranges: vec![PushConstantRange {
-                    stage_flags: 0x01, // VERTEX
-                    offset: 0,
-                    size: 8, // vec2 screen_size
-                }],
-                debug_label: Some("ui-overlay-pll".into()),
-            };
-            let ui_pll = self
-                .device
-                .create_pipeline_layout(&ui_pll_desc)
-                .map_err(|e| {
-                    vec![Diagnostic::new(
-                        "RV0214",
-                        DiagnosticSeverity::Error,
-                        "scene_renderer",
-                        format!("create_ui_pipeline_layout: {e:?}"),
-                    )]
-                })?;
-
-            // Create UI pipeline: no depth, alpha blending, 2D vertex format
-            let ui_desc = render_core::PipelineDescriptor {
-                shader_modules: vec![],
-                vertex_layout: VertexLayout {
-                    stride_bytes: 32,
-                    attributes: vec![
-                        VertexAttribute {
-                            semantic: "position".into(),
-                            format: "float32x2".into(),
-                            offset_bytes: 0,
-                        },
-                        VertexAttribute {
-                            semantic: "uv".into(),
-                            format: "float32x2".into(),
-                            offset_bytes: 8,
-                        },
-                        VertexAttribute {
-                            semantic: "color".into(),
-                            format: "float32x4".into(),
-                            offset_bytes: 16,
-                        },
-                    ],
-                },
-                bind_layouts: vec![],
-                pipeline_layout: Some(ui_pll),
-                raster_state: render_core::RasterState {
-                    cull_mode: Some("none".into()),
-                    front_face: None,
-                },
-                depth_state: render_core::DepthState {
-                    format: None,
-                    write_enabled: false,
-                    compare: None,
-                },
-                blend_state: render_core::BlendState {
-                    mode: Some("Alpha".into()),
-                },
-                render_targets: vec![TextureFormat::Bgra8Unorm],
-                debug_label: Some("ui-overlay-pl".into()),
-                topology: Some("triangle_list".into()),
-                polygon_mode: Some("fill".into()),
-                sample_count: Some(1),
-                render_pass: Some(rp),
-                specialization: Vec::new(),
-            };
-            let ui_pl = self.device.create_pipeline(&ui_desc).map_err(|e| {
-                vec![Diagnostic::new(
-                    "RV0215",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!("create_ui_pipeline: {e:?}"),
-                )]
-            })?;
-
-            self.ui_pll = Some(ui_pll);
-            self.ui_pl = Some(ui_pl);
-
-            // Restore forward shaders
-            if let (Some(v), Some(f)) = (old_vert, old_frag) {
-                self.device.set_mvp_shaders(&v, &f);
-            }
-        }
-
         self.initialized = true;
         Ok(())
     }
@@ -891,30 +1299,17 @@ impl SceneRenderer {
                 "scene render pass is unavailable while rebuilding framebuffers",
             )]
         })?;
-        let vk_render_pass = self
-            .device
-            .render_passes
-            .get(render_pass.index, render_pass.generation)
-            .copied()
-            .ok_or_else(|| {
-                vec![Diagnostic::new(
-                    "RV0233",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    "scene render-pass handle is stale while rebuilding framebuffers",
-                )]
-            })?;
-        self.framebuffers = self
-            .device
-            .create_scene_framebuffers(vk_render_pass)
-            .map_err(|error| {
-                vec![Diagnostic::new(
-                    "RV0234",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!("create_scene_framebuffers: {error:?}"),
-                )]
-            })?;
+        self.framebuffers =
+            self.device
+                .create_scene_framebuffers(render_pass)
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0234",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("create_scene_framebuffers: {error:?}"),
+                    )]
+                })?;
         Ok(())
     }
 
@@ -1051,12 +1446,7 @@ impl SceneRenderer {
     }
 
     fn validate_uploaded_meshes(&self, input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
-        for mesh_id in input
-            .drawables
-            .iter()
-            .map(|item| &item.mesh.id)
-            .chain(input.skinned_items.iter().map(|item| &item.mesh.id))
-        {
+        let validate_mesh = |mesh_id: &str, expected_format: MeshVertexFormat| {
             let Some(mesh) = self.meshes.get(mesh_id) else {
                 return Err(vec![Diagnostic::new(
                     "RV0230",
@@ -1065,6 +1455,17 @@ impl SceneRenderer {
                     format!("drawable references mesh '{mesh_id}' before a successful upload"),
                 )]);
             };
+            if mesh.vertex_format != expected_format {
+                return Err(vec![Diagnostic::new(
+                    "RV0292",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!(
+                        "mesh '{mesh_id}' has {:?} vertices but this draw requires {:?}",
+                        mesh.vertex_format, expected_format
+                    ),
+                )]);
+            }
             let vertex_is_live = self
                 .device
                 .buffers
@@ -1083,6 +1484,13 @@ impl SceneRenderer {
                     format!("mesh '{mesh_id}' refers to released GPU buffers"),
                 )]);
             }
+            Ok(())
+        };
+        for mesh_id in input.drawables.iter().map(|item| &item.mesh.id) {
+            validate_mesh(mesh_id, MeshVertexFormat::Pbr32)?;
+        }
+        for mesh_id in input.skinned_items.iter().map(|item| &item.mesh.id) {
+            validate_mesh(mesh_id, MeshVertexFormat::Skinned64)?;
         }
         for material_id in input
             .drawables
@@ -1124,10 +1532,13 @@ impl SceneRenderer {
             &mut self.material_resolver,
             &mut self.device,
             &material,
-            pll,
-            rp,
+            ScenePipelineResources {
+                shader_modules: &self.forward_shader_modules,
+                pipeline_layout: pll,
+                render_pass: rp,
+                sample_count,
+            },
             PipelineVariantKey::NONE,
-            sample_count,
         )
         .map_err(|e| {
             vec![Diagnostic::new(
@@ -1167,9 +1578,12 @@ impl SceneRenderer {
             &mut self.material_resolver,
             &mut self.device,
             &material,
-            pll,
-            rp,
-            sample_count,
+            ScenePipelineResources {
+                shader_modules: &self.skinned_shader_modules,
+                pipeline_layout: pll,
+                render_pass: rp,
+                sample_count,
+            },
         )
         .map_err(|e| {
             vec![Diagnostic::new(
@@ -1242,7 +1656,7 @@ impl SceneRenderer {
         // Create the buffer
         let buf_desc = BufferDescriptor {
             size_bytes: 4096,
-            usage_flags: render_core::BufferUsage(0),
+            usage_flags: render_core::BufferUsage::UNIFORM,
             memory_hint: MemoryHint::CpuToGpu,
             debug_label: Some(format!("bone-{skeleton_id}")),
         };
@@ -1609,7 +2023,7 @@ impl SceneRenderer {
         // Create a small UBO buffer (32 bytes for MaterialUBO)
         let buf_desc = BufferDescriptor {
             size_bytes: 32,
-            usage_flags: render_core::BufferUsage(0),
+            usage_flags: render_core::BufferUsage::UNIFORM,
             memory_hint: MemoryHint::CpuToGpu,
             debug_label: Some(format!("mat-ubo-{material_id}")),
         };
@@ -1805,7 +2219,7 @@ impl SceneRenderer {
         // --- Vertex buffer ---
         let vb_desc = BufferDescriptor {
             size_bytes: vertex_bytes.len() as u64,
-            usage_flags: render_core::BufferUsage(0),
+            usage_flags: render_core::BufferUsage::VERTEX,
             memory_hint: MemoryHint::CpuToGpu,
             debug_label: Some(format!("mesh-{mesh_id}-vertices")),
         };
@@ -1830,7 +2244,7 @@ impl SceneRenderer {
         // --- Index buffer ---
         let ib_desc = BufferDescriptor {
             size_bytes: index_bytes.len() as u64,
-            usage_flags: render_core::BufferUsage(0),
+            usage_flags: render_core::BufferUsage::INDEX,
             memory_hint: MemoryHint::CpuToGpu,
             debug_label: Some(format!("mesh-{mesh_id}-indices")),
         };
@@ -1863,6 +2277,7 @@ impl SceneRenderer {
             index_buffer: ib,
             index_count,
             index_format: IndexFormat::U16,
+            vertex_format: MeshVertexFormat::Pbr32,
             content_hash: [0; 32],
             revision: 1,
         };
@@ -1912,6 +2327,24 @@ impl SceneRenderer {
         }
         self.validate_uploaded_meshes(input)?;
         self.prepare_frame_cache_capacity(input)?;
+        if let Some(texture_id) = first_missing_ui_texture(&input.ui_batches, |id| {
+            self.device.textures.contains_key(id)
+        }) {
+            return Err(vec![Diagnostic::new(
+                "RV0308",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("UI batch references texture '{texture_id}' before a successful upload"),
+            )]);
+        }
+        prepare_ui_overlay(&input.ui_batches, self.width, self.height).map_err(|message| {
+            vec![Diagnostic::new(
+                "RV0298",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                message,
+            )]
+        })?;
 
         // Apply the requested MSAA sample count to the device before any
         // resource creation takes place (ensure_sc �?ensure_hdr_resources).
@@ -1920,6 +2353,20 @@ impl SceneRenderer {
             // Swapchain setup creates the HDR forward pipeline, so the scene
             // shaders must be registered before `create_swapchain`.
             self.configure_scene_shaders();
+        }
+
+        if self.device.swapchain_recreate_pending {
+            self.device.wait_idle_checked().map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0314",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("wait for suboptimal swapchain replacement: {error}"),
+                )]
+            })?;
+            self.device.destroy_scene_framebuffers(&self.framebuffers);
+            self.framebuffers.clear();
+            self.device.destroy_mvp();
         }
 
         let sc_desc = SwapchainDescriptor {
@@ -1937,6 +2384,17 @@ impl SceneRenderer {
                 format!("create_swapchain: {e:?}"),
             )]
         })?;
+
+        if !input.ui_batches.is_empty() {
+            self.device.ensure_ui_overlay_resources().map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0309",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("initialize UI overlay resources: {error}"),
+                )]
+            })?;
+        }
 
         // Swapchain creation also establishes the per-frame, shadow, and
         // material descriptor layouts. Scene pipelines and framebuffers must
@@ -2060,42 +2518,27 @@ impl SceneRenderer {
             self.device.write_light_ssbo(&light_ssbo_data, 0);
         }
 
-        // Begin HDR render pass with clear values.
-        let msaa_active = self.device.hdr_msaa_samples != vk::SampleCountFlags::TYPE_1;
-        let clear_values: &[vk::ClearValue] = &if msaa_active {
-            vec![
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.02, 0.02, 0.06, 1.0],
-                    },
+        // Contract validation above limits this backend to one full-surface
+        // ColorAndDepth view, but its authored clear colour is still part of
+        // the frame contract and must not be replaced with a backend constant.
+        let clear_color = input
+            .views
+            .first()
+            .map(|view| view.clear_color)
+            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: clear_color,
                 },
-                vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
+            },
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
                 },
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 0.0],
-                    },
-                },
-            ]
-        } else {
-            vec![
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.02, 0.02, 0.06, 1.0],
-                    },
-                },
-                vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                },
-            ]
-        };
+            },
+        ];
         let rpbi = vk::RenderPassBeginInfo::default()
             .render_pass(hdr_rp)
             .framebuffer(hdr_fb)
@@ -2106,7 +2549,7 @@ impl SceneRenderer {
                     height: self.height,
                 },
             })
-            .clear_values(clear_values);
+            .clear_values(&clear_values);
         // SAFETY: command buffer is in recording state; RP, FB valid.
         unsafe {
             d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
@@ -2403,34 +2846,6 @@ impl SceneRenderer {
             d.cmd_end_render_pass(cmd);
         }
 
-        // Barrier: HDR color attachment -> shader read-only
-        if let Some(hdr_img) = self.device.hdr_color_image {
-            let barrier = vk::ImageMemoryBarrier::default()
-                .image(hdr_img)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-            unsafe {
-                d.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[barrier],
-                );
-            }
-        }
-
         apply_extraction_stats(stats, input);
         Ok(())
     }
@@ -2707,14 +3122,47 @@ impl SceneRenderer {
         input: &RenderFrameInput,
         stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
-        let Some(ref mut enc) = self.cur_enc else {
+        if self.cur_enc.is_none() {
             return Err(vec![Diagnostic::new(
                 "RV0227",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
                 "tone-map pass requires an active frame encoder",
             )]);
-        };
+        }
+
+        let swapchain_format = self
+            .device
+            .swapchain
+            .as_ref()
+            .map(|swapchain| swapchain.format)
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0228",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    "tone-map pass requires an active swapchain format",
+                )]
+            })?;
+        let tone_map_push = tone_map_push_constants(
+            input.render_options.tone_mapping,
+            input.render_options.exposure_ev100,
+            swapchain_format,
+        )
+        .map_err(|message| {
+            vec![Diagnostic::new(
+                "RV0320",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                message,
+            )
+            .path("render_options.exposure_ev100")]
+        })?;
+        let tone_map_push_bytes = tone_map_push.to_bytes();
+        let enc = self
+            .cur_enc
+            .as_mut()
+            .expect("active frame encoder checked above");
 
         let d = &self.device.logical_device.device;
         let fi = self.device.current_frame;
@@ -2793,116 +3241,246 @@ impl SceneRenderer {
             }
         }
 
-        let identity: [u8; 128] = [0; 128];
         unsafe {
-            d.cmd_push_constants(cmd, tone_pll, vk::ShaderStageFlags::VERTEX, 0, &identity);
+            d.cmd_push_constants(
+                cmd,
+                tone_pll,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                &tone_map_push_bytes,
+            );
         }
 
         enc.draw(3, 1, 0, 0);
         enc.end_render_pass();
 
-        let _ = input;
         let _ = stats;
         Ok(())
     }
 
     // ── UI overlay rendering ─────────────────────────────────────────────
 
-    /// Render UI batches after the main 3D scene, within the same render pass.
-    fn render_ui_overlay(
+    /// Render UI in a dedicated load-op pass over the tone-mapped swapchain
+    /// image. This is invoked by the graph's Present pass, so no later scene
+    /// pass can overwrite the overlay.
+    fn execute_ui_overlay_pass(
         &mut self,
-        encoder: &mut dyn CommandEncoder,
-        ui_pl: PipelineHandle,
-        ui_pll: PipelineLayoutHandle,
         batches: &[UiBatch],
-        draw_calls: &mut u32,
+        stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
         if batches.is_empty() {
             return Ok(());
         }
-
-        // Count total vertices (non-indexed: 6 vertices per quad)
-        let mut total_verts = 0usize;
-        for batch in batches {
-            total_verts += (batch.indices.len() / 6) * 6;
-        }
-        if total_verts == 0 {
+        let prepared = prepare_ui_overlay(batches, self.width, self.height).map_err(|message| {
+            vec![Diagnostic::new(
+                "RV0298",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                message,
+            )]
+        })?;
+        if prepared.draws.is_empty() {
             return Ok(());
         }
 
-        // Build interleaved vertex data: [pos2, uv2, color4] = 32 bytes per vertex
-        let stride: u64 = 32;
-        let vb_size = total_verts as u64 * stride;
-
-        // Expand indexed quads to non-indexed triangles
-        let mut vert_bytes: Vec<u8> = Vec::with_capacity(total_verts * stride as usize);
-        for batch in batches {
-            let verts = &batch.vertices;
-            for chunk in batch.indices.chunks(6) {
-                for &idx in chunk {
-                    let v = &verts[idx as usize];
-                    vert_bytes.extend_from_slice(&v.position[0].to_ne_bytes());
-                    vert_bytes.extend_from_slice(&v.position[1].to_ne_bytes());
-                    vert_bytes.extend_from_slice(&v.uv[0].to_ne_bytes());
-                    vert_bytes.extend_from_slice(&v.uv[1].to_ne_bytes());
-                    let r = v.color[0] as f32 / 255.0;
-                    let g = v.color[1] as f32 / 255.0;
-                    let b = v.color[2] as f32 / 255.0;
-                    let a = v.color[3] as f32 / 255.0;
-                    vert_bytes.extend_from_slice(&r.to_ne_bytes());
-                    vert_bytes.extend_from_slice(&g.to_ne_bytes());
-                    vert_bytes.extend_from_slice(&b.to_ne_bytes());
-                    vert_bytes.extend_from_slice(&a.to_ne_bytes());
-                }
-            }
+        let mut descriptor_sets = Vec::with_capacity(prepared.draws.len());
+        for draw in &prepared.draws {
+            let descriptor_set = self
+                .device
+                .ui_overlay_descriptor_set(draw.texture_id.as_deref())
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0299",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("cannot bind UI texture: {error}"),
+                    )]
+                })?;
+            descriptor_sets.push(descriptor_set);
         }
 
-        // Ensure vertex buffer is large enough
-        if self.ui_vb_capacity < vb_size {
-            if let Some(old) = self.ui_vb.take() {
+        let frame_index = self.device.current_frame;
+        let required_bytes = u64::try_from(prepared.vertex_bytes.len()).map_err(|_| {
+            vec![Diagnostic::new(
+                "RV0300",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "UI vertex data exceeds the Vulkan buffer size contract",
+            )]
+        })?;
+        if self.ui_vb_capacities[frame_index] < required_bytes {
+            if let Some(old) = self.ui_vbs[frame_index].take() {
                 self.device.destroy_buffer(old);
             }
-            let vb_desc = BufferDescriptor {
-                size_bytes: vb_size,
-                usage_flags: render_core::BufferUsage(0),
-                memory_hint: MemoryHint::CpuToGpu,
-                debug_label: Some("ui-overlay-vb".into()),
-            };
-            let vb = self.device.create_buffer(&vb_desc).map_err(|e| {
-                vec![Diagnostic::new(
-                    "RV0216",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!("create_ui_vb: {e:?}"),
-                )]
-            })?;
-            self.ui_vb = Some(vb);
-            self.ui_vb_capacity = vb_size;
+            let vertex_buffer = self
+                .device
+                .create_buffer(&BufferDescriptor {
+                    size_bytes: required_bytes,
+                    usage_flags: render_core::BufferUsage::VERTEX,
+                    memory_hint: MemoryHint::CpuToGpu,
+                    debug_label: Some(format!("ui-overlay-vb-{frame_index}")),
+                })
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0216",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("create UI vertex buffer: {error:?}"),
+                    )]
+                })?;
+            self.ui_vbs[frame_index] = Some(vertex_buffer);
+            self.ui_vb_capacities[frame_index] = required_bytes;
         }
-
-        // Write vertex data
-        if let Some(vb) = self.ui_vb {
-            self.device.write_buffer(vb, &vert_bytes, 0).map_err(|e| {
+        let vertex_buffer = self.ui_vbs[frame_index].ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0301",
+                DiagnosticSeverity::Fatal,
+                "scene_renderer",
+                "UI vertex buffer was not retained after creation",
+            )]
+        })?;
+        self.device
+            .write_buffer(vertex_buffer, &prepared.vertex_bytes, 0)
+            .map_err(|error| {
                 vec![Diagnostic::new(
                     "RV0217",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    format!("write_ui_vb: {e:?}"),
+                    format!("write UI vertex buffer: {error:?}"),
                 )]
             })?;
 
-            encoder.bind_pipeline(ui_pl);
-
-            let mut pc = Vec::with_capacity(8);
-            pc.extend_from_slice(&(self.width as f32).to_ne_bytes());
-            pc.extend_from_slice(&(self.height as f32).to_ne_bytes());
-            encoder.push_constants(ui_pll, 0x01, 0, &pc);
-
-            encoder.bind_vertex_buffers(&[vb], &[0]);
-            encoder.draw(total_verts as u32, 1, 0, 0);
-            *draw_calls += 1;
+        let raw_vertex_buffer = self
+            .device
+            .buffers
+            .get(vertex_buffer.index, vertex_buffer.generation)
+            .map(|entry| entry.buffer)
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0302",
+                    DiagnosticSeverity::Fatal,
+                    "scene_renderer",
+                    "UI vertex buffer handle became invalid before recording",
+                )]
+            })?;
+        let render_pass = self.device.ui_overlay_rp.ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0303",
+                DiagnosticSeverity::Fatal,
+                "scene_renderer",
+                "UI overlay render pass is not initialized",
+            )]
+        })?;
+        let pipeline = self.device.ui_overlay_pipeline.ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0304",
+                DiagnosticSeverity::Fatal,
+                "scene_renderer",
+                "UI overlay pipeline is not initialized",
+            )]
+        })?;
+        let pipeline_layout = self.device.ui_overlay_pipeline_layout.ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0305",
+                DiagnosticSeverity::Fatal,
+                "scene_renderer",
+                "UI overlay pipeline layout is not initialized",
+            )]
+        })?;
+        let framebuffer = self
+            .device
+            .ui_overlay_framebuffers
+            .get(self.cur_fb_index as usize)
+            .copied()
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0306",
+                    DiagnosticSeverity::Fatal,
+                    "scene_renderer",
+                    "UI overlay framebuffer is missing for the acquired swapchain image",
+                )]
+            })?;
+        let command_buffer = self
+            .device
+            .frame_sync
+            .get(frame_index)
+            .map(|frame| frame.command_buffer)
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0307",
+                    DiagnosticSeverity::Fatal,
+                    "scene_renderer",
+                    "UI overlay command buffer is unavailable",
+                )]
+            })?;
+        let d = &self.device.logical_device.device;
+        let begin_info = vk::RenderPassBeginInfo::default()
+            .render_pass(render_pass)
+            .framebuffer(framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: self.width,
+                    height: self.height,
+                },
+            });
+        unsafe {
+            d.cmd_begin_render_pass(command_buffer, &begin_info, vk::SubpassContents::INLINE);
+            d.cmd_set_viewport(
+                command_buffer,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: self.width as f32,
+                    height: self.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            d.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            d.cmd_bind_vertex_buffers(command_buffer, 0, &[raw_vertex_buffer], &[0]);
+            let mut screen_size = [0u8; 8];
+            screen_size[..4].copy_from_slice(&(self.width as f32).to_ne_bytes());
+            screen_size[4..].copy_from_slice(&(self.height as f32).to_ne_bytes());
+            d.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &screen_size,
+            );
+            for (draw, descriptor_set) in prepared.draws.iter().zip(descriptor_sets) {
+                d.cmd_set_scissor(
+                    command_buffer,
+                    0,
+                    &[vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: draw.scissor.x,
+                            y: draw.scissor.y,
+                        },
+                        extent: vk::Extent2D {
+                            width: draw.scissor.width,
+                            height: draw.scissor.height,
+                        },
+                    }],
+                );
+                d.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline_layout,
+                    0,
+                    &[descriptor_set],
+                    &[],
+                );
+                d.cmd_draw(command_buffer, draw.vertex_count, 1, draw.first_vertex, 0);
+                stats.draw_calls = stats.draw_calls.saturating_add(1);
+                stats.triangles = stats
+                    .triangles
+                    .saturating_add(u64::from(draw.vertex_count / 3));
+            }
+            d.cmd_end_render_pass(command_buffer);
         }
-
         Ok(())
     }
 
@@ -2962,7 +3540,16 @@ impl SceneRenderer {
         encoder.set_scissor(0, 0, self.width, self.height);
 
         if let Some(pll) = self.pll {
-            encoder.bind_descriptor_sets(pll, 0, &[], &[]);
+            encoder
+                .bind_descriptor_sets(pll, 0, &[], &[])
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0244",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("failed to bind the frame descriptor set: {error}"),
+                    )]
+                })?;
         }
 
         let mut draw_calls: u32 = 0;
@@ -3147,18 +3734,6 @@ impl SceneRenderer {
         }
 
         // ── UI overlay ────────────────────────────────────────────────
-        if let (Some(ui_pl), Some(ui_pll)) = (self.ui_pl, self.ui_pll) {
-            if !input.ui_batches.is_empty() {
-                self.render_ui_overlay(
-                    &mut *encoder,
-                    ui_pl,
-                    ui_pll,
-                    &input.ui_batches,
-                    &mut draw_calls,
-                )?;
-            }
-        }
-
         encoder.end_render_pass();
 
         let stats = self.device.end_frame(sc_h, encoder, ii).map_err(|e| {
@@ -3188,7 +3763,20 @@ impl SceneRenderer {
 // ============================================================================
 
 impl BackendRenderer for SceneRenderer {
+    fn frame_mode(&self) -> engine_renderer::BackendFrameMode {
+        engine_renderer::BackendFrameMode::RenderGraph
+    }
+
+    fn configure_render_graph(
+        &mut self,
+        _input: &RenderFrameInput,
+        graph: &mut engine_renderer::render_graph2::RenderGraph,
+    ) -> Result<(), Vec<Diagnostic>> {
+        apply_registered_custom_pass_declarations(&self.pass_registry, graph)
+    }
+
     fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
+        validate_vulkan_frame_contract(input)?;
         let diagnostics = engine_renderer::validate_frame_input(input);
         if diagnostics.iter().any(|diagnostic| {
             matches!(
@@ -3199,25 +3787,11 @@ impl BackendRenderer for SceneRenderer {
             return Err(diagnostics);
         }
 
-        let graph = engine_renderer::render_graph2::RenderGraph::build_with_config(
+        let mut graph = engine_renderer::render_graph2::RenderGraph::build_with_config(
             input,
             &input.render_options.pass_graph_config,
         );
-        if let Some(name) = graph.passes.iter().find_map(|pass| match &pass.kind {
-            engine_renderer::render_graph2::PassKind::Custom(name)
-                if self.pass_registry.find(name).is_none() =>
-            {
-                Some(*name)
-            }
-            _ => None,
-        }) {
-            return Err(vec![Diagnostic::new(
-                "RV0291",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("render graph references unregistered custom pass '{name}'"),
-            )]);
-        }
+        self.configure_render_graph(input, &mut graph)?;
         let compiled = graph.compile_v2().map_err(|error| {
             vec![Diagnostic::new(
                 "RV0284",
@@ -3276,11 +3850,20 @@ impl BackendRenderer for SceneRenderer {
         barriers: &[engine_renderer::render_graph::CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
         let fi = self.device.current_frame;
-        self.device.apply_render_graph_barriers(fi, barriers);
-        Ok(())
+        self.device
+            .apply_render_graph_barriers(fi, barriers)
+            .map_err(|message| {
+                vec![Diagnostic::new(
+                    "RV0316",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    message,
+                )]
+            })
     }
 
     fn begin_frame(&mut self, input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        validate_vulkan_frame_contract(input)?;
         if self.cur_enc.is_some() || self.cur_sc.is_some() || self.cur_ii.is_some() {
             return Err(vec![Diagnostic::new(
                 "RV0269",
@@ -3300,7 +3883,7 @@ impl BackendRenderer for SceneRenderer {
                 ),
             )]);
         }
-        let msaa = self.device.msaa_samples(input.render_options.msaa_samples);
+        let msaa = vk::SampleCountFlags::TYPE_1;
         let (sc_h, ii, enc) = match self.begin_frame_impl(input, msaa) {
             Ok(frame) => frame,
             Err(mut diagnostics) => {
@@ -3346,21 +3929,18 @@ impl BackendRenderer for SceneRenderer {
             render_graph::PassKind::ToneMap => {
                 self.execute_tonemap_pass(input, stats)?;
             }
-            render_graph::PassKind::Present => {}
+            render_graph::PassKind::Present => {
+                self.execute_ui_overlay_pass(&input.ui_batches, stats)?;
+            }
             render_graph::PassKind::Custom(name) => {
-                if let Some(rp) = self.pass_registry.find_mut(name) {
-                    if rp.is_enabled(input) {
-                        let enc = self.cur_enc.as_mut().expect("encoder checked above");
-                        rp.execute(input, &mut **enc, stats)?;
-                    }
-                } else {
-                    return Err(vec![Diagnostic::new(
-                        "RV0291",
-                        DiagnosticSeverity::Error,
-                        "scene_renderer",
-                        format!("render graph references unregistered custom pass '{name}'"),
-                    )]);
-                }
+                let enc = self.cur_enc.as_mut().expect("encoder checked above");
+                execute_registered_custom_pass(
+                    &mut self.pass_registry,
+                    name,
+                    input,
+                    &mut **enc,
+                    stats,
+                )?;
             }
         }
 
@@ -3501,6 +4081,7 @@ impl BackendRenderer for SceneRenderer {
             index_buffer: ib,
             index_count: upload.index_count,
             index_format,
+            vertex_format: upload.vertex_format,
             content_hash: upload.content_hash,
             revision,
         };
@@ -3624,6 +4205,17 @@ impl BackendRenderer for SceneRenderer {
             .collect();
         let mut old_texture = self.device.textures.insert(texture_id.clone(), new_texture);
         let mut rebind_diagnostics = Vec::new();
+        if let Err(error) = self
+            .device
+            .refresh_ui_overlay_texture_descriptor(&texture_id)
+        {
+            rebind_diagnostics.push(Diagnostic::new(
+                "RV0311",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("failed to rebind replacement UI texture '{texture_id}': {error}"),
+            ));
+        }
         for descriptor_set in descriptor_sets.iter().copied() {
             match self
                 .device
@@ -3652,6 +4244,19 @@ impl BackendRenderer for SceneRenderer {
                 self.device
                     .textures
                     .insert(texture_id.clone(), previous_texture);
+                if let Err(error) = self
+                    .device
+                    .refresh_ui_overlay_texture_descriptor(&texture_id)
+                {
+                    rebind_diagnostics.push(Diagnostic::new(
+                        "RV0312",
+                        DiagnosticSeverity::Fatal,
+                        "scene_renderer",
+                        format!(
+                            "failed to restore UI texture '{texture_id}' descriptor after replacement rollback: {error}"
+                        ),
+                    ));
+                }
                 for descriptor_set in descriptor_sets {
                     match self
                         .device
@@ -3857,6 +4462,18 @@ impl BackendRenderer for SceneRenderer {
                         entry.bound_texture_id = FALLBACK_MATERIAL_TEXTURE_ID.to_owned();
                     }
                 }
+                self.device
+                    .release_ui_overlay_texture_descriptor(&resource_id)
+                    .map_err(|error| {
+                        vec![Diagnostic::new(
+                            "RV0313",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!(
+                                "failed to release UI descriptor for texture '{resource_id}': {error}"
+                            ),
+                        )]
+                    })?;
                 if let Some(texture) = self.device.textures.remove(&resource_id) {
                     self.device.destroy_gpu_texture(texture);
                 }
@@ -3918,6 +4535,8 @@ impl BackendRenderer for SceneRenderer {
 mod tests {
     use super::*;
     use engine_renderer::hash_vertex_layout;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     struct MockDevice {
         next_index: u32,
@@ -3956,6 +4575,411 @@ mod tests {
         fn destroy_pipeline(&mut self, handle: PipelineHandle) {
             self.destroyed.push(handle);
         }
+
+        fn destroy_buffer(&mut self, _buffer: BufferHandle) {}
+
+        fn destroy_texture(&mut self, _texture: render_core::TextureHandle) {}
+
+        fn destroy_shader_module(&mut self, _module: ShaderModuleHandle) {}
+
+        fn destroy_render_pass(&mut self, _pass: RenderPassHandle) {}
+
+        fn destroy_framebuffer(&mut self, _framebuffer: FramebufferHandle) {}
+
+        fn destroy_pipeline_layout(&mut self, _layout: PipelineLayoutHandle) {}
+
+        fn destroy_swapchain(&mut self, _swapchain: SwapchainHandle) {}
+
+        fn destroy_surface(&mut self, _surface: render_core::SurfaceHandle) {}
+
+        fn wait_idle(&self) {}
+    }
+
+    #[derive(Default)]
+    struct MockEncoder;
+
+    impl CommandEncoder for MockEncoder {
+        fn begin_render_pass(
+            &mut self,
+            _render_pass: RenderPassHandle,
+            _framebuffer: FramebufferHandle,
+            _area: (u32, u32, u32, u32),
+            _clear_color: [f32; 4],
+            _clear_depth: Option<f32>,
+        ) {
+        }
+
+        fn bind_pipeline(&mut self, _pipeline: PipelineHandle) {}
+
+        fn bind_vertex_buffers(&mut self, _buffers: &[BufferHandle], _offsets: &[u64]) {}
+
+        fn bind_index_buffer(
+            &mut self,
+            _buffer: BufferHandle,
+            _offset: u64,
+            _index_format: IndexFormat,
+        ) {
+        }
+
+        fn bind_descriptor_sets(
+            &mut self,
+            _pipeline_layout: PipelineLayoutHandle,
+            _first_set: u32,
+            _sets: &[render_core::DescriptorSetHandle],
+            _dynamic_offsets: &[u32],
+        ) -> Result<(), render_core::RhiError> {
+            Ok(())
+        }
+
+        fn set_viewport(
+            &mut self,
+            _x: f32,
+            _y: f32,
+            _w: f32,
+            _h: f32,
+            _min_depth: f32,
+            _max_depth: f32,
+        ) {
+        }
+
+        fn set_scissor(&mut self, _x: i32, _y: i32, _w: u32, _h: u32) {}
+
+        fn draw(
+            &mut self,
+            _vertex_count: u32,
+            _instance_count: u32,
+            _first_vertex: u32,
+            _first_instance: u32,
+        ) {
+        }
+
+        fn draw_indexed(
+            &mut self,
+            _index_count: u32,
+            _instance_count: u32,
+            _first_index: u32,
+            _vertex_offset: i32,
+            _first_instance: u32,
+        ) {
+        }
+
+        fn end_render_pass(&mut self) {}
+
+        fn push_constants(
+            &mut self,
+            _pipeline_layout: PipelineLayoutHandle,
+            _stage_flags: u32,
+            _offset: u32,
+            _data: &[u8],
+        ) {
+        }
+    }
+
+    struct CountingPass {
+        kind: &'static str,
+        prepare_count: Arc<AtomicUsize>,
+        execute_count: Arc<AtomicUsize>,
+        fail_prepare: bool,
+        reads_depth: bool,
+        writes_swapchain: bool,
+    }
+
+    impl CountingPass {
+        fn new(
+            kind: &'static str,
+            prepare_count: Arc<AtomicUsize>,
+            execute_count: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                kind,
+                prepare_count,
+                execute_count,
+                fail_prepare: false,
+                reads_depth: false,
+                writes_swapchain: false,
+            }
+        }
+
+        fn with_declared_resources(mut self) -> Self {
+            self.reads_depth = true;
+            self.writes_swapchain = true;
+            self
+        }
+
+        fn failing(
+            kind: &'static str,
+            prepare_count: Arc<AtomicUsize>,
+            execute_count: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                kind,
+                prepare_count,
+                execute_count,
+                fail_prepare: true,
+                reads_depth: false,
+                writes_swapchain: false,
+            }
+        }
+    }
+
+    impl RenderPass for CountingPass {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+
+        fn declare(&self, view_id: u32) -> render_graph::PassNode {
+            render_graph::PassNode {
+                kind: render_graph::PassKind::Custom(self.kind),
+                name: self.kind,
+                view_id,
+                reads_depth: self.reads_depth,
+                writes_swapchain: self.writes_swapchain,
+            }
+        }
+
+        fn prepare(&mut self, _device: &mut dyn Device) -> Result<(), Vec<Diagnostic>> {
+            self.prepare_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_prepare {
+                Err(vec![Diagnostic::new(
+                    "TEST_PREPARE",
+                    DiagnosticSeverity::Error,
+                    "test",
+                    "custom pass preparation failed",
+                )])
+            } else {
+                Ok(())
+            }
+        }
+
+        fn execute(
+            &mut self,
+            _input: &RenderFrameInput,
+            _encoder: &mut dyn CommandEncoder,
+            stats: &mut FrameStats,
+        ) -> Result<(), Vec<Diagnostic>> {
+            self.execute_count.fetch_add(1, Ordering::SeqCst);
+            stats.draw_calls = stats.draw_calls.saturating_add(1);
+            Ok(())
+        }
+    }
+
+    fn frame_with_custom_pass(kind: &str) -> RenderFrameInput {
+        let mut input = RenderFrameInput::empty(7);
+        input.views.push(engine_renderer::RenderView {
+            view_id: 0,
+            camera_entity: None,
+            viewport: engine_renderer::Rect::FULL,
+            viewport_rect_normalized: engine_renderer::Rect::FULL,
+            view_matrix: engine_renderer::IDENTITY_MAT4,
+            projection_matrix: engine_renderer::IDENTITY_MAT4,
+            clear_flags: engine_renderer::ClearFlags::ColorAndDepth,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            render_layer_mask: u32::MAX,
+            msaa_samples: 1,
+            compose: engine_renderer::ViewCompose::Base {
+                clear: engine_renderer::ClearFlags::ColorAndDepth,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+            },
+            stack_order: 0,
+            frustum: None,
+        });
+        input.render_options.pass_graph_config = engine_renderer::PassGraphConfig {
+            passes: vec![
+                engine_renderer::PassConfigEntry {
+                    kind: kind.to_string(),
+                    enabled: true,
+                },
+                engine_renderer::PassConfigEntry {
+                    kind: "Present".to_string(),
+                    enabled: true,
+                },
+            ],
+            enabled: true,
+            output_mode: engine_renderer::PassGraphOutputMode::HdrThenToneMap,
+        };
+        input
+    }
+
+    #[test]
+    fn configured_custom_pass_is_prepared_once_and_executed() {
+        let prepare_count = Arc::new(AtomicUsize::new(0));
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let mut registry = PassRegistry::new();
+        let mut device = MockDevice::new();
+        prepare_and_register_custom_pass(
+            &mut registry,
+            &mut device,
+            Box::new(CountingPass::new(
+                "custom_post",
+                Arc::clone(&prepare_count),
+                Arc::clone(&execute_count),
+            )),
+        )
+        .expect("custom pass registration");
+
+        let input = frame_with_custom_pass("custom_post");
+        let mut graph = engine_renderer::render_graph2::RenderGraph::build_with_config(
+            &input,
+            &input.render_options.pass_graph_config,
+        );
+        apply_registered_custom_pass_declarations(&registry, &mut graph)
+            .expect("custom pass declaration");
+        let compiled = graph.compile_v2().expect("custom render graph compile");
+        let mut encoder = MockEncoder;
+        let mut stats = FrameStats::default();
+        let mut executed_custom_node = false;
+        for pass_index in compiled.pass_order {
+            let pass = &graph.passes[pass_index];
+            if let engine_renderer::render_graph2::PassKind::Custom(name) = pass.kind {
+                execute_registered_custom_pass(
+                    &mut registry,
+                    name,
+                    &input,
+                    &mut encoder,
+                    &mut stats,
+                )
+                .expect("registered custom pass execution");
+                executed_custom_node = true;
+            }
+        }
+
+        assert!(executed_custom_node);
+        assert_eq!(prepare_count.load(Ordering::SeqCst), 1);
+        assert_eq!(execute_count.load(Ordering::SeqCst), 1);
+        assert_eq!(stats.draw_calls, 1);
+    }
+
+    #[test]
+    fn registered_custom_pass_declaration_populates_graph_resources() {
+        let mut registry = PassRegistry::new();
+        let mut device = MockDevice::new();
+        prepare_and_register_custom_pass(
+            &mut registry,
+            &mut device,
+            Box::new(
+                CountingPass::new(
+                    "custom_composite",
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                )
+                .with_declared_resources(),
+            ),
+        )
+        .expect("custom pass registration");
+
+        let input = frame_with_custom_pass("custom_composite");
+        let mut graph = engine_renderer::render_graph2::RenderGraph::build_with_config(
+            &input,
+            &input.render_options.pass_graph_config,
+        );
+        apply_registered_custom_pass_declarations(&registry, &mut graph)
+            .expect("custom pass declaration");
+        let custom = graph
+            .passes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.kind,
+                    engine_renderer::render_graph2::PassKind::Custom(name)
+                        if *name == "custom_composite"
+                )
+            })
+            .expect("custom graph node");
+
+        assert_eq!(custom.inputs.len(), 1);
+        assert_eq!(custom.inputs[0].name, "depth_stencil");
+        assert_eq!(
+            custom.inputs[0].access,
+            engine_renderer::render_graph2::ResourceAccess::Read
+        );
+        assert_eq!(custom.outputs.len(), 1);
+        assert_eq!(custom.outputs[0].name, "swapchain");
+        assert_eq!(
+            custom.outputs[0].access,
+            engine_renderer::render_graph2::ResourceAccess::Write
+        );
+    }
+
+    #[test]
+    fn duplicate_custom_pass_is_rejected_before_prepare() {
+        let first_prepares = Arc::new(AtomicUsize::new(0));
+        let duplicate_prepares = Arc::new(AtomicUsize::new(0));
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let mut registry = PassRegistry::new();
+        let mut device = MockDevice::new();
+        prepare_and_register_custom_pass(
+            &mut registry,
+            &mut device,
+            Box::new(CountingPass::new(
+                "custom_post",
+                Arc::clone(&first_prepares),
+                Arc::clone(&execute_count),
+            )),
+        )
+        .expect("first registration");
+
+        let diagnostics = prepare_and_register_custom_pass(
+            &mut registry,
+            &mut device,
+            Box::new(CountingPass::new(
+                "custom_post",
+                Arc::clone(&duplicate_prepares),
+                Arc::clone(&execute_count),
+            )),
+        )
+        .expect_err("duplicate registration must fail");
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RV0299"));
+        assert_eq!(first_prepares.load(Ordering::SeqCst), 1);
+        assert_eq!(duplicate_prepares.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn failed_custom_pass_prepare_does_not_register_the_pass() {
+        let prepare_count = Arc::new(AtomicUsize::new(0));
+        let execute_count = Arc::new(AtomicUsize::new(0));
+        let mut registry = PassRegistry::new();
+        let mut device = MockDevice::new();
+
+        let diagnostics = prepare_and_register_custom_pass(
+            &mut registry,
+            &mut device,
+            Box::new(CountingPass::failing(
+                "custom_post",
+                Arc::clone(&prepare_count),
+                execute_count,
+            )),
+        )
+        .expect_err("prepare failure must fail registration");
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "TEST_PREPARE"));
+        assert_eq!(prepare_count.load(Ordering::SeqCst), 1);
+        assert!(registry.find("custom_post").is_none());
+    }
+
+    #[test]
+    fn configured_unregistered_custom_pass_still_fails_closed() {
+        let input = frame_with_custom_pass("missing_post");
+        let mut registry = PassRegistry::new();
+        let mut encoder = MockEncoder;
+        let mut stats = FrameStats::default();
+
+        let diagnostics = execute_registered_custom_pass(
+            &mut registry,
+            "missing_post",
+            &input,
+            &mut encoder,
+            &mut stats,
+        )
+        .expect_err("unregistered custom pass must fail");
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RV0291"));
     }
 
     #[test]
@@ -4018,11 +5042,12 @@ mod tests {
         let resolver = MaterialResolver::new(4);
         let pll = PipelineLayoutHandle::new(3, 1);
         let rp = RenderPassHandle::new(7, 2);
+        let shaders = [ShaderModuleHandle::new(8, 1), ShaderModuleHandle::new(9, 1)];
         let material = fallback_material_binding(&AssetId::new("mat_default"));
 
         let (key, desc) = resolver.resolve(
             &material,
-            &scene_forward_pipeline_context(pll, rp, 1),
+            &scene_forward_pipeline_context(&shaders, pll, rp, 1),
             PipelineVariantKey::NONE,
         );
 
@@ -4034,6 +5059,7 @@ mod tests {
         assert_eq!(key.variant_key, PipelineVariantKey::NONE);
         assert_eq!(desc.pipeline_layout, Some(pll));
         assert_eq!(desc.render_pass, Some(rp));
+        assert_eq!(desc.shader_modules, shaders);
     }
 
     #[test]
@@ -4042,26 +5068,29 @@ mod tests {
         let mut device = MockDevice::new();
         let pll = PipelineLayoutHandle::new(1, 1);
         let rp = RenderPassHandle::new(2, 1);
+        let shaders = [ShaderModuleHandle::new(3, 1), ShaderModuleHandle::new(4, 1)];
+        let resources = ScenePipelineResources {
+            shader_modules: &shaders,
+            pipeline_layout: pll,
+            render_pass: rp,
+            sample_count: 1,
+        };
         let material = fallback_material_binding(&AssetId::new("mat_shared"));
 
         let first = get_or_create_scene_forward_pipeline(
             &mut resolver,
             &mut device,
             &material,
-            pll,
-            rp,
+            resources,
             PipelineVariantKey::NONE,
-            1,
         )
         .expect("first pipeline create should succeed");
         let second = get_or_create_scene_forward_pipeline(
             &mut resolver,
             &mut device,
             &material,
-            pll,
-            rp,
+            resources,
             PipelineVariantKey::NONE,
-            1,
         )
         .expect("cache hit should succeed");
 
@@ -4079,26 +5108,29 @@ mod tests {
         let mut device = MockDevice::new();
         let pll = PipelineLayoutHandle::new(1, 1);
         let rp = RenderPassHandle::new(2, 1);
+        let shaders = [ShaderModuleHandle::new(3, 1), ShaderModuleHandle::new(4, 1)];
+        let resources = ScenePipelineResources {
+            shader_modules: &shaders,
+            pipeline_layout: pll,
+            render_pass: rp,
+            sample_count: 1,
+        };
         let material = fallback_material_binding(&AssetId::new("mat_shared"));
 
         let first = get_or_create_scene_forward_pipeline(
             &mut resolver,
             &mut device,
             &material,
-            pll,
-            rp,
+            resources,
             PipelineVariantKey::NONE,
-            1,
         )
         .expect("first pipeline create should succeed");
         let second = get_or_create_scene_forward_pipeline(
             &mut resolver,
             &mut device,
             &material,
-            pll,
-            rp,
+            resources,
             PipelineVariantKey::SKINNED,
-            1,
         )
         .expect("second pipeline create should succeed");
 
@@ -4106,5 +5138,234 @@ mod tests {
         assert_eq!(device.create_calls, 2);
         assert_eq!(device.destroyed, vec![first]);
         assert_eq!(resolver.library().len(), 1);
+    }
+
+    fn ui_batch(texture: Option<&str>, clip_rect: engine_renderer::Rect) -> UiBatch {
+        UiBatch {
+            canvas_id: "editor".into(),
+            z_order: 0,
+            clip_rect,
+            texture: texture.map(AssetId::new),
+            vertices: vec![
+                engine_renderer::UiVertex {
+                    position: [10.0, 20.0],
+                    uv: [0.0, 0.0],
+                    color: [255, 128, 0, 255],
+                },
+                engine_renderer::UiVertex {
+                    position: [20.0, 20.0],
+                    uv: [1.0, 0.0],
+                    color: [255, 128, 0, 255],
+                },
+                engine_renderer::UiVertex {
+                    position: [20.0, 30.0],
+                    uv: [1.0, 1.0],
+                    color: [255, 128, 0, 255],
+                },
+            ],
+            indices: vec![0, 1, 2],
+            material: AssetId::new("ui-material"),
+        }
+    }
+
+    #[test]
+    fn ui_preparation_keeps_batch_order_and_one_draw_per_batch() {
+        let clip = engine_renderer::Rect {
+            min: [0.0, 0.0],
+            max: [200.0, 100.0],
+        };
+        let batches = vec![ui_batch(Some("first"), clip), ui_batch(None, clip)];
+
+        let prepared = prepare_ui_overlay(&batches, 200, 100).unwrap();
+
+        assert_eq!(prepared.draws.len(), 2);
+        assert_eq!(prepared.draws[0].texture_id.as_deref(), Some("first"));
+        assert_eq!(prepared.draws[1].texture_id, None);
+        assert_eq!(prepared.draws[0].first_vertex, 0);
+        assert_eq!(prepared.draws[1].first_vertex, 3);
+        assert_eq!(prepared.vertex_bytes.len(), 6 * UI_VERTEX_STRIDE);
+    }
+
+    #[test]
+    fn empty_ui_preparation_has_no_overlay_draws() {
+        let prepared = prepare_ui_overlay(&[], 1280, 720).unwrap();
+
+        assert!(prepared.draws.is_empty());
+        assert!(prepared.vertex_bytes.is_empty());
+    }
+
+    #[test]
+    fn ui_preparation_clamps_fractional_clip_to_the_swapchain() {
+        let batch = ui_batch(
+            None,
+            engine_renderer::Rect {
+                min: [-3.4, 8.2],
+                max: [500.7, 120.1],
+            },
+        );
+
+        let prepared = prepare_ui_overlay(&[batch], 320, 100).unwrap();
+
+        assert_eq!(
+            prepared.draws[0].scissor,
+            UiScissor {
+                x: 0,
+                y: 8,
+                width: 320,
+                height: 92,
+            }
+        );
+    }
+
+    #[test]
+    fn ui_preparation_rejects_an_out_of_bounds_index() {
+        let mut batch = ui_batch(
+            None,
+            engine_renderer::Rect {
+                min: [0.0, 0.0],
+                max: [100.0, 100.0],
+            },
+        );
+        batch.indices[2] = 99;
+
+        let error = prepare_ui_overlay(&[batch], 100, 100).unwrap_err();
+
+        assert!(error.contains("index 99"));
+        assert!(error.contains("outside 3 vertices"));
+    }
+
+    #[test]
+    fn missing_ui_texture_check_ignores_textureless_batches() {
+        let clip = engine_renderer::Rect {
+            min: [0.0, 0.0],
+            max: [100.0, 100.0],
+        };
+        let batches = vec![ui_batch(None, clip), ui_batch(Some("missing"), clip)];
+
+        assert_eq!(
+            first_missing_ui_texture(&batches, |id| id == "known"),
+            Some("missing")
+        );
+        assert_eq!(first_missing_ui_texture(&batches, |_| true), None);
+    }
+
+    #[test]
+    fn ui_fragment_shader_multiplies_texture_and_vertex_color() {
+        let source = include_str!("../shaders/ui_overlay.frag");
+        assert!(source.contains("texture(ui_texture, out_uv) * out_color"));
+    }
+
+    #[test]
+    fn vulkan_scene_renderer_rejects_direct_to_swapchain() {
+        let diagnostics =
+            validate_vulkan_output_mode(engine_renderer::PassGraphOutputMode::DirectToSwapchain)
+                .unwrap_err();
+
+        assert_eq!(diagnostics[0].code, "RV0310");
+        assert!(diagnostics[0].message.contains("DirectToSwapchain"));
+        assert!(
+            validate_vulkan_output_mode(engine_renderer::PassGraphOutputMode::HdrThenToneMap)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn vulkan_scene_renderer_fails_closed_for_unimplemented_view_options() {
+        let mut input = frame_with_custom_pass("custom_post");
+        assert!(validate_vulkan_frame_contract(&input).is_ok());
+
+        input.render_options.msaa_samples = 4;
+        assert_eq!(
+            validate_vulkan_frame_contract(&input).unwrap_err()[0].code,
+            "RV0317"
+        );
+        input.render_options.msaa_samples = 1;
+
+        input.views[0].viewport_rect_normalized.max = [0.5, 1.0];
+        assert_eq!(
+            validate_vulkan_frame_contract(&input).unwrap_err()[0].code,
+            "RV0318"
+        );
+        input.views[0].viewport_rect_normalized = engine_renderer::Rect::FULL;
+
+        input.views[0].clear_flags = engine_renderer::ClearFlags::Nothing;
+        assert_eq!(
+            validate_vulkan_frame_contract(&input).unwrap_err()[0].code,
+            "RV0319"
+        );
+    }
+
+    #[test]
+    fn tone_map_push_constants_cover_modes_exposure_and_target_encoding() {
+        let aces = tone_map_push_constants(
+            engine_renderer::ToneMapping::Aces,
+            None,
+            vk::Format::B8G8R8A8_SRGB,
+        )
+        .unwrap();
+        assert_eq!(aces.mode, TONE_MAP_MODE_ACES);
+        assert_eq!(aces.exposure, 1.0);
+        assert_eq!(aces.output_is_srgb, 1);
+
+        let reinhard = tone_map_push_constants(
+            engine_renderer::ToneMapping::Reinhard,
+            Some(2.0),
+            vk::Format::B8G8R8A8_UNORM,
+        )
+        .unwrap();
+        assert_eq!(reinhard.mode, TONE_MAP_MODE_REINHARD);
+        assert_eq!(reinhard.exposure, 0.25);
+        assert_eq!(reinhard.output_is_srgb, 0);
+
+        let identity = tone_map_push_constants(
+            engine_renderer::ToneMapping::None,
+            Some(-1.0),
+            vk::Format::R8G8B8A8_SRGB,
+        )
+        .unwrap();
+        assert_eq!(identity.mode, TONE_MAP_MODE_NONE);
+        assert_eq!(identity.exposure, 2.0);
+        assert_eq!(identity.output_is_srgb, 1);
+
+        let bytes = identity.to_bytes();
+        assert_eq!(bytes.len(), ToneMapPushConstants::SIZE);
+        assert_eq!(
+            u32::from_ne_bytes(bytes[0..4].try_into().unwrap()),
+            TONE_MAP_MODE_NONE
+        );
+        assert_eq!(f32::from_ne_bytes(bytes[4..8].try_into().unwrap()), 2.0);
+        assert_eq!(u32::from_ne_bytes(bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_ne_bytes(bytes[12..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn tone_map_push_constants_reject_non_finite_exposure() {
+        for exposure in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = tone_map_push_constants(
+                engine_renderer::ToneMapping::Aces,
+                Some(exposure),
+                vk::Format::B8G8R8A8_SRGB,
+            )
+            .unwrap_err();
+            assert!(error.contains("must be finite"));
+        }
+
+        let overflow = tone_map_push_constants(
+            engine_renderer::ToneMapping::Aces,
+            Some(-1000.0),
+            vk::Format::B8G8R8A8_SRGB,
+        )
+        .unwrap_err();
+        assert!(overflow.contains("non-finite exposure multiplier"));
+    }
+
+    #[test]
+    fn tone_map_fragment_shader_declares_all_runtime_branches() {
+        let source = include_str!("../shaders/tonemap.frag");
+        assert!(source.contains("layout(push_constant)"));
+        assert!(source.contains("aces_narkowicz"));
+        assert!(source.contains("TONE_MAP_REINHARD"));
+        assert!(source.contains("TONE_MAP_NONE"));
+        assert!(source.contains("tone_map.output_is_srgb == 0u"));
     }
 }

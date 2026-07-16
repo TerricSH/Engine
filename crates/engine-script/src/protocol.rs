@@ -104,6 +104,40 @@ pub enum ScriptMessage {
         value: Option<ScriptValue>,
     },
 
+    /// Request: replace the frame-local gameplay snapshot for an instance.
+    #[serde(rename = "SetGameplayContext")]
+    SetGameplayContext {
+        /// The target instance.
+        instance_id: String,
+        /// JSON-encoded [`crate::GameplayContext`]. Keeping the inner payload
+        /// opaque lets user assemblies define their API without referencing
+        /// types from the engine-owned host executable.
+        context_json: String,
+    },
+
+    /// Response: the gameplay snapshot was accepted.
+    #[serde(rename = "GameplayContextSet")]
+    GameplayContextSet {
+        /// The instance from the corresponding request.
+        instance_id: String,
+    },
+
+    /// Request: return and clear gameplay commands queued by an instance.
+    #[serde(rename = "DrainGameplayCommands")]
+    DrainGameplayCommands {
+        /// The target instance.
+        instance_id: String,
+    },
+
+    /// Response: JSON-encoded [`crate::GameplayCommand`] values.
+    #[serde(rename = "GameplayCommands")]
+    GameplayCommands {
+        /// The instance from the corresponding request.
+        instance_id: String,
+        /// JSON array containing only commands for the owning entity.
+        commands_json: String,
+    },
+
     /// Request: shut down the script runtime gracefully.
     #[serde(rename = "Shutdown")]
     Shutdown,
@@ -220,6 +254,28 @@ mod tests {
         assert!(
             matches!(back, ScriptMessage::FieldValue { value: Some(ScriptValue::Float(v)), .. } if (v - 200.0).abs() < f64::EPSILON)
         );
+    }
+
+    #[test]
+    fn protocol_gameplay_bridge_roundtrip() {
+        let set = ScriptMessage::SetGameplayContext {
+            instance_id: "inst-001".into(),
+            context_json: r#"{"entity_id":"player"}"#.into(),
+        };
+        assert!(matches!(
+            ScriptMessage::from_json(&set.to_json().unwrap()).unwrap(),
+            ScriptMessage::SetGameplayContext { instance_id, .. } if instance_id == "inst-001"
+        ));
+
+        let commands = ScriptMessage::GameplayCommands {
+            instance_id: "inst-001".into(),
+            commands_json: r#"[{"type":"load_scene","scene_id":"level_two"}]"#.into(),
+        };
+        assert!(matches!(
+            ScriptMessage::from_json(&commands.to_json().unwrap()).unwrap(),
+            ScriptMessage::GameplayCommands { commands_json, .. }
+                if commands_json == r#"[{"type":"load_scene","scene_id":"level_two"}]"#
+        ));
     }
 
     #[test]

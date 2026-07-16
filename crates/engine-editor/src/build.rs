@@ -209,7 +209,7 @@ fn which(name: &str) -> Result<String, ()> {
             // On Windows also check with .exe appended.
             #[cfg(target_os = "windows")]
             {
-                if candidate.extension().map_or(false, |ext| ext == "exe") {
+                if candidate.extension().is_some_and(|ext| ext == "exe") {
                     return Ok(candidate.to_string_lossy().to_string());
                 }
                 let with_exe = candidate.with_extension("exe");
@@ -235,7 +235,7 @@ fn find_csproj(dir: &Path) -> Result<PathBuf, BuildError> {
             BuildError::IoError(format!("cannot read entry in {}: {e}", dir.display()))
         })?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "csproj") {
+        if path.extension().is_some_and(|ext| ext == "csproj") {
             return Ok(path);
         }
     }
@@ -265,7 +265,7 @@ fn find_assembly(project_dir: &Path) -> Option<PathBuf> {
             if let Ok(files) = std::fs::read_dir(&tfm_dir) {
                 for file in files.flatten() {
                     let path = file.path();
-                    if path.extension().map_or(false, |ext| ext == "dll") {
+                    if path.extension().is_some_and(|ext| ext == "dll") {
                         // Skip known system assemblies.
                         let name = path
                             .file_stem()
@@ -301,10 +301,10 @@ fn parse_error_lines(output: &str) -> Vec<String> {
             errors.push(trimmed.to_string());
         }
         // Also catch lines starting with "error" (e.g. from dotnet CLI)
-        if trimmed.starts_with("error ") || trimmed.starts_with("error:") {
-            if !errors.iter().any(|e| e == trimmed) {
-                errors.push(trimmed.to_string());
-            }
+        if (trimmed.starts_with("error ") || trimmed.starts_with("error:"))
+            && !errors.iter().any(|e| e == trimmed)
+        {
+            errors.push(trimmed.to_string());
         }
     }
 

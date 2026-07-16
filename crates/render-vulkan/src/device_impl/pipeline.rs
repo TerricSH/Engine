@@ -11,6 +11,9 @@ impl VulkanDevice {
     /// present).  Also tears down descriptor infrastructure and depth texture so
     /// they can be re-created at the new resolution.
     pub(crate) fn destroy_mvp(&mut self) {
+        // UI framebuffers reference swapchain image views and therefore must
+        // be destroyed before the swapchain is dropped or replaced.
+        self.destroy_ui_overlay_resources();
         self.destroy_descriptor_infra();
         self.destroy_depth_texture();
         let d = &self.logical_device.device;
@@ -67,6 +70,7 @@ impl VulkanDevice {
         // re-created at the new swapchain extent.
         self.destroy_hdr_resources();
         self.swapchain = None;
+        self.swapchain_recreate_pending = false;
     }
 
     /// Build the MVP triangle pipeline (color-only, no depth, no vertex input).

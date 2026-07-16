@@ -310,6 +310,31 @@ fn evaluate_single_channel_overrides_joint() {
 }
 
 #[test]
+fn evaluate_pose_preserves_rest_components_missing_from_channel() {
+    let skeleton = test_runtime_skeleton();
+    let clip = AnimationClip {
+        name: "rotate_child".into(),
+        duration: 1.0,
+        channels: vec![AnimationChannel {
+            joint_index: 1,
+            translations: vec![],
+            rotations: vec![Keyframe {
+                time: 0.0,
+                value: Quat::from_rotation_y(1.0).to_array(),
+            }],
+            scales: vec![],
+        }],
+        joint_indices: vec![1],
+    };
+
+    let pose = AnimationEvaluator::evaluate_pose(&clip, 0.0, &skeleton);
+
+    assert_eq!(pose.local_transforms()[1].translation, Vec3::Y);
+    assert_eq!(pose.local_transforms()[1].scale, Vec3::ONE);
+    assert!(pose.local_transforms()[1].rotation.is_finite());
+}
+
+#[test]
 fn evaluate_interpolates_between_keyframes() {
     let skeleton = test_skeleton();
     let clip = AnimationClip {
@@ -570,6 +595,85 @@ fn load_animation_clip_invalid_data_returns_error() {
     assert!(result.is_err());
 }
 
+#[test]
+fn load_skeleton_rejects_forward_parent_reference() {
+    let mut skeleton = test_skeleton();
+    skeleton.joints[0].parent_index = Some(1);
+    let bytes = bincode::serialize(&skeleton).unwrap();
+
+    let error = load_skeleton(&bytes).unwrap_err();
+    assert!(error.contains("parents must precede children"));
+}
+
+#[test]
+fn load_skeleton_rejects_bind_matrix_count_mismatch() {
+    let mut skeleton = test_skeleton();
+    skeleton.inverse_bind_matrices.pop();
+    let bytes = bincode::serialize(&skeleton).unwrap();
+
+    let error = load_skeleton(&bytes).unwrap_err();
+    assert!(error.contains("inverse bind matrices"));
+}
+
+#[test]
+fn load_animation_clip_rejects_unsorted_keyframes() {
+    let clip = AnimationClip {
+        name: "bad".into(),
+        duration: 1.0,
+        channels: vec![AnimationChannel {
+            joint_index: 0,
+            translations: vec![
+                Keyframe {
+                    time: 1.0,
+                    value: [0.0; 3],
+                },
+                Keyframe {
+                    time: 0.0,
+                    value: [1.0; 3],
+                },
+            ],
+            rotations: vec![],
+            scales: vec![],
+        }],
+        joint_indices: vec![0],
+    };
+    let bytes = bincode::serialize(&clip).unwrap();
+
+    let error = load_animation_clip(&bytes).unwrap_err();
+    assert!(error.contains("not sorted"));
+}
+
+#[test]
+fn clip_conversion_skips_channels_without_a_matching_joint() {
+    let clip = AnimationClip {
+        name: "orphan".into(),
+        duration: 1.0,
+        channels: vec![AnimationChannel {
+            joint_index: 99,
+            translations: vec![Keyframe {
+                time: 0.0,
+                value: [1.0, 0.0, 0.0],
+            }],
+            rotations: vec![Keyframe {
+                time: 0.0,
+                value: [0.0, 0.0, 0.0, 1.0],
+            }],
+            scales: vec![Keyframe {
+                time: 0.0,
+                value: [1.0; 3],
+            }],
+        }],
+        joint_indices: vec![99],
+    };
+
+    let runtime = clip_asset_to_runtime(&clip, &[]);
+    let empty_skeleton = crate::skeleton::Skeleton::new("empty".into());
+    assert!(runtime
+        .sample(0.0, &empty_skeleton)
+        .local_transforms()
+        .is_empty());
+}
+
 // ── Extractor tests ────────────────────────────────────────────────────
 
 #[test]
@@ -620,6 +724,43 @@ fn skinned_extract_producer_produce_injects_into_input() {
     assert_eq!(input.skinned_items[0].bone_palette.len(), 2);
 }
 
+#[test]
+fn skinned_extract_replaces_the_matching_static_drawable() {
+    let producer = SkinnedExtractProducer::new();
+    producer.push(PendingSkinnedItem {
+        entity: Some("animated".into()),
+        mesh: "mesh-char".into(),
+        material: "mat-skin".into(),
+        skeleton: "skel-human".into(),
+        bone_palette: vec![IDENTITY_MAT4_4X4],
+        world_transform: IDENTITY_MAT4_4X4,
+        bounds_min: [-1.0; 3],
+        bounds_max: [1.0; 3],
+        render_layer: "default".into(),
+        cast_shadows: true,
+    });
+
+    let drawable = |entity: &str| engine_renderer::RenderableItem {
+        entity: Some(entity.into()),
+        mesh: engine_serialize::AssetId::new(format!("mesh-{entity}")),
+        material: engine_serialize::AssetId::new("mat-default"),
+        world_transform: Mat4::IDENTITY.to_cols_array(),
+        bounds: engine_renderer::AxisAlignedBox::UNIT,
+        render_layer: "default".into(),
+        cast_shadows: true,
+        sort_key: 0,
+    };
+    let mut input = engine_renderer::RenderFrameInput::empty(42);
+    input.drawables = vec![drawable("animated"), drawable("static")];
+
+    producer.produce(&mut input, 42);
+
+    assert_eq!(input.skinned_items.len(), 1);
+    assert_eq!(input.skinned_items[0].entity.as_deref(), Some("animated"));
+    assert_eq!(input.drawables.len(), 1);
+    assert_eq!(input.drawables[0].entity.as_deref(), Some("static"));
+}
+
 // ── Debug draw tests ───────────────────────────────────────────────────
 
 #[test]
@@ -659,7 +800,7 @@ fn register_animation_extensions_registers_components() {
     let mut render_ext_reg = engine_renderer::RenderExtensionRegistry::new();
     let mut debug_draw_reg = engine_renderer::DebugDrawRegistry::new();
 
-    register_animation_extensions(
+    let handles = register_animation_extensions(
         &mut component_reg,
         &mut asset_type_reg,
         &mut render_ext_reg,
@@ -682,6 +823,23 @@ fn register_animation_extensions_registers_components() {
 
     // Debug draw — SkeletonDebugDraw + IkDebugDraw
     assert_eq!(debug_draw_reg.provider_count(), 2);
+
+    handles.skinned_extract.push(PendingSkinnedItem {
+        entity: Some("entity-1".into()),
+        mesh: "mesh".into(),
+        material: "material".into(),
+        skeleton: "skeleton".into(),
+        bone_palette: vec![IDENTITY_MAT4_4X4],
+        world_transform: IDENTITY_MAT4_4X4,
+        bounds_min: [-0.5; 3],
+        bounds_max: [0.5; 3],
+        render_layer: "default".into(),
+        cast_shadows: true,
+    });
+    let mut frame = engine_renderer::RenderFrameInput::empty(1);
+    render_ext_reg.produce_all(&mut frame, 1);
+    assert_eq!(frame.skinned_items.len(), 1);
+    assert_eq!(handles.skinned_extract.pending_count(), 0);
 }
 
 // ── Advanced evaluator tests ───────────────────────────────────────────
@@ -1101,6 +1259,7 @@ fn pipeline_clip_advances_time() {
     );
 
     assert_eq!(matrices.len(), 2);
+    assert!((player.current_time - 0.5).abs() < 1e-5);
 
     // At effective time 0.5, bone 0 local translation is [5, 0, 0].
     // rest_global[0] = identity (root at origin), so
@@ -1120,4 +1279,186 @@ fn pipeline_clip_advances_time() {
         "expected tz ≈ 0.0 at t=0.5, got {}",
         matrices[0][3][2]
     );
+}
+
+#[test]
+fn pipeline_paused_clip_holds_current_pose() {
+    let skel = test_runtime_skeleton();
+    let clip = AnimationClip {
+        name: "paused".into(),
+        duration: 1.0,
+        channels: vec![AnimationChannel {
+            joint_index: 0,
+            translations: vec![
+                Keyframe {
+                    time: 0.0,
+                    value: [0.0, 0.0, 0.0],
+                },
+                Keyframe {
+                    time: 1.0,
+                    value: [10.0, 0.0, 0.0],
+                },
+            ],
+            rotations: vec![],
+            scales: vec![],
+        }],
+        joint_indices: vec![0],
+    };
+    let mut player = AnimationPlayer {
+        clip_asset: Some("paused".into()),
+        playing: false,
+        current_time: 0.5,
+        ..Default::default()
+    };
+
+    let matrices = update_animation_pipeline(
+        &mut player,
+        &mut None,
+        &[("paused", clip)],
+        &skel,
+        None,
+        0.5,
+    );
+
+    assert!((player.current_time - 0.5).abs() < 1e-5);
+    assert!((matrices[0][3][0] - 5.0).abs() < 1e-4);
+}
+
+#[test]
+fn pipeline_non_looping_clip_stops_at_end() {
+    let skel = test_runtime_skeleton();
+    let clip = AnimationClip {
+        name: "once".into(),
+        duration: 1.0,
+        channels: vec![AnimationChannel {
+            joint_index: 0,
+            translations: vec![
+                Keyframe {
+                    time: 0.0,
+                    value: [0.0, 0.0, 0.0],
+                },
+                Keyframe {
+                    time: 1.0,
+                    value: [10.0, 0.0, 0.0],
+                },
+            ],
+            rotations: vec![],
+            scales: vec![],
+        }],
+        joint_indices: vec![0],
+    };
+    let mut player = AnimationPlayer {
+        clip_asset: Some("once".into()),
+        playing: true,
+        looping: false,
+        current_time: 0.75,
+        ..Default::default()
+    };
+
+    let matrices =
+        update_animation_pipeline(&mut player, &mut None, &[("once", clip)], &skel, None, 0.5);
+
+    assert!(!player.playing);
+    assert!((player.current_time - 1.0).abs() < 1e-5);
+    assert!((matrices[0][3][0] - 10.0).abs() < 1e-4);
+}
+
+fn two_bone_layer_clip(name: &str) -> AnimationClip {
+    AnimationClip {
+        name: name.into(),
+        duration: 1.0,
+        channels: vec![
+            AnimationChannel {
+                joint_index: 0,
+                translations: vec![
+                    Keyframe {
+                        time: 0.0,
+                        value: [0.0, 0.0, 0.0],
+                    },
+                    Keyframe {
+                        time: 1.0,
+                        value: [10.0, 0.0, 0.0],
+                    },
+                ],
+                rotations: vec![],
+                scales: vec![],
+            },
+            AnimationChannel {
+                joint_index: 1,
+                translations: vec![
+                    Keyframe {
+                        time: 0.0,
+                        value: [0.0, 1.0, 0.0],
+                    },
+                    Keyframe {
+                        time: 1.0,
+                        value: [4.0, 1.0, 0.0],
+                    },
+                ],
+                rotations: vec![],
+                scales: vec![],
+            },
+        ],
+        joint_indices: vec![0, 1],
+    }
+}
+
+#[test]
+fn pipeline_overwrite_layer_respects_bone_mask() {
+    let skel = test_runtime_skeleton();
+    let clip = two_bone_layer_clip("upper_body");
+    let mut player = AnimationPlayer {
+        playing: true,
+        layers: vec![
+            AnimLayer::new("base"),
+            AnimLayer::new("upper")
+                .with_clip("upper_body")
+                .with_mask(vec![1])
+                .with_blend_mode(LayerBlendMode::Overwrite),
+        ],
+        ..Default::default()
+    };
+
+    let matrices = update_animation_pipeline(
+        &mut player,
+        &mut None,
+        &[("upper_body", clip)],
+        &skel,
+        None,
+        0.5,
+    );
+
+    assert!(matrices[0][3][0].abs() < 1e-5);
+    assert!((matrices[1][3][0] - 2.0).abs() < 1e-4);
+    assert!((player.layers[1].current_time - 0.5).abs() < 1e-5);
+}
+
+#[test]
+fn pipeline_additive_layer_uses_rest_pose_delta() {
+    let skel = test_runtime_skeleton();
+    let clip = two_bone_layer_clip("additive");
+    let mut player = AnimationPlayer {
+        playing: true,
+        layers: vec![
+            AnimLayer::new("base"),
+            AnimLayer::new("offset")
+                .with_clip("additive")
+                .with_weight(0.5)
+                .with_mask(vec![1])
+                .with_blend_mode(LayerBlendMode::Additive),
+        ],
+        ..Default::default()
+    };
+
+    let matrices = update_animation_pipeline(
+        &mut player,
+        &mut None,
+        &[("additive", clip)],
+        &skel,
+        None,
+        0.5,
+    );
+
+    assert!(matrices[0][3][0].abs() < 1e-5);
+    assert!((matrices[1][3][0] - 1.0).abs() < 1e-4);
 }

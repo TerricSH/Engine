@@ -18,7 +18,8 @@ use super::watch::WatchEvent;
 use crate::cook::dependency::DependencyGraph;
 use crate::cook::manifest::{AssetType, SourceAssetEntry, SourceManifest};
 use crate::cook::{
-    cook_mesh, cook_scene, cook_shader, cook_texture, write_cooked_artifact, CookResult,
+    cook_material, cook_mesh, cook_scene, cook_shader, cook_texture, write_cooked_artifact,
+    CookResult,
 };
 use crate::hot_reload::path_to_asset_id;
 use crate::registry::AssetRegistry;
@@ -31,13 +32,12 @@ use crate::registry::AssetRegistry;
 ///
 /// # Algorithm
 ///
-/// 1. For each [`WatchEvent`], convert the changed path to an [`AssetId`]
-///    using the standard `path_to_asset_id` convention.
+/// 1. For each [`WatchEvent`], resolve the changed source path through the
+///    manifest, falling back to the standard `path_to_asset_id` convention.
 /// 2. Collect all directly affected assets plus their reverse dependencies
 ///    (assets that depend on the changed file) from the dependency graph.
-/// 3. For each unique asset, determine the [`AssetType`] from its id
-///    category prefix, find the source file, dispatch to the appropriate
-///    cooker, and update the graph.
+/// 3. For each unique asset, use manifest metadata (or its id category as a
+///    fallback), dispatch to the appropriate cooker, and update the graph.
 /// 4. Return a [`CookResult`] for each asset that was re-cooked (or
 ///    attempted).
 ///
@@ -64,11 +64,18 @@ pub fn incremental_recook(
         return Vec::new();
     }
 
+    // Resolve source paths through manifests before falling back to filename
+    // conventions. Project asset IDs are not required to encode their type.
+    let manifest_entries_for_resolution = scan_manifests(source_dir);
+
     // ── Step 1: Resolve paths to AssetIds ──────────────────────────────
     let mut affected = BTreeSet::new();
 
     for event in events {
-        if let Some(asset_id) = path_to_asset_id(&event.path) {
+        if let Some(asset_id) =
+            manifest_asset_id_for_path(&event.path, source_dir, &manifest_entries_for_resolution)
+                .or_else(|| path_to_asset_id(&event.path))
+        {
             affected.insert(asset_id);
         } else {
             tracing::debug!(
@@ -102,7 +109,10 @@ pub fn incremental_recook(
 
     for id in &all_affected {
         // Determine asset type from category prefix.
-        let asset_type = category_to_asset_type(&id.id);
+        let asset_type = manifest_entries
+            .get(id)
+            .map(|entry| entry.asset_type.clone())
+            .unwrap_or_else(|| category_to_asset_type(&id.id));
 
         // Resolve source path from manifest if available, else fallback.
         let source_path = manifest_entries
@@ -137,13 +147,14 @@ pub fn incremental_recook(
         let result = match &asset_type {
             AssetType::Mesh => cook_mesh(&source_path, &output_path),
             AssetType::Texture => cook_texture(&source_path, &output_path),
+            AssetType::Material => cook_material(&source_path, &output_path),
             AssetType::Shader => {
                 let stage = determine_shader_stage(&source_path);
                 cook_shader(&source_path, &output_path, 0, &stage)
             }
             AssetType::Scene => cook_scene(&source_path, &output_path, 0),
-            // For material, pipeline, script, audio, font, animation,
-            // skeleton, navmesh — use a generic pass-through cooker
+            // For pipeline, script, audio, font, animation, skeleton, and
+            // navmesh — use a generic pass-through cooker
             // that copies the source as-is.
             other => generic_cook(other, &source_path, &output_path),
         };
@@ -188,6 +199,29 @@ pub fn incremental_recook(
     }
 
     results
+}
+
+fn manifest_asset_id_for_path(
+    changed_path: &Path,
+    source_dir: &Path,
+    entries: &std::collections::BTreeMap<AssetId, SourceAssetEntry>,
+) -> Option<AssetId> {
+    let changed = comparable_path(changed_path);
+    entries.iter().find_map(|(id, entry)| {
+        (comparable_path(&source_dir.join(&entry.source_path)) == changed).then(|| id.clone())
+    })
+}
+
+fn comparable_path(path: &Path) -> String {
+    let normalized = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +274,7 @@ pub(super) fn scan_manifests(
 
     for entry in dir.filter_map(|r| r.ok()) {
         let path = entry.path();
-        if path.extension().map_or(true, |e| e != "manifest") {
+        if path.extension().is_none_or(|e| e != "manifest") {
             continue;
         }
 
@@ -281,7 +315,7 @@ fn resolve_source_fallback(id: &AssetId, source_dir: &Path) -> PathBuf {
 /// Resolve the cooked artifact path for an asset under `cooked_dir`.
 fn resolve_cooked_path(id: &AssetId, cooked_dir: &Path) -> PathBuf {
     let mut buf = cooked_dir.to_path_buf();
-    buf.push(format!("{}.cooked", id.id.replace('-', "_")));
+    buf.push(format!("{}.cooked", id.id));
     buf
 }
 
@@ -328,7 +362,11 @@ fn generic_cook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cook::DependencyGraph;
+    use crate::cook::{
+        decode_cooked_material, read_cooked_artifact, CookRules, DependencyGraph,
+        MATERIAL_SOURCE_SCHEMA,
+    };
+    use crate::reload::watch::WatchEventKind;
 
     fn id(name: &str) -> AssetId {
         AssetId::new(name)
@@ -381,6 +419,67 @@ mod tests {
     }
 
     #[test]
+    fn incremental_recook_dispatches_material_cooker() {
+        let root = std::env::temp_dir().join(format!(
+            "engine_asset_material_recook_{}",
+            std::process::id()
+        ));
+        let source_dir = root.join("assets").join("source");
+        let cooked_dir = root.join("cooked");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join("sample.material.json");
+        std::fs::write(
+            &source_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": MATERIAL_SOURCE_SCHEMA,
+                "base_color": [1.0, 1.0, 1.0, 1.0],
+                "metallic": 0.0,
+                "roughness": 0.5,
+                "ambient_occlusion": 1.0,
+                "transparency": "Opaque",
+                "double_sided": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest = SourceManifest {
+            schema_version: crate::cook::manifest::CURRENT_MANIFEST_VERSION,
+            assets: vec![SourceAssetEntry {
+                id: id("sample-material"),
+                asset_type: AssetType::Material,
+                source_path: "sample.material.json".into(),
+                cook_rules: CookRules::default(),
+            }],
+        };
+        std::fs::write(
+            source_dir.join("assets.manifest"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut graph = DependencyGraph::new();
+        graph.register(id("sample-material"));
+        let mut registry = AssetRegistry::new();
+        let results = incremental_recook(
+            &[WatchEvent {
+                path: source_path,
+                kind: WatchEventKind::Modified,
+            }],
+            &mut graph,
+            &source_dir,
+            &cooked_dir,
+            &mut registry,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success);
+        let artifact = read_cooked_artifact(&cooked_dir.join("sample-material.cooked")).unwrap();
+        assert_eq!(decode_cooked_material(&artifact).unwrap().roughness, 0.5);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn resolve_source_fallback_convention() {
         let asset_id = id("mesh-cube");
         let path = resolve_source_fallback(&asset_id, Path::new("source"));
@@ -391,7 +490,7 @@ mod tests {
     fn resolve_cooked_path_convention() {
         let asset_id = id("mesh-cube");
         let path = resolve_cooked_path(&asset_id, Path::new("cooked"));
-        assert!(path.to_string_lossy().contains("mesh_cube.cooked"));
+        assert!(path.to_string_lossy().contains("mesh-cube.cooked"));
     }
 
     #[test]

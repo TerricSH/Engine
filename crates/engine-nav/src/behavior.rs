@@ -228,7 +228,7 @@ pub fn behavior_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String
 }
 
 /// Behavior asset loader: bincode-deserialises into a `BehaviorAsset`.
-pub fn behavior_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any>, String> {
+pub fn behavior_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String> {
     let asset: BehaviorAsset =
         bincode::deserialize(cooked).map_err(|e| format!("BehaviorAsset load failed: {e}"))?;
     Ok(Box::new(asset))

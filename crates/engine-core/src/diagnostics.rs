@@ -132,7 +132,7 @@ impl Default for DiagnosticsCollector {
 /// When `frame % interval == 0` the full scene validation is run and any
 /// diagnostics are returned.  At other frames an empty `Vec` is returned.
 pub fn validate_scene_periodic(scene: &Scene, frame: u64, interval: u64) -> Vec<Diagnostic> {
-    if interval == 0 || frame % interval != 0 {
+    if interval == 0 || !frame.is_multiple_of(interval) {
         return Vec::new();
     }
     validate_scene(scene)

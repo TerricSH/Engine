@@ -112,6 +112,9 @@ pub struct AnimStateMachineInstance {
     pub transitioning: bool,
     /// The state being transitioned *from*.
     pub transition_from: String,
+    /// Playback cursor retained for the source state during a crossfade.
+    #[serde(default)]
+    pub transition_from_time: f32,
     /// Progress within the transition blend (0.0 = fully `from`, 1.0 = fully `to`).
     pub transition_progress: f32,
     /// Total duration of the current transition in seconds.
@@ -130,6 +133,7 @@ impl AnimStateMachineInstance {
             current_time: 0.0,
             transitioning: false,
             transition_from: String::new(),
+            transition_from_time: 0.0,
             transition_progress: 0.0,
             transition_duration: 0.0,
             parameters: Vec::new(),
@@ -168,6 +172,9 @@ impl AnimStateMachineInstance {
             self.current_state = state_name.to_string();
             self.current_time = 0.0;
             self.transitioning = false;
+            self.transition_from.clear();
+            self.transition_from_time = 0.0;
+            self.transition_progress = 0.0;
             true
         } else {
             false
@@ -221,9 +228,23 @@ impl AnimStateMachineInstance {
     /// `0..1` during a crossfade transition (0 = from-state, 1 = to-state) and
     /// `1.0` when fully on the current state.
     pub fn update(&mut self, dt: f32) -> (&str, f32) {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
         if self.transitioning {
+            let from_speed = self
+                .state_machine
+                .find_state(&self.transition_from)
+                .map(|state| finite_speed(state.speed))
+                .unwrap_or(1.0);
+            let to_speed = self
+                .state_machine
+                .find_state(&self.current_state)
+                .map(|state| finite_speed(state.speed))
+                .unwrap_or(1.0);
+            self.transition_from_time += dt * from_speed;
+            self.current_time += dt * to_speed;
+
             // Advance the crossfade blend
-            if self.transition_duration > 0.0 {
+            if self.transition_duration.is_finite() && self.transition_duration > 0.0 {
                 self.transition_progress =
                     (self.transition_progress + dt / self.transition_duration).min(1.0);
             } else {
@@ -233,7 +254,8 @@ impl AnimStateMachineInstance {
             if self.transition_progress >= 1.0 {
                 // Transition complete — snap to the new state
                 self.transitioning = false;
-                self.current_time = 0.0;
+                self.transition_from.clear();
+                self.transition_from_time = 0.0;
                 return (&self.current_state, 1.0);
             }
 
@@ -242,19 +264,100 @@ impl AnimStateMachineInstance {
 
         // Advance current clip time
         if let Some(state) = self.state_machine.find_state(&self.current_state) {
-            self.current_time += dt * state.speed;
+            self.current_time += dt * finite_speed(state.speed);
         }
 
         // Check for an active transition (clone to avoid borrow conflict)
         if let Some(transition) = self.find_active_transition().cloned() {
             self.transitioning = true;
             self.transition_from = self.current_state.clone();
+            self.transition_from_time = self.current_time;
             self.current_state = transition.to_state;
+            self.current_time = 0.0;
             self.transition_progress = 0.0;
-            self.transition_duration = transition.blend_duration;
+            self.transition_duration = if transition.blend_duration.is_finite() {
+                transition.blend_duration.max(0.0)
+            } else {
+                0.0
+            };
             return (&self.current_state, 0.0);
         }
 
         (&self.current_state, 1.0)
+    }
+}
+
+fn finite_speed(speed: f32) -> f32 {
+    if speed.is_finite() {
+        speed
+    } else {
+        1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transition_machine() -> AnimStateMachineInstance {
+        let mut machine = AnimStateMachine::new("idle".into());
+        machine.add_state(AnimationState {
+            name: "idle".into(),
+            clip_asset: "idle_clip".into(),
+            blend_space_1d: None,
+            speed: 1.0,
+            looping: true,
+        });
+        machine.add_state(AnimationState {
+            name: "run".into(),
+            clip_asset: "run_clip".into(),
+            blend_space_1d: None,
+            speed: 2.0,
+            looping: true,
+        });
+        machine.add_transition(StateTransition {
+            from_state: "idle".into(),
+            to_state: "run".into(),
+            conditions: vec![TransitionCondition {
+                parameter_name: "go".into(),
+                op: ConditionOp::Equal,
+                threshold: 1.0,
+            }],
+            priority: 0,
+            blend_duration: 1.0,
+        });
+        AnimStateMachineInstance::new(machine)
+    }
+
+    #[test]
+    fn transition_advances_source_and_target_cursors() {
+        let mut instance = transition_machine();
+        instance.set_param("go", AnimParamValue::Bool(true));
+
+        let _ = instance.update(0.25);
+        assert!(instance.transitioning);
+        assert_eq!(instance.current_state, "run");
+        assert!((instance.transition_from_time - 0.25).abs() < 1e-5);
+        assert_eq!(instance.current_time, 0.0);
+
+        let _ = instance.update(0.5);
+        assert!((instance.transition_progress - 0.5).abs() < 1e-5);
+        assert!((instance.transition_from_time - 0.75).abs() < 1e-5);
+        assert!((instance.current_time - 1.0).abs() < 1e-5);
+
+        let _ = instance.update(0.5);
+        assert!(!instance.transitioning);
+        assert!((instance.current_time - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn update_sanitizes_non_finite_time_and_speed() {
+        let mut instance = transition_machine();
+        instance.state_machine.states[0].speed = f32::NAN;
+
+        let _ = instance.update(f32::NAN);
+
+        assert!(instance.current_time.is_finite());
+        assert_eq!(instance.current_time, 0.0);
     }
 }

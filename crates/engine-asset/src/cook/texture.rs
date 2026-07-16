@@ -210,9 +210,9 @@ mod tests {
     fn generate_mip_chain_4x4() {
         let mut img = image::RgbaImage::new(4, 4);
         // Fill with a simple pattern
-        for y in 0..4 {
-            for x in 0..4 {
-                let pixel = if (x + y) % 2 == 0 {
+        for y in 0u32..4 {
+            for x in 0u32..4 {
+                let pixel = if (x + y).is_multiple_of(2) {
                     image::Rgba([255, 0, 0, 255])
                 } else {
                     image::Rgba([0, 255, 0, 255])

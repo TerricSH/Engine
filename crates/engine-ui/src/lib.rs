@@ -27,7 +27,10 @@ mod types;
 
 pub use canvas::{register_ui_extensions, Canvas};
 pub use color::Color;
-pub use input::{hit_test, update_input, CallbackRegistry, UiInputState};
+pub use input::{
+    hit_test, hit_test_interactive, update_input, CallbackRegistry, UiClickEvent, UiInputState,
+    UiPointerEvent,
+};
 pub use layout::{Layout, ScaleMode};
 pub use render::{canvas_scale, extract_ui_quads, UiQuad, UiRenderBatch};
 pub use types::{ElementId, UiElement, UiElementKind, UiError, UiRect};

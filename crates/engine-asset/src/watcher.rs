@@ -72,7 +72,7 @@ impl FileWatcher {
 /// File extensions that the hot-reload system should react to.
 const RELOAD_EXTENSIONS: &[&str] = &[
     "asset", "manifest", "gltf", "glb", "png", "jpg", "jpeg", "bmp", "tga", "vert", "frag", "comp",
-    "geom", "tesc", "tese",
+    "geom", "tesc", "tese", "json",
 ];
 
 /// Returns `true` if `path` has an extension that is relevant for hot-reload.
@@ -258,6 +258,7 @@ mod tests {
         assert!(is_relevant_extension(Path::new("texture.png")));
         assert!(is_relevant_extension(Path::new("model.gltf")));
         assert!(is_relevant_extension(Path::new("model.glb")));
+        assert!(is_relevant_extension(Path::new("sample.material.json")));
     }
 
     #[test]

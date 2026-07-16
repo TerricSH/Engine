@@ -32,6 +32,7 @@ mod api_compat;
 mod component;
 mod engine;
 pub mod extension;
+mod gameplay;
 mod host;
 pub mod ilruntime_host;
 mod lifecycle;
@@ -47,6 +48,12 @@ pub use lifecycle::{ON_CREATE, ON_DESTROY, ON_START, ON_UPDATE};
 // Core types.
 pub use component::{ScriptComponent, ScriptInstanceState, ScriptManager};
 pub use engine::ScriptEngine;
+pub use gameplay::{
+    validate_entity_id, validate_scene_id, validate_script_transform, GameplayCommand,
+    GameplayContext, GameplayEntitySnapshot, GameplayInputTransitions, GameplayInputValue,
+    GameplayPhysicsEvent, GameplayPhysicsEventKind, GameplayUiEvent, OwnedGameplayCommand,
+    ScriptTransform,
+};
 pub use host::{
     MockHost, MockScriptInstance, NullScriptHost, ScriptError, ScriptHandle, ScriptHost,
     ScriptInstance,

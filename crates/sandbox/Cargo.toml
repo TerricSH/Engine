@@ -10,10 +10,25 @@ default = []
 backend-vulkan = ["dep:render-vulkan", "engine-core/backend-vulkan"]
 backend-opengl = ["dep:render-opengl"]
 backend-dx12 = ["dep:render-dx12"]
-tooling-editor = ["engine-editor/tooling-editor", "dep:engine-editor"]
-target-desktop = []
+runtime-subsystems = ["engine-core/runtime-subsystems"]
+runtime-audio-output = ["engine-core/runtime-audio-output"]
+tooling-editor = [
+    "engine-editor/tooling-editor",
+    "dep:engine-editor",
+    "runtime-subsystems",
+]
+target-desktop = [
+    "engine-core/gameplay",
+    "runtime-subsystems",
+    "runtime-audio-output",
+]
 target-mobile = []
-subsystem-scripting-csharp = []
+subsystem-scripting-csharp = [
+    "engine-core/subsystem-scripting-csharp",
+    "engine-core/gameplay",
+    "dep:engine-script",
+    "runtime-subsystems",
+]
 
 [dependencies]
 engine-animation = { path = "../engine-animation" }
@@ -25,15 +40,25 @@ engine-physics = { path = "../engine-physics" }
 engine-editor = { path = "../engine-editor", optional = true }
 engine-renderer = { path = "../engine-renderer" }
 engine-scene = { path = "../engine-scene" }
+engine-script = { path = "../engine-script", optional = true }
 engine-serialize = { path = "../engine-serialize" }
 glam.workspace = true
 gltf.workspace = true
 render-core = { path = "../render-core" }
 platform = { path = "../platform" }
 raw-window-handle.workspace = true
+ron.workspace = true
 render-vulkan = { path = "../render-vulkan", optional = true }
 render-opengl = { path = "../render-opengl", optional = true }
 render-dx12 = { path = "../render-dx12", optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde_json.workspace = true
+serde.workspace = true
 sha2.workspace = true
+tempfile = "3"
+
+[dev-dependencies]
+bincode.workspace = true
+engine-audio = { path = "../engine-audio" }
+engine-nav = { path = "../engine-nav" }

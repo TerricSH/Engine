@@ -169,7 +169,7 @@ pub fn prefab_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> 
 }
 
 /// Prefab loader: bincode-deserialises into a `Prefab`.
-pub fn prefab_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any>, String> {
+pub fn prefab_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String> {
     let prefab: Prefab =
         bincode::deserialize(cooked).map_err(|e| format!("Prefab load failed: {e}"))?;
     Ok(Box::new(prefab))

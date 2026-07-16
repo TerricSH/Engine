@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-msvc]
+# MSVC's default PE/PDB timestamps and debug signature change on every link.
+# /Brepro replaces them with deterministic values derived from the inputs.
+rustflags = ["-C", "link-arg=/Brepro"]

@@ -24,7 +24,7 @@ pub use extraction::{
     aabb_in_frustum, extract_frustum_planes, extract_renderer_input,
     extract_renderer_input_from_world,
 };
-pub use pool::ObjectPool;
+pub use pool::{ObjectPool, ObjectPoolError};
 pub use prefab::{
     detect_prefab_cycles, prefab_cooker, prefab_loader, register_prefab_asset_type,
     validate_prefab, Prefab, PrefabChildRef, PREFAB_CONTRACT, PREFAB_SCHEMA_VERSION,
@@ -37,7 +37,7 @@ pub use registry::{
 };
 pub use scene::*;
 pub use validation::validate_scene;
-pub use world::World;
+pub use world::{PersistentEntityCreateError, World};
 pub use world_slot::{WeakWorldSlot, WorldSlot};
 
 #[cfg(test)]

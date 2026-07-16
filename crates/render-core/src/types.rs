@@ -27,6 +27,13 @@ pub enum ShaderFormat {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ShaderStage {
+    Vertex,
+    Fragment,
+    Compute,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IndexFormat {
     U16,
     U32,
@@ -186,6 +193,9 @@ pub struct TextureDescriptor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShaderModuleDescriptor {
     pub format: ShaderFormat,
+    pub stage: ShaderStage,
+    /// Backend-ready shader bytes (for example SPIR-V or DXBC/DXIL).
+    pub source_bytes: Vec<u8>,
     pub entry_points: Vec<String>,
     pub source_hash: [u8; 32],
     pub debug_label: Option<String>,
@@ -196,6 +206,9 @@ pub struct RenderPassDescriptor {
     pub color_attachments: Vec<TextureFormat>,
     pub depth_stencil_format: Option<TextureFormat>,
     pub sample_count: u8,
+    /// Transition the first color attachment to the platform present layout
+    /// when the pass ends. Valid only for swapchain-backed framebuffers.
+    pub present_after: bool,
     pub debug_label: Option<String>,
 }
 

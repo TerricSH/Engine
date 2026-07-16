@@ -179,6 +179,12 @@ pub(crate) enum AudioCommand {
         id: u64,
         position: glam::Vec3,
     },
+    /// Replace the complete spatial-emitter configuration. `None` disables
+    /// spatialisation without restarting the voice.
+    SetEmitter {
+        id: u64,
+        emitter: Option<AudioEmitter>,
+    },
     SetMasterVolume(f32),
     SetListener(AudioListener),
     SetGroupVolume(MixerGroup, f32),
@@ -317,4 +323,3 @@ impl AudioListener {
 }
 
 // ---------------------------------------------------------------------------
-

@@ -264,5 +264,3 @@ pub fn render_text(
     }
     Some(atlas.text_quads(text, font_size, color, rect))
 }
-
-

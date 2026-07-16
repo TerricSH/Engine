@@ -32,7 +32,40 @@ pub trait CommandEncoder: Send {
         first_set: u32,
         sets: &[DescriptorSetHandle],
         dynamic_offsets: &[u32],
-    );
+    ) -> Result<(), RhiError>;
+    /// Bind one sampled 2D texture through the backend's scene-material path.
+    /// Returns `false` when the backend or texture does not expose a sampled
+    /// descriptor. General descriptor-set binding remains the preferred API;
+    /// this narrow bridge keeps the portable scene renderer fail-closed while
+    /// descriptor allocation is added to the RHI contract.
+    fn bind_sampled_texture(
+        &mut self,
+        _pipeline_layout: PipelineLayoutHandle,
+        _texture: TextureHandle,
+    ) -> bool {
+        false
+    }
+    /// Bind a base-color texture and shadow map as one contiguous SRV/sampler
+    /// table. Backends return `false` when this portable two-texture scene
+    /// binding is unavailable.
+    fn bind_sampled_texture_pair(
+        &mut self,
+        _pipeline_layout: PipelineLayoutHandle,
+        _base_color: TextureHandle,
+        _shadow_map: TextureHandle,
+    ) -> bool {
+        false
+    }
+    /// Bind a uniform buffer through a backend root/descriptor binding used by
+    /// the portable skinning path. Returns `false` if the layout does not
+    /// declare a compatible binding.
+    fn bind_uniform_buffer(
+        &mut self,
+        _pipeline_layout: PipelineLayoutHandle,
+        _buffer: BufferHandle,
+    ) -> bool {
+        false
+    }
     fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min_depth: f32, max_depth: f32);
     fn set_scissor(&mut self, x: i32, y: i32, w: u32, h: u32);
     fn draw(
@@ -56,14 +89,18 @@ pub trait CommandEncoder: Send {
     /// structs (each 20 bytes: index_count, instance_count, first_index,
     /// vertex_offset, first_instance).
     ///
-    /// The default implementation is a no-op; Vulkan backends override this.
+    /// Backends that do not support indirect draws return a structured
+    /// `UnsupportedFeature` error instead of silently dropping the command.
     fn draw_indexed_indirect(
         &mut self,
         _buffer: BufferHandle,
         _offset: u64,
         _draw_count: u32,
         _stride: u32,
-    ) {
+    ) -> Result<(), RhiError> {
+        Err(RhiError::UnsupportedFeature {
+            feature: "indexed indirect draw".to_string(),
+        })
     }
     fn end_render_pass(&mut self);
     fn push_constants(
@@ -73,31 +110,6 @@ pub trait CommandEncoder: Send {
         offset: u32,
         data: &[u8],
     );
-    /// Insert a pipeline barrier for the shadow map (default no-op).
-    fn shadow_barrier(&mut self) {}
-
-    /// Insert a pipeline barrier for the HDR color image (default no-op).
-    fn hdr_barrier(&mut self) {}
-
-    // ── Secondary command buffer support ──
-
-    /// Execute a chain of pre-recorded secondary command buffers.
-    ///
-    /// Secondary command buffers are recorded offline (potentially from
-    /// worker threads) and executed inside a render pass.  The default
-    /// implementation is a no-op; backends that support secondary buffers
-    /// override this method.
-    fn execute_commands(&mut self, _secondaries: &[SecondaryCmdBuffer]) {}
-}
-
-/// Handle to a pre-recorded secondary command buffer.
-///
-/// Created by [`CommandPool::record_secondary`](crate::handles::CommandPool::record_secondary)
-/// and consumed by [`CommandEncoder::execute_commands`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SecondaryCmdBuffer {
-    pub(crate) index: u32,
-    pub(crate) generation: u32,
 }
 
 // ============================================================================
@@ -243,18 +255,18 @@ pub trait Device: Send + Sync {
 
     // --- Resource destruction ---
 
-    fn destroy_buffer(&mut self, _buffer: BufferHandle) {}
-    fn destroy_texture(&mut self, _texture: TextureHandle) {}
-    fn destroy_shader_module(&mut self, _module: ShaderModuleHandle) {}
-    fn destroy_render_pass(&mut self, _pass: RenderPassHandle) {}
-    fn destroy_framebuffer(&mut self, _fb: FramebufferHandle) {}
-    fn destroy_pipeline_layout(&mut self, _layout: PipelineLayoutHandle) {}
-    fn destroy_pipeline(&mut self, _pipeline: PipelineHandle) {}
-    fn destroy_swapchain(&mut self, _swapchain: SwapchainHandle) {}
-    fn destroy_surface(&mut self, _surface: SurfaceHandle) {}
+    fn destroy_buffer(&mut self, buffer: BufferHandle);
+    fn destroy_texture(&mut self, texture: TextureHandle);
+    fn destroy_shader_module(&mut self, module: ShaderModuleHandle);
+    fn destroy_render_pass(&mut self, pass: RenderPassHandle);
+    fn destroy_framebuffer(&mut self, framebuffer: FramebufferHandle);
+    fn destroy_pipeline_layout(&mut self, layout: PipelineLayoutHandle);
+    fn destroy_pipeline(&mut self, pipeline: PipelineHandle);
+    fn destroy_swapchain(&mut self, swapchain: SwapchainHandle);
+    fn destroy_surface(&mut self, surface: SurfaceHandle);
 
     /// Wait for all pending GPU work to complete.
-    fn wait_idle(&self) {}
+    fn wait_idle(&self);
 
     // --- Screenshot ---
 

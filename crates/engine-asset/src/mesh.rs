@@ -156,7 +156,11 @@ pub fn create_test_cube() -> MeshData {
 ///
 /// Returns `None` if the mesh has no joint/weight data.
 pub fn mesh_data_to_skinned_bytes(mesh: &MeshData) -> Option<(Vec<u8>, Vec<u8>, u32, bool)> {
-    if mesh.joints.is_empty() || mesh.weights.is_empty() {
+    if mesh.joints.is_empty()
+        || mesh.weights.is_empty()
+        || mesh.joints.len() != mesh.positions.len()
+        || mesh.weights.len() != mesh.positions.len()
+    {
         return None;
     }
     let vertex_count = mesh.positions.len();
@@ -328,5 +332,9 @@ mod tests {
             weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
         };
         assert!(mesh_data_to_skinned_bytes(&mesh).is_some());
+
+        let mut invalid = mesh;
+        invalid.weights.pop();
+        assert!(mesh_data_to_skinned_bytes(&invalid).is_none());
     }
 }

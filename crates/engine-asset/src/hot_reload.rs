@@ -191,6 +191,14 @@ pub(crate) fn path_to_asset_id(path: &Path) -> Option<AssetId> {
         // Nested one level: assets/{dir}/{name}.asset
         let dir_name = parent.file_name()?.to_str()?;
         let category = singularize(dir_name);
+        // Human-authored JSON assets commonly use a double suffix such as
+        // `sample.material.json`. Preserve the project convention
+        // `sample-material` when the inner suffix identifies this category.
+        if let Some((name, inner_kind)) = stem.rsplit_once('.') {
+            if singularize(inner_kind) == category {
+                return Some(AssetId::new(format!("{name}-{inner_kind}")));
+            }
+        }
         Some(AssetId::new(format!("{}-{}", category, stem)))
     }
 }
@@ -267,6 +275,12 @@ mod tests {
     fn standard_scene_convention() {
         let id = path_to_asset_id(&native_path("assets/scenes/gate04.asset"));
         assert_eq!(id, Some(AssetId::new("scene-gate04")));
+    }
+
+    #[test]
+    fn double_suffix_material_uses_authoring_id_convention() {
+        let id = path_to_asset_id(&native_path("assets/materials/sample.material.json"));
+        assert_eq!(id, Some(AssetId::new("sample-material")));
     }
 
     #[test]

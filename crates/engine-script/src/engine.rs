@@ -9,6 +9,7 @@ use engine_serialize::Diagnostic;
 
 use crate::component::{ScriptComponent, ScriptManager};
 use crate::host::{ScriptError, ScriptHandle, ScriptHost, ScriptInstance};
+use crate::{GameplayContext, OwnedGameplayCommand};
 
 /// The main script system that manages hosts and dispatches script operations.
 ///
@@ -153,6 +154,18 @@ impl ScriptEngine {
         all
     }
 
+    /// Push entity-bound gameplay snapshots to every registered host.
+    pub fn set_gameplay_contexts(
+        &mut self,
+        contexts: &std::collections::BTreeMap<String, GameplayContext>,
+    ) -> Vec<Diagnostic> {
+        let mut all = Vec::new();
+        for manager in &mut self.managers {
+            all.extend(manager.set_gameplay_contexts(contexts));
+        }
+        all
+    }
+
     /// Call `OnDestroy` on all instances across all hosts.
     ///
     /// Returns any diagnostics produced during destruction.
@@ -160,6 +173,15 @@ impl ScriptEngine {
         let mut all = Vec::new();
         for manager in &mut self.managers {
             all.extend(manager.destroy());
+        }
+        all
+    }
+
+    /// Call `OnDestroy` and detach all instances owned by one ECS entity.
+    pub fn destroy_entity_instances(&mut self, entity_id: &str) -> Vec<Diagnostic> {
+        let mut all = Vec::new();
+        for manager in &mut self.managers {
+            all.extend(manager.destroy_entity_instances(entity_id));
         }
         all
     }
@@ -174,6 +196,18 @@ impl ScriptEngine {
             all.extend(manager.update(dt));
         }
         all
+    }
+
+    /// Drain gameplay commands from all hosts after their lifecycle update.
+    pub fn drain_gameplay_commands(&mut self) -> (Vec<OwnedGameplayCommand>, Vec<Diagnostic>) {
+        let mut commands = Vec::new();
+        let mut diagnostics = Vec::new();
+        for manager in &mut self.managers {
+            let (manager_commands, manager_diagnostics) = manager.drain_gameplay_commands();
+            commands.extend(manager_commands);
+            diagnostics.extend(manager_diagnostics);
+        }
+        (commands, diagnostics)
     }
 
     /// Capture the current field values for a script on an entity (for scene

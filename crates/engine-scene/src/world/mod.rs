@@ -5,10 +5,11 @@ use std::sync::Arc;
 use crate::component::ComponentStorageDyn;
 use crate::registry::ComponentRegistry;
 use crate::scene::{ComponentRecord, DiagnosticsPolicy, SceneSettings};
-use crate::{Component, Entity, EntityManager, SparseSet};
+use crate::{components::Transform, Component, Entity, EntityManager, SparseSet};
 use engine_serialize::{
     AssetId, ComponentTypeId, EngineVersion, PersistentId, SchemaVersion, Value,
 };
+use thiserror::Error;
 
 pub(crate) mod scene;
 
@@ -23,6 +24,15 @@ const WORLD_GENERATION_STRIDE: u32 = 0x9E37_79B9;
 fn fresh_world_entity_manager() -> EntityManager {
     let id = NEXT_WORLD_GENERATION_ID.fetch_add(1, Ordering::Relaxed);
     EntityManager::with_initial_generation(id.wrapping_mul(WORLD_GENERATION_STRIDE))
+}
+
+/// Failure returned when creating a runtime entity with a persistent ID.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum PersistentEntityCreateError {
+    #[error("persistent entity id cannot be empty")]
+    EmptyId,
+    #[error("persistent entity id '{0}' already exists")]
+    DuplicateId(String),
 }
 
 /// The ECS World — owns all entities and component storages.
@@ -140,10 +150,63 @@ impl World {
         entity
     }
 
+    /// Create a runtime entity and atomically assign its persistent scene ID.
+    ///
+    /// Empty and duplicate IDs are rejected before an ECS slot is allocated,
+    /// leaving the World unchanged. The returned generational handle remains
+    /// internal runtime state; integrations should retain `persistent_id` and
+    /// resolve it again with [`Self::entity_by_persistent_id`].
+    pub fn create_persistent_entity(
+        &mut self,
+        persistent_id: impl Into<String>,
+    ) -> Result<Entity, PersistentEntityCreateError> {
+        let persistent_id = persistent_id.into();
+        if persistent_id.is_empty() {
+            return Err(PersistentEntityCreateError::EmptyId);
+        }
+        if self.persistent_to_entity.contains_key(&persistent_id) {
+            return Err(PersistentEntityCreateError::DuplicateId(persistent_id));
+        }
+
+        let entity = self.create_entity();
+        let index = entity.index() as usize;
+        if self.entity_to_persistent.len() <= index {
+            self.entity_to_persistent.resize(index + 1, None);
+        }
+        debug_assert!(self.entity_to_persistent[index].is_none());
+        self.entity_to_persistent[index] = Some(persistent_id.clone());
+        self.persistent_to_entity.insert(persistent_id, entity);
+        Ok(entity)
+    }
+
     /// Destroy an entity and all of its components.
     ///
     /// Returns `false` if the entity handle is stale.
     pub fn destroy_entity(&mut self, entity: Entity) -> bool {
+        if !self.entities.is_alive(entity) {
+            return false;
+        }
+
+        // Surviving children become roots. Leaving a stale generational
+        // handle here would make hierarchy extraction fail after an otherwise
+        // valid runtime entity destruction.
+        let children = self
+            .query_all::<Transform>()
+            .filter_map(|(child, transform)| (transform.parent == Some(entity)).then_some(child))
+            .collect::<Vec<_>>();
+        for child in children {
+            if let Some(transform) = self.get_mut::<Transform>(child) {
+                transform.parent = None;
+            }
+        }
+        if let Some(persistent_id) = self.persistent_id(entity).map(str::to_owned) {
+            for parent in &mut self.entity_parents {
+                if parent.as_deref() == Some(persistent_id.as_str()) {
+                    *parent = None;
+                }
+            }
+        }
+
         if !self.entities.free(entity) {
             return false;
         }
@@ -221,6 +284,30 @@ impl World {
         } else {
             None
         }
+    }
+
+    /// Resolve a persistent scene ID to its current live ECS handle.
+    ///
+    /// Handles are intentionally not stable across scene reloads. Editor and
+    /// scripting hosts should retain the persistent ID and call this method
+    /// again after every World replacement instead of caching an entity index.
+    pub fn entity_by_persistent_id(&self, id: &str) -> Option<Entity> {
+        self.persistent_to_entity
+            .get(id)
+            .copied()
+            .filter(|entity| self.entities.is_alive(*entity))
+    }
+
+    /// Iterate every live entity that has a persistent scene identifier.
+    ///
+    /// Persistent ids, rather than generational ECS handles, are the stable
+    /// identity boundary exposed to editor and scripting integrations.
+    pub fn persistent_entities(&self) -> impl Iterator<Item = (&str, Entity)> + '_ {
+        self.persistent_to_entity.iter().filter_map(|(id, entity)| {
+            self.entities
+                .is_alive(*entity)
+                .then_some((id.as_str(), *entity))
+        })
     }
 
     // ── Component management ──────────────────────────────────────────
@@ -755,5 +842,102 @@ mod tests {
         assert!(world.has::<Name>(e));
         assert!(world.has::<Transform>(e));
         assert_eq!(world.get::<Transform>(e).unwrap().translation.x, 1.0);
+    }
+
+    #[test]
+    fn persistent_id_resolves_current_live_entity() {
+        let mut world = World::from_scene(&crate::sample_scene());
+        let entity = world
+            .entity_by_persistent_id("cube-01")
+            .expect("sample entity");
+        assert_eq!(world.persistent_id(entity), Some("cube-01"));
+
+        assert!(world.destroy_entity(entity));
+        assert!(world.entity_by_persistent_id("cube-01").is_none());
+        assert!(world.entity_by_persistent_id("missing").is_none());
+    }
+
+    #[test]
+    fn create_persistent_entity_rejects_empty_and_duplicate_ids_transactionally() {
+        let mut world = World::new();
+
+        assert_eq!(
+            world.create_persistent_entity(""),
+            Err(PersistentEntityCreateError::EmptyId)
+        );
+        assert_eq!(world.alive_count(), 0);
+        assert!(world.persistent_entities().next().is_none());
+
+        let first = world
+            .create_persistent_entity("runtime-entity")
+            .expect("valid persistent entity");
+        let alive_before_duplicate = world.alive_count();
+        assert_eq!(
+            world.create_persistent_entity("runtime-entity"),
+            Err(PersistentEntityCreateError::DuplicateId(
+                "runtime-entity".into()
+            ))
+        );
+        assert_eq!(world.alive_count(), alive_before_duplicate);
+        assert_eq!(world.entity_by_persistent_id("runtime-entity"), Some(first));
+        assert_eq!(world.persistent_id(first), Some("runtime-entity"));
+    }
+
+    #[test]
+    fn create_persistent_entity_maintains_mappings_when_handles_are_recycled() {
+        let mut world = World::new();
+        let old = world
+            .create_persistent_entity("old-id")
+            .expect("first persistent entity");
+        assert!(world.destroy_entity(old));
+        assert!(world.entity_by_persistent_id("old-id").is_none());
+
+        let recycled = world
+            .create_persistent_entity("new-id")
+            .expect("recycled persistent entity");
+
+        assert_eq!(recycled.index(), old.index());
+        assert_ne!(recycled.generation(), old.generation());
+        assert_eq!(world.persistent_id(recycled), Some("new-id"));
+        assert_eq!(world.entity_by_persistent_id("new-id"), Some(recycled));
+        assert!(world.entity_by_persistent_id("old-id").is_none());
+        assert_eq!(
+            world
+                .persistent_entities()
+                .map(|(id, entity)| (id.to_owned(), entity))
+                .collect::<Vec<_>>(),
+            vec![("new-id".into(), recycled)]
+        );
+    }
+
+    #[test]
+    fn persistent_entity_iteration_and_parent_cleanup_survive_destroy() {
+        let mut world = World::from_scene(&crate::sample_scene());
+        let parent = world
+            .entity_by_persistent_id("camera-main")
+            .expect("sample camera");
+        let child = world
+            .entity_by_persistent_id("cube-01")
+            .expect("sample cube");
+        if !world.has::<Transform>(child) {
+            world.add_component(child, Transform::default());
+        }
+        world.get_mut::<Transform>(child).unwrap().parent = Some(parent);
+
+        let ids = world
+            .persistent_entities()
+            .map(|(id, _)| id.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["camera-main", "cube-01"]);
+
+        assert!(world.destroy_entity(parent));
+        assert_eq!(world.get::<Transform>(child).unwrap().parent, None);
+        assert_eq!(
+            world
+                .persistent_entities()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["cube-01"]
+        );
     }
 }

@@ -13,9 +13,19 @@ impl From<assets::JointTransform> for BoneTransform {
     fn from(jt: assets::JointTransform) -> Self {
         Self {
             translation: Vec3::from(jt.translation),
-            rotation: Quat::from_array(jt.rotation),
+            rotation: safe_quat(jt.rotation),
             scale: Vec3::from(jt.scale),
         }
+    }
+}
+
+fn safe_quat(value: [f32; 4]) -> Quat {
+    let quat = Quat::from_array(value);
+    let length_squared = quat.length_squared();
+    if quat.is_finite() && length_squared.is_finite() && length_squared > f32::EPSILON {
+        quat / length_squared.sqrt()
+    } else {
+        Quat::IDENTITY
     }
 }
 
@@ -42,13 +52,34 @@ pub fn skeleton_asset_to_runtime(
 ) -> (skeleton::Skeleton, Vec<BoneIndex>) {
     let mut runtime = skeleton::Skeleton::new("converted".into());
     let mut joint_map = Vec::with_capacity(asset_skel.joints.len());
+    if asset_skel.joints.len() > u16::MAX as usize + 1 {
+        tracing::warn!(
+            joints = asset_skel.joints.len(),
+            maximum = u16::MAX as usize + 1,
+            "truncating skeleton that exceeds BoneIndex capacity"
+        );
+    }
 
-    for joint in &asset_skel.joints {
-        // Convert parent index: asset uses u32, runtime uses u16 via BoneIndex.
-        // Clamp to u16::MAX as a safe fallback if asset data is corrupted.
-        let parent = joint
-            .parent_index
-            .map(|p| BoneIndex(p.min(u16::MAX as u32) as u16));
+    for (joint_index, joint) in asset_skel
+        .joints
+        .iter()
+        .take(u16::MAX as usize + 1)
+        .enumerate()
+    {
+        let parent = match joint.parent_index {
+            Some(parent_index) if (parent_index as usize) < joint_map.len() => {
+                Some(joint_map[parent_index as usize])
+            }
+            Some(parent_index) => {
+                tracing::warn!(
+                    joint = joint_index,
+                    parent = parent_index,
+                    "ignoring invalid skeleton parent; parents must precede children"
+                );
+                None
+            }
+            None => None,
+        };
         let bone_idx = runtime.add_bone(
             parent,
             joint.name.clone(),
@@ -82,18 +113,14 @@ pub fn clip_asset_to_runtime(
     for channel in &asset_clip.channels {
         // Map asset joint index through the joint map.
         let joint_idx = channel.joint_index as usize;
-        // Bounds check: if the asset references a joint beyond the skeleton,
-        // fall back to bone 0 (root) to avoid a panic on malformed data.
-        let bone = if joint_idx < joint_map.len() {
-            joint_map[joint_idx]
-        } else {
+        let Some(&bone) = joint_map.get(joint_idx) else {
             tracing::warn!(
                 "clip '{}' references joint index {} but skeleton has {} joints",
                 asset_clip.name,
                 joint_idx,
                 joint_map.len()
             );
-            joint_map[0]
+            continue;
         };
 
         // Zip the three parallel SRT tracks together by index.
@@ -115,7 +142,7 @@ pub fn clip_asset_to_runtime(
                 time: t.time,
                 transform: BoneTransform {
                     translation: Vec3::from(t.value),
-                    rotation: Quat::from_array(r.value),
+                    rotation: safe_quat(r.value),
                     scale: Vec3::from(s.value),
                 },
             });

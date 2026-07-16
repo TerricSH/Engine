@@ -115,6 +115,14 @@ pub(crate) fn f32_field(component: &ComponentRecord, field: &str) -> Option<f32>
     }
 }
 
+pub(crate) fn u32_field(component: &ComponentRecord, field: &str) -> Option<u32> {
+    match component.fields.get(field) {
+        Some(Value::UInt(value)) => (*value).try_into().ok(),
+        Some(Value::Int(value)) => (*value).try_into().ok(),
+        _ => None,
+    }
+}
+
 pub(crate) fn vec3_field(component: &ComponentRecord, field: &str) -> Option<[f32; 3]> {
     match component.fields.get(field) {
         Some(Value::Vec3(value)) => Some(*value),

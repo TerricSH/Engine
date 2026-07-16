@@ -232,7 +232,7 @@ pub fn draw_animation_preview(ui: &mut EditorUi, panel: &mut AnimationPreviewPan
     let skeleton_label = panel.selected_skeleton.as_deref().unwrap_or("<none>");
     ui.text_field("Skeleton", skeleton_label);
 
-    let _ = ui.separator();
+    ui.separator();
 
     let _ = ui.collapsing_header("Clip", true);
     let clip_label = panel.selected_clip.as_deref().unwrap_or("<none>");
@@ -240,7 +240,7 @@ pub fn draw_animation_preview(ui: &mut EditorUi, panel: &mut AnimationPreviewPan
 
     // ── Clip info ────────────────────────────────────────────────────
     if let Some(info) = &panel.clip_info {
-        let _ = ui.separator();
+        ui.separator();
         let _ = ui.collapsing_header("Clip Info", true);
         ui.text_field("Duration", &format!("{:.3} s", info.duration));
         ui.text_field("Events", &info.event_count.to_string());
@@ -249,7 +249,7 @@ pub fn draw_animation_preview(ui: &mut EditorUi, panel: &mut AnimationPreviewPan
         }
     }
 
-    let _ = ui.separator();
+    ui.separator();
 
     // ── Timeline scrubber ────────────────────────────────────────────
     let duration = panel.clip_info.as_ref().map(|i| i.duration).unwrap_or(1.0);
@@ -261,7 +261,7 @@ pub fn draw_animation_preview(ui: &mut EditorUi, panel: &mut AnimationPreviewPan
     }
 
     // ── Transport controls ───────────────────────────────────────────
-    let _ = ui.separator();
+    ui.separator();
     let _ = ui.collapsing_header("Transport", true);
 
     // Play / Pause toggle
@@ -294,7 +294,7 @@ pub fn draw_animation_preview(ui: &mut EditorUi, panel: &mut AnimationPreviewPan
 
     // ── Event markers ────────────────────────────────────────────────
     if !panel.events.is_empty() {
-        let _ = ui.separator();
+        ui.separator();
         let _ = ui.collapsing_header("Events", true);
         for event in &panel.events {
             ui.text_field(&event.name, &format!("{:.3} s", event.time));
@@ -303,7 +303,7 @@ pub fn draw_animation_preview(ui: &mut EditorUi, panel: &mut AnimationPreviewPan
 
     // ── Blend state display ──────────────────────────────────────────
     if let Some(ref state) = panel.blend_state {
-        let _ = ui.separator();
+        ui.separator();
         let _ = ui.collapsing_header("Blend State", true);
         ui.text_field("Current State", state);
     }

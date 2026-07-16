@@ -15,6 +15,7 @@ pub(crate) mod rendering;
 pub(crate) mod shadow;
 pub(crate) mod slab;
 pub(crate) mod texture;
+pub(crate) mod ui;
 
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -32,7 +33,7 @@ use crate::error::{VkResult, VulkanError};
 use crate::instance::Instance;
 use crate::surface::Surface;
 
-use self::slab::{BufEntry, FrameSync, PipeEntry, PlEntry, Slab};
+use self::slab::{BufEntry, FbEntry, FrameSync, PipeEntry, PlEntry, Slab, TexEntry};
 
 // SAFETY: all fields are Send-safe: Vulkan handles are integers or wrapped in
 // ManuallyDrop which is Send; Instance/Surface are Send; allocator Mutex is Send.
@@ -71,6 +72,9 @@ pub struct VulkanDevice {
     pub(crate) window_width: u32,
     pub(crate) window_height: u32,
     pub(crate) minimized: bool,
+    /// A suboptimal present keeps the old swapchain alive until SceneRenderer
+    /// can first destroy framebuffers that reference its image views.
+    pub(crate) swapchain_recreate_pending: bool,
 
     // MVP triangle
     pub(crate) mvp_framebuffers: Vec<vk::Framebuffer>,
@@ -101,9 +105,10 @@ pub struct VulkanDevice {
 
     // Phase 2: handle tables
     pub(crate) buffers: Slab<BufEntry>,
+    pub(crate) rhi_textures: Slab<TexEntry>,
     pub(crate) pipelines: Slab<PipeEntry>,
     pub(crate) render_passes: Slab<vk::RenderPass>,
-    pub(crate) framebuffers: Slab<vk::Framebuffer>,
+    pub(crate) framebuffers: Slab<FbEntry>,
     pub(crate) pipeline_layouts: Slab<PlEntry>,
 
     // P1.2: Shader module storage (handle → (vk::ShaderModule, stage))
@@ -116,6 +121,9 @@ pub struct VulkanDevice {
 
     // Render pass metadata
     pub(crate) rp_has_depth: HashMap<u32, bool>,
+    pub(crate) rp_color_formats: HashMap<u32, Vec<vk::Format>>,
+    pub(crate) rp_depth_formats: HashMap<u32, vk::Format>,
+    pub(crate) rp_sample_counts: HashMap<u32, u8>,
 
     // Per-frame descriptor infrastructure (set=0 per FD-041)
     pub(crate) desc_set_layout_0: Option<vk::DescriptorSetLayout>,
@@ -205,6 +213,15 @@ pub struct VulkanDevice {
     // Material texture cache (Phase 3.1)
     /// Uploaded GPU textures indexed by asset ID string.
     pub(crate) textures: HashMap<String, GpuTexture>,
+
+    // Editor UI overlay (load-op pass over the tone-mapped swapchain image).
+    pub(crate) ui_overlay_rp: Option<vk::RenderPass>,
+    pub(crate) ui_overlay_pipeline_layout: Option<vk::PipelineLayout>,
+    pub(crate) ui_overlay_pipeline: Option<vk::Pipeline>,
+    pub(crate) ui_overlay_desc_layout: Option<vk::DescriptorSetLayout>,
+    pub(crate) ui_overlay_desc_pool: Option<vk::DescriptorPool>,
+    pub(crate) ui_overlay_desc_sets: HashMap<String, vk::DescriptorSet>,
+    pub(crate) ui_overlay_framebuffers: Vec<vk::Framebuffer>,
 }
 
 impl VulkanDevice {
@@ -299,6 +316,7 @@ impl VulkanDevice {
             window_width: width.max(1),
             window_height: height.max(1),
             minimized: width == 0 || height == 0,
+            swapchain_recreate_pending: false,
             mvp_framebuffers: Vec::new(),
             mvp_rp: None,
             mvp_pipeline_layout: None,
@@ -319,6 +337,7 @@ impl VulkanDevice {
             cached_adapter_info: info,
             last_image_index: 0,
             buffers: Slab::new(),
+            rhi_textures: Slab::new(),
             pipelines: Slab::new(),
             render_passes: Slab::new(),
             framebuffers: Slab::new(),
@@ -327,6 +346,9 @@ impl VulkanDevice {
             pipeline_cache: vk::PipelineCache::null(),
             pso_cache_path: None,
             rp_has_depth: HashMap::new(),
+            rp_color_formats: HashMap::new(),
+            rp_depth_formats: HashMap::new(),
+            rp_sample_counts: HashMap::new(),
             desc_set_layout_0: None,
             desc_pool: None,
             frame_desc_sets: Vec::new(),
@@ -386,6 +408,15 @@ impl VulkanDevice {
 
             // Material texture cache (Phase 3.1)
             textures: HashMap::new(),
+
+            // Editor UI overlay
+            ui_overlay_rp: None,
+            ui_overlay_pipeline_layout: None,
+            ui_overlay_pipeline: None,
+            ui_overlay_desc_layout: None,
+            ui_overlay_desc_pool: None,
+            ui_overlay_desc_sets: HashMap::new(),
+            ui_overlay_framebuffers: Vec::new(),
 
             // Light SSBO (Phase 4.3)
             light_ssbo: None,
@@ -542,8 +573,13 @@ impl VulkanDevice {
     /// handles that the `VkCmdEncoder` can resolve.
     pub fn create_scene_framebuffers(
         &mut self,
-        render_pass: vk::RenderPass,
+        render_pass: render_core::RenderPassHandle,
     ) -> VkResult<Vec<FramebufferHandle>> {
+        let render_pass = self
+            .render_passes
+            .get(render_pass.index, render_pass.generation)
+            .copied()
+            .ok_or_else(|| VulkanError::Loader("invalid scene render-pass handle".into()))?;
         let sc = self
             .swapchain
             .as_ref()
@@ -567,7 +603,11 @@ impl VulkanDevice {
                 )
             }
             .map_err(|e| VulkanError::vk("create_scene_fb", e))?;
-            let (idx, gen) = self.framebuffers.insert(fb);
+            let (idx, gen) = self.framebuffers.insert(FbEntry {
+                framebuffer: fb,
+                color_attachment_count: 1,
+                has_depth: true,
+            });
             handles.push(FramebufferHandle::new(idx, gen));
         }
         Ok(handles)
@@ -581,7 +621,7 @@ impl VulkanDevice {
                 // SAFETY: `fb` was created by this device and is no longer
                 // referenced by any in-flight frame.
                 unsafe {
-                    d.destroy_framebuffer(fb, None);
+                    d.destroy_framebuffer(fb.framebuffer, None);
                 }
             }
         }
@@ -862,17 +902,23 @@ fn compare_op(s: &Option<String>) -> vk::CompareOp {
 ///   sized for the targeted shader stage).
 ///
 /// Map a resource kind string to a `VkDescriptorType`.
-fn resource_kind_to_descriptor_type(kind: &str) -> vk::DescriptorType {
+fn resource_kind_to_descriptor_type(
+    kind: &str,
+) -> Result<vk::DescriptorType, render_core::RhiError> {
     match kind {
-        "uniform_buffer" => vk::DescriptorType::UNIFORM_BUFFER,
-        "storage_buffer" => vk::DescriptorType::STORAGE_BUFFER,
-        "sampler" | "combined_image_sampler" => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        "sampled_image" => vk::DescriptorType::SAMPLED_IMAGE,
-        "storage_image" => vk::DescriptorType::STORAGE_IMAGE,
-        "uniform_texel_buffer" => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
-        "storage_texel_buffer" => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
-        "input_attachment" => vk::DescriptorType::INPUT_ATTACHMENT,
-        _ => vk::DescriptorType::UNIFORM_BUFFER,
+        "uniform_buffer" => Ok(vk::DescriptorType::UNIFORM_BUFFER),
+        "storage_buffer" => Ok(vk::DescriptorType::STORAGE_BUFFER),
+        "sampler" => Ok(vk::DescriptorType::SAMPLER),
+        "combined_image_sampler" => Ok(vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
+        "sampled_image" => Ok(vk::DescriptorType::SAMPLED_IMAGE),
+        "storage_image" => Ok(vk::DescriptorType::STORAGE_IMAGE),
+        "uniform_texel_buffer" => Ok(vk::DescriptorType::UNIFORM_TEXEL_BUFFER),
+        "storage_texel_buffer" => Ok(vk::DescriptorType::STORAGE_TEXEL_BUFFER),
+        "input_attachment" => Ok(vk::DescriptorType::INPUT_ATTACHMENT),
+        _ => Err(render_core::RhiError::InvalidDescriptor {
+            field: "bind_group_layouts.bindings.resource_kind".into(),
+            reason: format!("unsupported Vulkan descriptor resource kind '{kind}'"),
+        }),
     }
 }
 
@@ -918,7 +964,7 @@ unsafe fn mk_sm(d: &AshDevice, spv: &[u8]) -> VkResult<vk::ShaderModule> {
     if spv.is_empty() {
         return Err(VulkanError::MissingShader(""));
     }
-    if spv.len() % 4 != 0 {
+    if !spv.len().is_multiple_of(4) {
         return Err(VulkanError::Loader(format!("len {}", spv.len())));
     }
     let mut code = vec![0u32; spv.len() / 4];

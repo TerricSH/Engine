@@ -20,6 +20,18 @@ use std::sync::{Arc, Mutex};
 use crate::host::{ScriptError, ScriptHandle, ScriptHost, ScriptInstance};
 use crate::protocol::ScriptMessage;
 use crate::value::ScriptValue;
+use crate::{GameplayCommand, GameplayContext};
+
+fn encode_gameplay_context(
+    instance_id: &str,
+    context: &GameplayContext,
+) -> Result<String, ScriptError> {
+    serde_json::to_string(context).map_err(|error| {
+        ScriptError::HostError(format!(
+            "Failed to serialize gameplay context for instance '{instance_id}': {error}"
+        ))
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Shared IO — single lock guards both pipes so messages are serialised
@@ -136,6 +148,61 @@ impl ScriptInstance for ProcessScriptInstance {
         match response {
             ScriptMessage::FieldValue { value, .. } => value,
             _ => None,
+        }
+    }
+
+    fn set_gameplay_context(&mut self, context: &GameplayContext) -> Result<(), ScriptError> {
+        let context_json = encode_gameplay_context(&self.instance_id, context)?;
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|e| ScriptError::HostError(format!("Script IO lock poisoned: {e}")))?;
+        let response = io.roundtrip(&ScriptMessage::SetGameplayContext {
+            instance_id: self.instance_id.clone(),
+            context_json,
+        })?;
+
+        match response {
+            ScriptMessage::GameplayContextSet { instance_id }
+                if instance_id == self.instance_id =>
+            {
+                Ok(())
+            }
+            ScriptMessage::Error { message } => Err(ScriptError::ExecutionError(format!(
+                "SetGameplayContext failed for '{}': {message}",
+                self.instance_id
+            ))),
+            other => Err(ScriptError::ExecutionError(format!(
+                "Unexpected response to SetGameplayContext for '{}': {other:?}",
+                self.instance_id
+            ))),
+        }
+    }
+
+    fn drain_gameplay_commands(&mut self) -> Result<Vec<GameplayCommand>, ScriptError> {
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|e| ScriptError::HostError(format!("Script IO lock poisoned: {e}")))?;
+        let response = io.roundtrip(&ScriptMessage::DrainGameplayCommands {
+            instance_id: self.instance_id.clone(),
+        })?;
+
+        match response {
+            ScriptMessage::GameplayCommands {
+                instance_id,
+                commands_json,
+            } if instance_id == self.instance_id => {
+                decode_gameplay_commands(&self.instance_id, &commands_json)
+            }
+            ScriptMessage::Error { message } => Err(ScriptError::ExecutionError(format!(
+                "DrainGameplayCommands failed for '{}': {message}",
+                self.instance_id
+            ))),
+            other => Err(ScriptError::ExecutionError(format!(
+                "Unexpected response to DrainGameplayCommands for '{}': {other:?}",
+                self.instance_id
+            ))),
         }
     }
 }
@@ -362,6 +429,43 @@ fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
+fn decode_gameplay_commands(
+    instance_id: &str,
+    commands_json: &str,
+) -> Result<Vec<GameplayCommand>, ScriptError> {
+    let raw_commands: Vec<serde_json::Value> =
+        serde_json::from_str(commands_json).map_err(|error| {
+            ScriptError::ExecutionError(format!(
+                "DrainGameplayCommands returned invalid JSON for '{instance_id}': {error}"
+            ))
+        })?;
+    let mut commands = Vec::with_capacity(raw_commands.len());
+    for (index, raw_command) in raw_commands.into_iter().enumerate() {
+        if raw_command.get("type").and_then(serde_json::Value::as_str) == Some("load_scene")
+            && raw_command
+                .get("scene_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return Err(ScriptError::ExecutionError(format!(
+                "DrainGameplayCommands returned invalid command {index} for '{instance_id}': load_scene requires a string `scene_id`; use a key from game.project.json `scenes`"
+            )));
+        }
+        let command: GameplayCommand = serde_json::from_value(raw_command).map_err(|error| {
+            ScriptError::ExecutionError(format!(
+                "DrainGameplayCommands returned invalid command {index} for '{instance_id}': {error}"
+            ))
+        })?;
+        command.validate().map_err(|error| {
+            ScriptError::ExecutionError(format!(
+                "DrainGameplayCommands returned invalid command {index} for '{instance_id}': {error}"
+            ))
+        })?;
+        commands.push(command);
+    }
+    Ok(commands)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -409,6 +513,120 @@ mod tests {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
         assert_eq!(base64_encode(b"\x00\xff"), "AP8=");
         assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn gameplay_command_decoder_preserves_legacy_and_explicit_entity_commands() {
+        let commands = decode_gameplay_commands(
+            "inst-0001",
+            r#"[
+                {"type":"set_transform","transform":{"translation":[1,2,3],"rotation":[0,0,0,1],"scale":[1,1,1]}},
+                {"type":"set_entity_transform","entity_id":"enemy-01","transform":{"translation":[4,5,6],"rotation":[0,0,0,1],"scale":[2,2,2]}},
+                {"type":"create_entity","entity_id":"spawned-01","transform":{"translation":[7,8,9],"rotation":[0,0,0,1],"scale":[1,1,1]}},
+                {"type":"destroy_entity","entity_id":"enemy-01"},
+                {"type":"destroy_self"},
+                {"type":"load_scene","scene_id":"level_two"}
+            ]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &commands[0],
+            GameplayCommand::SetTransform { transform }
+                if transform.translation == [1.0, 2.0, 3.0]
+        ));
+        assert_eq!(
+            commands[1],
+            GameplayCommand::SetEntityTransform {
+                entity_id: "enemy-01".into(),
+                transform: crate::ScriptTransform {
+                    translation: [4.0, 5.0, 6.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [2.0, 2.0, 2.0],
+                }
+            }
+        );
+        assert_eq!(
+            commands[2],
+            GameplayCommand::CreateEntity {
+                entity_id: "spawned-01".into(),
+                transform: crate::ScriptTransform {
+                    translation: [7.0, 8.0, 9.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0, 1.0, 1.0],
+                }
+            }
+        );
+        assert_eq!(
+            commands[3],
+            GameplayCommand::DestroyEntity {
+                entity_id: "enemy-01".into()
+            }
+        );
+        assert_eq!(commands[4], GameplayCommand::DestroySelf);
+        assert_eq!(
+            commands[5],
+            GameplayCommand::LoadScene {
+                scene_id: "level_two".into()
+            }
+        );
+    }
+
+    #[test]
+    fn gameplay_command_decoder_rejects_unsafe_scene_ids_with_guidance() {
+        for json in [
+            r#"[{"type":"load_scene","scene_id":""}]"#,
+            r#"[{"type":"load_scene","scene_id":"../outside"}]"#,
+            r#"[{"type":"load_scene","scene_id":"levels/boss"}]"#,
+            r#"[{"type":"load_scene"}]"#,
+            r#"[{"type":"load_scene","scene_id":null}]"#,
+        ] {
+            let error = decode_gameplay_commands("inst-0001", json).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("invalid command 0"), "{message}");
+            assert!(message.contains("game.project.json `scenes`"), "{message}");
+        }
+    }
+
+    #[test]
+    fn gameplay_command_decoder_rejects_unsafe_targets_and_non_finite_transforms() {
+        for json in [
+            r#"[{"type":"destroy_entity","entity_id":"../outside"}]"#,
+            r#"[{"type":"set_entity_transform","entity_id":"enemy/child","transform":{"translation":[0,0,0],"rotation":[0,0,0,1],"scale":[1,1,1]}}]"#,
+            r#"[{"type":"set_entity_transform","entity_id":"enemy","transform":{"translation":[0,0,0],"rotation":[0,0,0,0],"scale":[1,1,1]}}]"#,
+            r#"[{"type":"create_entity","entity_id":"../spawn","transform":{"translation":[0,0,0],"rotation":[0,0,0,1],"scale":[1,1,1]}}]"#,
+            r#"[{"type":"create_entity","entity_id":"spawn","transform":{"translation":[0,0,0],"rotation":[0,0,0,0],"scale":[1,1,1]}}]"#,
+        ] {
+            let error = decode_gameplay_commands("inst-0001", json).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("invalid command 0"), "{message}");
+        }
+    }
+
+    #[test]
+    fn process_host_context_encoder_preserves_gameplay_ui_events() {
+        let mut context: GameplayContext =
+            serde_json::from_str(r#"{"entity_id":"player","transform":null,"input_actions":{}}"#)
+                .unwrap();
+        context.ui_events = vec![crate::GameplayUiEvent {
+            canvas_id: "main-menu".into(),
+            element_id: 7,
+            callback_id: Some("continue".into()),
+        }];
+
+        let context_json = encode_gameplay_context("inst-ui", &context).unwrap();
+        let encoded: serde_json::Value = serde_json::from_str(&context_json).unwrap();
+        assert_eq!(
+            encoded["ui_events"],
+            serde_json::json!([{
+                "canvas_id": "main-menu",
+                "element_id": 7,
+                "callback_id": "continue"
+            }])
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayContext>(&context_json).unwrap(),
+            context
+        );
     }
 
     #[test]

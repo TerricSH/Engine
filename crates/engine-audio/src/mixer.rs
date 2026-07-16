@@ -163,6 +163,18 @@ impl MixerState {
                         slot.emitter_position = position;
                     }
                 }
+                AudioCommand::SetEmitter { id, emitter } => {
+                    if let Some(slot) = self.find_voice(id) {
+                        if let Some(emitter) = emitter {
+                            slot.spatial = true;
+                            slot.emitter_position = emitter.position;
+                            slot.emitter_max_distance = emitter.max_distance;
+                            slot.emitter_rolloff = emitter.rolloff_factor;
+                        } else {
+                            slot.spatial = false;
+                        }
+                    }
+                }
                 AudioCommand::SetMasterVolume(vol) => {
                     self.master_volume = vol.clamp(0.0, 1.0);
                 }
@@ -329,5 +341,53 @@ impl MixerVoice {
             self.volume_ramp_delta = 0.0;
             self.ramp_samples_remaining = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_emitter_updates_can_enable_change_and_disable_spatial_audio() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let finished = Arc::new(AtomicBool::new(false));
+        sender
+            .send(AudioCommand::Play {
+                id: 7,
+                clip: Arc::new(AudioClip::new(vec![0.25; 16], 48_000, 1)),
+                volume: 1.0,
+                loop_enabled: true,
+                emitter: None,
+                finished,
+                group: MixerGroup::Sfx,
+            })
+            .unwrap();
+        let mut emitter = crate::AudioEmitter::new(Vec3::new(3.0, 4.0, 5.0));
+        emitter.set_max_distance(25.0);
+        emitter.set_rolloff_factor(0.4);
+        sender
+            .send(AudioCommand::SetEmitter {
+                id: 7,
+                emitter: Some(emitter),
+            })
+            .unwrap();
+
+        let mut mixer = MixerState::new(48_000);
+        mixer.process_commands(&receiver);
+        let voice = mixer.find_voice(7).unwrap();
+        assert!(voice.spatial);
+        assert_eq!(voice.emitter_position, Vec3::new(3.0, 4.0, 5.0));
+        assert_eq!(voice.emitter_max_distance, 25.0);
+        assert_eq!(voice.emitter_rolloff, 0.4);
+
+        sender
+            .send(AudioCommand::SetEmitter {
+                id: 7,
+                emitter: None,
+            })
+            .unwrap();
+        mixer.process_commands(&receiver);
+        assert!(!mixer.find_voice(7).unwrap().spatial);
     }
 }

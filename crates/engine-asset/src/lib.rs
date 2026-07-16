@@ -22,6 +22,7 @@ pub mod hot_reload;
 mod loader;
 pub mod mesh;
 mod path;
+pub mod project;
 mod registry;
 pub mod reload;
 mod watcher;
@@ -34,6 +35,19 @@ pub use path::{
 pub use registry::{AssetInfo, AssetRegistry, AssetState};
 pub use reload::ReloadCoordinator;
 pub use watcher::FileWatcher;
+
+/// Compute a stable SHA-256 content digest from a sequence of byte slices.
+/// Boundaries are length-prefixed so distinct part groupings cannot alias.
+pub fn compute_content_hash(parts: &[&[u8]]) -> engine_serialize::HashDigest {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize().into()
+}
 
 #[cfg(test)]
 mod tests {
@@ -69,6 +83,52 @@ mod tests {
         let cloned = handle.clone();
         assert_eq!(*handle.get(), *cloned.get());
         assert_eq!(*handle.id(), *cloned.id());
+        assert!(std::sync::Arc::ptr_eq(&handle.shared(), &cloned.shared()));
+    }
+
+    #[test]
+    fn typed_insertion_replaces_cache_without_invalidating_old_handles() {
+        let id = AssetId::new("runtime-value");
+        let mut registry = AssetRegistry::new();
+        let old = registry.insert_typed(id.clone(), 7u32);
+        let new = registry.insert_typed(id.clone(), 11u32);
+
+        assert_eq!(*old.get(), 7);
+        assert_eq!(*new.get(), 11);
+        assert_eq!(*registry.get::<u32>(&id).expect("cached").get(), 11);
+        assert!(registry.get::<String>(&id).is_none());
+    }
+
+    #[test]
+    fn erased_insertion_populates_raw_and_typed_cache() {
+        let id = AssetId::new("extension-value");
+        let mut registry = AssetRegistry::new();
+        registry.insert_erased(id.clone(), vec![1, 2, 3], Box::new("decoded".to_string()));
+
+        assert_eq!(
+            registry
+                .get::<String>(&id)
+                .expect("typed extension asset")
+                .get(),
+            "decoded"
+        );
+        assert_eq!(
+            registry.load(&id).expect("raw extension asset").get(),
+            &[1, 2, 3]
+        );
+        assert!(registry.get::<u32>(&id).is_none());
+    }
+
+    #[test]
+    fn content_hash_preserves_part_boundaries() {
+        assert_ne!(
+            compute_content_hash(&[b"ab", b"c"]),
+            compute_content_hash(&[b"a", b"bc"])
+        );
+        assert_eq!(
+            compute_content_hash(&[b"same"]),
+            compute_content_hash(&[b"same"])
+        );
     }
 
     // ── AssetError display tests ──────────────────────────────────────────

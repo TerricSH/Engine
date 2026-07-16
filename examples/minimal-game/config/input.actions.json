@@ -1,0 +1,99 @@
+{
+  "schema": "InputActions-v0",
+  "map": {
+    "name": "player",
+    "actions": [
+      {
+        "name": "move_forward",
+        "bindings": [
+          {
+            "device": "KeyboardMouse",
+            "action": "move_forward",
+            "keys": ["W", "Up"],
+            "gamepad_button": null,
+            "gamepad_axis": null,
+            "modifier": "None"
+          }
+        ],
+        "value_type": "Digital",
+        "current_value": { "Bool": false }
+      },
+      {
+        "name": "move_backward",
+        "bindings": [
+          {
+            "device": "KeyboardMouse",
+            "action": "move_backward",
+            "keys": ["S", "Down"],
+            "gamepad_button": null,
+            "gamepad_axis": null,
+            "modifier": "None"
+          }
+        ],
+        "value_type": "Digital",
+        "current_value": { "Bool": false }
+      },
+      {
+        "name": "move_left",
+        "bindings": [
+          {
+            "device": "KeyboardMouse",
+            "action": "move_left",
+            "keys": ["A", "Left"],
+            "gamepad_button": null,
+            "gamepad_axis": null,
+            "modifier": "None"
+          }
+        ],
+        "value_type": "Digital",
+        "current_value": { "Bool": false }
+      },
+      {
+        "name": "move_right",
+        "bindings": [
+          {
+            "device": "KeyboardMouse",
+            "action": "move_right",
+            "keys": ["D", "Right"],
+            "gamepad_button": null,
+            "gamepad_axis": null,
+            "modifier": "None"
+          }
+        ],
+        "value_type": "Digital",
+        "current_value": { "Bool": false }
+      },
+      {
+        "name": "jump",
+        "bindings": [
+          {
+            "device": "KeyboardMouse",
+            "action": "jump",
+            "keys": ["Space"],
+            "gamepad_button": null,
+            "gamepad_axis": null,
+            "modifier": "None"
+          }
+        ],
+        "value_type": "Digital",
+        "current_value": { "Bool": false }
+      },
+      {
+        "name": "fire",
+        "bindings": [
+          {
+            "device": "KeyboardMouse",
+            "action": "fire",
+            "keys": ["MouseLeft"],
+            "gamepad_button": null,
+            "gamepad_axis": null,
+            "modifier": "None"
+          }
+        ],
+        "value_type": "Digital",
+        "current_value": { "Bool": false }
+      }
+    ],
+    "context": "gameplay"
+  }
+}

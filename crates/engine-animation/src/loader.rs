@@ -10,13 +10,18 @@ use crate::assets::{AnimationClip, Skeleton};
 
 /// Deserialize a [`Skeleton`] from bincode-encoded bytes.
 pub fn load_skeleton(data: &[u8]) -> Result<Skeleton, String> {
-    bincode::deserialize::<Skeleton>(data).map_err(|e| format!("bincode deserialize skeleton: {e}"))
+    let skeleton = bincode::deserialize::<Skeleton>(data)
+        .map_err(|e| format!("bincode deserialize skeleton: {e}"))?;
+    skeleton.validate()?;
+    Ok(skeleton)
 }
 
 /// Deserialize an [`AnimationClip`] from bincode-encoded bytes.
 pub fn load_animation_clip(data: &[u8]) -> Result<AnimationClip, String> {
-    bincode::deserialize::<AnimationClip>(data)
-        .map_err(|e| format!("bincode deserialize animation clip: {e}"))
+    let clip = bincode::deserialize::<AnimationClip>(data)
+        .map_err(|e| format!("bincode deserialize animation clip: {e}"))?;
+    clip.validate()?;
+    Ok(clip)
 }
 
 // ---------------------------------------------------------------------------
@@ -68,12 +73,12 @@ fn cook_animation_clip(source: &[u8], output: &mut Vec<u8>) -> Result<(), String
 
 // ── Typed loader fns ───────────────────────────────────────────────────
 
-fn load_skeleton_typed(cooked: &[u8]) -> Result<Box<dyn Any>, String> {
+fn load_skeleton_typed(cooked: &[u8]) -> Result<Box<dyn Any + Send + Sync>, String> {
     let skel = load_skeleton(cooked)?;
     Ok(Box::new(skel))
 }
 
-fn load_animation_clip_typed(cooked: &[u8]) -> Result<Box<dyn Any>, String> {
+fn load_animation_clip_typed(cooked: &[u8]) -> Result<Box<dyn Any + Send + Sync>, String> {
     let clip = load_animation_clip(cooked)?;
     Ok(Box::new(clip))
 }

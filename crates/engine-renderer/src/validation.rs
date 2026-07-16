@@ -1,4 +1,7 @@
-use crate::{Diagnostic, DiagnosticSeverity, LightKind, RenderFrameInput, ShadowMode, ViewCompose};
+use crate::{
+    BonePaletteLayout, Diagnostic, DiagnosticSeverity, LightKind, PassGraphOutputMode,
+    RenderFrameInput, ShadowMode, ToneMapping, ViewCompose,
+};
 use std::collections::BTreeSet;
 
 pub fn validate_frame_input(input: &RenderFrameInput) -> Vec<Diagnostic> {
@@ -24,6 +27,22 @@ pub fn validate_frame_input(input: &RenderFrameInput) -> Vec<Diagnostic> {
             )
             .contract("RendererInput-v0", input.contract_version.clone())
             .path("views"),
+        );
+    }
+    if input
+        .render_options
+        .exposure_ev100
+        .is_some_and(|exposure| !exposure.is_finite())
+    {
+        diagnostics.push(
+            Diagnostic::new(
+                "RV0022",
+                DiagnosticSeverity::Error,
+                "engine-renderer",
+                "render_options.exposure_ev100 must be finite when provided",
+            )
+            .contract("RendererInput-v0", input.contract_version.clone())
+            .path("render_options.exposure_ev100"),
         );
     }
 
@@ -55,6 +74,44 @@ pub fn validate_frame_input(input: &RenderFrameInput) -> Vec<Diagnostic> {
                     .contract("RendererInput-v0", input.contract_version.clone()),
                 );
             }
+        }
+    }
+
+    for (item_index, item) in input.skinned_items.iter().enumerate() {
+        let count = match item.bone_palette_layout {
+            BonePaletteLayout::Full4x4 { count } => count,
+            BonePaletteLayout::Packed3x4 { .. } => {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "RV0020",
+                        DiagnosticSeverity::Error,
+                        "engine-renderer",
+                        "Packed3x4 bone palettes are not supported by the runtime backends",
+                    )
+                    .contract("RendererInput-v0", input.contract_version.clone())
+                    .path(format!("skinned_items[{item_index}].bone_palette_layout")),
+                );
+                continue;
+            }
+        };
+        let palette_is_valid = count as usize == item.bone_palette.len()
+            && (1..=64).contains(&item.bone_palette.len())
+            && item
+                .bone_palette
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite());
+        if !palette_is_valid {
+            diagnostics.push(
+                Diagnostic::new(
+                    "RV0020",
+                    DiagnosticSeverity::Error,
+                    "engine-renderer",
+                    "skinned item requires 1..=64 finite Full4x4 bones and a matching count",
+                )
+                .contract("RendererInput-v0", input.contract_version.clone())
+                .path(format!("skinned_items[{item_index}].bone_palette")),
+            );
         }
     }
 
@@ -135,7 +192,6 @@ fn validate_pass_graph_config(input: &RenderFrameInput, diagnostics: &mut Vec<Di
 
     for (kind, found) in [
         ("OpaquePbrForward", opaque.len()),
-        ("ToneMap", tone_map.len()),
         ("Present", present.len()),
     ] {
         if found != 1 {
@@ -153,6 +209,41 @@ fn validate_pass_graph_config(input: &RenderFrameInput, diagnostics: &mut Vec<Di
             );
         }
     }
+    let direct_to_swapchain = config.output_mode == PassGraphOutputMode::DirectToSwapchain;
+    let expected_tone_map_count = usize::from(!direct_to_swapchain);
+    if tone_map.len() != expected_tone_map_count {
+        diagnostics.push(
+            Diagnostic::new(
+                "RV0017",
+                DiagnosticSeverity::Error,
+                "engine-renderer",
+                format!(
+                    "render graph output mode {:?} must contain exactly {expected_tone_map_count} enabled ToneMap pass; found {}",
+                    config.output_mode,
+                    tone_map.len()
+                ),
+            )
+            .contract("RendererInput-v0", input.contract_version.clone())
+            .path("render_options.pass_graph_config.passes"),
+        );
+    }
+    let direct_output_has_tone_mapping =
+        direct_to_swapchain && input.render_options.tone_mapping != ToneMapping::None;
+    if direct_output_has_tone_mapping {
+        diagnostics.push(
+            Diagnostic::new(
+                "RV0017",
+                DiagnosticSeverity::Error,
+                "engine-renderer",
+                format!(
+                    "DirectToSwapchain output cannot apply ToneMapping::{:?}; select ToneMapping::None or use HdrThenToneMap",
+                    input.render_options.tone_mapping
+                ),
+            )
+            .contract("RendererInput-v0", input.contract_version.clone())
+            .path("render_options.tone_mapping"),
+        );
+    }
     if shadow.len() > 1 {
         diagnostics.push(
             Diagnostic::new(
@@ -166,20 +257,28 @@ fn validate_pass_graph_config(input: &RenderFrameInput, diagnostics: &mut Vec<Di
         );
     }
 
-    if let (Some(&opaque), Some(&tone_map), Some(&present)) =
-        (opaque.first(), tone_map.first(), present.first())
-    {
-        let shadow_is_ordered = shadow.first().map_or(true, |shadow| *shadow < opaque);
+    let required_pass_counts_are_valid = opaque.len() == 1
+        && present.len() == 1
+        && tone_map.len() == expected_tone_map_count
+        && shadow.len() <= 1
+        && !direct_output_has_tone_mapping;
+    if required_pass_counts_are_valid {
+        let opaque = opaque[0];
+        let present = present[0];
+        let shadow_is_ordered = shadow.first().is_none_or(|shadow| *shadow < opaque);
+        let tone_map_is_ordered = tone_map
+            .first()
+            .is_none_or(|tone_map| opaque < *tone_map && *tone_map < present);
         let present_is_final = enabled
             .last()
             .is_some_and(|(index, kind)| *index == present && *kind == "Present");
-        if !(shadow_is_ordered && opaque < tone_map && tone_map < present && present_is_final) {
+        if !(shadow_is_ordered && opaque < present && tone_map_is_ordered && present_is_final) {
             diagnostics.push(
                 Diagnostic::new(
                     "RV0019",
                     DiagnosticSeverity::Error,
                     "engine-renderer",
-                    "render graph order must be DirectionalShadow (optional), OpaquePbrForward, optional custom passes, ToneMap, then terminal Present",
+                    "render graph order must be DirectionalShadow (optional), OpaquePbrForward, optional custom passes, ToneMap (for HdrThenToneMap output), then terminal Present",
                 )
                 .contract("RendererInput-v0", input.contract_version.clone())
                 .path("render_options.pass_graph_config.passes"),

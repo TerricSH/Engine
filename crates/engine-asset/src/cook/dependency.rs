@@ -146,6 +146,29 @@ impl DependencyGraph {
     pub fn to_diagnostics(&self) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
 
+        // A failed or unfinished root asset must be visible even when it has no
+        // dependency edges. Previously those failures disappeared from reports.
+        for (id, node) in &self.nodes {
+            let (code, message) = match &node.state {
+                CookState::Failed(message) => (
+                    "COOK_ASSET_FAILED",
+                    format!("asset {:?} failed to cook: {message}", id.id),
+                ),
+                CookState::Uncooked => (
+                    "COOK_ASSET_NOT_READY",
+                    format!("asset {:?} was registered but never cooked", id.id),
+                ),
+                CookState::Cooking => (
+                    "COOK_ASSET_NOT_READY",
+                    format!("asset {:?} did not finish cooking", id.id),
+                ),
+                CookState::Cooked(_) => continue,
+            };
+            let mut diagnostic = Diagnostic::new(code, DiagnosticSeverity::Error, "cook", message);
+            diagnostic.asset = Some(id.clone());
+            diags.push(diagnostic);
+        }
+
         // Check that all referenced dependencies exist
         for (id, node) in &self.nodes {
             for dep in &node.deps {
@@ -399,6 +422,20 @@ mod tests {
         g.mark_failed(&id("b"), "boom".into());
         let diags = g.to_diagnostics();
         assert!(diags.iter().any(|d| d.code == "COOK_DEP_FAILED"));
+    }
+
+    #[test]
+    fn diagnostics_surface_a_failed_root_asset() {
+        let mut g = DependencyGraph::new();
+        g.register(id("root"));
+        g.mark_failed(&id("root"), "boom".into());
+
+        let diags = g.to_diagnostics();
+
+        assert!(diags.iter().any(|d| {
+            d.code == "COOK_ASSET_FAILED"
+                && d.asset.as_ref().is_some_and(|asset| asset.id == "root")
+        }));
     }
 
     #[test]

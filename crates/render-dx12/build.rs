@@ -1,97 +1,91 @@
 //! Build script for the DX12 renderer.
 //!
-//! Attempts to compile HLSL shaders to DXIL bytecode via dxc.exe.
-//! If dxc is not available, a placeholder blob is used so the PSO
-//! creation code can still be exercised on developer machines.
+//! Compiles HLSL with the Windows system shader compiler. Shader Model 5.1
+//! DXBC remains compatible with the D3D12 runtime shipped by supported
+//! Windows 10 installations and needs no external DXIL validator.
 
-use std::path::Path;
+#[cfg(windows)]
+use std::ffi::CString;
+#[cfg(windows)]
+use windows::{
+    core::PCSTR,
+    Win32::Graphics::Direct3D::{Fxc::*, ID3DBlob, ID3DInclude},
+};
 
 fn main() {
-    // Rebuild if the shader source changes.
     println!("cargo:rerun-if-changed=src/shaders.hlsl");
 
-    // Attempt to compile shaders with dxc.exe (Windows SDK).
-    let dxc_path = find_dxc();
-
-    if let Some(dxc) = dxc_path {
-        println!("cargo:warning=dxc found at {:?}, compiling shaders", dxc);
-        let status = std::process::Command::new(&dxc)
-            .args([
-                "-T",
-                "vs_6_0",
-                "-E",
-                "VSMain",
-                "-Fo",
-                &output_path("scene_vs.dxil"),
-                "-nologo",
-                "src/shaders.hlsl",
-            ])
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
-                println!("cargo:warning=Vertex shader compiled successfully");
-            }
-            _ => {
-                println!("cargo:warning=Vertex shader compilation failed, using fallback");
-            }
-        }
-
-        let status = std::process::Command::new(&dxc)
-            .args([
-                "-T",
-                "ps_6_0",
-                "-E",
-                "PSMain",
-                "-Fo",
-                &output_path("scene_ps.dxil"),
-                "-nologo",
-                "src/shaders.hlsl",
-            ])
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
-                println!("cargo:warning=Pixel shader compiled successfully");
-            }
-            _ => {
-                println!("cargo:warning=Pixel shader compilation failed, using fallback");
-            }
-        }
-    } else {
-        println!("cargo:warning=dxc not found, DX12 shader compilation skipped");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
     }
+    #[cfg(windows)]
+    {
+        compile("vs_5_1", "VSMain", "scene_vs.dxil");
+        compile("vs_5_1", "SkinnedVSMain", "scene_skinned_vs.dxil");
+        compile("ps_5_1", "PSMain", "scene_ps.dxil");
+        compile("vs_5_1", "ShadowVSMain", "shadow_vs.dxil");
+        compile("vs_5_1", "SkinnedShadowVSMain", "shadow_skinned_vs.dxil");
+    }
+    #[cfg(not(windows))]
+    panic!("cross-compiling the DX12 backend requires precompiled Windows shader objects");
 }
 
-fn find_dxc() -> Option<std::path::PathBuf> {
-    // Check common dxc locations
-    let candidates = vec![
-        // Windows SDK 10
-        r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\dxc.exe",
-        r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.20348.0\x64\dxc.exe",
-        r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22000.0\x64\dxc.exe",
-        // Vulkan SDK (includes dxc)
-        r"C:\VulkanSDK\1.3\Bin\dxc.exe",
-    ];
-
-    for path in candidates {
-        let p = Path::new(path);
-        if p.exists() {
-            return Some(p.to_path_buf());
-        }
+#[cfg(windows)]
+fn compile(profile: &str, entry: &str, output: &str) {
+    let source = std::fs::read("src/shaders.hlsl").expect("read DX12 HLSL source");
+    let entry = CString::new(entry).expect("shader entry point contains no NUL");
+    let profile = CString::new(profile).expect("shader profile contains no NUL");
+    let mut bytecode: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    let result = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            PCSTR(c"shaders.hlsl".as_ptr().cast()),
+            None,
+            None::<&ID3DInclude>,
+            PCSTR(entry.as_ptr().cast()),
+            PCSTR(profile.as_ptr().cast()),
+            D3DCOMPILE_ENABLE_STRICTNESS,
+            0,
+            &mut bytecode,
+            Some(&mut errors as *mut _),
+        )
+    };
+    if let Err(error) = result {
+        let compiler_message = errors
+            .as_ref()
+            .map(|blob| unsafe {
+                let bytes = std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                );
+                String::from_utf8_lossy(bytes)
+                    .trim_end_matches('\0')
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        panic!(
+            "D3DCompile failed for {}: {error}; {compiler_message}",
+            entry.to_string_lossy()
+        );
     }
-
-    // Try PATH
-    if let Ok(output) = std::process::Command::new("dxc").arg("--version").output() {
-        if output.status.success() {
-            return Some("dxc".into());
-        }
-    }
-
-    None
+    let bytecode = bytecode.expect("D3DCompile succeeded without bytecode");
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            bytecode.GetBufferPointer().cast::<u8>(),
+            bytecode.GetBufferSize(),
+        )
+    };
+    std::fs::write(output_path(output), bytes).expect("write compiled DX12 shader object");
+    println!(
+        "cargo:warning={} compiled successfully for {}",
+        entry.to_string_lossy(),
+        profile.to_string_lossy()
+    );
 }
 
 fn output_path(name: &str) -> String {
     let out = std::env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
-    format!("{}/{}", out, name)
+    format!("{out}/{name}")
 }

@@ -18,11 +18,13 @@
 
 use std::collections::BTreeMap;
 
+use engine_core::game_loop::GameLoop;
+use engine_core::EngineConfig;
 use engine_editor::commands::{
     AddComponent, AddEntity, RemoveComponent, RemoveEntity, SetComponentField, SetEntityName,
 };
 use engine_editor::io;
-use engine_editor::{EditorError, EditorScene};
+use engine_editor::{EditorError, EditorPlayMode, EditorPlaySession, EditorScene};
 use engine_renderer::{validate_frame_input, RenderFrameInput};
 use engine_scene::{
     extract_renderer_input, sample_scene, validate_scene, ComponentRecord, EntityRecord, Scene,
@@ -82,7 +84,10 @@ fn make_camera() -> ComponentRecord {
     );
     fields.insert("near".to_string(), Value::Float32(0.1));
     fields.insert("far".to_string(), Value::Float32(100.0));
-    fields.insert("fov_y".to_string(), Value::Float32(1.0472)); // 60°
+    fields.insert(
+        "fov_y".to_string(),
+        Value::Float32(std::f32::consts::FRAC_PI_3),
+    ); // 60°
     fields.insert(
         "clear_color".to_string(),
         Value::Color([0.0, 0.0, 0.0, 1.0]),
@@ -525,6 +530,10 @@ fn editor_save_load_roundtrip() {
     let path = dir.join("test_roundtrip.scene.ron");
     let _ = std::fs::remove_file(&path);
     es.save(Some(&path)).expect("save should succeed");
+    assert!(
+        !es.is_dirty(),
+        "a successful editor save must mark history clean"
+    );
 
     // Load into a fresh EditorScene
     let loaded_scene = io::load_scene(&path).expect("load should succeed");
@@ -600,11 +609,7 @@ fn full_editor_pipeline() {
 
     // 5. Verify data flows through to renderer
     //    (Renderer is constructed as a mock — no GPU needed)
-    let mut renderer = engine_renderer::Renderer::new();
-    let stats = renderer
-        .draw_scene(&input)
-        .expect("draw_scene should succeed with valid input");
-    assert_eq!(stats.draw_calls, 1, "expected 1 draw call");
+    assert_eq!(input.drawables.len(), 1, "expected 1 draw item");
 
     // 6. Undo the add, verify extraction changes
     es.undo().unwrap();
@@ -699,4 +704,56 @@ fn editor_mutations_never_produce_invalid_scene() {
     es.undo().unwrap();
     let diags = validate_scene(&es.scene);
     assert!(diags.is_empty(), "scene valid after 2 undo: {:?}", diags);
+}
+
+#[test]
+fn play_mode_runtime_changes_are_discarded_on_stop() {
+    use engine_scene::components::Renderable;
+
+    let mut editor_scene = EditorScene::new(sample_scene());
+    editor_scene.selected_entity = Some("cube-01".to_string());
+    let authoring_scene = editor_scene.scene.clone();
+    let mut game_loop = GameLoop::new(EngineConfig::default());
+    game_loop.load_scene(authoring_scene.clone()).unwrap();
+    let mut play = EditorPlaySession::default();
+
+    assert!(play
+        .start(&editor_scene.scene, |scene| game_loop.load_scene(scene))
+        .unwrap());
+    game_loop.runtime.with_world_mut(|world| {
+        let entities = world
+            .query::<Renderable>()
+            .map(|(entity, _)| entity)
+            .collect::<Vec<_>>();
+        let cube = entities
+            .into_iter()
+            .find(|entity| world.persistent_id(*entity) == Some("cube-01"))
+            .expect("sample cube entity");
+        world.get_mut::<Renderable>(cube).unwrap().visible = false;
+    });
+
+    let runtime_visible = game_loop.runtime.with_world(|world| {
+        world
+            .query::<Renderable>()
+            .find_map(|(entity, renderable)| {
+                (world.persistent_id(entity) == Some("cube-01")).then_some(renderable.visible)
+            })
+            .unwrap()
+    });
+    assert_eq!(runtime_visible, Some(false));
+    assert_eq!(editor_scene.scene, authoring_scene);
+
+    assert!(play.stop(|scene| game_loop.load_scene(scene)).unwrap());
+    assert_eq!(play.mode(), EditorPlayMode::Editing);
+    let restored_visible = game_loop.runtime.with_world(|world| {
+        world
+            .query::<Renderable>()
+            .find_map(|(entity, renderable)| {
+                (world.persistent_id(entity) == Some("cube-01")).then_some(renderable.visible)
+            })
+            .unwrap()
+    });
+    assert_eq!(restored_visible, Some(true));
+    assert_eq!(editor_scene.selected_entity.as_deref(), Some("cube-01"));
+    assert!(!editor_scene.is_dirty());
 }

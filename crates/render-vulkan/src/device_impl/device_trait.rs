@@ -8,12 +8,12 @@ use ash::vk;
 use std::ops::Range;
 
 use render_core::{
-    self, AdapterInfo, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
+    self, AdapterInfo, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle, BufferUsage,
     CommandEncoder as CmdEncoderTrait, FramebufferDescriptor, FramebufferHandle,
     PipelineDescriptor, PipelineHandle, PipelineLayoutDescriptor, PipelineLayoutHandle,
     RenderPassDescriptor, RenderPassHandle, RendererStatistics, ShaderModuleDescriptor,
-    ShaderModuleHandle, SurfaceDescriptor, SurfaceHandle, SwapchainDescriptor, SwapchainHandle,
-    TextureDescriptor, TextureFormat, TextureHandle,
+    ShaderModuleHandle, ShaderStage, SurfaceDescriptor, SurfaceHandle, SwapchainDescriptor,
+    SwapchainHandle, TextureDescriptor, TextureFormat, TextureHandle, TextureUsage,
 };
 
 use crate::allocator::{AllocationCreateDesc, AllocationScheme, MemoryLocation};
@@ -23,7 +23,7 @@ use super::{
     encoder::VkCmdEncoder,
     mk_sm, parse_polygon_mode, parse_sample_count, parse_topology,
     resource_kind_to_descriptor_type,
-    slab::{BufEntry, PipeEntry, PlEntry},
+    slab::{BufEntry, FbEntry, PipeEntry, PlEntry, TexEntry},
     vfmt, VulkanDevice,
 };
 
@@ -88,6 +88,32 @@ fn ordered_bind_group_layouts(
     Ok(ordered)
 }
 
+fn vulkan_descriptor_bindings(
+    layout: &BindGroupLayoutDescriptor,
+) -> Result<Vec<vk::DescriptorSetLayoutBinding<'static>>, render_core::RhiError> {
+    let mut binding_indices = std::collections::BTreeSet::new();
+    layout
+        .bindings
+        .iter()
+        .map(|binding| {
+            if !binding_indices.insert(binding.binding) {
+                return Err(render_core::RhiError::InvalidDescriptor {
+                    field: "bind_group_layouts.bindings".into(),
+                    reason: format!(
+                        "descriptor set {} contains duplicate binding {}",
+                        layout.set_index, binding.binding
+                    ),
+                });
+            }
+            Ok(vk::DescriptorSetLayoutBinding::default()
+                .binding(binding.binding)
+                .descriptor_type(resource_kind_to_descriptor_type(&binding.resource_kind)?)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT))
+        })
+        .collect()
+}
+
 fn color_attachment_format(
     requested: Option<&TextureFormat>,
     swapchain_format: Option<vk::Format>,
@@ -97,6 +123,16 @@ fn color_attachment_format(
         Some(TextureFormat::Rgba8Unorm) => vk::Format::R8G8B8A8_UNORM,
         Some(TextureFormat::Rgba16Float) => vk::Format::R16G16B16A16_SFLOAT,
         _ => swapchain_format.unwrap_or(vk::Format::B8G8R8A8_UNORM),
+    }
+}
+
+fn texture_format(format: TextureFormat) -> vk::Format {
+    match format {
+        TextureFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        TextureFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        TextureFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        TextureFormat::Depth32Float => vk::Format::D32_SFLOAT,
+        _ => vk::Format::UNDEFINED,
     }
 }
 
@@ -132,6 +168,163 @@ fn checked_buffer_write_range(
     Ok(start..end)
 }
 
+fn vertex_format_size(format: &str) -> Option<u32> {
+    match format {
+        "float32x2" => Some(8),
+        "float32x3" => Some(12),
+        "float32x4" | "uint32x4" => Some(16),
+        _ => None,
+    }
+}
+
+fn validate_graphics_pipeline_descriptor(
+    desc: &PipelineDescriptor,
+) -> Result<(), render_core::RhiError> {
+    let sample_count = desc.sample_count.unwrap_or(1);
+    if !matches!(sample_count, 1 | 2 | 4 | 8) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.sample_count".into(),
+            reason: format!("unsupported sample count {sample_count}"),
+        });
+    }
+    if !matches!(
+        desc.topology.as_deref(),
+        None | Some("point_list")
+            | Some("line_list")
+            | Some("line_strip")
+            | Some("triangle_list")
+            | Some("triangle_strip")
+            | Some("triangle_fan")
+    ) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.topology".into(),
+            reason: format!("unsupported topology {:?}", desc.topology),
+        });
+    }
+    if !matches!(
+        desc.polygon_mode.as_deref(),
+        None | Some("fill") | Some("line") | Some("point")
+    ) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.polygon_mode".into(),
+            reason: format!("unsupported polygon mode {:?}", desc.polygon_mode),
+        });
+    }
+    if !matches!(
+        desc.raster_state.cull_mode.as_deref(),
+        None | Some("none") | Some("front") | Some("back")
+    ) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.raster_state.cull_mode".into(),
+            reason: format!("unsupported cull mode {:?}", desc.raster_state.cull_mode),
+        });
+    }
+    if !matches!(
+        desc.raster_state.front_face.as_deref(),
+        None | Some("clockwise") | Some("cw") | Some("counter_clockwise") | Some("ccw")
+    ) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.raster_state.front_face".into(),
+            reason: format!("unsupported front face {:?}", desc.raster_state.front_face),
+        });
+    }
+    if !matches!(
+        desc.depth_state.compare.as_deref(),
+        None | Some("less") | Some("equal") | Some("lequal") | Some("greater") | Some("always")
+    ) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.depth_state.compare".into(),
+            reason: format!(
+                "unsupported depth comparison {:?}",
+                desc.depth_state.compare
+            ),
+        });
+    }
+    if !matches!(
+        desc.blend_state.mode.as_deref(),
+        None | Some("Opaque") | Some("Alpha") | Some("Additive") | Some("Multiply")
+    ) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.blend_state.mode".into(),
+            reason: format!("unsupported blend mode {:?}", desc.blend_state.mode),
+        });
+    }
+    if desc.render_targets.contains(&TextureFormat::Depth32Float) {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.render_targets".into(),
+            reason: "Depth32Float is not a color render target".into(),
+        });
+    }
+    if let Some(format) = desc.depth_state.format {
+        if format != TextureFormat::Depth32Float {
+            return Err(render_core::RhiError::UnsupportedFeature {
+                feature: format!("Vulkan pipeline depth format {format:?}"),
+            });
+        }
+    }
+    if !desc.vertex_layout.attributes.is_empty() && desc.vertex_layout.stride_bytes == 0 {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.vertex_layout.stride_bytes".into(),
+            reason: "a non-empty vertex layout requires a non-zero stride".into(),
+        });
+    }
+    for attribute in &desc.vertex_layout.attributes {
+        let size = vertex_format_size(&attribute.format).ok_or_else(|| {
+            render_core::RhiError::InvalidDescriptor {
+                field: "pipeline.vertex_layout.attributes.format".into(),
+                reason: format!("unsupported vertex format '{}'", attribute.format),
+            }
+        })?;
+        if attribute
+            .offset_bytes
+            .checked_add(size)
+            .is_none_or(|end| end > desc.vertex_layout.stride_bytes)
+        {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "pipeline.vertex_layout.attributes.offset_bytes".into(),
+                reason: format!(
+                    "attribute '{}' exceeds vertex stride {}",
+                    attribute.semantic, desc.vertex_layout.stride_bytes
+                ),
+            });
+        }
+    }
+    let mut specialization_ids = std::collections::BTreeSet::new();
+    if let Some(duplicate) = desc
+        .specialization
+        .iter()
+        .find(|constant| !specialization_ids.insert(constant.id))
+    {
+        return Err(render_core::RhiError::InvalidDescriptor {
+            field: "pipeline.specialization".into(),
+            reason: format!("duplicate specialization constant id {}", duplicate.id),
+        });
+    }
+    Ok(())
+}
+
+fn vulkan_specialization_data(
+    constants: &[render_core::SpecConstant],
+) -> (Vec<u8>, Vec<vk::SpecializationMapEntry>) {
+    let mut data = Vec::with_capacity(constants.len() * std::mem::size_of::<u32>());
+    let mut entries = Vec::with_capacity(constants.len());
+    for constant in constants {
+        let offset = data.len() as u32;
+        let bytes = match constant.value {
+            render_core::SpecValue::Bool(value) => u32::from(value).to_ne_bytes(),
+            render_core::SpecValue::U32(value) => value.to_ne_bytes(),
+            render_core::SpecValue::F32(value) => value.to_ne_bytes(),
+        };
+        data.extend_from_slice(&bytes);
+        entries.push(vk::SpecializationMapEntry {
+            constant_id: constant.id,
+            offset,
+            size: bytes.len(),
+        });
+    }
+    (data, entries)
+}
+
 impl render_core::Device for VulkanDevice {
     fn adapter_info(&self) -> &AdapterInfo {
         &self.cached_adapter_info
@@ -153,16 +346,70 @@ impl render_core::Device for VulkanDevice {
         Ok(SwapchainHandle::new(1, 1))
     }
 
+    fn destroy_swapchain(&mut self, swapchain: SwapchainHandle) {
+        if swapchain != SwapchainHandle::new(1, 1) || self.swapchain.is_none() {
+            return;
+        }
+        self.wait_idle();
+        self.destroy_mvp();
+    }
+
+    fn destroy_surface(&mut self, surface: SurfaceHandle) {
+        if surface != SurfaceHandle::new(0, 1) || self.surface.is_none() {
+            return;
+        }
+        self.wait_idle();
+        self.destroy_mvp();
+        drop(self.surface.take());
+    }
+
     fn create_buffer(
         &mut self,
         desc: &BufferDescriptor,
     ) -> Result<BufferHandle, render_core::RhiError> {
+        if desc.size_bytes == 0 {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "buffer.size_bytes".into(),
+                reason: "buffer size must be non-zero".into(),
+            });
+        }
+        let known_usage_mask = BufferUsage::VERTEX.0
+            | BufferUsage::INDEX.0
+            | BufferUsage::UNIFORM.0
+            | BufferUsage::STORAGE.0
+            | BufferUsage::COPY_SRC.0
+            | BufferUsage::COPY_DST.0
+            | BufferUsage::INDIRECT.0;
+        if desc.usage_flags.0 == 0 || desc.usage_flags.0 & !known_usage_mask != 0 {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "buffer.usage_flags".into(),
+                reason: "at least one recognized buffer usage flag is required".into(),
+            });
+        }
         let d = &self.logical_device;
-        let size = desc.size_bytes.max(1);
-        let usage = vk::BufferUsageFlags::TRANSFER_DST
-            | vk::BufferUsageFlags::VERTEX_BUFFER
-            | vk::BufferUsageFlags::INDEX_BUFFER
-            | vk::BufferUsageFlags::UNIFORM_BUFFER;
+        let size = desc.size_bytes;
+        let mut usage = vk::BufferUsageFlags::empty();
+        if desc.usage_flags.0 & BufferUsage::VERTEX.0 != 0 {
+            usage |= vk::BufferUsageFlags::VERTEX_BUFFER;
+        }
+        if desc.usage_flags.0 & BufferUsage::INDEX.0 != 0 {
+            usage |= vk::BufferUsageFlags::INDEX_BUFFER;
+        }
+        if desc.usage_flags.0 & BufferUsage::UNIFORM.0 != 0 {
+            usage |= vk::BufferUsageFlags::UNIFORM_BUFFER;
+        }
+        if desc.usage_flags.0 & BufferUsage::STORAGE.0 != 0 {
+            usage |= vk::BufferUsageFlags::STORAGE_BUFFER;
+        }
+        if desc.usage_flags.0 & BufferUsage::COPY_SRC.0 != 0 {
+            usage |= vk::BufferUsageFlags::TRANSFER_SRC;
+        }
+        if desc.usage_flags.0 & BufferUsage::COPY_DST.0 != 0 {
+            usage |= vk::BufferUsageFlags::TRANSFER_DST;
+        }
+        if desc.usage_flags.0 & BufferUsage::INDIRECT.0 != 0 {
+            usage |= vk::BufferUsageFlags::INDIRECT_BUFFER;
+        }
         let bi = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
@@ -178,7 +425,12 @@ impl render_core::Device for VulkanDevice {
         // requirements for a valid buffer is safe.
         let req = unsafe { d.device.get_buffer_memory_requirements(buffer) };
         let alloc_handle = d.allocator();
-        let location = MemoryLocation::CpuToGpu;
+        let location = match desc.memory_hint {
+            render_core::MemoryHint::GpuOnly => MemoryLocation::GpuOnly,
+            render_core::MemoryHint::CpuToGpu => MemoryLocation::CpuToGpu,
+            render_core::MemoryHint::GpuToCpu => MemoryLocation::GpuToCpu,
+            render_core::MemoryHint::CpuOnly => MemoryLocation::CpuOnly,
+        };
         let allocation_result = match alloc_handle.lock() {
             Ok(mut allocator) => allocator.allocate(&AllocationCreateDesc {
                 name: "device-buffer",
@@ -260,11 +512,12 @@ impl render_core::Device for VulkanDevice {
             .ok_or_else(|| render_core::RhiError::Backend {
                 detail: "no alloc".into(),
             })?;
-        let slice = alloc
-            .mapped_slice_mut()
-            .ok_or_else(|| render_core::RhiError::Backend {
-                detail: "not mapped".into(),
-            })?;
+        let slice =
+            alloc
+                .mapped_slice_mut()
+                .ok_or_else(|| render_core::RhiError::UnsupportedFeature {
+                    feature: "write_buffer requires host-visible buffer memory".into(),
+                })?;
         if write_range.end > slice.len() {
             return Err(render_core::RhiError::Backend {
                 detail: format!(
@@ -293,43 +546,305 @@ impl render_core::Device for VulkanDevice {
 
     fn create_texture(
         &mut self,
-        _: &TextureDescriptor,
+        desc: &TextureDescriptor,
     ) -> Result<TextureHandle, render_core::RhiError> {
-        Err(render_core::RhiError::Backend {
-            detail: "not in Phase 2".into(),
-        })
+        if desc.width == 0
+            || desc.height == 0
+            || desc.depth_or_layers == 0
+            || desc.mip_levels == 0
+            || desc.sample_count == 0
+        {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "texture".into(),
+                reason: "dimensions, layers, mip levels and sample count must be non-zero".into(),
+            });
+        }
+        if !matches!(desc.sample_count, 1 | 2 | 4 | 8) {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "texture.sample_count".into(),
+                reason: format!("unsupported sample count {}", desc.sample_count),
+            });
+        }
+        if desc.sample_count > 1 && desc.mip_levels > 1 {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "texture.mip_levels".into(),
+                reason: "multisampled textures must have exactly one mip level".into(),
+            });
+        }
+        let mut usage = vk::ImageUsageFlags::empty();
+        if desc.usage_flags.0 & TextureUsage::SAMPLED.0 != 0 {
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
+        if desc.usage_flags.0 & TextureUsage::COLOR_ATTACHMENT.0 != 0 {
+            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if desc.usage_flags.0 & TextureUsage::DEPTH_ATTACHMENT.0 != 0 {
+            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        }
+        if desc.usage_flags.0 & TextureUsage::COPY_SRC.0 != 0 {
+            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        if desc.usage_flags.0 & TextureUsage::COPY_DST.0 != 0 {
+            usage |= vk::ImageUsageFlags::TRANSFER_DST;
+        }
+        if usage.is_empty() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "texture.usage_flags".into(),
+                reason: "at least one texture usage flag is required".into(),
+            });
+        }
+        let is_depth = desc.format == TextureFormat::Depth32Float;
+        if is_depth && desc.usage_flags.0 & TextureUsage::COLOR_ATTACHMENT.0 != 0 {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "texture.usage_flags".into(),
+                reason: "Depth32Float cannot be a color attachment".into(),
+            });
+        }
+        if !is_depth && desc.usage_flags.0 & TextureUsage::DEPTH_ATTACHMENT.0 != 0 {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "texture.usage_flags".into(),
+                reason: "only Depth32Float can be a depth attachment".into(),
+            });
+        }
+        let d = &self.logical_device.device;
+        let format = texture_format(desc.format);
+        if format == vk::Format::UNDEFINED {
+            return Err(render_core::RhiError::UnsupportedFeature {
+                feature: format!("Vulkan texture format {:?}", desc.format),
+            });
+        }
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: desc.width,
+                height: desc.height,
+                depth: 1,
+            })
+            .mip_levels(desc.mip_levels)
+            .array_layers(desc.depth_or_layers)
+            .samples(parse_sample_count(Some(desc.sample_count)))
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let image = unsafe { d.create_image(&image_info, None) }.map_err(|result| {
+            render_core::RhiError::Backend {
+                detail: format!("create texture image: {result:?}"),
+            }
+        })?;
+        let requirements = unsafe { d.get_image_memory_requirements(image) };
+        let allocator = self.logical_device.allocator();
+        let allocation_result = match allocator.lock() {
+            Ok(mut guard) => guard.allocate(&AllocationCreateDesc {
+                name: "rhi-texture",
+                requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            }),
+            Err(error) => {
+                unsafe { d.destroy_image(image, None) };
+                return Err(render_core::RhiError::Backend {
+                    detail: format!("texture allocator lock: {error}"),
+                });
+            }
+        };
+        let mut allocation = match allocation_result {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                unsafe { d.destroy_image(image, None) };
+                return Err(render_core::RhiError::Backend { detail: error });
+            }
+        };
+        if let Err(result) =
+            unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
+        {
+            unsafe { d.destroy_image(image, None) };
+            match allocator.lock() {
+                Ok(mut guard) => guard.free(&mut allocation),
+                Err(poisoned) => poisoned.into_inner().free(&mut allocation),
+            }
+            return Err(render_core::RhiError::Backend {
+                detail: format!("bind texture image: {result:?}"),
+            });
+        }
+        let aspect = if is_depth {
+            vk::ImageAspectFlags::DEPTH
+        } else {
+            vk::ImageAspectFlags::COLOR
+        };
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(if desc.depth_or_layers == 1 {
+                vk::ImageViewType::TYPE_2D
+            } else {
+                vk::ImageViewType::TYPE_2D_ARRAY
+            })
+            .format(format)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: 0,
+                level_count: desc.mip_levels,
+                base_array_layer: 0,
+                layer_count: desc.depth_or_layers,
+            });
+        let view = match unsafe { d.create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(result) => {
+                unsafe { d.destroy_image(image, None) };
+                match allocator.lock() {
+                    Ok(mut guard) => guard.free(&mut allocation),
+                    Err(poisoned) => poisoned.into_inner().free(&mut allocation),
+                }
+                return Err(render_core::RhiError::Backend {
+                    detail: format!("create texture view: {result:?}"),
+                });
+            }
+        };
+        let sampler = if desc.usage_flags.0 & TextureUsage::SAMPLED.0 != 0 {
+            match unsafe {
+                d.create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .max_lod(desc.mip_levels.saturating_sub(1) as f32),
+                    None,
+                )
+            } {
+                Ok(sampler) => Some(sampler),
+                Err(result) => {
+                    unsafe {
+                        d.destroy_image_view(view, None);
+                        d.destroy_image(image, None);
+                    }
+                    match allocator.lock() {
+                        Ok(mut guard) => guard.free(&mut allocation),
+                        Err(poisoned) => poisoned.into_inner().free(&mut allocation),
+                    }
+                    return Err(render_core::RhiError::Backend {
+                        detail: format!("create texture sampler: {result:?}"),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let (index, generation) = self.rhi_textures.insert(TexEntry {
+            image,
+            view,
+            sampler,
+            format,
+            width: desc.width,
+            height: desc.height,
+            sample_count: desc.sample_count,
+            allocator,
+            allocation: Some(allocation),
+        });
+        Ok(TextureHandle::new(index, generation))
+    }
+
+    fn destroy_texture(&mut self, texture: TextureHandle) {
+        let Some(entry) = self.rhi_textures.remove(texture.index, texture.generation) else {
+            return;
+        };
+        entry.destroy(&self.logical_device.device);
     }
 
     fn create_shader_module(
         &mut self,
-        _desc: &ShaderModuleDescriptor,
+        desc: &ShaderModuleDescriptor,
     ) -> Result<ShaderModuleHandle, render_core::RhiError> {
+        if desc.format != render_core::ShaderFormat::SpirV || desc.source_bytes.is_empty() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "shader_module".into(),
+                reason: "Vulkan requires non-empty SPIR-V source bytes".into(),
+            });
+        }
+        if !desc.source_bytes.len().is_multiple_of(4) {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "shader_module.source_bytes".into(),
+                reason: "SPIR-V byte length must be divisible by four".into(),
+            });
+        }
+        if desc.source_bytes.len() < 4
+            || u32::from_le_bytes(desc.source_bytes[0..4].try_into().expect("four-byte slice"))
+                != 0x0723_0203
+        {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "shader_module.source_bytes".into(),
+                reason: "shader source does not start with the SPIR-V magic number".into(),
+            });
+        }
+        if desc.entry_points.as_slice() != ["main"] {
+            return Err(render_core::RhiError::UnsupportedFeature {
+                feature: "Vulkan shader modules currently require one 'main' entry point".into(),
+            });
+        }
         let d = &self.logical_device.device;
-        // Get SPIR-V bytes.  The descriptor does not carry inline SPIR-V yet
-        // (Phase 2), so fall back to the embedded MVP vertex shader as a
-        // placeholder.  This establishes the storage pipeline.
-        let spv = self
-            .mvp_vert_spv
-            .as_deref()
-            .ok_or_else(|| render_core::RhiError::Backend {
-                detail: "create_shader_module: no embedded shaders available".into(),
-            })?;
-        // SAFETY: `d` is a valid AshDevice; `spv` is valid SPIR-V.
-        let sm = (unsafe { mk_sm(d, spv) }).map_err(|e| render_core::RhiError::Backend {
-            detail: format!("create_shader_module: {e}"),
+        let sm = (unsafe { mk_sm(d, &desc.source_bytes) }).map_err(|e| {
+            render_core::RhiError::Backend {
+                detail: format!("create_shader_module: {e}"),
+            }
         })?;
-        // Default to VERTEX stage; the descriptor does not carry stage info yet.
-        let (idx, gen) = self
-            .shader_modules
-            .insert((sm, vk::ShaderStageFlags::VERTEX));
+        let stage = match desc.stage {
+            ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
+            ShaderStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
+            ShaderStage::Compute => vk::ShaderStageFlags::COMPUTE,
+        };
+        let (idx, gen) = self.shader_modules.insert((sm, stage));
         Ok(ShaderModuleHandle::new(idx, gen))
+    }
+
+    fn destroy_shader_module(&mut self, module: ShaderModuleHandle) {
+        if let Some((shader, _)) = self.shader_modules.remove(module.index, module.generation) {
+            unsafe {
+                self.logical_device
+                    .device
+                    .destroy_shader_module(shader, None);
+            }
+        }
     }
 
     fn create_render_pass(
         &mut self,
         desc: &RenderPassDescriptor,
     ) -> Result<RenderPassHandle, render_core::RhiError> {
+        if desc.color_attachments.len() > 1 {
+            return Err(render_core::RhiError::UnsupportedFeature {
+                feature: "Vulkan generic render passes with multiple color attachments".into(),
+            });
+        }
+        if desc.color_attachments.is_empty() && desc.depth_stencil_format.is_none() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "render_pass.attachments".into(),
+                reason: "at least one color or depth attachment is required".into(),
+            });
+        }
+        if desc.present_after && desc.color_attachments.is_empty() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "render_pass.present_after".into(),
+                reason: "a present pass requires a color attachment".into(),
+            });
+        }
+        if let Some(format) = desc.depth_stencil_format {
+            if format != TextureFormat::Depth32Float {
+                return Err(render_core::RhiError::UnsupportedFeature {
+                    feature: format!("Vulkan depth format {format:?}"),
+                });
+            }
+        }
+        if !matches!(desc.sample_count, 1 | 2 | 4 | 8) {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "render_pass.sample_count".into(),
+                reason: format!("unsupported sample count {}", desc.sample_count),
+            });
+        }
         let d = &self.logical_device.device;
+        let samples = parse_sample_count(Some(desc.sample_count));
         let vk_fmt = color_attachment_format(
             desc.color_attachments.first(),
             self.swapchain.as_ref().map(|swapchain| swapchain.format),
@@ -337,20 +852,24 @@ impl render_core::Device for VulkanDevice {
         let has_depth = desc.depth_stencil_format.is_some();
 
         // Build render pass using a flat approach to avoid ash lifetime issues
-        let (rp, has_depth) = if has_depth {
+        let (rp, has_depth) = if has_depth && !desc.color_attachments.is_empty() {
             let atts = [
                 vk::AttachmentDescription::default()
                     .format(vk_fmt)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(samples)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                    .final_layout(if desc.present_after {
+                        vk::ImageLayout::PRESENT_SRC_KHR
+                    } else {
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    }),
                 vk::AttachmentDescription::default()
                     .format(vk::Format::D32_SFLOAT)
-                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .samples(samples)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::DONT_CARE)
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
@@ -400,16 +919,62 @@ impl render_core::Device for VulkanDevice {
                 })?,
                 true,
             )
-        } else {
-            let atts = [vk::AttachmentDescription::default()
-                .format(vk_fmt)
-                .samples(vk::SampleCountFlags::TYPE_1)
+        } else if has_depth {
+            let attachments = [vk::AttachmentDescription::default()
+                .format(vk::Format::D32_SFLOAT)
+                .samples(samples)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)];
+            let depth_ref = vk::AttachmentReference::default()
+                .attachment(0)
+                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            let subpass = vk::SubpassDescription::default()
+                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                .depth_stencil_attachment(&depth_ref);
+            let dependency = vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(
+                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                )
+                .dst_stage_mask(
+                    vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                )
+                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+            let subpasses = [subpass];
+            let dependencies = [dependency];
+            let info = vk::RenderPassCreateInfo::default()
+                .attachments(&attachments)
+                .subpasses(&subpasses)
+                .dependencies(&dependencies);
+            (
+                unsafe { d.create_render_pass(&info, None) }.map_err(|result| {
+                    render_core::RhiError::Backend {
+                        detail: format!("create depth-only render pass: {result:?}"),
+                    }
+                })?,
+                true,
+            )
+        } else {
+            let atts = [vk::AttachmentDescription::default()
+                .format(vk_fmt)
+                .samples(samples)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(if desc.present_after {
+                    vk::ImageLayout::PRESENT_SRC_KHR
+                } else {
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                })];
             let color_ref = [vk::AttachmentReference::default()
                 .attachment(0)
                 .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
@@ -437,13 +1002,45 @@ impl render_core::Device for VulkanDevice {
         };
         let (idx, gen) = self.render_passes.insert(rp);
         self.rp_has_depth.insert(idx, has_depth);
+        self.rp_color_formats.insert(
+            idx,
+            desc.color_attachments
+                .iter()
+                .copied()
+                .map(texture_format)
+                .collect(),
+        );
+        if let Some(format) = desc.depth_stencil_format {
+            self.rp_depth_formats.insert(idx, texture_format(format));
+        }
+        self.rp_sample_counts.insert(idx, desc.sample_count);
         Ok(RenderPassHandle::new(idx, gen))
+    }
+
+    fn destroy_render_pass(&mut self, pass: RenderPassHandle) {
+        if let Some(render_pass) = self.render_passes.remove(pass.index, pass.generation) {
+            self.rp_has_depth.remove(&pass.index);
+            self.rp_color_formats.remove(&pass.index);
+            self.rp_depth_formats.remove(&pass.index);
+            self.rp_sample_counts.remove(&pass.index);
+            unsafe {
+                self.logical_device
+                    .device
+                    .destroy_render_pass(render_pass, None);
+            }
+        }
     }
 
     fn create_framebuffer(
         &mut self,
         desc: &FramebufferDescriptor,
     ) -> Result<FramebufferHandle, render_core::RhiError> {
+        if desc.width == 0 || desc.height == 0 {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "framebuffer".into(),
+                reason: "width and height must be non-zero".into(),
+            });
+        }
         let d = &self.logical_device.device;
         let rp = self
             .render_passes
@@ -455,40 +1052,143 @@ impl render_core::Device for VulkanDevice {
             .get(&desc.render_pass.index)
             .copied()
             .unwrap_or(false);
-        let fb = if has_depth {
-            let depth_view = self.depth_image_view.unwrap_or(vk::ImageView::null());
-            let atts = [vk::ImageView::null(), depth_view];
-            let fi = vk::FramebufferCreateInfo::default()
-                .render_pass(rp)
-                .attachments(&atts)
-                .width(desc.width)
-                .height(desc.height)
-                .layers(1);
-            // SAFETY: `d` is a valid AshDevice; `fi` references a valid render
-            // pass and image views (null image views are allowed for placeholders);
-            // `None` means no custom allocator.
-            unsafe { d.create_framebuffer(&fi, None) }
-        } else {
-            let fi = vk::FramebufferCreateInfo::default()
-                .render_pass(rp)
-                .width(desc.width)
-                .height(desc.height)
-                .layers(1);
-            // SAFETY: `d` is a valid AshDevice; `fi` references a valid render
-            // pass; `None` means no custom allocator.
-            unsafe { d.create_framebuffer(&fi, None) }
+        let expected_colors = self
+            .rp_color_formats
+            .get(&desc.render_pass.index)
+            .ok_or(render_core::RhiError::InvalidHandle)?;
+        let expected_samples = self
+            .rp_sample_counts
+            .get(&desc.render_pass.index)
+            .copied()
+            .ok_or(render_core::RhiError::InvalidHandle)?;
+        if desc.color_attachments.len() != expected_colors.len() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "framebuffer.color_attachments".into(),
+                reason: format!(
+                    "render pass expects {} color attachment(s), got {}",
+                    expected_colors.len(),
+                    desc.color_attachments.len()
+                ),
+            });
         }
-        .map_err(|r| render_core::RhiError::Backend {
-            detail: format!("{r:?}"),
+        if has_depth != desc.depth_stencil_attachment.is_some() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "framebuffer.depth_stencil_attachment".into(),
+                reason: "framebuffer depth attachment does not match its render pass".into(),
+            });
+        }
+        let mut attachments = Vec::with_capacity(
+            desc.color_attachments.len() + usize::from(desc.depth_stencil_attachment.is_some()),
+        );
+        for (handle, expected_format) in desc.color_attachments.iter().zip(expected_colors) {
+            let texture = self
+                .rhi_textures
+                .get(handle.index, handle.generation)
+                .ok_or(render_core::RhiError::InvalidHandle)?;
+            if texture.format != *expected_format
+                || texture.width != desc.width
+                || texture.height != desc.height
+                || texture.sample_count != expected_samples
+            {
+                return Err(render_core::RhiError::InvalidDescriptor {
+                    field: "framebuffer.color_attachments".into(),
+                    reason: "color attachment format or extent is incompatible".into(),
+                });
+            }
+            attachments.push(texture.view);
+        }
+        if let Some(handle) = desc.depth_stencil_attachment {
+            let expected_depth = self
+                .rp_depth_formats
+                .get(&desc.render_pass.index)
+                .copied()
+                .ok_or(render_core::RhiError::InvalidHandle)?;
+            let texture = self
+                .rhi_textures
+                .get(handle.index, handle.generation)
+                .ok_or(render_core::RhiError::InvalidHandle)?;
+            if texture.format != expected_depth
+                || texture.width != desc.width
+                || texture.height != desc.height
+                || texture.sample_count != expected_samples
+            {
+                return Err(render_core::RhiError::InvalidDescriptor {
+                    field: "framebuffer.depth_stencil_attachment".into(),
+                    reason: "depth attachment must be matching-extent Depth32Float".into(),
+                });
+            }
+            attachments.push(texture.view);
+        }
+        if attachments.is_empty() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "framebuffer.attachments".into(),
+                reason: "at least one attachment is required".into(),
+            });
+        }
+        let info = vk::FramebufferCreateInfo::default()
+            .render_pass(rp)
+            .attachments(&attachments)
+            .width(desc.width)
+            .height(desc.height)
+            .layers(1);
+        let framebuffer = unsafe { d.create_framebuffer(&info, None) }.map_err(|result| {
+            render_core::RhiError::Backend {
+                detail: format!("create framebuffer: {result:?}"),
+            }
         })?;
-        let (idx, gen) = self.framebuffers.insert(fb);
+        let (idx, gen) = self.framebuffers.insert(FbEntry {
+            framebuffer,
+            color_attachment_count: desc.color_attachments.len() as u32,
+            has_depth,
+        });
         Ok(FramebufferHandle::new(idx, gen))
+    }
+
+    fn destroy_framebuffer(&mut self, framebuffer: FramebufferHandle) {
+        if let Some(framebuffer) = self
+            .framebuffers
+            .remove(framebuffer.index, framebuffer.generation)
+        {
+            unsafe {
+                self.logical_device
+                    .device
+                    .destroy_framebuffer(framebuffer.framebuffer, None);
+            }
+        }
     }
 
     fn create_pipeline_layout(
         &mut self,
         desc: &PipelineLayoutDescriptor,
     ) -> Result<PipelineLayoutHandle, render_core::RhiError> {
+        let allowed_stage_flags = (vk::ShaderStageFlags::VERTEX
+            | vk::ShaderStageFlags::FRAGMENT
+            | vk::ShaderStageFlags::COMPUTE)
+            .as_raw();
+        let max_push_constants = self.adapter.properties.limits.max_push_constants_size;
+        for range in &desc.push_constant_ranges {
+            let end = range.offset.checked_add(range.size).ok_or_else(|| {
+                render_core::RhiError::InvalidDescriptor {
+                    field: "pipeline_layout.push_constant_ranges".into(),
+                    reason: "push constant range overflows u32".into(),
+                }
+            })?;
+            if range.size == 0
+                || !range.offset.is_multiple_of(4)
+                || !range.size.is_multiple_of(4)
+                || range.stage_flags == 0
+                || range.stage_flags & !allowed_stage_flags != 0
+                || end > max_push_constants
+            {
+                return Err(render_core::RhiError::InvalidDescriptor {
+                    field: "pipeline_layout.push_constant_ranges".into(),
+                    reason: format!(
+                        "range offset={} size={} stages={:#x} exceeds Vulkan limits",
+                        range.offset, range.size, range.stage_flags
+                    ),
+                });
+            }
+        }
         let d = &self.logical_device.device;
         let pc_ranges: Vec<vk::PushConstantRange> = desc
             .push_constant_ranges
@@ -516,28 +1216,26 @@ impl render_core::Device for VulkanDevice {
             )?;
         } else {
             set_layouts = Vec::new();
-            for bg in ordered_bind_group_layouts(&desc.bind_group_layouts)? {
-                let vk_bindings: Vec<vk::DescriptorSetLayoutBinding> = bg
-                    .bindings
-                    .iter()
-                    .map(|b| {
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(b.binding)
-                            .descriptor_type(resource_kind_to_descriptor_type(&b.resource_kind))
-                            .descriptor_count(1)
-                            .stage_flags(
-                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                            )
-                    })
-                    .collect();
+            let ordered = ordered_bind_group_layouts(&desc.bind_group_layouts)?;
+            let binding_sets = ordered
+                .iter()
+                .map(|layout| vulkan_descriptor_bindings(layout))
+                .collect::<Result<Vec<_>, _>>()?;
+            for vk_bindings in binding_sets {
                 let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&vk_bindings);
                 // SAFETY: `d` is a valid AshDevice; `info` describes a valid
                 // descriptor set layout; `None` means no custom allocator.
-                let sl = unsafe { d.create_descriptor_set_layout(&info, None) }.map_err(|r| {
-                    render_core::RhiError::Backend {
-                        detail: format!("create descriptor set layout: {r:?}"),
+                let sl = match unsafe { d.create_descriptor_set_layout(&info, None) } {
+                    Ok(layout) => layout,
+                    Err(result) => {
+                        for layout in owned_set_layouts.drain(..) {
+                            unsafe { d.destroy_descriptor_set_layout(layout, None) };
+                        }
+                        return Err(render_core::RhiError::Backend {
+                            detail: format!("create descriptor set layout: {result:?}"),
+                        });
                     }
-                })?;
+                };
                 owned_set_layouts.push(sl);
                 set_layouts.push(sl);
             }
@@ -549,11 +1247,17 @@ impl render_core::Device for VulkanDevice {
         // SAFETY: `d` is a valid AshDevice; `info` describes a valid pipeline
         // layout with descriptor set layouts and push constant ranges; `None`
         // means no custom allocator.
-        let layout = unsafe { d.create_pipeline_layout(&info, None) }.map_err(|r| {
-            render_core::RhiError::Backend {
-                detail: format!("{r:?}"),
+        let layout = match unsafe { d.create_pipeline_layout(&info, None) } {
+            Ok(layout) => layout,
+            Err(result) => {
+                for layout in owned_set_layouts.drain(..) {
+                    unsafe { d.destroy_descriptor_set_layout(layout, None) };
+                }
+                return Err(render_core::RhiError::Backend {
+                    detail: format!("create pipeline layout: {result:?}"),
+                });
             }
-        })?;
+        };
         let (idx, gen) = self.pipeline_layouts.insert(PlEntry {
             layout,
             set_layouts: owned_set_layouts,
@@ -562,12 +1266,52 @@ impl render_core::Device for VulkanDevice {
         Ok(PipelineLayoutHandle::new(idx, gen))
     }
 
+    fn destroy_pipeline_layout(&mut self, layout: PipelineLayoutHandle) {
+        if let Some(layout) = self
+            .pipeline_layouts
+            .remove(layout.index, layout.generation)
+        {
+            for set_layout in layout.set_layouts {
+                unsafe {
+                    self.logical_device
+                        .device
+                        .destroy_descriptor_set_layout(set_layout, None);
+                }
+            }
+            unsafe {
+                self.logical_device
+                    .device
+                    .destroy_pipeline_layout(layout.layout, None);
+            }
+        }
+    }
+
     fn create_pipeline(
         &mut self,
         desc: &PipelineDescriptor,
     ) -> Result<PipelineHandle, render_core::RhiError> {
+        validate_graphics_pipeline_descriptor(desc)?;
         let d = &self.logical_device.device;
         let main = c"main";
+
+        if desc.shader_modules.is_empty() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "shader_modules".into(),
+                reason: "a graphics pipeline requires explicit shader module handles".into(),
+            });
+        }
+        if desc.render_pass.is_none() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "render_pass".into(),
+                reason: "a graphics pipeline requires an explicit render pass".into(),
+            });
+        }
+        if desc.pipeline_layout.is_none() {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "pipeline_layout".into(),
+                reason: "a graphics pipeline requires an explicit pipeline layout".into(),
+            });
+        }
 
         // ── Shader stages ──────────────────────────────────────────────
         // If the descriptor provides shader module handles, resolve them
@@ -575,69 +1319,126 @@ impl render_core::Device for VulkanDevice {
         // embedded vertex/fragment SPIR-V.  Skinned pipelines use the
         // dedicated skinned vertex shader (detected by the presence of a
         // uint32x4 vertex attribute, which indicates joints).
-        let is_skinned = desc
-            .vertex_layout
-            .attributes
+        let render_pass_handle = desc.render_pass.expect("render pass validated above");
+        let rp = self
+            .render_passes
+            .get(render_pass_handle.index, render_pass_handle.generation)
+            .copied()
+            .ok_or(render_core::RhiError::InvalidHandle)?;
+        let expected_colors = self
+            .rp_color_formats
+            .get(&render_pass_handle.index)
+            .ok_or(render_core::RhiError::InvalidHandle)?;
+        let requested_colors: Vec<_> = desc
+            .render_targets
             .iter()
-            .any(|a| a.format == "uint32x4");
-        let (sr, destroy_temp_modules) = if desc.shader_modules.is_empty() {
-            // Fallback: use mvp_vert_spv / mvp_frag_spv (or skinned vert)
-            let vert = if is_skinned {
-                self.skinned_vert_spv
-                    .as_deref()
-                    .or(self.mvp_vert_spv.as_deref())
-            } else {
-                self.mvp_vert_spv.as_deref()
-            };
-            let frag = self.mvp_frag_spv.as_deref();
-            let (vs, fs) = (
-                vert.ok_or_else(|| render_core::RhiError::Backend {
-                    detail: "no vert spv".into(),
-                })?,
-                frag.ok_or_else(|| render_core::RhiError::Backend {
-                    detail: "no frag spv".into(),
-                })?,
-            );
-            // SAFETY: `d` is a valid AshDevice; `vs`/`fs` contain valid SPIR-V.
-            let vm = (unsafe { mk_sm(d, vs) }).map_err(|e| render_core::RhiError::Backend {
-                detail: format!("{e}"),
-            })?;
-            let fm = (unsafe { mk_sm(d, fs) }).map_err(|e| render_core::RhiError::Backend {
-                detail: format!("{e}"),
-            })?;
-            let stages: Vec<vk::PipelineShaderStageCreateInfo> = vec![
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::VERTEX)
-                    .module(vm)
-                    .name(main),
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(vk::ShaderStageFlags::FRAGMENT)
-                    .module(fm)
-                    .name(main),
-            ];
-            // These temp modules must be destroyed after pipeline creation.
-            let temp_modules = vec![vm, fm];
-            (stages, Some(temp_modules))
-        } else {
-            // Resolve shader modules from handles
-            let stages: Vec<vk::PipelineShaderStageCreateInfo> = desc
+            .copied()
+            .map(texture_format)
+            .collect();
+        if requested_colors != *expected_colors {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "pipeline.render_targets".into(),
+                reason: "pipeline color formats do not match the render pass".into(),
+            });
+        }
+        let expected_samples = self
+            .rp_sample_counts
+            .get(&render_pass_handle.index)
+            .copied()
+            .ok_or(render_core::RhiError::InvalidHandle)?;
+        if desc.sample_count.unwrap_or(1) != expected_samples {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "pipeline.sample_count".into(),
+                reason: format!(
+                    "pipeline sample count {} does not match render pass sample count {expected_samples}",
+                    desc.sample_count.unwrap_or(1)
+                ),
+            });
+        }
+        let render_pass_depth = self
+            .rp_depth_formats
+            .get(&render_pass_handle.index)
+            .copied();
+        let requested_depth = desc.depth_state.format.map(texture_format);
+        if requested_depth.is_some() && requested_depth != render_pass_depth {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "pipeline.depth_state.format".into(),
+                reason: "pipeline depth format does not match the render pass".into(),
+            });
+        }
+        if (desc.depth_state.write_enabled || desc.depth_state.compare.is_some())
+            && render_pass_depth.is_none()
+        {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "pipeline.depth_state".into(),
+                reason: "depth testing requires a render pass depth attachment".into(),
+            });
+        }
+        let pipeline_layout_handle = desc
+            .pipeline_layout
+            .expect("pipeline layout validated above");
+        let pll = self
+            .pipeline_layouts
+            .get(
+                pipeline_layout_handle.index,
+                pipeline_layout_handle.generation,
+            )
+            .map(|entry| entry.layout)
+            .ok_or(render_core::RhiError::InvalidHandle)?;
+
+        let (specialization_data, specialization_entries) =
+            vulkan_specialization_data(&desc.specialization);
+        let specialization_info = vk::SpecializationInfo::default()
+            .map_entries(&specialization_entries)
+            .data(&specialization_data);
+        let has_specialization = !specialization_entries.is_empty();
+        let mut has_vertex = false;
+        let mut has_fragment = false;
+        let mut sr = Vec::with_capacity(desc.shader_modules.len());
+        for handle in &desc.shader_modules {
+            let (shader, stage) = self
                 .shader_modules
-                .iter()
-                .map(|handle| {
-                    let (sm, stage) = self
-                        .shader_modules
-                        .get(handle.index, handle.generation)
-                        .copied()
-                        .ok_or(render_core::RhiError::InvalidHandle)?;
-                    Ok(vk::PipelineShaderStageCreateInfo::default()
-                        .stage(stage)
-                        .module(sm)
-                        .name(main))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            // Modules are owned by the slab; do NOT destroy them here.
-            (stages, None)
-        };
+                .get(handle.index, handle.generation)
+                .copied()
+                .ok_or(render_core::RhiError::InvalidHandle)?;
+            if stage == vk::ShaderStageFlags::VERTEX {
+                if has_vertex {
+                    return Err(render_core::RhiError::InvalidDescriptor {
+                        field: "pipeline.shader_modules".into(),
+                        reason: "graphics shader stages must not be duplicated".into(),
+                    });
+                }
+                has_vertex = true;
+            } else if stage == vk::ShaderStageFlags::FRAGMENT {
+                if has_fragment {
+                    return Err(render_core::RhiError::InvalidDescriptor {
+                        field: "pipeline.shader_modules".into(),
+                        reason: "graphics shader stages must not be duplicated".into(),
+                    });
+                }
+                has_fragment = true;
+            } else {
+                return Err(render_core::RhiError::InvalidDescriptor {
+                    field: "pipeline.shader_modules".into(),
+                    reason: "graphics pipelines accept only vertex and fragment shaders".into(),
+                });
+            }
+            let mut stage_info = vk::PipelineShaderStageCreateInfo::default()
+                .stage(stage)
+                .module(shader)
+                .name(main);
+            if has_specialization {
+                stage_info = stage_info.specialization_info(&specialization_info);
+            }
+            sr.push(stage_info);
+        }
+        if !has_vertex || (!desc.render_targets.is_empty() && !has_fragment) {
+            return Err(render_core::RhiError::InvalidDescriptor {
+                field: "pipeline.shader_modules".into(),
+                reason: "a vertex shader and, for color output, a fragment shader are required"
+                    .into(),
+            });
+        }
 
         // ── Vertex input state ─────────────────────────────────────────
         let stride = desc.vertex_layout.stride_bytes;
@@ -678,7 +1479,7 @@ impl render_core::Device for VulkanDevice {
             _ => vk::CullModeFlags::NONE,
         };
         let front_face = match desc.raster_state.front_face.as_deref() {
-            Some("clockwise") => vk::FrontFace::CLOCKWISE,
+            Some("clockwise" | "cw") => vk::FrontFace::CLOCKWISE,
             _ => vk::FrontFace::COUNTER_CLOCKWISE,
         };
         let rs = vk::PipelineRasterizationStateCreateInfo::default()
@@ -696,7 +1497,7 @@ impl render_core::Device for VulkanDevice {
             Some(mode) => blend_attachment_from_mode(mode),
             None => blend_attachment_from_mode("Opaque"),
         };
-        let cba = [blend_attachment];
+        let cba = vec![blend_attachment; desc.render_targets.len()];
         let cb = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(&cba);
@@ -708,66 +1509,7 @@ impl render_core::Device for VulkanDevice {
         // ── Render pass ────────────────────────────────────────────────
         // If the descriptor carries a handle, resolve it; otherwise create
         // an inline render pass from the descriptor's render targets.
-        let rp = match desc.render_pass {
-            Some(h) => self
-                .render_passes
-                .get(h.index, h.generation)
-                .copied()
-                .ok_or(render_core::RhiError::InvalidHandle)?,
-            None => {
-                // Check cached mvp_rp first, then create inline
-                if let Some(rp_) = self.mvp_rp {
-                    rp_
-                } else {
-                    let fmt = color_attachment_format(
-                        desc.render_targets.first(),
-                        self.swapchain.as_ref().map(|swapchain| swapchain.format),
-                    );
-                    let at = vk::AttachmentDescription::default()
-                        .format(fmt)
-                        .samples(parse_sample_count(desc.sample_count))
-                        .load_op(vk::AttachmentLoadOp::CLEAR)
-                        .store_op(vk::AttachmentStoreOp::STORE)
-                        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-                        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                        .initial_layout(vk::ImageLayout::UNDEFINED)
-                        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
-                    let cr = vk::AttachmentReference::default()
-                        .attachment(0)
-                        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-                    let crs = [cr];
-                    let atts = [at];
-                    let sp = vk::SubpassDescription::default()
-                        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                        .color_attachments(&crs);
-                    let sps = [sp];
-                    let dep = default_dep();
-                    let deps = [dep];
-                    let rpi = vk::RenderPassCreateInfo::default()
-                        .attachments(&atts)
-                        .subpasses(&sps)
-                        .dependencies(&deps);
-                    // SAFETY: `d` is a valid AshDevice; `rpi` describes a
-                    // valid render pass; `None` means no custom allocator.
-                    unsafe { d.create_render_pass(&rpi, None) }.map_err(|r| {
-                        render_core::RhiError::Backend {
-                            detail: format!("{r:?}"),
-                        }
-                    })?
-                }
-            }
-        };
-
         // ── Pipeline layout ────────────────────────────────────────────
-        let pll = match desc.pipeline_layout {
-            Some(h) => self
-                .pipeline_layouts
-                .get(h.index, h.generation)
-                .map(|e| e.layout)
-                .unwrap_or(vk::PipelineLayout::null()),
-            None => vk::PipelineLayout::null(),
-        };
-
         // ── Depth stencil state ────────────────────────────────────────
         let depth_enabled = desc.depth_state.write_enabled || desc.depth_state.compare.is_some();
         let ds_state = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -796,17 +1538,6 @@ impl render_core::Device for VulkanDevice {
             .map_err(|(_, r)| render_core::RhiError::Backend {
                 detail: format!("{r:?}"),
             })?[0];
-
-        // Destroy temporary shader modules created in the fallback path.
-        if let Some(modules) = destroy_temp_modules {
-            // SAFETY: modules were created by this device and are no longer
-            // needed after pipeline creation; `None` means no custom allocator.
-            for m in modules {
-                unsafe {
-                    d.destroy_shader_module(m, None);
-                }
-            }
-        }
 
         let (idx, gen) = self.pipelines.insert(PipeEntry { pipeline });
         Ok(PipelineHandle::new(idx, gen))
@@ -853,8 +1584,6 @@ impl render_core::Device for VulkanDevice {
         let encoder = Box::new(VkCmdEncoder {
             device: self.logical_device.device.clone(),
             cmd: f.command_buffer,
-            shadow_map: self.shadow_map.unwrap_or(vk::Image::null()),
-            hdr_image: self.hdr_color_image.unwrap_or(vk::Image::null()),
             // Snapshot slab entries into owned Vec caches — no raw pointers.
             pipeline_cache: self
                 .pipelines
@@ -869,7 +1598,21 @@ impl render_core::Device for VulkanDevice {
                 .map(|s| s.as_ref().map(|(g, e)| (*g, e.buffer)))
                 .collect(),
             render_pass_cache: self.render_passes.slots.clone(),
-            framebuffer_cache: self.framebuffers.slots.clone(),
+            framebuffer_cache: self
+                .framebuffers
+                .slots
+                .iter()
+                .map(|slot| {
+                    slot.as_ref().map(|(generation, entry)| {
+                        (
+                            *generation,
+                            entry.framebuffer,
+                            entry.color_attachment_count,
+                            entry.has_depth,
+                        )
+                    })
+                })
+                .collect(),
             pipeline_layout_cache: self
                 .pipeline_layouts
                 .slots
@@ -877,6 +1620,7 @@ impl render_core::Device for VulkanDevice {
                 .map(|s| s.as_ref().map(|(g, e)| (*g, e.layout)))
                 .collect(),
             current_desc_set: desc_set,
+            render_pass_active: false,
         });
 
         // Pre-bind the shadow descriptor set at set=1 (if available) so that
@@ -922,7 +1666,11 @@ impl render_core::Device for VulkanDevice {
             unsafe {
                 let _ = self.logical_device.device.device_wait_idle();
             };
-            self.swapchain = None;
+            // Keep the swapchain and every framebuffer that references its
+            // image views alive until SceneRenderer starts the next frame. It
+            // can then destroy its own framebuffers before device-owned HDR/UI
+            // resources and the swapchain are torn down in dependency order.
+            self.swapchain_recreate_pending = true;
         }
         self.current_frame = (fi + 1) % 2;
         if let Some(instance) = self.instance.as_ref() {
@@ -1420,6 +2168,80 @@ mod tests {
             .expect("contiguous layouts should be sorted by set index");
         assert_eq!(ordered[0].set_index, 0);
         assert_eq!(ordered[1].set_index, 1);
+    }
+
+    #[test]
+    fn descriptor_bindings_reject_duplicates_and_unknown_resource_kinds() {
+        let duplicate = BindGroupLayoutDescriptor {
+            set_index: 0,
+            bindings: vec![
+                render_core::BindGroupLayoutBinding {
+                    binding: 1,
+                    resource_kind: "uniform_buffer".into(),
+                },
+                render_core::BindGroupLayoutBinding {
+                    binding: 1,
+                    resource_kind: "sampler".into(),
+                },
+            ],
+        };
+        assert!(vulkan_descriptor_bindings(&duplicate).is_err());
+
+        let unknown = BindGroupLayoutDescriptor {
+            set_index: 0,
+            bindings: vec![render_core::BindGroupLayoutBinding {
+                binding: 0,
+                resource_kind: "mystery_resource".into(),
+            }],
+        };
+        assert!(vulkan_descriptor_bindings(&unknown).is_err());
+        assert_eq!(
+            resource_kind_to_descriptor_type("sampler").unwrap(),
+            vk::DescriptorType::SAMPLER
+        );
+    }
+
+    #[test]
+    fn graphics_pipeline_validation_rejects_silent_fallback_inputs() {
+        let descriptor = PipelineDescriptor {
+            topology: Some("unknown".into()),
+            ..PipelineDescriptor::default()
+        };
+        assert!(validate_graphics_pipeline_descriptor(&descriptor).is_err());
+
+        let descriptor = PipelineDescriptor {
+            vertex_layout: render_core::VertexLayout {
+                stride_bytes: 8,
+                attributes: vec![render_core::VertexAttribute {
+                    semantic: "position".into(),
+                    format: "float32x3".into(),
+                    offset_bytes: 0,
+                }],
+            },
+            ..PipelineDescriptor::default()
+        };
+        assert!(validate_graphics_pipeline_descriptor(&descriptor).is_err());
+    }
+
+    #[test]
+    fn specialization_data_uses_four_byte_vulkan_scalars() {
+        let constants = [
+            render_core::SpecConstant {
+                id: 4,
+                value: render_core::SpecValue::Bool(true),
+            },
+            render_core::SpecConstant {
+                id: 9,
+                value: render_core::SpecValue::F32(2.5),
+            },
+        ];
+        let (data, entries) = vulkan_specialization_data(&constants);
+        assert_eq!(data.len(), 8);
+        assert_eq!(&data[..4], &1u32.to_ne_bytes());
+        assert_eq!(&data[4..], &2.5f32.to_ne_bytes());
+        assert_eq!(entries[0].constant_id, 4);
+        assert_eq!(entries[0].size, 4);
+        assert_eq!(entries[1].offset, 4);
     }
 
     #[test]

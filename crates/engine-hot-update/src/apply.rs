@@ -739,17 +739,16 @@ mod tests {
             }),
         }];
 
-        let dir = std::env::temp_dir().join("apply_asm_copy");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/GameAssembly.dll"), b"assembly data").unwrap();
 
-        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir, &PlatformKind::Android);
+        let diags = UpdateApplier::apply_android_assembly(&manifest, dir, &PlatformKind::Android);
         assert!(diags.iter().any(|d| d.code == "HOT_UPDATE_ASSEMBLY_OK"));
 
         // Clean up
         let _ = std::fs::remove_file("assets/assemblies/GameAssembly.dll");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -767,11 +766,10 @@ mod tests {
             }),
         }];
 
-        let dir = std::env::temp_dir().join("apply_asm_miss");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
 
-        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir, &PlatformKind::Android);
+        let diags = UpdateApplier::apply_android_assembly(&manifest, dir, &PlatformKind::Android);
         assert!(diags
             .iter()
             .any(|d| d.code == "HOT_UPDATE_ASSEMBLY_MISSING"));
@@ -792,12 +790,12 @@ mod tests {
             }),
         }];
 
-        let dir = std::env::temp_dir().join("apply_asm_all");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         std::fs::create_dir_all(dir.join("all")).unwrap();
         std::fs::write(dir.join("all/asm.dll"), b"assembly").unwrap();
 
-        let diags = UpdateApplier::apply_android_assembly(&manifest, &dir, &PlatformKind::Android);
+        let diags = UpdateApplier::apply_android_assembly(&manifest, dir, &PlatformKind::Android);
         // "All" platform is matched by the apply logic.
         let codes: Vec<_> = diags.iter().map(|d| d.code.as_str()).collect();
         assert!(
@@ -806,7 +804,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_file("assets/assemblies/asm.dll");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

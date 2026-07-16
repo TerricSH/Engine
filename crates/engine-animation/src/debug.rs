@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use engine_renderer::{DebugDrawBuffer, DebugDrawProvider};
 use glam::{Mat4, Vec3};
@@ -20,15 +20,16 @@ pub struct SkeletonDebugInfo {
 ///
 /// Draws a small sphere at each joint position and a line from each joint
 /// to its parent.
+#[derive(Clone)]
 pub struct SkeletonDebugDraw {
-    skeletons: Mutex<Vec<SkeletonDebugInfo>>,
+    skeletons: Arc<Mutex<Vec<SkeletonDebugInfo>>>,
 }
 
 impl SkeletonDebugDraw {
     /// Create a new empty skeleton debug drawer.
     pub fn new() -> Self {
         Self {
-            skeletons: Mutex::new(Vec::new()),
+            skeletons: Arc::new(Mutex::new(Vec::new())),
         }
     }
 

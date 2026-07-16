@@ -15,10 +15,6 @@ use render_core::{
 pub(crate) struct VkCmdEncoder {
     pub(crate) device: AshDevice,
     pub(crate) cmd: vk::CommandBuffer,
-    /// Shadow map image for pipeline barrier (null = no shadow map).
-    pub(crate) shadow_map: vk::Image,
-    /// HDR color image for pipeline barrier (null = no HDR).
-    pub(crate) hdr_image: vk::Image,
     /// Snapshot of slab entries taken at encoder creation.
     /// Each slot: `Some((generation, pipeline))` if occupied.
     pub(crate) pipeline_cache: Vec<Option<(u32, vk::Pipeline)>>,
@@ -30,12 +26,13 @@ pub(crate) struct VkCmdEncoder {
     pub(crate) render_pass_cache: Vec<Option<(u32, vk::RenderPass)>>,
     /// Snapshot of slab entries taken at encoder creation.
     /// Each slot: `Some((generation, framebuffer))` if occupied.
-    pub(crate) framebuffer_cache: Vec<Option<(u32, vk::Framebuffer)>>,
+    pub(crate) framebuffer_cache: Vec<Option<(u32, vk::Framebuffer, u32, bool)>>,
     /// Snapshot of slab entries taken at encoder creation.
     /// Each slot: `Some((generation, layout))` if occupied.
     pub(crate) pipeline_layout_cache: Vec<Option<(u32, vk::PipelineLayout)>>,
     // Per-frame descriptor set (set=0 per FD-041), set by begin_frame
     pub(crate) current_desc_set: vk::DescriptorSet,
+    pub(crate) render_pass_active: bool,
 }
 // VkCmdEncoder: all fields are Send (AshDevice and Vulkan handles), no raw pointers.
 // The unsafe impl Send is removed — Send is derived automatically.
@@ -47,7 +44,7 @@ impl CmdEncoderTrait for VkCmdEncoder {
         fb: FramebufferHandle,
         area: (u32, u32, u32, u32),
         clear: [f32; 4],
-        _depth: Option<f32>,
+        depth: Option<f32>,
     ) {
         let rp_ = self.render_pass_cache.get(rp.index as usize).and_then(|s| {
             s.as_ref()
@@ -56,14 +53,28 @@ impl CmdEncoderTrait for VkCmdEncoder {
         });
         let fb_ = self.framebuffer_cache.get(fb.index as usize).and_then(|s| {
             s.as_ref()
-                .filter(|(g, _)| *g == fb.generation)
-                .map(|(_, v)| *v)
+                .filter(|(g, ..)| *g == fb.generation)
+                .map(|(_, v, color_count, has_depth)| (*v, *color_count, *has_depth))
         });
-        if let (Some(rp_), Some(fb_)) = (rp_, fb_) {
-            let cc = vk::ClearValue {
-                color: vk::ClearColorValue { float32: clear },
-            };
-            let cc_arr = [cc];
+        if let (Some(rp_), Some((fb_, color_count, has_depth))) = (rp_, fb_) {
+            if self.render_pass_active {
+                return;
+            }
+            let mut clear_values =
+                Vec::with_capacity(color_count as usize + usize::from(has_depth));
+            for _ in 0..color_count {
+                clear_values.push(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: clear },
+                });
+            }
+            if has_depth {
+                clear_values.push(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: depth.unwrap_or(1.0),
+                        stencil: 0,
+                    },
+                });
+            }
             let rpbi = vk::RenderPassBeginInfo::default()
                 .render_pass(rp_)
                 .framebuffer(fb_)
@@ -77,11 +88,12 @@ impl CmdEncoderTrait for VkCmdEncoder {
                         height: area.3,
                     },
                 })
-                .clear_values(&cc_arr);
+                .clear_values(&clear_values);
             unsafe {
                 self.device
                     .cmd_begin_render_pass(self.cmd, &rpbi, vk::SubpassContents::INLINE);
             }
+            self.render_pass_active = true;
         }
     }
     fn bind_pipeline(&mut self, p: PipelineHandle) {
@@ -136,33 +148,44 @@ impl CmdEncoderTrait for VkCmdEncoder {
         &mut self,
         pl: PipelineLayoutHandle,
         fs: u32,
-        _: &[render_core::DescriptorSetHandle],
+        sets: &[render_core::DescriptorSetHandle],
         do_: &[u32],
-    ) {
-        if let Some(&layout) = self
+    ) -> Result<(), render_core::RhiError> {
+        if !sets.is_empty() {
+            return Err(render_core::RhiError::UnsupportedFeature {
+                feature: "binding external Vulkan descriptor-set handles through the portable RHI"
+                    .to_owned(),
+            });
+        }
+
+        let layout = self
             .pipeline_layout_cache
             .get(pl.index as usize)
             .and_then(|s| {
                 s.as_ref()
                     .filter(|(g, _)| *g == pl.generation)
-                    .map(|(_, l)| l)
+                    .map(|(_, l)| *l)
             })
-        {
-            let set = self.current_desc_set;
-            if set != vk::DescriptorSet::null() {
-                let sets = [set];
-                unsafe {
-                    self.device.cmd_bind_descriptor_sets(
-                        self.cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        layout,
-                        fs,
-                        &sets,
-                        do_,
-                    );
-                }
-            }
+            .ok_or(render_core::RhiError::InvalidHandle)?;
+        let set = self.current_desc_set;
+        if set == vk::DescriptorSet::null() {
+            return Err(render_core::RhiError::UnsupportedFeature {
+                feature: "binding the per-frame Vulkan descriptor set before it is allocated"
+                    .to_owned(),
+            });
         }
+        let frame_sets = [set];
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                fs,
+                &frame_sets,
+                do_,
+            );
+        }
+        Ok(())
     }
     fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, md: f32, mxd: f32) {
         unsafe {
@@ -211,20 +234,24 @@ impl CmdEncoderTrait for VkCmdEncoder {
         offset: u64,
         draw_count: u32,
         stride: u32,
-    ) {
-        if let Some(&buf) = self.buffer_cache.get(buffer.index as usize).and_then(|s| {
-            s.as_ref()
-                .filter(|(g, _)| *g == buffer.generation)
-                .map(|(_, b)| b)
-        }) {
-            // SAFETY: command buffer is in recording state; `buf` is a valid
-            // VkBuffer with INDIRECT_BUFFER usage; draw_count, offset and stride
-            // are within the buffer's bounds.
-            unsafe {
-                self.device
-                    .cmd_draw_indexed_indirect(self.cmd, buf, offset, draw_count, stride);
-            }
+    ) -> Result<(), render_core::RhiError> {
+        let buf = self
+            .buffer_cache
+            .get(buffer.index as usize)
+            .and_then(|slot| {
+                slot.as_ref()
+                    .filter(|(generation, _)| *generation == buffer.generation)
+                    .map(|(_, buffer)| *buffer)
+            })
+            .ok_or(render_core::RhiError::InvalidHandle)?;
+        // SAFETY: command buffer is in recording state; `buf` is a valid
+        // VkBuffer owned by this device. Buffer usage/range validation is done
+        // when the RHI buffer and draw list are built.
+        unsafe {
+            self.device
+                .cmd_draw_indexed_indirect(self.cmd, buf, offset, draw_count, stride);
         }
+        Ok(())
     }
     fn push_constants(&mut self, pl: PipelineLayoutHandle, sf: u32, off: u32, data: &[u8]) {
         if let Some(&layout) = self
@@ -248,75 +275,11 @@ impl CmdEncoderTrait for VkCmdEncoder {
         }
     }
     fn end_render_pass(&mut self) {
-        unsafe {
-            self.device.cmd_end_render_pass(self.cmd);
-        }
-    }
-
-    fn hdr_barrier(&mut self) {
-        if self.hdr_image == vk::Image::null() {
-            return;
-        }
-        // Transition HDR color image from COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
-        // so the tone-mapping pass can sample it as a texture.
-        let barrier = vk::ImageMemoryBarrier::default()
-            .image(self.hdr_image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        // SAFETY: command buffer is in recording state; barrier references
-        // a valid HDR color image handle that outlives this encoder.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-        }
-    }
-
-    fn shadow_barrier(&mut self) {
-        if self.shadow_map == vk::Image::null() {
-            return;
-        }
-        // Barrier covers all 3 cascade layers (CSM).
-        let barrier = vk::ImageMemoryBarrier::default()
-            .image(self.shadow_map)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 3,
-            })
-            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
-            .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
-        // SAFETY: command buffer is in recording state; barrier references
-        // a valid shadow image handle that outlives this encoder.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
+        if self.render_pass_active {
+            unsafe {
+                self.device.cmd_end_render_pass(self.cmd);
+            }
+            self.render_pass_active = false;
         }
     }
 }

@@ -12,6 +12,7 @@ default = []
 bincode.workspace = true
 crossbeam-channel.workspace = true
 engine-serialize = { path = "../engine-serialize" }
+engine-scene = { path = "../engine-scene" }
 glam.workspace = true
 gltf.workspace = true
 image.workspace = true

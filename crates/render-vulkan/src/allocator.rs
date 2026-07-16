@@ -24,6 +24,16 @@ mod inner {
     use ash::vk;
     use ash::Device as AshDevice;
 
+    fn rollback_on_error<T, E>(result: Result<T, E>, rollback: impl FnOnce()) -> Result<T, E> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                rollback();
+                Err(error)
+            }
+        }
+    }
+
     /// Location hint that guides memory-type selection.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum MemoryLocation {
@@ -111,11 +121,17 @@ mod inner {
             let mapped_ptr = match desc.location {
                 MemoryLocation::GpuOnly => None,
                 _ => {
-                    let p = unsafe {
+                    // If mapping fails, ownership has not reached an
+                    // `Allocation` yet, so roll back the successful Vulkan
+                    // allocation before returning the error.
+                    let map_result = unsafe {
                         self.device
                             .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-                            .map_err(|e| format!("vkMapMemory({}): {:?}", desc.name, e))?
                     };
+                    let p = rollback_on_error(map_result, || unsafe {
+                        self.device.free_memory(memory, None);
+                    })
+                    .map_err(|e| format!("vkMapMemory({}): {:?}", desc.name, e))?;
                     Some(p as *mut u8)
                 }
             };
@@ -163,6 +179,28 @@ mod inner {
                 }
             }
             None
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::rollback_on_error;
+        use std::cell::Cell;
+
+        #[test]
+        fn rollback_runs_only_when_the_wrapped_operation_fails() {
+            let rollback_count = Cell::new(0);
+            let success = rollback_on_error(Ok::<_, ()>(7), || {
+                rollback_count.set(rollback_count.get() + 1);
+            });
+            assert_eq!(success, Ok(7));
+            assert_eq!(rollback_count.get(), 0);
+
+            let failure = rollback_on_error(Err::<(), _>("map failed"), || {
+                rollback_count.set(rollback_count.get() + 1);
+            });
+            assert_eq!(failure, Err("map failed"));
+            assert_eq!(rollback_count.get(), 1);
         }
     }
 }

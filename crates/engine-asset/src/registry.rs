@@ -107,6 +107,62 @@ impl AssetRegistry {
         }
     }
 
+    /// Insert or atomically replace an already-decoded asset.
+    ///
+    /// This is the bridge used by importers, procedural generators, and
+    /// runtime systems that already own a typed value and therefore should not
+    /// serialize it merely to pass through an [`AssetLoader`]. Existing
+    /// [`AssetHandle`] values remain valid through their independent `Arc`.
+    pub fn insert_typed<T: Send + Sync + 'static>(
+        &mut self,
+        id: AssetId,
+        value: T,
+    ) -> AssetHandle<T> {
+        let typed = Arc::new(value);
+        self.cache.insert(
+            id.clone(),
+            CachedEntry {
+                _info: AssetInfo {
+                    id: id.clone(),
+                    path: asset_path(&id).map(|path| path.display().to_string()),
+                    state: AssetState::Ready,
+                },
+                raw_bytes: Arc::new(Vec::new()),
+                typed: Some(Arc::clone(&typed) as Arc<dyn Any + Send + Sync>),
+            },
+        );
+        AssetHandle { id, inner: typed }
+    }
+
+    /// Insert an asset produced by a type-erased subsystem loader.
+    ///
+    /// Extension registries choose the concrete type at runtime, so their
+    /// loaders cannot call [`insert_typed`](Self::insert_typed) directly.
+    /// This bridge preserves the cooked payload for raw inspection while
+    /// retaining the decoded value in the same cache used by typed assets.
+    /// Callers should finish validating a complete load batch before invoking
+    /// this method because insertion replaces an existing asset with the same
+    /// ID.
+    pub fn insert_erased(
+        &mut self,
+        id: AssetId,
+        raw_bytes: Vec<u8>,
+        value: Box<dyn Any + Send + Sync + 'static>,
+    ) {
+        self.cache.insert(
+            id.clone(),
+            CachedEntry {
+                _info: AssetInfo {
+                    id: id.clone(),
+                    path: asset_path(&id).map(|path| path.display().to_string()),
+                    state: AssetState::Ready,
+                },
+                raw_bytes: Arc::new(raw_bytes),
+                typed: Some(Arc::from(value)),
+            },
+        );
+    }
+
     /// Load an asset as raw bytes.
     ///
     /// Resolves the filesystem path via [`asset_path`], reads the file,

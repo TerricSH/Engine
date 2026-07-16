@@ -20,6 +20,7 @@ Every frozen contract must have an owner gate, a version, a validation command, 
 | `RHI-v0` | Gate 1 | Gate 2 renderer backends | Backend reports required features and limits before device creation | Device creation returns `UnsupportedFeature` or `UnsupportedLimit`; no partial device |
 | `RendererInput-v0` | Gate 3 | ECS extraction, UI, debug draw, animation runtime (skinned items, v0.2), renderer | Contract version and required asset/material fields before frame submission; skinned-item palette/skeleton size match | Frame is not submitted; skinned item with palette/skeleton mismatch is dropped with diagnostic while rest of frame still submits |
 | `ECSScene-v0` | Gate 4 | Editor, scripts, prefabs, gameplay systems | Schema version, component registry, IDs, references, active camera | Load fails before runtime world mutation |
+| `GameProject-v0` | Gate 19 | Project CLI, editor, player, asset cooker, packaging | `sandbox project check`: schema, safe relative paths, startup scene, authoring inputs, strict ECS restoration | Command fails before editor/player startup or package staging |
 | `AssetRegistry-v0` | Gate 5 | Renderer, scenes, scripts, hot update, packages | Registry schema, asset IDs, hashes, dependencies, platform profile | Snapshot swap is aborted; old registry remains active |
 | `CookedShader-v0` | Gate 5 (cook) / Gate 2 (consumer) | All render backends (`render-vulkan`, `render-opengl`, `render-dx12`) | Contract version, `target_platform` matches runtime platform, `entry_point == "main"`, four-set `reflected_layout` shape, presence of `glsl` / `dxil` blobs matches enabled `backend-*` features, `cook_inputs_hash` equality | Shader load is rejected with `SH0001 NonMainEntryPoint` / `SH0007 PlatformMismatch`; renderer falls back to `variant_key = 0` with `RV0011 ShaderVariantMissing` if the requested variant is absent; PSO cache mismatch is silently ignored (cache is per-machine) |
 | `ScriptAPI-v0` | Gate 5 | C# scripts, mobile subset, gameplay APIs | Required API version and platform capability flags at assembly/component load | Script component is faulted or disabled; world continues |
@@ -100,6 +101,15 @@ Two notation styles coexist and **must not** be mixed within one subsystem:
 | `rhi.*` | Gate 1 | `RhiError` variant mapping per `FD-032` (see [gate-01-workspace-rhi/01-code-architecture.md](gate-01-workspace-rhi/01-code-architecture.md) § Error Model) |
 
 ### Active Codes
+
+#### Asset (`AS`)
+
+| Code | Severity | Emitter | Meaning |
+|---|---|---|---|
+| `AS0001` `RegisteredAssetIdMismatch` | error | Engine core asset registry bridge | A typed render upload embeds a different ID from the ID used to register it. |
+| `AS0002` `CookedAssetLoadFailed` | error | Engine core cooked asset loader | A cooked path, header, payload length, hash, type, mesh, or texture cannot be validated before runtime registration. |
+
+`AS0003+` is available for future Gate 5 asset registry and cooker allocations.
 
 #### Shader (`SH`)
 

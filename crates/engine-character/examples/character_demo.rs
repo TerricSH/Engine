@@ -19,7 +19,7 @@ use engine_scene::components::Transform;
 use engine_scene::World;
 use glam::{Mat4, Vec3};
 use platform::winit::window::Window;
-use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
+use platform::{EventFlow, KeyCode, PlatformEvent, WindowApp, WindowDescriptor};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use render_core::{BufferDescriptor, BufferHandle, Device, MemoryHint};
 use render_vulkan::device_impl::VulkanDevice;
@@ -33,7 +33,7 @@ struct App {
     renderer: Option<Backend>,
     frames: u64,
     last_frame: Instant,
-    keys: HashSet<u32>,
+    keys: HashSet<KeyCode>,
     ctrl: CharacterController,
     physics: Option<PhysicsWorld>,
     _world: World,
@@ -107,7 +107,7 @@ fn build_buffers(dev: &mut VulkanDevice) -> (BufferHandle, BufferHandle, u32) {
     let vb = dev
         .create_buffer(&BufferDescriptor {
             size_bytes: vert.len() as u64,
-            usage_flags: render_core::BufferUsage(0),
+            usage_flags: render_core::BufferUsage::VERTEX,
             memory_hint: MemoryHint::CpuToGpu,
             debug_label: Some("v".into()),
         })
@@ -116,7 +116,7 @@ fn build_buffers(dev: &mut VulkanDevice) -> (BufferHandle, BufferHandle, u32) {
     let ibh = dev
         .create_buffer(&BufferDescriptor {
             size_bytes: ib.len() as u64,
-            usage_flags: render_core::BufferUsage(0),
+            usage_flags: render_core::BufferUsage::INDEX,
             memory_hint: MemoryHint::CpuToGpu,
             debug_label: Some("i".into()),
         })
@@ -187,16 +187,16 @@ impl WindowApp for App {
                 // Build movement command from key state
                 // (winit discriminant: W=41, A=19, S=37, D=22, Space=62)
                 let mut dir = Vec3::ZERO;
-                if self.keys.contains(&41) {
+                if self.keys.contains(&KeyCode::W) {
                     dir.z -= 1.0;
                 }
-                if self.keys.contains(&37) {
+                if self.keys.contains(&KeyCode::S) {
                     dir.z += 1.0;
                 }
-                if self.keys.contains(&19) {
+                if self.keys.contains(&KeyCode::A) {
                     dir.x -= 1.0;
                 }
-                if self.keys.contains(&22) {
+                if self.keys.contains(&KeyCode::D) {
                     dir.x += 1.0;
                 }
                 if dir.length_squared() > 0.0 {
@@ -207,7 +207,7 @@ impl WindowApp for App {
                 self.ctrl.push_command(CharacterCommand {
                     direction: dir,
                     desired_speed: 0.0,
-                    jump_requested: self.keys.contains(&62),
+                    jump_requested: self.keys.contains(&KeyCode::Space),
                 });
 
                 let input = engine_character::CharacterMovement {

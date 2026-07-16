@@ -23,7 +23,10 @@ impl VulkanDevice {
     /// objects. `acquire` resets the frame fence and signals the image-available
     /// semaphore, so merely dropping the encoder would deadlock or reuse a
     /// signalled binary semaphore on the next frame.
-    pub(crate) fn abort_current_frame_recording(&mut self) -> VkResult<()> {
+    /// This is public so lightweight clients that drive [`VulkanDevice`]
+    /// directly (without [`crate::SceneRenderer`]) can honour the same
+    /// fail-and-recover frame contract.
+    pub fn abort_current_frame_recording(&mut self) -> VkResult<()> {
         if self.frame_sync.is_empty() {
             return Ok(());
         }

@@ -14,6 +14,8 @@ pub(crate) struct Dx12SwapchainInner {
     pub(crate) back_buffers: Vec<ID3D12Resource>,
     pub(crate) rtv_heap: ID3D12DescriptorHeap,
     pub(crate) rtv_size: u32,
+    pub(crate) depth_buffer: ID3D12Resource,
+    pub(crate) dsv_heap: ID3D12DescriptorHeap,
     pub(crate) width: u32,
     pub(crate) height: u32,
 }

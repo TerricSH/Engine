@@ -16,6 +16,8 @@ glslc shaders/shadow.vert -o shaders/shadow.vert.spv
 glslc shaders/shadow.frag -o shaders/shadow.frag.spv
 glslc shaders/tonemap.vert -o shaders/tonemap.vert.spv
 glslc shaders/tonemap.frag -o shaders/tonemap.frag.spv
+glslc shaders/ui_overlay.vert -o shaders/ui_overlay.vert.spv
+glslc shaders/ui_overlay.frag -o shaders/ui_overlay.frag.spv
 ```
 
 For local development without the LunarG SDK, the checked-in sample
@@ -33,6 +35,8 @@ naga --input-kind glsl --shader-stage vert --entry-point main shaders/shadow.ver
 naga --input-kind glsl --shader-stage frag --entry-point main shaders/shadow.frag shaders/shadow.frag.spv
 naga --input-kind glsl --shader-stage vert --entry-point main shaders/tonemap.vert shaders/tonemap.vert.spv
 naga --input-kind glsl --shader-stage frag --entry-point main shaders/tonemap.frag shaders/tonemap.frag.spv
+naga --input-kind glsl --shader-stage vert --entry-point main shaders/ui_overlay.vert shaders/ui_overlay.vert.spv
+naga --input-kind glsl --shader-stage frag --entry-point main shaders/ui_overlay.frag shaders/ui_overlay.frag.spv
 ```
 
 `build.rs` picks the artifacts up automatically. When any `.spv` is

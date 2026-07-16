@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use engine_renderer::{
-    AxisAlignedBox, ClearFlags, ExtractionStats, LightItem, LightKind, Rect, RenderFrameInput,
-    RenderView, RenderableItem, ShadowMode, ViewCompose, IDENTITY_MAT4,
+    AxisAlignedBox, BlendMode, ClearFlags, ExtractionStats, LightItem, LightKind, Rect,
+    RenderFrameInput, RenderView, RenderableItem, ShadowMode, ViewCompose, IDENTITY_MAT4,
 };
 use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, PersistentId};
 
@@ -11,7 +11,7 @@ use crate::components;
 use crate::scene::{Scene, ECS_SCENE_CONTRACT};
 use crate::validation::{
     active_camera_entity, asset_field, bool_field, enabled_component, f32_field, light_kind_field,
-    string_field, validate_scene, vec3_field,
+    string_field, u32_field, validate_scene, vec3_field,
 };
 use crate::World;
 
@@ -35,6 +35,7 @@ pub fn extract_renderer_input(
 
     let mut input = RenderFrameInput::empty(frame_index);
     input.render_options.tone_mapping = scene.scene_settings.tone_mapping;
+    input.render_options.pass_graph_config = scene.scene_settings.pass_graph_config.clone();
     input.stats_scope = Some(scene.name.clone());
 
     let Some(camera_entity) = active_camera_entity(scene) else {
@@ -47,6 +48,21 @@ pub fn extract_renderer_input(
         .contract("ECSScene-v0", ECS_SCENE_CONTRACT)]);
     };
 
+    let camera_component = enabled_component(camera_entity, "engine.camera")
+        .expect("active_camera_entity only returns entities with an enabled camera");
+    let render_layer_mask = u32_field(camera_component, "render_layer_mask").unwrap_or(u32::MAX);
+    let camera_defaults = components::Camera::default();
+    let msaa_samples = u32_field(camera_component, "msaa_samples")
+        .and_then(|samples| u8::try_from(samples).ok())
+        .unwrap_or(camera_defaults.msaa_samples);
+    input.render_options.msaa_samples = msaa_samples;
+    input.render_options.exposure_ev100 = physical_exposure_ev100(
+        f32_field(camera_component, "aperture").unwrap_or(camera_defaults.aperture),
+        f32_field(camera_component, "shutter_speed").unwrap_or(camera_defaults.shutter_speed),
+        f32_field(camera_component, "iso").unwrap_or(camera_defaults.iso),
+        f32_field(camera_component, "ev_compensation").unwrap_or(camera_defaults.ev_compensation),
+    );
+
     input.views.push(RenderView {
         view_id: 0,
         camera_entity: Some(camera_entity.persistent_id.clone()),
@@ -56,8 +72,8 @@ pub fn extract_renderer_input(
         projection_matrix: IDENTITY_MAT4,
         clear_flags: ClearFlags::ColorAndDepth,
         clear_color: scene.scene_settings.ambient,
-        render_layer_mask: u32::MAX,
-        msaa_samples: 1,
+        render_layer_mask,
+        msaa_samples,
         compose: ViewCompose::Base {
             clear: ClearFlags::ColorAndDepth,
             clear_color: scene.scene_settings.ambient,
@@ -73,6 +89,17 @@ pub fn extract_renderer_input(
                     asset_field(renderable, "mesh"),
                     asset_field(renderable, "material"),
                 ) {
+                    let render_layer = string_field(renderable, "render_layer")
+                        .unwrap_or_else(|| scene.scene_settings.default_render_layer.clone());
+                    let Some(render_layer_bit) = render_layer_bit(&render_layer) else {
+                        return Err(vec![unknown_render_layer_diagnostic(
+                            &render_layer,
+                            Some(entity.persistent_id.clone()),
+                        )]);
+                    };
+                    if render_layer_mask & (1_u32 << render_layer_bit) == 0 {
+                        continue;
+                    }
                     let sk = batch_sort_key(&material, &mesh);
                     input.drawables.push(RenderableItem {
                         entity: Some(entity.persistent_id.clone()),
@@ -80,8 +107,7 @@ pub fn extract_renderer_input(
                         material,
                         world_transform: IDENTITY_MAT4,
                         bounds: AxisAlignedBox::UNIT,
-                        render_layer: string_field(renderable, "render_layer")
-                            .unwrap_or_else(|| scene.scene_settings.default_render_layer.clone()),
+                        render_layer,
                         cast_shadows: bool_field(renderable, "cast_shadows").unwrap_or(true),
                         sort_key: sk,
                     });
@@ -131,6 +157,8 @@ pub fn extract_renderer_input_from_world(
     frame_index: u64,
 ) -> Result<RenderFrameInput, Vec<Diagnostic>> {
     let mut input = RenderFrameInput::empty(frame_index);
+    input.render_options.tone_mapping = world.scene_settings().tone_mapping;
+    input.render_options.pass_graph_config = world.scene_settings().pass_graph_config.clone();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
     // Resolve every Transform once up front. Hierarchy corruption is fatal:
@@ -193,6 +221,71 @@ pub fn extract_renderer_input_from_world(
                 .entity(pid.clone()),
             );
         }
+        if let Some([x, y, width, height]) = camera.viewport_rect {
+            let viewport_is_valid = [x, y, width, height].into_iter().all(f32::is_finite)
+                && x >= 0.0
+                && y >= 0.0
+                && width > 0.0
+                && height > 0.0
+                && x + width <= 1.0
+                && y + height <= 1.0;
+            if !viewport_is_valid {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "SC0031",
+                        DiagnosticSeverity::Error,
+                        "engine-scene",
+                        format!(
+                            "Camera '{}' viewport_rect must be finite, positive, and contained in [0, 1]",
+                            pid.as_deref().unwrap_or("?")
+                        ),
+                    )
+                    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                    .path("components.engine.camera.viewport_rect")
+                    .entity(pid.clone()),
+                );
+            }
+        }
+        if !matches!(camera.msaa_samples, 1 | 2 | 4 | 8) {
+            diagnostics.push(
+                Diagnostic::new(
+                    "SC0032",
+                    DiagnosticSeverity::Error,
+                    "engine-scene",
+                    format!(
+                        "Camera '{}' msaa_samples must be one of 1, 2, 4, or 8 (got {})",
+                        pid.as_deref().unwrap_or("?"),
+                        camera.msaa_samples
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .path("components.engine.camera.msaa_samples")
+                .entity(pid.clone()),
+            );
+        }
+        if physical_exposure_ev100(
+            camera.aperture,
+            camera.shutter_speed,
+            camera.iso,
+            camera.ev_compensation,
+        )
+        .is_none()
+        {
+            diagnostics.push(
+                Diagnostic::new(
+                    "SC0034",
+                    DiagnosticSeverity::Error,
+                    "engine-scene",
+                    format!(
+                        "Camera '{}' exposure requires finite aperture/shutter/ISO values greater than zero and finite EV compensation",
+                        pid.as_deref().unwrap_or("?")
+                    ),
+                )
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .path("components.engine.camera.exposure")
+                .entity(pid.clone()),
+            );
+        }
 
         let determinant = world_matrix.determinant();
         if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
@@ -252,17 +345,35 @@ pub fn extract_renderer_input_from_world(
         return Err(diagnostics);
     }
 
-    // Sort by priority (ascending = earlier render).
-    cameras.sort_by_key(|(priority, _, _, _, _)| *priority);
+    // The active camera is the single Base view in v0. Other cameras become
+    // deterministic overlays. Worlds authored directly (without scene
+    // settings) use the lowest-priority camera as their Base view.
+    let active_camera = world.scene_settings().active_camera.as_deref();
+    cameras.sort_by(|left, right| {
+        let left_is_active = left.1.as_deref() == active_camera;
+        let right_is_active = right.1.as_deref() == active_camera;
+        right_is_active
+            .cmp(&left_is_active)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let base_camera = &cameras[0].2;
+    input.render_options.msaa_samples = base_camera.msaa_samples;
+    input.render_options.exposure_ev100 = physical_exposure_ev100(
+        base_camera.aperture,
+        base_camera.shutter_speed,
+        base_camera.iso,
+        base_camera.ev_compensation,
+    );
 
-    // Compute the primary frustum from the first camera for culling.
-    let primary_frustum: Option<[glam::Vec4; 6]> =
-        cameras.first().map(|(_, _, camera, world_matrix, _)| {
-            let view = compute_view_matrix(*world_matrix);
-            let proj = compute_projection_matrix(camera);
-            let view_proj = proj * view;
-            extract_frustum_planes(&view_proj)
-        });
+    let camera_frustums: Vec<[glam::Vec4; 6]> = cameras
+        .iter()
+        .map(|(_, _, camera, world_matrix, _)| {
+            extract_frustum_planes(
+                &(compute_projection_matrix(camera) * compute_view_matrix(*world_matrix)),
+            )
+        })
+        .collect();
 
     for (view_idx, (priority, pid, camera, world_matrix, _entity)) in cameras.iter().enumerate() {
         let view = compute_view_matrix(*world_matrix);
@@ -281,6 +392,24 @@ pub fn extract_renderer_input_from_world(
             None => Rect::FULL,
         };
 
+        let (view_clear_flags, compose) = if view_idx == 0 {
+            (
+                clear_flags,
+                ViewCompose::Base {
+                    clear: clear_flags,
+                    clear_color,
+                },
+            )
+        } else {
+            (
+                ClearFlags::Nothing,
+                ViewCompose::Overlay {
+                    base_view_id: 0,
+                    blend_mode: BlendMode::Replace,
+                },
+            )
+        };
+
         input.views.push(RenderView {
             view_id: view_idx as u32,
             camera_entity: pid.clone(),
@@ -288,14 +417,11 @@ pub fn extract_renderer_input_from_world(
             viewport_rect_normalized: viewport,
             view_matrix: view.to_cols_array(),
             projection_matrix: proj.to_cols_array(),
-            clear_flags,
+            clear_flags: view_clear_flags,
             clear_color,
             render_layer_mask: camera.render_layer_mask,
             msaa_samples: camera.msaa_samples,
-            compose: ViewCompose::Base {
-                clear: clear_flags,
-                clear_color,
-            },
+            compose,
             stack_order: *priority,
             frustum: frustum.map(|f| f.map(|p| p.to_array())),
         });
@@ -326,11 +452,22 @@ pub fn extract_renderer_input_from_world(
         let world_mat = world_matrix.to_cols_array();
         let (center, half_extents, world_bounds) = transform_bounds_to_world(bounds, world_matrix);
 
-        // Perform frustum culling against the primary camera frustum.
-        let is_visible = match &primary_frustum {
-            Some(frustum) => aabb_in_frustum(center, half_extents, frustum),
-            None => true,
+        let Some(layer_bit) = render_layer_bit(&renderable.render_layer) else {
+            diagnostics.push(unknown_render_layer_diagnostic(
+                &renderable.render_layer,
+                pid.clone(),
+            ));
+            continue;
         };
+        let layer_mask = 1_u32 << layer_bit;
+        let is_visible =
+            cameras
+                .iter()
+                .zip(&camera_frustums)
+                .any(|((_, _, camera, _, _), frustum)| {
+                    camera.render_layer_mask & layer_mask != 0
+                        && aabb_in_frustum(center, half_extents, frustum)
+                });
 
         if is_visible {
             visible_drawables += 1;
@@ -452,10 +589,13 @@ pub fn extract_renderer_input_from_world(
         culled_lights,
     });
 
-    // Emit warnings as non-fatal diagnostics.
-    if !diagnostics.is_empty() {
-        // Diagnostics are non-fatal; attach them to the result.
-        // In production they'd be routed to the diagnostics system.
+    if diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.severity,
+            DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+        )
+    }) {
+        return Err(diagnostics);
     }
 
     Ok(input)
@@ -464,6 +604,39 @@ pub fn extract_renderer_input_from_world(
 // ══════════════════════════════════════════════════════════════════════════════
 // Frustum culling
 // ══════════════════════════════════════════════════════════════════════════════
+
+/// Resolve a registered v0 render-layer name to its frozen bit index.
+/// Matching is ASCII case-insensitive; `Opaque` is retained as a compatibility
+/// alias for `Default`. User-reserved slots are named `User0` through `User26`.
+pub fn render_layer_bit(name: &str) -> Option<u32> {
+    let normalized = name.trim().to_ascii_lowercase().replace(['_', '-'], "");
+    match normalized.as_str() {
+        "default" | "opaque" => Some(0),
+        "transparent" => Some(1),
+        "ui" => Some(2),
+        "postprocess" => Some(3),
+        "debug" => Some(4),
+        _ => normalized
+            .strip_prefix("user")
+            .and_then(|suffix| suffix.parse::<u32>().ok())
+            .filter(|index| *index <= 26)
+            .map(|index| index + 5),
+    }
+}
+
+fn unknown_render_layer_diagnostic(layer: &str, entity: Option<PersistentId>) -> Diagnostic {
+    Diagnostic::new(
+        "SC0033",
+        DiagnosticSeverity::Error,
+        "engine-scene",
+        format!(
+            "unknown render layer '{layer}'; expected Default, Transparent, UI, PostProcess, Debug, or User0..User26"
+        ),
+    )
+    .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+    .path("components.engine.renderable.render_layer")
+    .entity(entity)
+}
 
 /// Extract the six frustum planes from a right-handed, zero-to-one-depth
 /// view-projection matrix.
@@ -800,6 +973,37 @@ fn map_clear_flags(flags: u8) -> ClearFlags {
     }
 }
 
+/// Compute physical EV100 for the renderer-wide exposure override.
+///
+/// RendererInput-v0 has no per-view exposure field yet, so the sorted base
+/// camera supplies the override. Positive compensation brightens the image by
+/// lowering the effective EV.
+fn physical_exposure_ev100(
+    aperture: f32,
+    shutter_seconds: f32,
+    iso: f32,
+    ev_compensation: f32,
+) -> Option<f32> {
+    if !aperture.is_finite()
+        || aperture <= 0.0
+        || !shutter_seconds.is_finite()
+        || shutter_seconds <= 0.0
+        || !iso.is_finite()
+        || iso <= 0.0
+        || !ev_compensation.is_finite()
+    {
+        return None;
+    }
+
+    let aperture = f64::from(aperture);
+    let shutter_seconds = f64::from(shutter_seconds);
+    let iso = f64::from(iso);
+    let ev100 = ((aperture * aperture / shutter_seconds) * (100.0 / iso)).log2()
+        - f64::from(ev_compensation);
+    (ev100.is_finite() && ev100 >= f32::MIN as f64 && ev100 <= f32::MAX as f64)
+        .then_some(ev100 as f32)
+}
+
 /// Map the engine's [`LightKind`] to the renderer's [`LightKind`].
 fn map_light_kind(kind: crate::components::LightKind) -> engine_renderer::LightKind {
     match kind {
@@ -993,6 +1197,56 @@ mod tests {
     }
 
     #[test]
+    fn world_extraction_preserves_scene_render_options_and_camera_exposure() {
+        let mut world = World::new();
+        world.scene_settings.tone_mapping = engine_renderer::ToneMapping::Reinhard;
+        world.scene_settings.pass_graph_config.enabled = false;
+        let camera = world.create_entity();
+        world.add_component(
+            camera,
+            components::Camera {
+                aperture: 2.0,
+                shutter_speed: 0.25,
+                iso: 100.0,
+                ev_compensation: 1.0,
+                msaa_samples: 4,
+                ..Default::default()
+            },
+        );
+        world.add_component(camera, components::Transform::default());
+
+        let input = extract_renderer_input_from_world(&world, 9).expect("valid extraction");
+
+        assert_eq!(
+            input.render_options.tone_mapping,
+            engine_renderer::ToneMapping::Reinhard
+        );
+        assert!(!input.render_options.pass_graph_config.enabled);
+        assert_eq!(input.render_options.msaa_samples, 4);
+        assert_eq!(input.views[0].msaa_samples, 4);
+        assert!((input.render_options.exposure_ev100.unwrap() - 3.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn world_extraction_rejects_invalid_physical_exposure() {
+        let mut world = World::new();
+        let camera = world.create_entity();
+        world.add_component(
+            camera,
+            components::Camera {
+                aperture: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let diagnostics = extract_renderer_input_from_world(&world, 0)
+            .expect_err("invalid exposure must not reach tone mapping");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SC0034"));
+    }
+
+    #[test]
     fn extract_from_world_without_camera_fails() {
         let world = World::new();
         let result = extract_renderer_input_from_world(&world, 0);
@@ -1000,6 +1254,134 @@ mod tests {
             result.is_err(),
             "expected extraction to fail without camera"
         );
+    }
+
+    #[test]
+    fn registered_render_layers_have_stable_bits() {
+        assert_eq!(render_layer_bit("Default"), Some(0));
+        assert_eq!(render_layer_bit("opaque"), Some(0));
+        assert_eq!(render_layer_bit("Transparent"), Some(1));
+        assert_eq!(render_layer_bit("UI"), Some(2));
+        assert_eq!(render_layer_bit("post-process"), Some(3));
+        assert_eq!(render_layer_bit("Debug"), Some(4));
+        assert_eq!(render_layer_bit("User0"), Some(5));
+        assert_eq!(render_layer_bit("User26"), Some(31));
+        assert_eq!(render_layer_bit("User27"), None);
+        assert_eq!(render_layer_bit("unregistered"), None);
+    }
+
+    #[test]
+    fn camera_layer_mask_culls_non_matching_drawables() {
+        let mut world = World::new();
+        let camera = world.create_entity();
+        world.add_component(
+            camera,
+            components::Camera {
+                render_layer_mask: 1 << 1,
+                ..Default::default()
+            },
+        );
+
+        let drawable = world.create_entity();
+        world.add_component(
+            drawable,
+            components::Renderable {
+                mesh_asset: "mesh-layered".into(),
+                material_asset: "material-layered".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            drawable,
+            components::Transform {
+                translation: glam::Vec3::new(0.0, 0.0, -5.0),
+                ..Default::default()
+            },
+        );
+
+        let input = extract_renderer_input_from_world(&world, 0).expect("valid extraction");
+        assert!(input.drawables.is_empty());
+        assert_eq!(input.extraction_stats.unwrap().culled_drawables, 1);
+    }
+
+    #[test]
+    fn unregistered_render_layer_fails_closed() {
+        let mut world = World::new();
+        add_default_camera(&mut world);
+        let drawable = world.create_entity();
+        world.add_component(
+            drawable,
+            components::Renderable {
+                mesh_asset: "mesh-unknown-layer".into(),
+                material_asset: "material-unknown-layer".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "GameplaySecret".into(),
+            },
+        );
+
+        let diagnostics = extract_renderer_input_from_world(&world, 0)
+            .expect_err("unknown layers must not be rendered implicitly");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SC0033"));
+    }
+
+    #[test]
+    fn additional_cameras_extract_as_non_clearing_overlays() {
+        let mut world = World::new();
+        let overlay = world.create_entity();
+        world.add_component(
+            overlay,
+            components::Camera {
+                priority: 10,
+                ..Default::default()
+            },
+        );
+        let base = world.create_entity();
+        world.add_component(
+            base,
+            components::Camera {
+                priority: -10,
+                ..Default::default()
+            },
+        );
+
+        let input = extract_renderer_input_from_world(&world, 0).expect("valid extraction");
+        assert!(matches!(input.views[0].compose, ViewCompose::Base { .. }));
+        assert!(matches!(
+            input.views[1].compose,
+            ViewCompose::Overlay {
+                base_view_id: 0,
+                blend_mode: BlendMode::Replace
+            }
+        ));
+        assert_eq!(input.views[1].clear_flags, ClearFlags::Nothing);
+    }
+
+    #[test]
+    fn invalid_camera_viewport_and_msaa_are_rejected() {
+        let mut world = World::new();
+        let camera = world.create_entity();
+        world.add_component(
+            camera,
+            components::Camera {
+                viewport_rect: Some([0.75, 0.0, 0.5, 1.0]),
+                msaa_samples: 3,
+                ..Default::default()
+            },
+        );
+
+        let diagnostics = extract_renderer_input_from_world(&world, 0)
+            .expect_err("invalid camera settings must fail extraction");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SC0031"));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SC0032"));
     }
 
     #[test]

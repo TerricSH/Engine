@@ -1,0 +1,14 @@
+{
+  "schema": "GameProject-v0",
+  "name": "Minimal Game",
+  "startup_scene": "assets/scenes/main.scene.ron",
+  "asset_source": "assets/source",
+  "cooked_assets": "build/cooked",
+  "input_actions": "config/input.actions.json",
+  "backend": "vulkan",
+  "window": {
+    "title": "Minimal Game",
+    "width": 1280,
+    "height": 720
+  }
+}

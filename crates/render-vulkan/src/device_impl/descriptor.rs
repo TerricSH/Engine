@@ -125,13 +125,13 @@ impl VulkanDevice {
         let fi = self.current_frame;
         let mut data = Vec::with_capacity(384);
         // Model matrix (identity for clip-space rendering)
-        for i in 0..16 {
-            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
+        for i in 0usize..16 {
+            let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
             data.extend_from_slice(&v.to_ne_bytes());
         }
         // View-proj matrix (identity as well)
-        for i in 0..16 {
-            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
+        for i in 0usize..16 {
+            let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
             data.extend_from_slice(&v.to_ne_bytes());
         }
         // Light direction (normalized, pointing down-left)
@@ -151,18 +151,18 @@ impl VulkanDevice {
             data.extend_from_slice(&v.to_ne_bytes());
         }
         // Light VP[0] (identity until the shadow pass writes cascade data)
-        for i in 0..16 {
-            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
+        for i in 0usize..16 {
+            let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
             data.extend_from_slice(&v.to_ne_bytes());
         }
         // Light VP[1] (identity)
-        for i in 0..16 {
-            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
+        for i in 0usize..16 {
+            let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
             data.extend_from_slice(&v.to_ne_bytes());
         }
         // Light VP[2] (identity)
-        for i in 0..16 {
-            let v = if i % 5 == 0 { 1.0f32 } else { 0.0f32 };
+        for i in 0usize..16 {
+            let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
             data.extend_from_slice(&v.to_ne_bytes());
         }
         self.write_ubo(fi, &data, 0);

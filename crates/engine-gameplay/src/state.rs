@@ -120,10 +120,7 @@ impl CallbackId {
 // StateChangeCallback type alias
 // ---------------------------------------------------------------------------
 
-type StateChangeCallback = (
-    CallbackId,
-    Box<dyn FnMut(&GameState, &GameState) + Send>,
-);
+type StateChangeCallback = (CallbackId, Box<dyn FnMut(&GameState, &GameState) + Send>);
 
 // ---------------------------------------------------------------------------
 // GameStateManager

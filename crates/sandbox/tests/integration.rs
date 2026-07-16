@@ -29,6 +29,10 @@ fn backend_error(code: &str, message: &str) -> Vec<Diagnostic> {
 }
 
 impl BackendRenderer for ContractBackend {
+    fn frame_mode(&self) -> engine_renderer::BackendFrameMode {
+        engine_renderer::BackendFrameMode::RenderGraph
+    }
+
     fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
         Err(backend_error(
             "SBX_TEST_LEGACY_RENDER",
@@ -46,6 +50,15 @@ impl BackendRenderer for ContractBackend {
         }
         trace.frame_active = true;
         trace.begin_count += 1;
+        Ok(())
+    }
+
+    fn apply_pass_barriers(
+        &mut self,
+        _input: &RenderFrameInput,
+        _pass: &engine_renderer::render_graph::PassNode,
+        _barriers: &[engine_renderer::render_graph::CompiledBarrier],
+    ) -> Result<(), Vec<Diagnostic>> {
         Ok(())
     }
 
@@ -94,6 +107,27 @@ impl BackendRenderer for ContractBackend {
         trace.frame_active = false;
         trace.abort_count += 1;
         Ok(())
+    }
+
+    fn upload_mesh(
+        &mut self,
+        _upload: engine_renderer::MeshUpload,
+    ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+        Ok(engine_renderer::UploadReceipt::new(1))
+    }
+
+    fn upload_texture(
+        &mut self,
+        _upload: engine_renderer::TextureUpload,
+    ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+        Ok(engine_renderer::UploadReceipt::new(1))
+    }
+
+    fn upload_material(
+        &mut self,
+        _upload: engine_renderer::MaterialUpload,
+    ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+        Ok(engine_renderer::UploadReceipt::new(1))
     }
 }
 

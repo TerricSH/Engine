@@ -1,0 +1,10 @@
+{
+  "schema": "ReleaseSmokeScene-v0",
+  "entities": [
+    {
+      "id": "sample-triangle",
+      "mesh": "sample-mesh",
+      "material": "default"
+    }
+  ]
+}

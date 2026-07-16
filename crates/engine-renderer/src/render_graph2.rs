@@ -11,7 +11,8 @@
 //! Custom orderings can be expressed via `build_with_config()` which
 //! honours `PassGraphConfig` (loadable from scene settings).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -74,9 +75,27 @@ impl PassKind {
             "OpaquePbrForward" => Some(Self::OpaquePbrForward),
             "ToneMap" => Some(Self::ToneMap),
             "Present" => Some(Self::Present),
-            custom => Some(Self::Custom(Box::leak(custom.to_string().into_boxed_str()))),
+            custom => Some(Self::Custom(intern_custom_pass_kind(custom))),
         }
     }
+}
+
+fn intern_custom_pass_kind(name: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+
+    // PassKind's public v0 contract uses &'static str. Interning once per
+    // distinct configured identifier keeps that API while avoiding the old
+    // per-frame Box::leak growth in build_with_config().
+    let interned = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(interned);
+    interned
 }
 
 // ── Resource access mode ─────────────────────────────────────────────────────
@@ -93,7 +112,7 @@ pub enum ResourceAccess {
 
 /// Describes how a single resource attachment (colour or depth) is bound
 /// for a pass.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassAttachment {
     pub name: String,
     pub format: Option<String>,
@@ -104,7 +123,7 @@ pub struct PassAttachment {
 }
 
 /// Determines how the attachment dimensions are resolved.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SizeSource {
     Swapchain,
     Custom(u32, u32),
@@ -114,7 +133,7 @@ pub enum SizeSource {
 // ── Pass node ───────────────────────────────────────────────────────────────
 
 /// A single node in the DAG-based render graph.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassNode {
     pub kind: PassKind,
     pub name: &'static str,
@@ -198,6 +217,7 @@ impl RenderGraph {
             .collect();
 
         for view in &views {
+            let first_pass = graph.passes.len();
             let has_shadow_casters = input.lights.iter().any(|l| {
                 l.kind == crate::LightKind::Directional
                     && matches!(
@@ -208,123 +228,25 @@ impl RenderGraph {
 
             // 1. Directional shadow pass (only if shadows are needed)
             if has_shadow_casters {
-                graph.add_pass(PassNode {
-                    kind: PassKind::DirectionalShadow,
-                    name: "directional_shadow_pass",
-                    view_id: view.view_id,
-                    inputs: vec![PassAttachment {
-                        name: "depth".into(),
-                        format: Some("D32".into()),
-                        clear: true,
-                        load_op: "clear".into(),
-                        size_source: SizeSource::Swapchain,
-                        access: ResourceAccess::Read,
-                    }],
-                    outputs: vec![PassAttachment {
-                        name: "shadow_map".into(),
-                        format: Some("D32".into()),
-                        clear: false,
-                        load_op: "load".into(),
-                        size_source: SizeSource::Custom(1024, 1024),
-                        access: ResourceAccess::Write,
-                    }],
-                    depth_stencil: Some(PassAttachment {
-                        name: "shadow_depth".into(),
-                        format: Some("D32".into()),
-                        clear: true,
-                        load_op: "clear".into(),
-                        size_source: SizeSource::Custom(1024, 1024),
-                        access: ResourceAccess::ReadWrite,
-                    }),
-                });
+                graph.add_pass(directional_shadow_pass(view.view_id));
             }
 
             // 2. Opaque forward pass
-            graph.add_pass(PassNode {
-                kind: PassKind::OpaquePbrForward,
-                name: "opaque_pbr_forward_pass",
-                view_id: view.view_id,
-                inputs: vec![PassAttachment {
-                    name: "depth".into(),
-                    format: Some("D32".into()),
-                    clear: true,
-                    load_op: "load".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Read,
-                }],
-                outputs: vec![PassAttachment {
-                    name: "hdr_color".into(),
-                    format: Some("RGBA16F".into()),
-                    clear: true,
-                    load_op: "clear".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Write,
-                }],
-                depth_stencil: Some(PassAttachment {
-                    name: "depth_stencil".into(),
-                    format: Some("D24S8".into()),
-                    clear: true,
-                    load_op: "clear".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::ReadWrite,
-                }),
-            });
+            graph.add_pass(opaque_pbr_forward_pass(
+                view.view_id,
+                PassGraphOutputMode::HdrThenToneMap,
+            ));
 
             // 3. Tone-map pass
-            graph.add_pass(PassNode {
-                kind: PassKind::ToneMap,
-                name: "tone_map_pass",
-                view_id: view.view_id,
-                inputs: vec![PassAttachment {
-                    name: "hdr_color".into(),
-                    format: Some("RGBA16F".into()),
-                    clear: false,
-                    load_op: "load".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Read,
-                }],
-                outputs: vec![PassAttachment {
-                    name: "ldr_color".into(),
-                    format: Some("RGBA8".into()),
-                    clear: true,
-                    load_op: "clear".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Write,
-                }],
-                depth_stencil: None,
-            });
+            graph.add_pass(tone_map_pass(view.view_id));
 
             // 4. Present
-            graph.add_pass(PassNode {
-                kind: PassKind::Present,
-                name: "present",
-                view_id: view.view_id,
-                inputs: vec![PassAttachment {
-                    name: "ldr_color".into(),
-                    format: Some("RGBA8".into()),
-                    clear: false,
-                    load_op: "load".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Read,
-                }],
-                outputs: vec![PassAttachment {
-                    name: "swapchain".into(),
-                    format: None,
-                    clear: false,
-                    load_op: "dont_care".into(),
-                    size_source: SizeSource::Swapchain,
-                    access: ResourceAccess::Write,
-                }],
-                depth_stencil: None,
-            });
+            graph.add_pass(present_pass(
+                view.view_id,
+                PassGraphOutputMode::HdrThenToneMap,
+            ));
 
-            // Add implicit edges for the canonical ordering.
-            let pass_indices: Vec<usize> = (0..graph.passes.len()).collect();
-            for window in pass_indices.windows(2) {
-                if window.len() == 2 {
-                    graph.add_edge(window[0], window[1], "auto");
-                }
-            }
+            add_sequential_view_edges(&mut graph, first_pass);
         }
 
         graph
@@ -365,6 +287,7 @@ impl RenderGraph {
         let mut graph = Self::new();
 
         for view in &views {
+            let first_pass = graph.passes.len();
             for entry in &config.passes {
                 if !entry.enabled {
                     continue;
@@ -381,39 +304,24 @@ impl RenderGraph {
                     continue;
                 }
 
+                // Direct-to-swapchain graphs never contain a tone-map pass.
+                // Validation reports a configured ToneMap as an error before
+                // rendering; keeping the builder fail-closed also prevents
+                // callers that use it directly from constructing an invalid
+                // implicit HDR path.
+                if matches!(kind, PassKind::ToneMap)
+                    && config.output_mode == PassGraphOutputMode::DirectToSwapchain
+                {
+                    continue;
+                }
+
                 let pass = match kind {
-                    PassKind::DirectionalShadow => PassNode {
-                        kind: PassKind::DirectionalShadow,
-                        name: "directional_shadow_pass",
-                        view_id: view.view_id,
-                        inputs: vec![],
-                        outputs: vec![],
-                        depth_stencil: None,
-                    },
-                    PassKind::OpaquePbrForward => PassNode {
-                        kind: PassKind::OpaquePbrForward,
-                        name: "opaque_pbr_forward_pass",
-                        view_id: view.view_id,
-                        inputs: vec![],
-                        outputs: vec![],
-                        depth_stencil: None,
-                    },
-                    PassKind::ToneMap => PassNode {
-                        kind: PassKind::ToneMap,
-                        name: "tone_map_pass",
-                        view_id: view.view_id,
-                        inputs: vec![],
-                        outputs: vec![],
-                        depth_stencil: None,
-                    },
-                    PassKind::Present => PassNode {
-                        kind: PassKind::Present,
-                        name: "present",
-                        view_id: view.view_id,
-                        inputs: vec![],
-                        outputs: vec![],
-                        depth_stencil: None,
-                    },
+                    PassKind::DirectionalShadow => directional_shadow_pass(view.view_id),
+                    PassKind::OpaquePbrForward => {
+                        opaque_pbr_forward_pass(view.view_id, config.output_mode)
+                    }
+                    PassKind::ToneMap => tone_map_pass(view.view_id),
+                    PassKind::Present => present_pass(view.view_id, config.output_mode),
                     PassKind::Custom(custom_name) => PassNode {
                         kind: PassKind::Custom(custom_name),
                         name: custom_name,
@@ -426,14 +334,8 @@ impl RenderGraph {
 
                 graph.add_pass(pass);
             }
-        }
 
-        // Add sequential edges based on the config ordering.
-        let pass_indices: Vec<usize> = (0..graph.passes.len()).collect();
-        for window in pass_indices.windows(2) {
-            if window.len() == 2 {
-                graph.add_edge(window[0], window[1], "auto");
-            }
+            add_sequential_view_edges(&mut graph, first_pass);
         }
 
         graph
@@ -531,12 +433,12 @@ impl RenderGraph {
                     .get(&input.name)
                     .copied()
                     .unwrap_or(ResourceState::Undefined);
-                let new = ResourceState::ShaderReadOnlyOptimal;
+                let new = input_resource_state(pass, input);
                 if old != new {
                     barriers_per_pass[sorted_idx].push(CompiledBarrier {
                         resource_name: input.name.clone(),
                         src_stage: previous_stage(&old),
-                        dst_stage: PipeStage::FragmentShader,
+                        dst_stage: input_stage(pass, input),
                         old_state: old,
                         new_state: new,
                     });
@@ -569,7 +471,7 @@ impl RenderGraph {
                     .get(&output.name)
                     .copied()
                     .unwrap_or(ResourceState::Undefined);
-                let new = output_resource_state(&output.name);
+                let new = output_resource_state(pass, &output.name);
                 if old != new {
                     barriers_per_pass[sorted_idx].push(CompiledBarrier {
                         resource_name: output.name.clone(),
@@ -725,16 +627,12 @@ impl RenderGraph {
                     .get(&input.name)
                     .copied()
                     .unwrap_or(ResourceState::Undefined);
-                let new = match input.access {
-                    ResourceAccess::Read => ResourceState::ShaderReadOnlyOptimal,
-                    ResourceAccess::ReadWrite => ResourceState::General,
-                    ResourceAccess::Write => ResourceState::ShaderReadOnlyOptimal,
-                };
+                let new = input_resource_state(pass, input);
                 if old != new {
                     barriers_per_pass[sorted_idx].push(CompiledBarrier {
                         resource_name: input.name.clone(),
                         src_stage: previous_stage(&old),
-                        dst_stage: PipeStage::FragmentShader,
+                        dst_stage: input_stage(pass, input),
                         old_state: old,
                         new_state: new,
                     });
@@ -772,7 +670,7 @@ impl RenderGraph {
                     .get(&output.name)
                     .copied()
                     .unwrap_or(ResourceState::Undefined);
-                let new = output_resource_state(&output.name);
+                let new = output_resource_state(pass, &output.name);
                 if old != new {
                     barriers_per_pass[sorted_idx].push(CompiledBarrier {
                         resource_name: output.name.clone(),
@@ -822,6 +720,23 @@ pub struct PassGraphConfig {
     /// Whether the graph config is active.  When `false`, the canonical
     /// 4-pass ordering is used.
     pub enabled: bool,
+    /// Describes whether the forward pass writes an intermediate HDR target
+    /// or writes the presentation image directly.
+    #[serde(default)]
+    pub output_mode: PassGraphOutputMode,
+}
+
+/// Output contract for a configured pass graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PassGraphOutputMode {
+    /// Forward rendering writes HDR and a final ToneMap/composite pass copies
+    /// it to the presentation image. `ToneMapping::None` makes that pass an
+    /// identity conversion; it does not remove the pass.
+    #[default]
+    HdrThenToneMap,
+    /// Forward rendering writes the presentation image directly, so a
+    /// ToneMap pass must not be declared.
+    DirectToSwapchain,
 }
 
 impl Default for PassGraphConfig {
@@ -846,6 +761,7 @@ impl Default for PassGraphConfig {
                 },
             ],
             enabled: true,
+            output_mode: PassGraphOutputMode::HdrThenToneMap,
         }
     }
 }
@@ -858,6 +774,156 @@ pub struct PassConfigEntry {
     pub kind: String,
     /// Whether this pass is enabled in the graph.
     pub enabled: bool,
+}
+
+// ============================================================================
+// Built-in pass declarations
+// ============================================================================
+
+/// Connect only the passes emitted for the current view. Keeping this next to
+/// the shared pass constructors makes both graph-building paths follow the
+/// same resource and dependency contract.
+fn add_sequential_view_edges(graph: &mut RenderGraph, first_pass: usize) {
+    let end_pass = graph.passes.len();
+    for from_pass in first_pass..end_pass.saturating_sub(1) {
+        graph.add_edge(from_pass, from_pass + 1, "auto");
+    }
+}
+
+fn directional_shadow_pass(view_id: u32) -> PassNode {
+    PassNode {
+        kind: PassKind::DirectionalShadow,
+        name: "directional_shadow_pass",
+        view_id,
+        inputs: vec![PassAttachment {
+            name: "depth".into(),
+            format: Some("D32".into()),
+            clear: true,
+            load_op: "clear".into(),
+            size_source: SizeSource::Swapchain,
+            access: ResourceAccess::Read,
+        }],
+        outputs: vec![PassAttachment {
+            name: "shadow_map".into(),
+            format: Some("D32".into()),
+            clear: false,
+            load_op: "load".into(),
+            size_source: SizeSource::Custom(1024, 1024),
+            access: ResourceAccess::Write,
+        }],
+        depth_stencil: Some(PassAttachment {
+            name: "shadow_depth".into(),
+            format: Some("D32".into()),
+            clear: true,
+            load_op: "clear".into(),
+            size_source: SizeSource::Custom(1024, 1024),
+            access: ResourceAccess::ReadWrite,
+        }),
+    }
+}
+
+fn opaque_pbr_forward_pass(view_id: u32, output_mode: PassGraphOutputMode) -> PassNode {
+    let color_output = match output_mode {
+        PassGraphOutputMode::HdrThenToneMap => PassAttachment {
+            name: "hdr_color".into(),
+            format: Some("RGBA16F".into()),
+            clear: true,
+            load_op: "clear".into(),
+            size_source: SizeSource::Swapchain,
+            access: ResourceAccess::Write,
+        },
+        PassGraphOutputMode::DirectToSwapchain => PassAttachment {
+            name: "swapchain".into(),
+            format: None,
+            clear: true,
+            load_op: "clear".into(),
+            size_source: SizeSource::Swapchain,
+            access: ResourceAccess::Write,
+        },
+    };
+
+    PassNode {
+        kind: PassKind::OpaquePbrForward,
+        name: "opaque_pbr_forward_pass",
+        view_id,
+        inputs: vec![PassAttachment {
+            name: "depth".into(),
+            format: Some("D32".into()),
+            clear: true,
+            load_op: "load".into(),
+            size_source: SizeSource::Swapchain,
+            access: ResourceAccess::Read,
+        }],
+        outputs: vec![color_output],
+        depth_stencil: Some(PassAttachment {
+            name: "depth_stencil".into(),
+            format: Some("D24S8".into()),
+            clear: true,
+            load_op: "clear".into(),
+            size_source: SizeSource::Swapchain,
+            access: ResourceAccess::ReadWrite,
+        }),
+    }
+}
+
+fn tone_map_pass(view_id: u32) -> PassNode {
+    PassNode {
+        kind: PassKind::ToneMap,
+        name: "tone_map_pass",
+        view_id,
+        inputs: vec![PassAttachment {
+            name: "hdr_color".into(),
+            format: Some("RGBA16F".into()),
+            clear: false,
+            load_op: "load".into(),
+            size_source: SizeSource::Swapchain,
+            access: ResourceAccess::Read,
+        }],
+        outputs: vec![PassAttachment {
+            name: "swapchain".into(),
+            format: None,
+            clear: true,
+            load_op: "clear".into(),
+            size_source: SizeSource::Swapchain,
+            access: ResourceAccess::Write,
+        }],
+        depth_stencil: None,
+    }
+}
+
+fn present_pass(view_id: u32, output_mode: PassGraphOutputMode) -> PassNode {
+    match output_mode {
+        PassGraphOutputMode::HdrThenToneMap => PassNode {
+            kind: PassKind::Present,
+            name: "present",
+            view_id,
+            inputs: vec![PassAttachment {
+                name: "swapchain".into(),
+                format: None,
+                clear: false,
+                load_op: "load".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Read,
+            }],
+            outputs: Vec::new(),
+            depth_stencil: None,
+        },
+        PassGraphOutputMode::DirectToSwapchain => PassNode {
+            kind: PassKind::Present,
+            name: "present",
+            view_id,
+            inputs: vec![PassAttachment {
+                name: "swapchain".into(),
+                format: None,
+                clear: false,
+                load_op: "load".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Read,
+            }],
+            outputs: Vec::new(),
+            depth_stencil: None,
+        },
+    }
 }
 
 // ============================================================================
@@ -880,11 +946,36 @@ fn previous_stage(state: &ResourceState) -> PipeStage {
     }
 }
 
+/// Determine the state required while a pass consumes an input. A direct
+/// present consumes the already-rendered swapchain image as a presentation
+/// source rather than sampling it as a texture.
+fn input_resource_state(pass: &PassNode, input: &PassAttachment) -> ResourceState {
+    if matches!(pass.kind, PassKind::Present) && input.name == "swapchain" {
+        return ResourceState::PresentSrc;
+    }
+
+    match input.access {
+        ResourceAccess::Read | ResourceAccess::Write => ResourceState::ShaderReadOnlyOptimal,
+        ResourceAccess::ReadWrite => ResourceState::General,
+    }
+}
+
+fn input_stage(pass: &PassNode, input: &PassAttachment) -> PipeStage {
+    if matches!(pass.kind, PassKind::Present) && input.name == "swapchain" {
+        PipeStage::BottomOfPipe
+    } else {
+        PipeStage::FragmentShader
+    }
+}
+
 /// Determine the [`ResourceState`] that an output attachment should be in
-/// after the pass produces it.
-fn output_resource_state(name: &str) -> ResourceState {
+/// after the pass produces it. In direct mode the opaque pass writes the
+/// swapchain as a color attachment; the following Present pass performs the
+/// transition to [`ResourceState::PresentSrc`].
+fn output_resource_state(pass: &PassNode, name: &str) -> ResourceState {
     match name {
-        "swapchain" => ResourceState::PresentSrc,
+        "swapchain" if matches!(pass.kind, PassKind::Present) => ResourceState::PresentSrc,
+        "swapchain" => ResourceState::ColorAttachmentOptimal,
         "shadow_map" | "shadow_depth" => ResourceState::DepthStencilAttachmentOptimal,
         "hdr_color" => ResourceState::ColorAttachmentOptimal,
         "ldr_color" => ResourceState::ColorAttachmentOptimal,
@@ -1052,6 +1143,56 @@ impl Default for TransientResourcePool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn custom_pass_names_are_interned_once_across_frame_builds() {
+        let PassKind::Custom(first) = PassKind::parse_str("custom_interned").unwrap() else {
+            unreachable!();
+        };
+        let PassKind::Custom(second) = PassKind::parse_str("custom_interned").unwrap() else {
+            unreachable!();
+        };
+
+        assert!(std::ptr::eq(first, second));
+    }
+
+    fn test_view(view_id: u32) -> RenderView {
+        RenderView {
+            view_id,
+            camera_entity: None,
+            viewport: crate::Rect::FULL,
+            viewport_rect_normalized: crate::Rect::FULL,
+            view_matrix: crate::IDENTITY_MAT4,
+            projection_matrix: crate::IDENTITY_MAT4,
+            clear_flags: crate::ClearFlags::ColorAndDepth,
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            render_layer_mask: u32::MAX,
+            msaa_samples: 1,
+            compose: ViewCompose::Base {
+                clear: crate::ClearFlags::ColorAndDepth,
+                clear_color: [0.0, 0.0, 0.0, 1.0],
+            },
+            stack_order: view_id as i32,
+            frustum: None,
+        }
+    }
+
+    fn input_with_shadowed_view() -> RenderFrameInput {
+        let mut input = RenderFrameInput::empty(0);
+        input.views.push(test_view(7));
+        input.lights.push(crate::LightItem {
+            entity: None,
+            kind: crate::LightKind::Directional,
+            color: [1.0, 1.0, 1.0],
+            intensity: 1.0,
+            range: 100.0,
+            position: [0.0, 10.0, 0.0],
+            direction: [0.0, -1.0, 0.0],
+            spot_angles: None,
+            shadow_mode: crate::ShadowMode::Hard,
+        });
+        input
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     fn make_graph() -> RenderGraph {
@@ -1163,6 +1304,135 @@ mod tests {
     }
 
     // ── compile_v2 tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_config_uses_canonical_builtin_resource_declarations() {
+        let input = input_with_shadowed_view();
+        let canonical = RenderGraph::build(&input);
+        let configured = RenderGraph::build_with_config(&input, &PassGraphConfig::default());
+
+        assert_eq!(configured.passes, canonical.passes);
+        assert_eq!(configured.edges.len(), canonical.edges.len());
+        assert!(configured.edges.iter().all(|edge| {
+            configured.passes[edge.from_pass].view_id == configured.passes[edge.to_pass].view_id
+        }));
+    }
+
+    #[test]
+    fn default_config_compile_v2_transitions_hdr_for_tone_mapping() {
+        let input = input_with_shadowed_view();
+        let graph = RenderGraph::build_with_config(&input, &PassGraphConfig::default());
+        let compiled = graph.compile_v2().expect("default graph should compile");
+        let tone_map = graph
+            .passes
+            .iter()
+            .find(|pass| matches!(pass.kind, PassKind::ToneMap))
+            .expect("tone-map pass");
+        let present = graph
+            .passes
+            .iter()
+            .find(|pass| matches!(pass.kind, PassKind::Present))
+            .expect("present pass");
+        assert_eq!(tone_map.outputs[0].name, "swapchain");
+        assert_eq!(present.inputs[0].name, "swapchain");
+        assert!(present.outputs.is_empty());
+        let tone_map_position = compiled
+            .pass_order
+            .iter()
+            .position(|&pass_idx| matches!(graph.passes[pass_idx].kind, PassKind::ToneMap))
+            .expect("tone-map pass should remain live");
+
+        assert!(compiled.barriers_per_pass[tone_map_position]
+            .iter()
+            .any(|barrier| {
+                barrier.resource_name == "hdr_color"
+                    && barrier.old_state == ResourceState::ColorAttachmentOptimal
+                    && barrier.new_state == ResourceState::ShaderReadOnlyOptimal
+                    && barrier.src_stage == PipeStage::ColorAttachmentOutput
+                    && barrier.dst_stage == PipeStage::FragmentShader
+            }));
+    }
+
+    #[test]
+    fn direct_to_swapchain_declares_opaque_and_present_resource_flow() {
+        let mut input = RenderFrameInput::empty(0);
+        input.views.push(test_view(3));
+        let config = PassGraphConfig {
+            output_mode: PassGraphOutputMode::DirectToSwapchain,
+            ..PassGraphConfig::default()
+        };
+
+        let graph = RenderGraph::build_with_config(&input, &config);
+        let kinds: Vec<&'static str> = graph.passes.iter().map(|pass| pass.kind.name()).collect();
+        assert_eq!(kinds, vec!["opaque_pbr_forward_pass", "present"]);
+
+        let opaque = &graph.passes[0];
+        assert_eq!(
+            opaque
+                .outputs
+                .iter()
+                .map(|attachment| attachment.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["swapchain"]
+        );
+        assert_eq!(
+            opaque
+                .depth_stencil
+                .as_ref()
+                .map(|depth| depth.name.as_str()),
+            Some("depth_stencil")
+        );
+        assert_eq!(
+            opaque.depth_stencil.as_ref().map(|depth| depth.access),
+            Some(ResourceAccess::ReadWrite)
+        );
+
+        let present = &graph.passes[1];
+        assert_eq!(
+            present
+                .inputs
+                .iter()
+                .map(|attachment| attachment.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["swapchain"]
+        );
+        assert!(present.outputs.is_empty());
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].from_pass, 0);
+        assert_eq!(graph.edges[0].to_pass, 1);
+
+        let compiled = graph.compile_v2().expect("direct graph should compile");
+        let present_position = compiled
+            .pass_order
+            .iter()
+            .position(|&pass_idx| matches!(graph.passes[pass_idx].kind, PassKind::Present))
+            .expect("present should remain live");
+        assert!(compiled.barriers_per_pass[present_position]
+            .iter()
+            .any(|barrier| {
+                barrier.resource_name == "swapchain"
+                    && barrier.old_state == ResourceState::ColorAttachmentOptimal
+                    && barrier.new_state == ResourceState::PresentSrc
+            }));
+    }
+
+    #[test]
+    fn builtin_multi_view_edges_never_cross_view_boundaries() {
+        let mut input = RenderFrameInput::empty(0);
+        input.views = vec![test_view(10), test_view(20)];
+        let graphs = [
+            RenderGraph::build(&input),
+            RenderGraph::build_with_config(&input, &PassGraphConfig::default()),
+        ];
+
+        for graph in graphs {
+            assert_eq!(graph.passes.len(), 6);
+            assert_eq!(graph.edges.len(), 4);
+            assert!(graph.edges.iter().all(|edge| {
+                graph.passes[edge.from_pass].view_id == graph.passes[edge.to_pass].view_id
+            }));
+        }
+    }
 
     #[test]
     fn compile_v2_topological_sort() {

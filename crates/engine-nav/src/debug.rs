@@ -32,7 +32,6 @@ const COLOR_AGENT: [f32; 4] = [1.0, 0.2, 0.2, 1.0];
 struct PolyDraw {
     /// Indices into the debug draw's vertex list.
     vertex_indices: Vec<usize>,
-
 }
 
 // ---------------------------------------------------------------------------

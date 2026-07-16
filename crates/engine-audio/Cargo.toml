@@ -7,11 +7,11 @@ license.workspace = true
 
 [features]
 default = []
-subsystem-audio-cpal = []
+subsystem-audio-cpal = ["dep:cpal"]
 
 [dependencies]
 bincode.workspace = true
-cpal.workspace = true
+cpal = { workspace = true, optional = true }
 crossbeam-channel.workspace = true
 engine-scene = { path = "../engine-scene" }
 engine-serialize = { path = "../engine-serialize" }

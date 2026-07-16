@@ -334,25 +334,33 @@ impl ReloadCoordinator {
 
         let output_path = {
             let mut buf = cooked_dir.to_path_buf();
-            buf.push(format!("{}.cooked", asset_id.id.replace('-', "_")));
+            buf.push(format!("{}.cooked", asset_id.id));
             buf
         };
 
         // Determine asset type and dispatch.
-        let category = asset_id.id.split('-').next().unwrap_or(&asset_id.id);
-        let asset_type = match category {
-            "mesh" => crate::cook::AssetType::Mesh,
-            "material" => crate::cook::AssetType::Material,
-            "texture" => crate::cook::AssetType::Texture,
-            "shader" => crate::cook::AssetType::Shader,
-            "scene" => crate::cook::AssetType::Scene,
-            _ => crate::cook::AssetType::Unknown,
-        };
+        let asset_type = manifest_entries
+            .get(asset_id)
+            .map(|entry| entry.asset_type.clone())
+            .unwrap_or_else(|| {
+                let category = asset_id.id.split('-').next().unwrap_or(&asset_id.id);
+                match category {
+                    "mesh" => crate::cook::AssetType::Mesh,
+                    "material" => crate::cook::AssetType::Material,
+                    "texture" => crate::cook::AssetType::Texture,
+                    "shader" => crate::cook::AssetType::Shader,
+                    "scene" => crate::cook::AssetType::Scene,
+                    _ => crate::cook::AssetType::Unknown,
+                }
+            });
 
         let cook_result = match asset_type {
             crate::cook::AssetType::Mesh => crate::cook::cook_mesh(&source_path, &output_path),
             crate::cook::AssetType::Texture => {
                 crate::cook::cook_texture(&source_path, &output_path)
+            }
+            crate::cook::AssetType::Material => {
+                crate::cook::cook_material(&source_path, &output_path)
             }
             crate::cook::AssetType::Shader => crate::cook::cook_shader(
                 &source_path,

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use engine_character::{CharacterCommand, CharacterController};
 use engine_scene::Component;
+use engine_serialize::AssetId;
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +29,7 @@ fn navmesh_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
 }
 
 /// NavMesh loader: bincode-deserialise and rebuild the acceleration structure.
-fn navmesh_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any>, String> {
+fn navmesh_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String> {
     let mut mesh: NavMesh =
         bincode::deserialize(cooked).map_err(|e| format!("NavMesh load failed: {e}"))?;
     mesh.rebuild_bvh();
@@ -134,7 +135,7 @@ pub fn serialize_ai_agent(
     if let Some(ref r) = agent.navmesh_ref {
         fields.insert(
             "navmesh_ref".into(),
-            engine_serialize::Value::Str(r.clone()),
+            engine_serialize::Value::Asset(AssetId::new(r)),
         );
     }
     fields.insert(
@@ -170,8 +171,10 @@ pub fn deserialize_ai_agent(
 ) -> Box<dyn std::any::Any> {
     let mut agent = AiAgent::new();
 
-    if let Some(engine_serialize::Value::Str(v)) = fields.get("navmesh_ref") {
-        agent.navmesh_ref = Some(v.clone());
+    match fields.get("navmesh_ref") {
+        Some(engine_serialize::Value::Asset(v)) => agent.navmesh_ref = Some(v.id.clone()),
+        Some(engine_serialize::Value::Str(v)) => agent.navmesh_ref = Some(v.clone()),
+        _ => {}
     }
     if let Some(engine_serialize::Value::Float32(v)) = fields.get("agent_radius") {
         agent.agent_radius = *v;
@@ -395,6 +398,12 @@ mod tests {
         agent.controller_entity_id = 7;
 
         let serialized = serialize_ai_agent(&agent);
+        assert_eq!(
+            serialized.get("navmesh_ref"),
+            Some(&engine_serialize::Value::Asset(AssetId::new(
+                "navmesh_main"
+            )))
+        );
         let deserialized = deserialize_ai_agent(&serialized);
         let restored: &AiAgent = deserialized.downcast_ref().unwrap();
 
@@ -405,6 +414,19 @@ mod tests {
         assert!((restored.stopping_distance - 1.0).abs() < 1e-6);
         assert_eq!(restored.target, Some(Vec3::new(100.0, 0.0, 200.0)));
         assert_eq!(restored.controller_entity_id, 7);
+    }
+
+    #[test]
+    fn ai_agent_serde_accepts_legacy_string_navmesh_reference() {
+        let fields = BTreeMap::from([(
+            "navmesh_ref".into(),
+            engine_serialize::Value::Str("navmesh_main".into()),
+        )]);
+
+        let deserialized = deserialize_ai_agent(&fields);
+        let restored: &AiAgent = deserialized.downcast_ref().unwrap();
+
+        assert_eq!(restored.navmesh_ref.as_deref(), Some("navmesh_main"));
     }
 
     #[test]

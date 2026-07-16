@@ -42,8 +42,9 @@ fn editor_disabled_is_non_exhaustive() {
 #[cfg(feature = "tooling-editor")]
 #[test]
 fn editor_ui_new_creates_context() {
-    let ui = EditorUi::new();
+    let mut ui = EditorUi::new();
     // Can't inspect fields directly, but reset should not panic
+    ui.reset();
 }
 
 #[cfg(feature = "tooling-editor")]
