@@ -4,6 +4,8 @@ pub mod diagnostics;
 pub use diagnostics::*;
 pub mod cooked_assets;
 pub use cooked_assets::*;
+pub mod asset_stream;
+pub use asset_stream::*;
 
 use engine_asset::{AssetHandle, AssetRegistry};
 use engine_renderer::{
@@ -204,6 +206,12 @@ pub struct EngineRuntime {
     asset_registry: AssetRegistry,
     loaded_cooked_asset_ids: BTreeSet<AssetId>,
     loaded_extension_asset_ids: BTreeMap<String, BTreeSet<AssetId>>,
+    /// Lazily created background cooked-asset decoder; see
+    /// [`EngineRuntime::enqueue_cooked_asset_stream`]. `None` until the first
+    /// streamed enqueue so runtimes that never stream never spawn a thread.
+    stream_loader: Option<AssetStreamLoader>,
+    /// Per-drain commit budget applied when the loader is created.
+    stream_budget: usize,
     scene: Option<Scene>,
     world_slot: WorldSlot,
     component_registry: Arc<ComponentRegistry>,
@@ -289,6 +297,8 @@ impl EngineRuntime {
             asset_registry,
             loaded_cooked_asset_ids: BTreeSet::new(),
             loaded_extension_asset_ids: BTreeMap::new(),
+            stream_loader: None,
+            stream_budget: asset_stream::DEFAULT_STREAM_COMMIT_BUDGET,
             scene: None,
             world_slot: WorldSlot::new(),
             component_registry,
@@ -3228,6 +3238,53 @@ mod tests {
         runtime.render_frame(17).expect("frame should render");
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn streamed_cooked_assets_install_additively_between_rendered_frames() {
+        let _guard = serial_ffi_world_test();
+        let dir = crate::cooked_assets::tests::cooked_case("mid_run_stream");
+        crate::cooked_assets::tests::cook_test_material(&dir, "material.streamed", None);
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_renderer_backend(Box::new(RecordingBackend {
+            uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            rendered_ui_batch_counts: None,
+        }));
+        runtime
+            .load_scene(engine_scene::sample_scene())
+            .expect("sample scene should load");
+        runtime.render_frame(0).expect("frame before streaming");
+        let streamed_id = AssetId::new("material.streamed");
+        assert!(runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&streamed_id)
+            .is_none());
+
+        // Mid-run: stream an extra cooked asset in the background and drain
+        // at the frame boundary while frames keep rendering.
+        runtime.enqueue_cooked_asset_stream(vec![dir.join("material.streamed.cooked")]);
+        let mut installed_frame = None;
+        for frame in 1..=600 {
+            let report = runtime.drain_cooked_asset_stream();
+            assert!(report.is_ok(), "diagnostics: {:?}", report.diagnostics);
+            runtime.render_frame(frame).expect("frame during streaming");
+            if runtime
+                .asset_registry()
+                .get::<MaterialUpload>(&streamed_id)
+                .is_some()
+            {
+                installed_frame = Some(frame);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(installed_frame.is_some(), "streamed asset never installed");
+        assert_eq!(runtime.cooked_asset_stream_pending(), 0);
+        assert_eq!(runtime.asset_registry().pending_loads(), 0);
+        // The runtime keeps rendering normally after the additive install.
+        runtime.render_frame(601).expect("frame after streaming");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

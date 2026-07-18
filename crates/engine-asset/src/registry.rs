@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -78,6 +78,12 @@ pub struct CachedEntry {
 pub struct AssetRegistry {
     loaders: BTreeMap<String, Arc<dyn AssetLoader>>,
     cache: BTreeMap<AssetId, CachedEntry>,
+    /// IDs with a background load in flight. Kept out of the typed cache so
+    /// [`contains`](Self::contains) and typed lookups keep meaning "ready to
+    /// use"; render synchronisation treats a missing typed entry as an error,
+    /// so a placeholder cache entry would surface false missing-asset
+    /// diagnostics.
+    pending: BTreeSet<AssetId>,
 }
 
 impl AssetRegistry {
@@ -90,6 +96,7 @@ impl AssetRegistry {
         Self {
             loaders: BTreeMap::new(),
             cache: BTreeMap::new(),
+            pending: BTreeSet::new(),
         }
     }
 
@@ -119,6 +126,7 @@ impl AssetRegistry {
         value: T,
     ) -> AssetHandle<T> {
         let typed = Arc::new(value);
+        self.pending.remove(&id);
         self.cache.insert(
             id.clone(),
             CachedEntry {
@@ -149,6 +157,7 @@ impl AssetRegistry {
         raw_bytes: Vec<u8>,
         value: Box<dyn Any + Send + Sync + 'static>,
     ) {
+        self.pending.remove(&id);
         self.cache.insert(
             id.clone(),
             CachedEntry {
@@ -189,6 +198,7 @@ impl AssetRegistry {
 
         let raw_bytes = Arc::new(bytes);
 
+        self.pending.remove(id);
         self.cache.insert(
             id.clone(),
             CachedEntry {
@@ -264,6 +274,7 @@ impl AssetRegistry {
             .map_err(|_| AssetError::TypeMismatch)?;
         let typed_arc = Arc::from(typed);
 
+        self.pending.remove(id);
         self.cache.insert(
             id.clone(),
             CachedEntry {
@@ -311,6 +322,7 @@ impl AssetRegistry {
     /// Existing [`AssetHandle`]s remain valid because they hold their own
     /// [`Arc`] reference to the data.
     pub fn unload(&mut self, id: &AssetId) -> bool {
+        self.pending.remove(id);
         self.cache.remove(id).is_some()
     }
 
@@ -351,6 +363,7 @@ impl AssetRegistry {
             raw_bytes,
             typed: None,
         };
+        self.pending.remove(id);
         self.cache.insert(id.clone(), replacement);
         Ok(())
     }
@@ -360,13 +373,50 @@ impl AssetRegistry {
         self.cache.keys().cloned().collect()
     }
 
-    /// Return the number of assets currently being loaded asynchronously.
+    /// Mark an asset as loading in the background without inserting a cache
+    /// entry.
     ///
-    /// All loads in this implementation are synchronous, so this always
-    /// returns `0`.  When asynchronous / background loading is added in a
-    /// future gate this will track in-flight requests.
+    /// The mark lives outside the typed cache, so in-flight assets are
+    /// invisible to [`contains`](Self::contains) and typed lookups: consumers
+    /// such as render synchronisation keep treating them as not yet usable
+    /// instead of mistaking a placeholder for a ready asset. Any operation
+    /// that installs or removes the asset ([`insert_typed`](Self::insert_typed),
+    /// [`insert_erased`](Self::insert_erased), [`load`](Self::load),
+    /// [`load_typed`](Self::load_typed),
+    /// [`reload_from_root`](Self::reload_from_root),
+    /// [`unload`](Self::unload)) clears the mark automatically; failed loads
+    /// clear it explicitly via [`unmark_loading`](Self::unmark_loading).
+    pub fn mark_loading(&mut self, id: AssetId) {
+        self.pending.insert(id);
+    }
+
+    /// Clear a background loading mark. Returns `true` when the asset was
+    /// marked.
+    pub fn unmark_loading(&mut self, id: &AssetId) -> bool {
+        self.pending.remove(id)
+    }
+
+    /// Lifecycle state of an asset: [`AssetState::Ready`] when usable in the
+    /// cache, [`AssetState::Loading`] while a background load is in flight,
+    /// `None` when the asset is unknown to this registry.
+    pub fn asset_state(&self, id: &AssetId) -> Option<AssetState> {
+        if self.cache.contains_key(id) {
+            return Some(AssetState::Ready);
+        }
+        self.pending.contains(id).then_some(AssetState::Loading)
+    }
+
+    /// Raw payload bytes of a cached asset without triggering a filesystem
+    /// load. Typed render uploads store no raw bytes, so this returns an
+    /// empty buffer for them; extension assets retain their cooked payload.
+    pub fn cached_raw_bytes(&self, id: &AssetId) -> Option<Arc<Vec<u8>>> {
+        self.cache.get(id).map(|entry| Arc::clone(&entry.raw_bytes))
+    }
+
+    /// Return the number of assets currently marked as loading in the
+    /// background (see [`mark_loading`](Self::mark_loading)).
     pub fn pending_loads(&self) -> usize {
-        0
+        self.pending.len()
     }
 }
 

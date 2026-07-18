@@ -24,6 +24,10 @@ pub struct CookedAssetLoadReport {
     pub loaded_materials: usize,
     pub loaded_extension_assets: BTreeMap<String, usize>,
     pub skipped_assets: Vec<String>,
+    /// Additive installs only: assets whose ID was already present with an
+    /// identical decoded payload. They are no-op successes, not reloads, so
+    /// they are counted here instead of in the `loaded_*` fields.
+    pub identical_assets: usize,
 }
 
 impl CookedAssetLoadReport {
@@ -40,6 +44,156 @@ impl CookedAssetLoadReport {
     }
 }
 
+/// How a validated batch of cooked assets is installed into the runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CookedCommitMode {
+    /// Unload the previously installed cooked batch, then install the new
+    /// one. This is the transactional whole-directory behaviour of
+    /// [`EngineRuntime::load_cooked_assets`].
+    Replace,
+    /// Install without unloading anything. An asset whose ID is already
+    /// present is a no-op success when its decoded payload is identical, and
+    /// a validation error naming the ID when the payload differs or a
+    /// different asset kind owns the ID.
+    Additive,
+}
+
+/// Cooked artifacts decoded and structurally validated, but not yet checked
+/// against a live asset registry.
+///
+/// Every payload is owned plain data (`Vec<u8>`, floats, strings), so the
+/// batch is `Send` and can be produced on a background thread; see
+/// [`crate::AssetStreamLoader`].
+pub struct DecodedBatch {
+    pub(crate) discovered_assets: usize,
+    pub(crate) skipped_assets: Vec<String>,
+    pub(crate) meshes: Vec<MeshUpload>,
+    pub(crate) textures: Vec<TextureUpload>,
+    pub(crate) materials: Vec<(PathBuf, MaterialUpload)>,
+    pub(crate) extensions: Vec<DecodedExtensionAsset>,
+}
+
+impl DecodedBatch {
+    /// Number of `.cooked` files the decode stage was asked to read.
+    pub fn discovered_assets(&self) -> usize {
+        self.discovered_assets
+    }
+
+    /// Artifacts intentionally skipped (shader, scene, logic, …).
+    pub fn skipped_assets(&self) -> &[String] {
+        &self.skipped_assets
+    }
+
+    /// Number of runtime-installable assets in the batch.
+    pub fn decoded_assets(&self) -> usize {
+        self.meshes.len() + self.textures.len() + self.materials.len() + self.extensions.len()
+    }
+
+    /// Flatten into commit order: textures, materials, meshes, extensions.
+    /// Textures precede materials so a same-batch material → texture
+    /// dependency is satisfied even when a commit budget splits the batch
+    /// across drains.
+    pub(crate) fn into_commit_order(self) -> Vec<DecodedCookedAsset> {
+        let mut items = Vec::with_capacity(self.decoded_assets());
+        items.extend(self.textures.into_iter().map(DecodedCookedAsset::Texture));
+        items.extend(
+            self.materials
+                .into_iter()
+                .map(|(path, upload)| DecodedCookedAsset::Material(path, upload)),
+        );
+        items.extend(self.meshes.into_iter().map(DecodedCookedAsset::Mesh));
+        items.extend(
+            self.extensions
+                .into_iter()
+                .map(DecodedCookedAsset::Extension),
+        );
+        items
+    }
+}
+
+/// A [`DecodedBatch`] whose cross-references — and, for additive installs,
+/// asset-ID conflicts — were validated against a specific runtime. Committing
+/// it cannot fail.
+pub struct ValidatedBatch {
+    pub(crate) decoded: DecodedBatch,
+    pub(crate) mode: CookedCommitMode,
+    /// Additive mode: asset IDs already installed with an identical payload.
+    pub(crate) identical_ids: BTreeSet<AssetId>,
+}
+
+impl ValidatedBatch {
+    /// Commit mode this batch was validated for.
+    pub fn mode(&self) -> CookedCommitMode {
+        self.mode
+    }
+
+    /// Additive mode: number of assets that will be skipped as identical.
+    pub fn identical_assets(&self) -> usize {
+        self.identical_ids.len()
+    }
+}
+
+/// Decode and structurally validate a set of cooked artifacts.
+///
+/// This is the first stage of [`EngineRuntime::load_cooked_assets`], reused
+/// by background loaders: it performs all file I/O and per-artifact checks
+/// but never touches an asset registry, so it is safe to run off the main
+/// thread. Paths are processed in the given order; any broken artifact fails
+/// the whole batch with one diagnostic per failure.
+pub fn decode_cooked_batch(
+    paths: &[PathBuf],
+    asset_type_registry: &AssetTypeRegistry,
+) -> Result<DecodedBatch, Vec<Diagnostic>> {
+    let mut batch = DecodedBatch {
+        discovered_assets: paths.len(),
+        skipped_assets: Vec::new(),
+        meshes: Vec::new(),
+        textures: Vec::new(),
+        materials: Vec::new(),
+        extensions: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    for path in paths {
+        match decode_cooked_asset(path, asset_type_registry) {
+            Ok(DecodedCookedAsset::Mesh(upload)) => batch.meshes.push(upload),
+            Ok(DecodedCookedAsset::Texture(upload)) => batch.textures.push(upload),
+            Ok(DecodedCookedAsset::Material(path, upload)) => {
+                batch.materials.push((path, upload));
+            }
+            Ok(DecodedCookedAsset::Extension(asset)) => batch.extensions.push(asset),
+            Ok(DecodedCookedAsset::Skipped(kind)) => {
+                batch.skipped_assets.push(format!(
+                    "{} ({kind:?})",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            Err(error) => diagnostics.push(cooked_error(path, error)),
+        }
+    }
+    if diagnostics.is_empty() {
+        Ok(batch)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+/// How one asset installs in additive mode: freshly, as an identical-payload
+/// no-op, or not at all because the ID is taken by a different payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstallPlan {
+    Install,
+    NoOp,
+    Conflict,
+}
+
+/// What [`EngineRuntime::install_decoded_item`] installed, for reporting.
+pub(crate) enum InstalledItemKind {
+    Mesh,
+    Texture,
+    Material,
+    Extension(String),
+}
+
 impl EngineRuntime {
     /// Validate and register every runtime-loadable cooked asset in `cooked_dir`.
     ///
@@ -48,6 +202,11 @@ impl EngineRuntime {
     /// or unsupported artifact leaves the previous successful batch intact.
     /// Shader, scene, logic, pipeline, and script artifacts are reported as
     /// skipped because their dedicated consumers do not use this cache.
+    ///
+    /// This is the staged pipeline
+    /// ([`decode_cooked_batch`] → [`validate_cooked_batch`](Self::validate_cooked_batch)
+    /// → [`commit_cooked_batch`](Self::commit_cooked_batch)) in
+    /// [`CookedCommitMode::Replace`] over the whole directory.
     pub fn load_cooked_assets(
         &mut self,
         cooked_dir: &Path,
@@ -93,101 +252,278 @@ impl EngineRuntime {
         }
         paths.sort();
 
-        let mut report = CookedAssetLoadReport {
-            discovered_assets: paths.len(),
-            ..CookedAssetLoadReport::default()
+        let batch = decode_cooked_batch(&paths, &self.asset_type_registry)?;
+        let batch = self.validate_cooked_batch(batch, CookedCommitMode::Replace)?;
+        Ok(self.commit_cooked_batch(batch))
+    }
+
+    /// Decode, validate, and additively install an explicit set of cooked
+    /// artifacts, synchronously, without unloading existing assets.
+    ///
+    /// Conflict rules: an asset ID already present with an identical decoded
+    /// payload is a no-op success (counted as
+    /// [`CookedAssetLoadReport::identical_assets`]); a differing payload, or
+    /// a different asset kind owning the same ID, is a validation error
+    /// listing the ID and nothing from the batch is installed. Existing
+    /// assets — including earlier batches — are never modified by a failure.
+    pub fn install_cooked_assets_additive(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<CookedAssetLoadReport, Vec<Diagnostic>> {
+        let batch = decode_cooked_batch(paths, &self.asset_type_registry)?;
+        let batch = self.validate_cooked_batch(batch, CookedCommitMode::Additive)?;
+        Ok(self.commit_cooked_batch(batch))
+    }
+
+    /// Second stage: check a decoded batch against this runtime's registry.
+    ///
+    /// Material → texture references must resolve inside the batch or against
+    /// the registry (in [`CookedCommitMode::Replace`] entries from the
+    /// previous cooked batch do not count — they are about to be unloaded).
+    /// Additive validation additionally classifies every asset ID as install
+    /// or identical-no-op and rejects payload conflicts.
+    pub fn validate_cooked_batch(
+        &self,
+        batch: DecodedBatch,
+        mode: CookedCommitMode,
+    ) -> Result<ValidatedBatch, Vec<Diagnostic>> {
+        let empty = BTreeSet::new();
+        let replaced_asset_ids = match mode {
+            CookedCommitMode::Replace => &self.loaded_cooked_asset_ids,
+            CookedCommitMode::Additive => &empty,
         };
-        let mut meshes = Vec::new();
-        let mut textures = Vec::new();
-        let mut materials = Vec::new();
-        let mut extensions = Vec::new();
-        let mut diagnostics = Vec::new();
-        for path in paths {
-            match decode_cooked_asset(&path, &self.asset_type_registry) {
-                Ok(DecodedCookedAsset::Mesh(upload)) => meshes.push(upload),
-                Ok(DecodedCookedAsset::Texture(upload)) => textures.push(upload),
-                Ok(DecodedCookedAsset::Material(upload)) => {
-                    materials.push((path.clone(), upload));
-                }
-                Ok(DecodedCookedAsset::Extension(asset)) => extensions.push(asset),
-                Ok(DecodedCookedAsset::Skipped(kind)) => {
-                    report.skipped_assets.push(format!(
-                        "{} ({kind:?})",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                }
-                Err(error) => diagnostics.push(cooked_error(&path, error)),
+        let mut diagnostics = validate_material_texture_dependencies(
+            self,
+            &batch.textures,
+            &batch.materials,
+            replaced_asset_ids,
+        );
+
+        let mut identical_ids = BTreeSet::new();
+        if mode == CookedCommitMode::Additive {
+            for upload in &batch.textures {
+                Self::classify_additive(
+                    &mut identical_ids,
+                    &mut diagnostics,
+                    &upload.texture_id,
+                    "texture",
+                    self.additive_typed_plan(&upload.texture_id, upload),
+                );
+            }
+            for (_, upload) in &batch.materials {
+                Self::classify_additive(
+                    &mut identical_ids,
+                    &mut diagnostics,
+                    &upload.material_id,
+                    "material",
+                    self.additive_typed_plan(&upload.material_id, upload),
+                );
+            }
+            for upload in &batch.meshes {
+                Self::classify_additive(
+                    &mut identical_ids,
+                    &mut diagnostics,
+                    &upload.mesh_id,
+                    "mesh",
+                    self.additive_typed_plan(&upload.mesh_id, upload),
+                );
+            }
+            for asset in &batch.extensions {
+                let plan = self.additive_extension_plan(asset);
+                Self::classify_additive(
+                    &mut identical_ids,
+                    &mut diagnostics,
+                    &asset.id,
+                    &asset.type_id,
+                    plan,
+                );
             }
         }
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }
+        Ok(ValidatedBatch {
+            decoded: batch,
+            mode,
+            identical_ids,
+        })
+    }
 
-        diagnostics.extend(validate_material_texture_dependencies(
-            self,
-            &textures,
-            &materials,
-            &self.loaded_cooked_asset_ids,
-        ));
-        if !diagnostics.is_empty() {
-            return Err(diagnostics);
+    fn classify_additive(
+        identical_ids: &mut BTreeSet<AssetId>,
+        diagnostics: &mut Vec<Diagnostic>,
+        id: &AssetId,
+        kind: &str,
+        plan: InstallPlan,
+    ) {
+        match plan {
+            InstallPlan::NoOp => {
+                identical_ids.insert(id.clone());
+            }
+            InstallPlan::Install => {}
+            InstallPlan::Conflict => diagnostics.push(additive_conflict_error(id, kind)),
         }
+    }
 
-        report.loaded_meshes = meshes.len();
-        report.loaded_textures = textures.len();
-        report.loaded_materials = materials.len();
-        for asset in &extensions {
-            *report
-                .loaded_extension_assets
-                .entry(asset.type_id.clone())
-                .or_default() += 1;
+    /// Third stage: install a validated batch. Infallible — validation has
+    /// already proven every install or no-op. Returns the deterministic
+    /// install summary. In [`CookedCommitMode::Replace`] the previous cooked
+    /// batch is unloaded first; in [`CookedCommitMode::Additive`] the new
+    /// assets merge into the tracked cooked set, so a later replace also
+    /// unloads them.
+    pub fn commit_cooked_batch(&mut self, batch: ValidatedBatch) -> CookedAssetLoadReport {
+        let ValidatedBatch {
+            mut decoded,
+            mode,
+            identical_ids,
+        } = batch;
+        let mut report = CookedAssetLoadReport {
+            discovered_assets: decoded.discovered_assets,
+            skipped_assets: std::mem::take(&mut decoded.skipped_assets),
+            identical_assets: identical_ids.len(),
+            ..CookedAssetLoadReport::default()
+        };
+        if mode == CookedCommitMode::Replace {
+            for id in std::mem::take(&mut self.loaded_cooked_asset_ids) {
+                self.asset_registry.unload(&id);
+            }
+            self.loaded_extension_asset_ids.clear();
         }
+        for item in decoded.into_commit_order() {
+            if identical_ids.contains(item.asset_id()) {
+                continue;
+            }
+            match self.install_decoded_item(item) {
+                InstalledItemKind::Mesh => report.loaded_meshes += 1,
+                InstalledItemKind::Texture => report.loaded_textures += 1,
+                InstalledItemKind::Material => report.loaded_materials += 1,
+                InstalledItemKind::Extension(type_id) => {
+                    *report.loaded_extension_assets.entry(type_id).or_default() += 1;
+                }
+            }
+        }
+        report
+    }
 
-        for id in std::mem::take(&mut self.loaded_cooked_asset_ids) {
-            self.asset_registry.unload(&id);
+    /// Install one decoded asset and record it in the cooked tracking sets.
+    pub(crate) fn install_decoded_item(&mut self, item: DecodedCookedAsset) -> InstalledItemKind {
+        match item {
+            DecodedCookedAsset::Texture(upload) => {
+                self.loaded_cooked_asset_ids
+                    .insert(upload.texture_id.clone());
+                self.register_texture_asset(upload);
+                InstalledItemKind::Texture
+            }
+            DecodedCookedAsset::Material(_, upload) => {
+                self.loaded_cooked_asset_ids
+                    .insert(upload.material_id.clone());
+                self.register_material_asset(upload);
+                InstalledItemKind::Material
+            }
+            DecodedCookedAsset::Mesh(upload) => {
+                self.loaded_cooked_asset_ids.insert(upload.mesh_id.clone());
+                self.register_mesh_asset(upload);
+                InstalledItemKind::Mesh
+            }
+            DecodedCookedAsset::Extension(asset) => {
+                self.loaded_cooked_asset_ids.insert(asset.id.clone());
+                self.loaded_extension_asset_ids
+                    .entry(asset.type_id.clone())
+                    .or_default()
+                    .insert(asset.id.clone());
+                let type_id = asset.type_id.clone();
+                self.asset_registry
+                    .insert_erased(asset.id, asset.payload, asset.value);
+                InstalledItemKind::Extension(type_id)
+            }
+            DecodedCookedAsset::Skipped(_) => {
+                unreachable!("skipped artifacts are never queued for commit")
+            }
         }
-        self.loaded_extension_asset_ids.clear();
+    }
 
-        let mut installed_ids = BTreeSet::new();
-        for upload in textures {
-            installed_ids.insert(upload.texture_id.clone());
-            self.register_texture_asset(upload);
+    /// Additive conflict check for a typed render asset: an identical typed
+    /// value already installed is a no-op; any other occupant of the same ID
+    /// (different payload or different asset kind) is a conflict.
+    pub(crate) fn additive_typed_plan<T>(&self, id: &AssetId, upload: &T) -> InstallPlan
+    where
+        T: PartialEq + Send + Sync + 'static,
+    {
+        if let Some(existing) = self.asset_registry.get::<T>(id) {
+            return if existing.get() == upload {
+                InstallPlan::NoOp
+            } else {
+                InstallPlan::Conflict
+            };
         }
-        for (_, upload) in materials {
-            installed_ids.insert(upload.material_id.clone());
-            self.register_material_asset(upload);
+        if self.asset_registry.contains(id) {
+            return InstallPlan::Conflict;
         }
-        for upload in meshes {
-            installed_ids.insert(upload.mesh_id.clone());
-            self.register_mesh_asset(upload);
+        InstallPlan::Install
+    }
+
+    /// Additive conflict check for an extension asset: a no-op only when the
+    /// same extension type already installed the same cooked payload.
+    pub(crate) fn additive_extension_plan(&self, asset: &DecodedExtensionAsset) -> InstallPlan {
+        if !self.asset_registry.contains(&asset.id) {
+            return InstallPlan::Install;
         }
-        for asset in extensions {
-            installed_ids.insert(asset.id.clone());
-            self.loaded_extension_asset_ids
-                .entry(asset.type_id)
-                .or_default()
-                .insert(asset.id.clone());
-            self.asset_registry
-                .insert_erased(asset.id, asset.payload, asset.value);
+        let same_extension = self
+            .loaded_extension_asset_ids
+            .get(&asset.type_id)
+            .is_some_and(|ids| ids.contains(&asset.id));
+        let same_payload = self
+            .asset_registry
+            .cached_raw_bytes(&asset.id)
+            .is_some_and(|bytes| *bytes == asset.payload);
+        if same_extension && same_payload {
+            InstallPlan::NoOp
+        } else {
+            InstallPlan::Conflict
         }
-        self.loaded_cooked_asset_ids = installed_ids;
-        Ok(report)
     }
 }
 
-enum DecodedCookedAsset {
+pub(crate) enum DecodedCookedAsset {
     Mesh(MeshUpload),
     Texture(TextureUpload),
-    Material(MaterialUpload),
+    Material(PathBuf, MaterialUpload),
     Extension(DecodedExtensionAsset),
     Skipped(AssetType),
 }
 
-struct DecodedExtensionAsset {
-    type_id: String,
-    id: AssetId,
-    payload: Vec<u8>,
-    value: Box<dyn Any + Send + Sync>,
+impl DecodedCookedAsset {
+    pub(crate) fn asset_id(&self) -> &AssetId {
+        match self {
+            DecodedCookedAsset::Mesh(upload) => &upload.mesh_id,
+            DecodedCookedAsset::Texture(upload) => &upload.texture_id,
+            DecodedCookedAsset::Material(_, upload) => &upload.material_id,
+            DecodedCookedAsset::Extension(asset) => &asset.id,
+            DecodedCookedAsset::Skipped(_) => {
+                unreachable!("skipped artifacts are never queued for commit")
+            }
+        }
+    }
+}
+
+pub(crate) struct DecodedExtensionAsset {
+    pub(crate) type_id: String,
+    pub(crate) id: AssetId,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) value: Box<dyn Any + Send + Sync>,
+}
+
+pub(crate) fn additive_conflict_error(id: &AssetId, kind: &str) -> Diagnostic {
+    Diagnostic::new(
+        "AS0003",
+        DiagnosticSeverity::Error,
+        "engine-core.cooked-assets",
+        format!(
+            "additive install of {kind} asset '{}' conflicts with a different asset already \
+             installed under the same ID; unload it explicitly or use a replace-mode load",
+            id.id
+        ),
+    )
 }
 
 fn decode_cooked_asset(
@@ -275,17 +611,20 @@ fn decode_cooked_asset(
             if material.double_sided {
                 return Err("double-sided cooked materials are not supported".into());
             }
-            Ok(DecodedCookedAsset::Material(MaterialUpload {
-                material_id: id,
-                base_color: material.base_color,
-                metallic: material.metallic,
-                roughness: material.roughness,
-                ambient_occlusion: material.ambient_occlusion,
-                base_color_texture: material.base_color_texture,
-                transparency,
-                double_sided: false,
-                content_hash: artifact.header.content_hash,
-            }))
+            Ok(DecodedCookedAsset::Material(
+                path.to_path_buf(),
+                MaterialUpload {
+                    material_id: id,
+                    base_color: material.base_color,
+                    metallic: material.metallic,
+                    roughness: material.roughness,
+                    ambient_occlusion: material.ambient_occlusion,
+                    base_color_texture: material.base_color_texture,
+                    transparency,
+                    double_sided: false,
+                    content_hash: artifact.header.content_hash,
+                },
+            ))
         }
         kind @ (AssetType::Audio
         | AssetType::Animation
@@ -337,26 +676,49 @@ fn validate_material_texture_dependencies(
         .iter()
         .filter_map(|(path, upload)| {
             let texture_id = upload.base_color_texture.as_ref()?;
-            let available = batch_texture_ids.contains(texture_id)
-                || (!replaced_asset_ids.contains(texture_id)
-                    && runtime
-                        .asset_registry()
-                        .get::<TextureUpload>(texture_id)
-                        .is_some());
-            (!available).then(|| {
-                cooked_error(
-                    path,
-                    format!(
-                        "cooked material '{}' references missing texture '{}'",
-                        upload.material_id.id, texture_id.id
-                    ),
-                )
-            })
+            (!material_texture_available(
+                runtime,
+                &batch_texture_ids,
+                replaced_asset_ids,
+                texture_id,
+            ))
+            .then(|| missing_texture_error(path, &upload.material_id, texture_id))
         })
         .collect()
 }
 
-fn cooked_asset_id(path: &Path) -> Result<AssetId, String> {
+pub(crate) fn missing_texture_error(
+    path: &Path,
+    material_id: &AssetId,
+    texture_id: &AssetId,
+) -> Diagnostic {
+    cooked_error(
+        path,
+        format!(
+            "cooked material '{}' references missing texture '{}'",
+            material_id.id, texture_id.id
+        ),
+    )
+}
+
+/// A material's base-color texture resolves when it is decoded in the same
+/// batch or already installed as a typed texture that the commit will not
+/// unload.
+pub(crate) fn material_texture_available(
+    runtime: &EngineRuntime,
+    batch_texture_ids: &BTreeSet<AssetId>,
+    replaced_asset_ids: &BTreeSet<AssetId>,
+    texture_id: &AssetId,
+) -> bool {
+    batch_texture_ids.contains(texture_id)
+        || (!replaced_asset_ids.contains(texture_id)
+            && runtime
+                .asset_registry()
+                .get::<TextureUpload>(texture_id)
+                .is_some())
+}
+
+pub(crate) fn cooked_asset_id(path: &Path) -> Result<AssetId, String> {
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -418,10 +780,10 @@ fn cooked_error(path: &Path, message: impl Into<String>) -> Diagnostic {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn cooked_case(name: &str) -> PathBuf {
+    pub(crate) fn cooked_case(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "engine_core_cooked_material_{name}_{}",
             std::process::id()
@@ -431,7 +793,16 @@ mod tests {
         dir
     }
 
-    fn cook_test_material(dir: &Path, id: &str, texture: Option<&str>) {
+    pub(crate) fn cook_test_material(dir: &Path, id: &str, texture: Option<&str>) {
+        cook_test_material_with_color(dir, id, texture, [0.8, 0.7, 0.6, 1.0]);
+    }
+
+    pub(crate) fn cook_test_material_with_color(
+        dir: &Path,
+        id: &str,
+        texture: Option<&str>,
+        base_color: [f32; 4],
+    ) {
         let texture_field = texture
             .map(|texture| format!(r#", "base_color_texture": "{texture}""#))
             .unwrap_or_default();
@@ -441,13 +812,14 @@ mod tests {
             format!(
                 r#"{{
                     "schema": "MaterialSource-v0",
-                    "base_color": [0.8, 0.7, 0.6, 1.0],
+                    "base_color": [{}, {}, {}, {}],
                     "metallic": 0.25,
                     "roughness": 0.5,
                     "ambient_occlusion": 1.0{texture_field},
                     "transparency": "Opaque",
                     "double_sided": false
-                }}"#
+                }}"#,
+                base_color[0], base_color[1], base_color[2], base_color[3]
             ),
         )
         .unwrap();
@@ -483,6 +855,21 @@ mod tests {
             double_sided: false,
             content_hash: [2; 32],
         }
+    }
+
+    fn drain_until_idle(
+        runtime: &mut EngineRuntime,
+        max_iterations: usize,
+    ) -> crate::StreamDrainReport {
+        let mut last = crate::StreamDrainReport::default();
+        for _ in 0..max_iterations {
+            last = runtime.drain_cooked_asset_stream();
+            if last.is_complete() {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        last
     }
 
     #[test]
@@ -584,6 +971,323 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn staged_pipeline_matches_legacy_whole_directory_load() {
+        let dir = cooked_case("staged_equivalence");
+        cook_test_material(&dir, "material.alpha", None);
+        cook_test_material(&dir, "material.beta", None);
+
+        let mut legacy = EngineRuntime::new(crate::EngineConfig::default());
+        let legacy_report = legacy.load_cooked_assets(&dir).unwrap();
+
+        let mut staged = EngineRuntime::new(crate::EngineConfig::default());
+        let paths = vec![
+            dir.join("material.alpha.cooked"),
+            dir.join("material.beta.cooked"),
+        ];
+        let decoded =
+            decode_cooked_batch(&paths, staged.asset_type_registry()).expect("decode stage");
+        assert_eq!(decoded.discovered_assets(), 2);
+        assert_eq!(decoded.decoded_assets(), 2);
+        let validated = staged
+            .validate_cooked_batch(decoded, CookedCommitMode::Replace)
+            .expect("validate stage");
+        assert_eq!(validated.mode(), CookedCommitMode::Replace);
+        let staged_report = staged.commit_cooked_batch(validated);
+
+        assert_eq!(legacy_report, staged_report);
+        for id in ["material.alpha", "material.beta"] {
+            let id = AssetId::new(id);
+            assert_eq!(
+                legacy
+                    .asset_registry()
+                    .get::<MaterialUpload>(&id)
+                    .map(|h| h.get().clone()),
+                staged
+                    .asset_registry()
+                    .get::<MaterialUpload>(&id)
+                    .map(|h| h.get().clone()),
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn additive_install_merges_without_unloading_and_tracks_for_later_replace() {
+        let dir_a = cooked_case("additive_base");
+        cook_test_material(&dir_a, "material.base", None);
+        let dir_b = cooked_case("additive_extra");
+        cook_test_material(&dir_b, "material.extra", None);
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+
+        runtime.load_cooked_assets(&dir_a).unwrap();
+        let report = runtime
+            .install_cooked_assets_additive(&[dir_b.join("material.extra.cooked")])
+            .unwrap();
+
+        assert_eq!(report.loaded_materials, 1);
+        assert_eq!(report.identical_assets, 0);
+        for id in ["material.base", "material.extra"] {
+            assert!(runtime
+                .asset_registry()
+                .get::<MaterialUpload>(&AssetId::new(id))
+                .is_some());
+        }
+
+        // A later whole-directory replace unloads additively installed assets too.
+        let empty = cooked_case("additive_empty");
+        runtime.load_cooked_assets(&empty).unwrap();
+        for id in ["material.base", "material.extra"] {
+            assert!(runtime
+                .asset_registry()
+                .get::<MaterialUpload>(&AssetId::new(id))
+                .is_none());
+        }
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+        let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    fn additive_identical_payload_is_a_noop_success() {
+        let dir = cooked_case("additive_identical");
+        cook_test_material(&dir, "material.same", None);
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+        let paths = [dir.join("material.same.cooked")];
+
+        let first = runtime.install_cooked_assets_additive(&paths).unwrap();
+        assert_eq!(first.loaded_materials, 1);
+        assert_eq!(first.identical_assets, 0);
+
+        let second = runtime.install_cooked_assets_additive(&paths).unwrap();
+        assert_eq!(second.loaded_materials, 0);
+        assert_eq!(second.loaded_assets(), 0);
+        assert_eq!(second.identical_assets, 1);
+        assert!(runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.same"))
+            .is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn additive_differing_payload_is_a_validation_error_naming_the_id() {
+        let dir_a = cooked_case("additive_conflict_a");
+        cook_test_material_with_color(&dir_a, "material.dup", None, [0.8, 0.7, 0.6, 1.0]);
+        let dir_b = cooked_case("additive_conflict_b");
+        cook_test_material_with_color(&dir_b, "material.dup", None, [0.1, 0.2, 0.3, 1.0]);
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+
+        runtime
+            .install_cooked_assets_additive(&[dir_a.join("material.dup.cooked")])
+            .unwrap();
+        let diagnostics = runtime
+            .install_cooked_assets_additive(&[dir_b.join("material.dup.cooked")])
+            .unwrap_err();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "AS0003");
+        assert!(diagnostics[0].message.contains("material.dup"));
+        // The original payload survives the rejected install.
+        let installed = runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.dup"))
+            .expect("original material remains");
+        assert_eq!(installed.get().base_color, [0.8, 0.7, 0.6, 1.0]);
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    #[test]
+    fn additive_validation_failure_leaves_prior_batch_active() {
+        let dir = cooked_case("additive_prior_batch");
+        cook_test_material(&dir, "material.prior", None);
+        let broken = cooked_case("additive_broken");
+        cook_test_material(&broken, "material.broken", Some("texture.missing"));
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+        runtime.load_cooked_assets(&dir).unwrap();
+
+        let diagnostics = runtime
+            .install_cooked_assets_additive(&[broken.join("material.broken.cooked")])
+            .unwrap_err();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("texture.missing"));
+        assert!(runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.prior"))
+            .is_some());
+        assert!(runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.broken"))
+            .is_none());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(broken);
+    }
+
+    #[test]
+    fn background_stream_installs_assets_at_the_frame_boundary() {
+        let dir = cooked_case("stream_roundtrip");
+        for index in 0..3 {
+            cook_test_material(&dir, &format!("material.stream{index}"), None);
+        }
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+        let paths = (0..3)
+            .map(|index| dir.join(format!("material.stream{index}.cooked")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(runtime.enqueue_cooked_asset_stream(paths), 3);
+        assert_eq!(runtime.asset_registry().pending_loads(), 3);
+        assert_eq!(runtime.cooked_asset_stream_pending(), 3);
+        assert_eq!(
+            runtime
+                .asset_registry()
+                .asset_state(&AssetId::new("material.stream1")),
+            Some(engine_asset::AssetState::Loading),
+        );
+
+        let report = drain_until_idle(&mut runtime, 1_000);
+        assert!(report.is_ok(), "diagnostics: {:?}", report.diagnostics);
+        assert_eq!(report.committed, 3);
+        assert_eq!(runtime.cooked_asset_stream_pending(), 0);
+        assert_eq!(runtime.asset_registry().pending_loads(), 0);
+        for index in 0..3 {
+            let id = AssetId::new(format!("material.stream{index}"));
+            assert!(runtime
+                .asset_registry()
+                .get::<MaterialUpload>(&id)
+                .is_some());
+            assert_eq!(
+                runtime.asset_registry().asset_state(&id),
+                Some(engine_asset::AssetState::Ready),
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stream_drain_respects_the_commit_budget() {
+        let dir = cooked_case("stream_budget");
+        for index in 0..5 {
+            cook_test_material(&dir, &format!("material.budget{index}"), None);
+        }
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+        runtime.set_cooked_asset_stream_budget(2);
+        assert_eq!(runtime.cooked_asset_stream_budget(), 2);
+        let paths = (0..5)
+            .map(|index| dir.join(format!("material.budget{index}.cooked")))
+            .collect::<Vec<_>>();
+        runtime.enqueue_cooked_asset_stream(paths);
+
+        let mut productive_drains = 0;
+        let mut total_committed = 0;
+        for _ in 0..1_000 {
+            let report = runtime.drain_cooked_asset_stream();
+            assert!(report.committed <= 2, "budget exceeded: {report:?}");
+            if report.committed > 0 {
+                productive_drains += 1;
+                total_committed += report.committed;
+            }
+            if report.is_complete() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert_eq!(total_committed, 5);
+        assert_eq!(productive_drains, 3, "5 assets at budget 2 commit 2+2+1");
+        for index in 0..5 {
+            assert!(runtime
+                .asset_registry()
+                .get::<MaterialUpload>(&AssetId::new(format!("material.budget{index}")))
+                .is_some());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stream_commit_conflict_discards_the_failed_batch_and_keeps_prior_state() {
+        let dir_a = cooked_case("stream_conflict_a");
+        cook_test_material_with_color(&dir_a, "material.keep", None, [0.8, 0.7, 0.6, 1.0]);
+        let dir_b = cooked_case("stream_conflict_b");
+        cook_test_material_with_color(&dir_b, "material.keep", None, [0.1, 0.2, 0.3, 1.0]);
+        cook_test_material(&dir_b, "material.sibling", None);
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+        runtime.load_cooked_assets(&dir_a).unwrap();
+
+        runtime.enqueue_cooked_asset_stream(vec![
+            dir_b.join("material.keep.cooked"),
+            dir_b.join("material.sibling.cooked"),
+        ]);
+        let report = drain_until_idle(&mut runtime, 1_000);
+
+        assert!(!report.is_ok());
+        assert_eq!(report.failed_batches, 1);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "AS0003"
+                && diagnostic.message.contains("material.keep")));
+        // The conflicting batch was discarded entirely; prior state is intact.
+        let installed = runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.keep"))
+            .expect("prior material remains");
+        assert_eq!(installed.get().base_color, [0.8, 0.7, 0.6, 1.0]);
+        assert!(runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.sibling"))
+            .is_none());
+        assert_eq!(runtime.asset_registry().pending_loads(), 0);
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    #[test]
+    fn stream_decode_failure_reports_and_clears_loading_marks() {
+        let dir = cooked_case("stream_decode_failure");
+        cook_test_material(&dir, "material.good", None);
+        engine_asset::cook::write_cooked_artifact(
+            &dir.join("broken.cooked"),
+            4_242,
+            b"valid outer artifact with unknown kind",
+            engine_serialize::SchemaVersion::new(0, 1, 0),
+        )
+        .unwrap();
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+
+        runtime.enqueue_cooked_asset_stream(vec![
+            dir.join("material.good.cooked"),
+            dir.join("broken.cooked"),
+        ]);
+        let report = drain_until_idle(&mut runtime, 1_000);
+
+        assert!(!report.is_ok());
+        assert_eq!(report.failed_batches, 1);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("kind code 4242")));
+        // Decode is all-or-nothing per batch: the good sibling never installs.
+        assert!(runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.good"))
+            .is_none());
+        assert_eq!(runtime.asset_registry().pending_loads(), 0);
+        assert_eq!(runtime.cooked_asset_stream_pending(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_without_enqueue_is_a_noop() {
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+        let report = runtime.drain_cooked_asset_stream();
+        assert!(report.is_complete());
+        assert!(report.is_ok());
+        assert_eq!(report.committed, 0);
+        assert_eq!(runtime.cooked_asset_stream_pending(), 0);
+    }
+
     #[cfg(not(feature = "runtime-subsystems"))]
     fn test_extension_loader(cooked: &[u8]) -> Result<Box<dyn Any + Send + Sync>, String> {
         String::from_utf8(cooked.to_vec())
@@ -667,6 +1371,73 @@ mod tests {
         assert_eq!(empty_report.loaded_assets(), 0);
         assert_eq!(runtime.extension_asset_count("audio_clip"), 0);
         assert!(runtime.asset_registry().get::<String>(&id).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(feature = "runtime-subsystems"))]
+    #[test]
+    fn additive_extension_assets_noop_on_identical_payload_and_reject_conflicts() {
+        use engine_scene::registry::{AssetTypeExtension, AssetTypeMeta};
+
+        let dir = cooked_case("additive_extension");
+        let id = AssetId::new("audio.custom");
+        let mut builder = crate::EngineRuntime::builder(crate::EngineConfig::default());
+        builder
+            .asset_type_registry_mut()
+            .register(AssetTypeExtension {
+                meta: AssetTypeMeta {
+                    type_id: "audio_clip",
+                    source_extensions: vec!["custom"],
+                    display_name: "Custom Audio",
+                },
+                cooker: None,
+                loader: Some(test_extension_loader),
+            })
+            .unwrap();
+        let mut runtime = builder.build();
+
+        let paths = [dir.join("audio.custom.cooked")];
+        engine_asset::cook::write_cooked_artifact(
+            &paths[0],
+            AssetType::Audio.kind_code(),
+            b"first payload",
+            engine_serialize::SchemaVersion::new(0, 1, 0),
+        )
+        .unwrap();
+        let first = runtime.install_cooked_assets_additive(&paths).unwrap();
+        assert_eq!(first.loaded_extension_assets(), 1);
+
+        // Identical cooked payload: no-op success.
+        let second = runtime.install_cooked_assets_additive(&paths).unwrap();
+        assert_eq!(second.loaded_extension_assets(), 0);
+        assert_eq!(second.identical_assets, 1);
+        assert_eq!(
+            runtime
+                .extension_asset::<String>("audio_clip", &id)
+                .expect("extension asset")
+                .get(),
+            "first payload"
+        );
+
+        // Differing cooked payload under the same ID: validation error.
+        engine_asset::cook::write_cooked_artifact(
+            &paths[0],
+            AssetType::Audio.kind_code(),
+            b"second payload",
+            engine_serialize::SchemaVersion::new(0, 1, 0),
+        )
+        .unwrap();
+        let diagnostics = runtime.install_cooked_assets_additive(&paths).unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "AS0003");
+        assert!(diagnostics[0].message.contains("audio.custom"));
+        assert_eq!(
+            runtime
+                .extension_asset::<String>("audio_clip", &id)
+                .expect("original payload remains")
+                .get(),
+            "first payload"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

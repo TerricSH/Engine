@@ -347,6 +347,55 @@ mod tests {
         assert!(format!("{:?}", AssetState::Failed("err".to_string())).contains("Failed"));
     }
 
+    #[test]
+    fn loading_marks_track_in_flight_assets_outside_the_typed_cache() {
+        let mut registry = AssetRegistry::new();
+        let id = AssetId::new("material.streamed");
+        assert_eq!(registry.asset_state(&id), None);
+        assert_eq!(registry.pending_loads(), 0);
+
+        registry.mark_loading(id.clone());
+        assert_eq!(registry.asset_state(&id), Some(AssetState::Loading));
+        assert_eq!(registry.pending_loads(), 1);
+        // In-flight assets are not usable yet: the typed cache stays clean.
+        assert!(!registry.contains(&id));
+        assert!(registry.get::<u32>(&id).is_none());
+
+        // Installing the asset clears the mark and reports Ready.
+        registry.insert_typed(id.clone(), 7u32);
+        assert_eq!(registry.asset_state(&id), Some(AssetState::Ready));
+        assert_eq!(registry.pending_loads(), 0);
+        assert!(registry.contains(&id));
+
+        // Unloading clears any stale mark as well.
+        registry.mark_loading(id.clone());
+        assert!(registry.unload(&id));
+        assert_eq!(registry.asset_state(&id), None);
+        assert_eq!(registry.pending_loads(), 0);
+
+        // A failed background load clears the mark explicitly.
+        registry.mark_loading(id.clone());
+        assert!(registry.unmark_loading(&id));
+        assert!(!registry.unmark_loading(&id));
+        assert_eq!(registry.asset_state(&id), None);
+    }
+
+    #[test]
+    fn cached_raw_bytes_reads_payload_without_a_filesystem_load() {
+        let mut registry = AssetRegistry::new();
+        let id = AssetId::new("audio.custom");
+        assert!(registry.cached_raw_bytes(&id).is_none());
+        registry.insert_erased(
+            id.clone(),
+            b"payload".to_vec(),
+            Box::new("decoded".to_string()),
+        );
+        assert_eq!(
+            registry.cached_raw_bytes(&id).as_deref().map(Vec::as_slice),
+            Some(b"payload".as_slice())
+        );
+    }
+
     // ── BincodeLoader tests ──────────────────────────────────────────────
 
     #[test]
