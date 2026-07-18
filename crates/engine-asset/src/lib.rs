@@ -20,6 +20,7 @@ pub mod cook;
 pub mod gltf;
 mod loader;
 pub mod mesh;
+pub mod partition;
 mod path;
 pub mod project;
 mod registry;

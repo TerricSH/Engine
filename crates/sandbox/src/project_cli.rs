@@ -1836,6 +1836,14 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
         loaded_scenes.push((scene_id, scene_path, scene));
     }
 
+    // The optional world partition manifest is validated against the scene
+    // catalog when present. Cell streaming is not yet active at runtime.
+    let partition = engine_asset::partition::WorldPartition::load_for_project(&project)
+        .map_err(|error| format!("world partition validation failed: {error}"))?;
+    let partition_cells = partition
+        .map(|partition| partition.cells.len())
+        .unwrap_or(0);
+
     let manifest_paths = source_manifest_paths(&project.asset_source)?;
     if manifest_paths.is_empty() {
         return Err(format!(
@@ -1930,6 +1938,7 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
         "scenes": loaded_scenes.len(),
         "scene_entities": scene_entities,
         "entities": total_entities,
+        "partition_cells": partition_cells,
         "source_manifests": manifest_paths.len(),
         "declared_assets": declared_asset_count,
         "prefabs": prefab_count,
@@ -3645,6 +3654,101 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
         assert_eq!(report["passed"], true);
         assert_eq!(report["prefabs"], 1);
+    }
+
+    fn write_world_partition(root: &Path, cells_json: &str) {
+        let partition = format!(
+            "{{ \"schema\": \"{}\", \"cells\": {{ {cells_json} }} }}\n",
+            engine_asset::partition::WORLD_PARTITION_SCHEMA
+        );
+        std::fs::write(
+            root.join(engine_asset::partition::WORLD_PARTITION_FILE_NAME),
+            partition,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn check_project_validates_world_partition_and_reports_cell_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("partition-project");
+        create_project(&root, Some("Partition Project"), false).unwrap();
+        create_project_scene(&root, "level_two", None).unwrap();
+        write_world_partition(
+            &root,
+            "\"cell_main\": { \"scene\": \"main\", \"bounds\": { \"center\": [0.0, 0.0, 0.0], \"half_extents\": [64.0, 16.0, 64.0] } },\n\
+             \"cell_two\": { \"scene\": \"level_two\", \"bounds\": { \"center\": [128.0, 0.0, 0.0], \"half_extents\": [32.0, 8.0, 32.0] } }",
+        );
+
+        let report_path = root.join("build/check.json");
+        check_project(&root, Some(&report_path)).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["partition_cells"], 2);
+    }
+
+    #[test]
+    fn check_project_reports_zero_partition_cells_without_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("no-partition-project");
+        create_project(&root, Some("No Partition"), false).unwrap();
+
+        let report_path = root.join("build/check.json");
+        check_project(&root, Some(&report_path)).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["partition_cells"], 0);
+    }
+
+    #[test]
+    fn check_project_rejects_partition_with_unknown_scene_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("partition-unknown-scene");
+        create_project(&root, Some("Partition Unknown Scene"), false).unwrap();
+        write_world_partition(
+            &root,
+            "\"cell_missing\": { \"scene\": \"missing_scene\", \"bounds\": { \"center\": [0.0, 0.0, 0.0], \"half_extents\": [16.0, 4.0, 16.0] } }",
+        );
+
+        let error = check_project(&root, None).unwrap_err();
+        assert!(
+            error.contains(
+                "world partition cell \"cell_missing\" references unknown project scene \"missing_scene\""
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn check_project_rejects_partition_with_invalid_bounds_or_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("partition-invalid-bounds");
+        create_project(&root, Some("Partition Invalid Bounds"), false).unwrap();
+        write_world_partition(
+            &root,
+            "\"cell_bad\": { \"scene\": \"main\", \"bounds\": { \"center\": [0.0, 0.0, 0.0], \"half_extents\": [-1.0, 4.0, 16.0] } }",
+        );
+
+        let error = check_project(&root, None).unwrap_err();
+        assert!(
+            error.contains("world partition cell \"cell_bad\" has invalid bounds"),
+            "{error}"
+        );
+
+        std::fs::write(
+            root.join(engine_asset::partition::WORLD_PARTITION_FILE_NAME),
+            "{ \"schema\": \"WorldPartition-v9\", \"cells\": {} }",
+        )
+        .unwrap();
+        let error = check_project(&root, None).unwrap_err();
+        assert!(
+            error.contains("unsupported world partition schema: WorldPartition-v9"),
+            "{error}"
+        );
     }
 
     #[test]

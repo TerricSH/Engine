@@ -7,6 +7,7 @@ Every authoring and runtime command is rooted by `game.project.json`. Paths in t
 ```text
 MyGame/
   game.project.json
+  world.partition.json       # optional world partition cells
   assets/
     scenes/main.scene.ron
     scenes/level-two.scene.ron
@@ -58,6 +59,42 @@ case-insensitive comparison.
 
 Authoring commands require `asset_source` and an optional `script_project` to exist. A scripted project also declares `script_assembly`; authoring builds produce that DLL while runtime packages omit the `.csproj` and keep only the DLL. `input_actions`, when present, is required in both authoring and packaged projects.
 
+## World partition
+
+A project may add an optional `world.partition.json` at its root (next to
+`game.project.json`) to describe world partition cells — the foundation for
+scene-based world streaming:
+
+```json
+{
+  "schema": "WorldPartition-v0",
+  "cells": {
+    "cell_forest": {
+      "scene": "forest",
+      "bounds": { "center": [0.0, 0.0, 0.0], "half_extents": [64.0, 16.0, 64.0] }
+    },
+    "cell_town": {
+      "scene": "town",
+      "bounds": { "center": [128.0, 0.0, 0.0], "half_extents": [32.0, 8.0, 32.0] }
+    }
+  }
+}
+```
+
+Each key of `cells` is a stable cell ID following the same identifier rules as
+scene IDs (1–128 ASCII letters, digits, hyphens, underscores, or dots, except
+`.` and `..`, case-insensitively unique). `scene` must reference an ID from the
+project scene catalog. `bounds` is an axis-aligned box: `center` and
+`half_extents` must be finite, and half extents must be non-negative. Cells
+**may overlap** — overlapping bounds are a legitimate way to layer content,
+such as a dense gameplay cell over a large background cell.
+
+`project check` validates the partition file when it is present (schema, cell
+IDs, scene references, and bounds) and reports the cell count as
+`partition_cells` in its JSON report. **Cell streaming is not yet active**: the
+runtime still loads only the startup scene, and the manifest is currently an
+authoring/validation contract that future streaming phases will consume.
+
 ## Commands
 
 ```powershell
@@ -93,9 +130,11 @@ existing catalog ID and stores that ID in `startup_scene`.
 `project check` validates the manifest and safe paths, then loads **every**
 cataloged scene. For each scene it checks the scene schema, script references,
 strict ECS restoration, and declared asset dependencies; it also validates the
-project input map, source manifests, duplicate IDs, and source files. Its JSON
+project input map, source manifests, duplicate IDs, and source files, plus the
+optional `world.partition.json` when present. Its JSON
 report also records validated cooked render/extension counts. Its other fields
-include `startup_scene_id`, the scene count, and an entity count per scene.
+include `startup_scene_id`, the scene count, an entity count per scene, and
+`partition_cells`.
 `game --headless` runs the normal GameLoop update/render path and fails
 if the active scene produces no visible draw calls.
 

@@ -508,7 +508,7 @@ fn validate_relative_path(field: &str, path: &Path) -> Result<(), ProjectError> 
     Ok(())
 }
 
-fn validate_scene_id(id: &str) -> Result<(), ProjectError> {
+pub(crate) fn validate_scene_id(id: &str) -> Result<(), ProjectError> {
     let valid = !id.is_empty()
         && id.len() <= 128
         && id != "."
