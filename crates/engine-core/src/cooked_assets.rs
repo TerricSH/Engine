@@ -52,17 +52,6 @@ impl EngineRuntime {
         &mut self,
         cooked_dir: &Path,
     ) -> Result<CookedAssetLoadReport, Vec<Diagnostic>> {
-        self.load_cooked_render_assets(cooked_dir)
-    }
-
-    /// Compatibility entry point for loading a complete cooked asset batch.
-    ///
-    /// The historical name is retained for callers, but extension-owned
-    /// assets are now loaded alongside render assets.
-    pub fn load_cooked_render_assets(
-        &mut self,
-        cooked_dir: &Path,
-    ) -> Result<CookedAssetLoadReport, Vec<Diagnostic>> {
         if !cooked_dir.exists() {
             return Ok(CookedAssetLoadReport::default());
         }
@@ -301,7 +290,8 @@ fn decode_cooked_asset(
         kind @ (AssetType::Audio
         | AssetType::Animation
         | AssetType::Skeleton
-        | AssetType::NavMesh) => {
+        | AssetType::NavMesh
+        | AssetType::Prefab) => {
             let type_id = registered_asset_type_id(&kind)
                 .expect("extension-owned asset types have a stable registry mapping");
             let extension = asset_type_registry.get(type_id).ok_or_else(|| {
@@ -508,7 +498,7 @@ mod tests {
     fn missing_cooked_directory_is_an_empty_load() {
         let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
         let missing = std::path::PathBuf::from("definitely-missing-cooked-assets");
-        let report = runtime.load_cooked_render_assets(&missing).unwrap();
+        let report = runtime.load_cooked_assets(&missing).unwrap();
         assert_eq!(report, CookedAssetLoadReport::default());
     }
 
@@ -560,7 +550,7 @@ mod tests {
         cook_test_material(&dir, "material.plain", None);
         let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
 
-        let report = runtime.load_cooked_render_assets(&dir).unwrap();
+        let report = runtime.load_cooked_assets(&dir).unwrap();
 
         assert_eq!(report.discovered_assets, 1);
         assert_eq!(report.loaded_materials, 1);
@@ -579,7 +569,7 @@ mod tests {
         cook_test_material(&dir, "material.invalid", Some("texture.missing"));
         let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
 
-        let diagnostics = runtime.load_cooked_render_assets(&dir).unwrap_err();
+        let diagnostics = runtime.load_cooked_assets(&dir).unwrap_err();
 
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("texture.missing"));

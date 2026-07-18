@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "sourceHash": "c1a8fa4c646182faea24702249b0e427164fc309b60b27368b568fa957a7a915",
+  "assets": {
+    "index.html": "4dbec092533916f22ed12cb169c88a048bda1ea757101f32fbd3268e7522de06",
+    "assets/editor.js": "6c3856011edc74a7d8897614d6b76479d77710e8a52d09a91a72685ddfd1fab5",
+    "assets/editor.css": "1713364b6cdc9f85e060f23c3e14cb3d07595f01211d4a065b088102a90566fb"
+  }
+}

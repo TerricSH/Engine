@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use engine_renderer::{
-    render_graph, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats,
+    render_graph2, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats,
     IndexFormat as RendererIndexFormat, MaterialUpload, MeshUpload,
     MeshVertexFormat as RendererMeshVertexFormat, RenderFrameInput, ResourceKind, ResourceRemoval,
     ShadowMode, TextureUpload, UploadReceipt,
@@ -1315,30 +1315,6 @@ impl Dx12SceneRenderer {
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 impl BackendRenderer for Dx12SceneRenderer {
-    fn frame_mode(&self) -> engine_renderer::BackendFrameMode {
-        engine_renderer::BackendFrameMode::RenderGraph
-    }
-
-    fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        self.begin_frame(input)?;
-        if let Err(mut diagnostics) = self.record_directional_shadow_pass(input) {
-            if let Err(mut abort_diagnostics) = self.abort_frame() {
-                diagnostics.append(&mut abort_diagnostics);
-            }
-            return Err(diagnostics);
-        }
-        if let Err(mut diagnostics) = self.record_forward_pass(input, None) {
-            if let Err(mut abort_diagnostics) = self.abort_frame() {
-                diagnostics.append(&mut abort_diagnostics);
-            }
-            return Err(diagnostics);
-        }
-
-        let mut stats = FrameStats::default();
-        self.end_frame(&mut stats)?;
-        Ok(stats)
-    }
-
     fn begin_frame(&mut self, input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
         validate_dx12_frame_contract(input)?;
         if let Some(reason) = &self.fatal_frame_error {
@@ -1406,8 +1382,8 @@ impl BackendRenderer for Dx12SceneRenderer {
     fn apply_pass_barriers(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &render_graph::PassNode,
-        barriers: &[engine_renderer::render_graph::CompiledBarrier],
+        _pass: &render_graph2::PassNode,
+        barriers: &[engine_renderer::render_graph2::CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
         if let Some(unsupported) = barriers.iter().find(|barrier| {
             !matches!(
@@ -1433,22 +1409,24 @@ impl BackendRenderer for Dx12SceneRenderer {
     fn execute_pass(
         &mut self,
         input: &RenderFrameInput,
-        pass: &render_graph::PassNode,
+        pass: &render_graph2::PassNode,
         _stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
         match &pass.kind {
-            render_graph::PassKind::OpaquePbrForward => {
+            render_graph2::PassKind::OpaquePbrForward => {
                 self.record_forward_pass(input, Some(pass.view_id))
             }
-            render_graph::PassKind::Present => Ok(()),
-            render_graph::PassKind::ToneMap => Err(vec![Diagnostic::new(
+            render_graph2::PassKind::Present => Ok(()),
+            render_graph2::PassKind::ToneMap => Err(vec![Diagnostic::new(
                 "DX1247",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
                 "ToneMap reached the direct-to-swapchain DX12 path",
             )]),
-            render_graph::PassKind::DirectionalShadow => self.record_directional_shadow_pass(input),
-            render_graph::PassKind::Custom(name) => Err(vec![Diagnostic::new(
+            render_graph2::PassKind::DirectionalShadow => {
+                self.record_directional_shadow_pass(input)
+            }
+            render_graph2::PassKind::Custom(name) => Err(vec![Diagnostic::new(
                 "DX1246",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
@@ -2123,10 +2101,6 @@ impl Dx12SceneRenderer {
 
 #[cfg(not(all(target_os = "windows", feature = "backend-dx12")))]
 impl BackendRenderer for Dx12SceneRenderer {
-    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        Err(Self::unavailable("render_frame"))
-    }
-
     fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
         Err(Self::unavailable("begin_frame"))
     }

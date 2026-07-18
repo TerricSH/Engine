@@ -99,7 +99,7 @@ impl VulkanDevice {
 
     /// Destroy all cached GPU textures.
     ///
-    /// Does NOT destroy the material descriptor pool or layout 鈥?those are
+    /// Does not destroy the material descriptor pool or layout; those are
     /// handled by the `Drop` impl.
     pub(crate) fn destroy_material_textures(&mut self) {
         // Drain into a local vec to avoid simultaneous &self borrow.

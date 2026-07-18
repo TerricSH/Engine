@@ -12,9 +12,7 @@ use std::sync::{Arc, Mutex};
 // ---------------------------------------------------------------------------
 
 pub type SharedAllocator = Arc<Mutex<VulkanAllocator>>;
-pub use self::inner::{
-    Allocation, AllocationCreateDesc, AllocationScheme, MemoryLocation, VulkanAllocator,
-};
+pub use self::inner::{Allocation, AllocationCreateDesc, MemoryLocation, VulkanAllocator};
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -40,7 +38,6 @@ mod inner {
         GpuOnly,
         CpuToGpu,
         GpuToCpu,
-        #[allow(dead_code)]
         CpuOnly,
     }
 
@@ -49,15 +46,6 @@ mod inner {
         pub name: &'static str,
         pub requirements: vk::MemoryRequirements,
         pub location: MemoryLocation,
-        #[allow(dead_code)]
-        pub linear: bool,
-        #[allow(dead_code)]
-        pub allocation_scheme: AllocationScheme,
-    }
-
-    /// Placeholder — unused.
-    pub enum AllocationScheme {
-        GpuAllocatorManaged,
     }
 
     /// A single device-memory allocation (owns one `VkDeviceMemory`).

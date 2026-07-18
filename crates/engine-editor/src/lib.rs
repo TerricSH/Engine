@@ -9,17 +9,9 @@ use thiserror::Error;
 /// Errors that can occur during editor operations.
 #[derive(Error, Debug)]
 pub enum EditorError {
-    /// A panel with the requested name does not exist.
-    #[error("panel not found: {0}")]
-    PanelNotFound(String),
-
     /// No scene is currently loaded or the requested scene is missing.
     #[error("scene not found")]
     SceneNotFound,
-
-    /// The requested asset is not available.
-    #[error("asset not found")]
-    AssetNotFound,
 
     /// Editor initialisation failed with a contextual message.
     #[error("init failed: {0}")]
@@ -33,34 +25,51 @@ pub enum EditorError {
     #[error("component not found: {0}")]
     ComponentNotFound(String),
 
+    /// A field-setting command targeted a field that is not part of the
+    /// serialized component record.
+    #[error("component field not found: {component_type}.{field_name}")]
+    ComponentFieldNotFound {
+        component_type: String,
+        field_name: String,
+    },
+
     /// The entity already owns a component of the requested type.
     #[error("component already exists: {0}")]
     ComponentAlreadyExists(String),
 
+    /// A hierarchy edit would create a cycle or reference an invalid parent.
+    #[error("invalid hierarchy: {0}")]
+    InvalidHierarchy(String),
+
+    /// Serialized entity records cannot form a self-contained clipboard.
+    #[error("invalid entity clipboard: {0}")]
+    InvalidEntityClipboard(String),
+
+    /// An entity operation would introduce a duplicate persistent ID.
+    #[error("entity persistent ID already exists: {0}")]
+    EntityAlreadyExists(String),
+
+    /// Entity clipboard serialization or deserialization failed.
+    #[error("entity clipboard serialization failed: {0}")]
+    EntityClipboardSerialization(String),
+
+    /// Serialized component data is missing required metadata or targets a
+    /// different component type.
+    #[error("invalid component clipboard: {0}")]
+    InvalidComponentClipboard(String),
+
+    /// Component clipboard serialization or deserialization failed.
+    #[error("component clipboard serialization failed: {0}")]
+    ComponentClipboardSerialization(String),
+
+    /// A command returned successfully but its resulting Scene failed the
+    /// canonical authoring validation boundary.
+    #[error("scene command {operation} rejected: {reason}")]
+    SceneCommandRejected { operation: String, reason: String },
+
     /// An I/O operation (read, write, create directory, …) failed.
     #[error("I/O error: {0}")]
     IoFailed(String),
-
-    /// The `dotnet` CLI was not found on `PATH`.
-    #[error("dotnet CLI not found on PATH")]
-    BuildDotnetNotFound,
-
-    /// A C# project build failed with a message.
-    #[error("build failed: {0}")]
-    BuildFailed(String),
-}
-
-// ---------------------------------------------------------------------------
-// Stub – available when the `tooling-editor` feature is NOT enabled
-// ---------------------------------------------------------------------------
-
-/// Placeholder type exposed when the `tooling-editor` feature is disabled.
-///
-/// Cannot be constructed outside this crate.  Match on this to handle the
-/// no-editor case at compile time.
-#[non_exhaustive]
-pub struct EditorDisabled {
-    pub(crate) _private: (),
 }
 
 // ---------------------------------------------------------------------------
@@ -72,27 +81,15 @@ pub mod animation_preview;
 #[cfg(feature = "tooling-editor")]
 pub mod asset_browser;
 #[cfg(feature = "tooling-editor")]
-pub mod build;
-#[cfg(feature = "tooling-editor")]
 pub mod commands;
 #[cfg(feature = "tooling-editor")]
-pub mod debug_views;
+pub mod component_catalog;
 #[cfg(feature = "tooling-editor")]
 pub mod diagnostics;
-#[cfg(feature = "tooling-editor")]
-mod editor_core;
-#[cfg(feature = "tooling-editor")]
-mod editor_ui;
 #[cfg(feature = "tooling-editor")]
 pub mod gizmo;
 #[cfg(feature = "tooling-editor")]
 pub mod gizmo_overlay;
-#[cfg(feature = "tooling-editor")]
-pub mod hierarchy;
-#[cfg(feature = "tooling-editor")]
-pub mod hot_reload_ui;
-#[cfg(feature = "tooling-editor")]
-pub mod inspector;
 #[cfg(feature = "tooling-editor")]
 pub mod io;
 #[cfg(feature = "tooling-editor")]
@@ -104,56 +101,31 @@ pub mod performance;
 #[cfg(feature = "tooling-editor")]
 mod play_mode;
 #[cfg(feature = "tooling-editor")]
-pub mod plugin;
-#[cfg(feature = "tooling-editor")]
-pub mod prefab_editor;
-#[cfg(feature = "tooling-editor")]
-pub mod scene_view;
-#[cfg(feature = "tooling-editor")]
-pub mod script_build;
-#[cfg(feature = "tooling-editor")]
-mod script_inspector;
-
-#[cfg(feature = "tooling-editor")]
-pub use build::{build_csharp_project, BuildError};
+pub mod prefab_authoring;
 #[cfg(feature = "tooling-editor")]
 pub use commands::{
-    AddComponent, AddEntity, Command, CommandHistory, RemoveComponent, RemoveEntity,
-    SequencedCommand, SetComponentEnabled, SetComponentField, SetEntityEnabled, SetEntityName,
+    AddComponent, AddEntity, Command, CommandBatch, CommandHistory, ComponentClipboard,
+    DuplicateEntitySubtree, EntityClipboard, EntityPasteParent, MoveEntitySibling,
+    PasteEntityRecords, RemoveComponent, RemoveEntity, ReplaceComponent, SetComponentEnabled,
+    SetComponentField, SetEntityEnabled, SetEntityName, SetEntityParent, SetSceneSettings,
+    SiblingMove,
 };
 #[cfg(feature = "tooling-editor")]
 pub use diagnostics::{DiagnosticEntry, DiagnosticsPanel};
 #[cfg(feature = "tooling-editor")]
-pub use editor_core::Editor;
-#[cfg(feature = "tooling-editor")]
-pub use editor_ui::{EditorUi, UiEvent, UiInteractionPhase, UiInteractionStamp, UiKey};
-#[cfg(feature = "tooling-editor")]
-pub use hierarchy::HierarchyPanel;
-#[cfg(feature = "tooling-editor")]
-pub use inspector::{InspectorContext, InspectorPanel};
-#[cfg(feature = "tooling-editor")]
 pub use io::{default_scene_path, load_scene, save_scene};
 #[cfg(feature = "tooling-editor")]
-pub use panels::{
-    AssetBrowserPanel, EditorPanel, InspectorPanel as LegacyInspectorPanel, SceneViewAction,
-    SceneViewPanel, SequencedSceneViewAction,
-};
+pub use panels::{SceneViewAction, SceneViewPanel};
 #[cfg(feature = "tooling-editor")]
 pub use play_mode::{EditorPlayMode, EditorPlaySession};
 #[cfg(feature = "tooling-editor")]
-pub use plugin::{
-    ComponentInspector, EditorPlugin, EditorPluginMeta, EditorPluginRegistry, PanelFactory,
+pub use prefab_authoring::{
+    create_prefab_asset_from_scene, load_prefab_source, prefab_from_scene_subtree,
+    prepare_prefab_instantiation, prepare_prefab_instantiation_from_registry,
+    prepare_prefab_instantiation_from_source, prepare_unpack_prefab, CreatedPrefabAsset,
+    PrefabAssetCreateRequest, PrefabAuthoringError, PrefabInstantiationPlan, PrefabUnpackMode,
+    PrefabUnpackPlan, PREFAB_SOURCE_SUFFIX,
 };
-#[cfg(feature = "tooling-editor")]
-pub use scene_view::{orbit_projection_matrix, orbit_view_matrix};
-#[cfg(feature = "tooling-editor")]
-pub use script_build::{BuildResult, ScriptBuildManager};
-#[cfg(feature = "tooling-editor")]
-pub use script_inspector::ScriptInspector;
-// Note: `build::BuildResult` is intentionally not re-exported here because
-// `script_build::BuildResult` already provides a similar type.  Use
-// `engine_editor::build::BuildResult` to access the build module's version.
-
 // ---------------------------------------------------------------------------
 // EditorScene – scene + undo/redo + selection
 // ---------------------------------------------------------------------------
@@ -187,9 +159,33 @@ impl EditorScene {
             scene,
             history: CommandHistory::new(),
             selected_entity: None,
-            diagnostics: DiagnosticsPanel::new("Diagnostics"),
+            diagnostics: DiagnosticsPanel::new(),
             gizmo_drag: None,
         }
+    }
+
+    /// Wrap a scene and install the same shared component registry used by the
+    /// runtime's strict Scene -> World loader.
+    ///
+    /// The initial scene is preflighted before the editor accepts the
+    /// registry, so subsequent execute/undo/redo operations cannot start from
+    /// an unmaterializable extension-component state.
+    pub fn new_with_component_registry(
+        scene: engine_scene::Scene,
+        component_registry: std::sync::Arc<engine_scene::ComponentRegistry>,
+    ) -> Result<Self, EditorError> {
+        let mut editor = Self::new(scene);
+        editor.install_component_registry(component_registry)?;
+        Ok(editor)
+    }
+
+    /// Install or replace the registry used for strict command preflight.
+    pub fn install_component_registry(
+        &mut self,
+        component_registry: std::sync::Arc<engine_scene::ComponentRegistry>,
+    ) -> Result<(), EditorError> {
+        self.history
+            .install_component_registry(&self.scene, component_registry)
     }
 
     /// Mutable access to the diagnostics panel.

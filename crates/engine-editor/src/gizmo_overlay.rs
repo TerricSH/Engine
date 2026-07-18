@@ -1,9 +1,8 @@
 //! Screen-space rendering for the editor transform gizmo.
 //!
-//! The runtime renderer already accepts UI triangle batches, while its legacy
-//! `DebugDrawBuffer` is not part of the windowed editor submission path.  This
-//! module projects the same three-axis gizmo used for hit testing and emits a
-//! small untextured UI batch that is drawn after the regular editor canvas.
+//! The editor projects the same three-axis gizmo used for hit testing into a
+//! renderer-owned [`UiBatch`], drawn after the regular editor canvas. This is
+//! the single production visualization path for transform gizmos.
 
 use engine_renderer::{Rect, UiBatch, UiVertex};
 use engine_serialize::AssetId;

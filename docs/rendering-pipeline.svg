@@ -1,0 +1,196 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1160" viewBox="0 0 1600 1160" role="img" aria-labelledby="title desc">
+  <title id="title">当前引擎渲染流水线架构图</title>
+  <desc id="desc">从 ECS 场景提取，经由 engine-renderer Render Graph，进入 Vulkan 阴影、HDR Forward、Tone Map、UI Overlay，最终提交并呈现。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#08111f"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="7" stdDeviation="9" flood-color="#000" flood-opacity="0.30"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#fbbf24"/>
+    </marker>
+    <style>
+      .title { font: 700 34px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #f8fafc; }
+      .subtitle { font: 400 16px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #94a3b8; }
+      .panel-title { font: 700 21px "Microsoft YaHei", "Segoe UI", sans-serif; }
+      .node-title { font: 700 17px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #f8fafc; }
+      .node-sub { font: 400 13px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #cbd5e1; }
+      .resource { font: 600 14px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #fef3c7; }
+      .edge-label { font: 500 12px "Microsoft YaHei", "Segoe UI", sans-serif; fill: #cbd5e1; }
+      .node { fill: #172033; stroke-width: 2; filter: url(#shadow); }
+      .edge { fill: none; stroke: #94a3b8; stroke-width: 2.5; marker-end: url(#arrow); }
+      .data-edge { fill: none; stroke: #38bdf8; stroke-width: 2.5; stroke-dasharray: 8 7; marker-end: url(#arrowBlue); }
+      .resource-edge { fill: none; stroke: #fbbf24; stroke-width: 2.5; stroke-dasharray: 7 6; marker-end: url(#arrowAmber); }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1160" fill="url(#bg)"/>
+  <circle cx="1410" cy="80" r="210" fill="#7c3aed" opacity="0.08"/>
+  <circle cx="130" cy="1040" r="260" fill="#0284c7" opacity="0.07"/>
+
+  <text x="50" y="55" class="title">当前引擎渲染流水线</text>
+  <text x="50" y="84" class="subtitle">ECS Scene → Renderer Frontend → Render Graph → Vulkan Passes → Queue Present</text>
+
+  <!-- Panels -->
+  <rect x="40" y="115" width="420" height="885" rx="24" fill="#0c1b2d" stroke="#0ea5e9" stroke-width="2" opacity="0.97"/>
+  <rect x="490" y="115" width="400" height="885" rx="24" fill="#17142c" stroke="#8b5cf6" stroke-width="2" opacity="0.97"/>
+  <rect x="920" y="115" width="640" height="985" rx="24" fill="#21180c" stroke="#f59e0b" stroke-width="2" opacity="0.97"/>
+
+  <text x="70" y="155" class="panel-title" fill="#38bdf8">01 · engine-scene / engine-core</text>
+  <text x="520" y="155" class="panel-title" fill="#a78bfa">02 · engine-renderer</text>
+  <text x="950" y="155" class="panel-title" fill="#fbbf24">03 · render-vulkan / SceneRenderer</text>
+
+  <!-- CPU nodes -->
+  <rect class="node" x="75" y="190" width="350" height="84" rx="15" stroke="#0ea5e9"/>
+  <text x="250" y="224" text-anchor="middle" class="node-title">ECS World</text>
+  <text x="250" y="250" text-anchor="middle" class="node-sub">Camera · Transform · Renderable · Light</text>
+
+  <rect class="node" x="75" y="325" width="350" height="100" rx="15" stroke="#0ea5e9"/>
+  <text x="250" y="361" text-anchor="middle" class="node-title">extract_renderer_input_from_world()</text>
+  <text x="250" y="387" text-anchor="middle" class="node-sub">层级变换 · 视锥裁剪 · Render Layer</text>
+  <text x="250" y="408" text-anchor="middle" class="node-sub">按 Material / Mesh 排序</text>
+
+  <rect class="node" x="75" y="480" width="350" height="120" rx="15" stroke="#38bdf8"/>
+  <text x="250" y="516" text-anchor="middle" class="node-title">RenderFrameInput</text>
+  <text x="250" y="543" text-anchor="middle" class="node-sub">Views · Drawables · Skinned Items</text>
+  <text x="250" y="565" text-anchor="middle" class="node-sub">Lights · UI · Render Options</text>
+
+  <rect class="node" x="75" y="655" width="165" height="88" rx="14" stroke="#0ea5e9"/>
+  <text x="157" y="687" text-anchor="middle" class="node-title">Render Extensions</text>
+  <text x="157" y="714" text-anchor="middle" class="node-sub">动画 / Debug Draw</text>
+
+  <rect class="node" x="260" y="655" width="165" height="88" rx="14" stroke="#0ea5e9"/>
+  <text x="342" y="687" text-anchor="middle" class="node-title">Runtime UI</text>
+  <text x="342" y="714" text-anchor="middle" class="node-sub">UiBatch 注入</text>
+
+  <rect class="node" x="75" y="810" width="350" height="95" rx="15" stroke="#0ea5e9"/>
+  <text x="250" y="846" text-anchor="middle" class="node-title">sync_render_assets()</text>
+  <text x="250" y="873" text-anchor="middle" class="node-sub">Texture → Material → Mesh 上传与去重</text>
+
+  <!-- CPU edges -->
+  <path class="edge" d="M250 274 L250 325"/>
+  <path class="edge" d="M250 425 L250 480"/>
+  <path class="data-edge" d="M157 655 C157 625 200 628 215 600"/>
+  <path class="data-edge" d="M342 655 C342 625 300 628 285 600"/>
+  <path class="edge" d="M250 600 L250 810"/>
+
+  <!-- Renderer nodes -->
+  <rect class="node" x="525" y="210" width="330" height="82" rx="15" stroke="#8b5cf6"/>
+  <text x="690" y="244" text-anchor="middle" class="node-title">Renderer::draw_scene()</text>
+  <text x="690" y="269" text-anchor="middle" class="node-sub">统一渲染前端入口</text>
+
+  <rect class="node" x="525" y="345" width="330" height="82" rx="15" stroke="#8b5cf6"/>
+  <text x="690" y="379" text-anchor="middle" class="node-title">validate_frame_input()</text>
+  <text x="690" y="404" text-anchor="middle" class="node-sub">契约、View、资源引用校验</text>
+
+  <rect class="node" x="525" y="480" width="330" height="88" rx="15" stroke="#8b5cf6"/>
+  <text x="690" y="514" text-anchor="middle" class="node-title">RenderGraph::build_with_config()</text>
+  <text x="690" y="541" text-anchor="middle" class="node-sub">内置 Pass + 自定义 Pass 声明</text>
+
+  <rect class="node" x="525" y="625" width="330" height="82" rx="15" stroke="#8b5cf6"/>
+  <text x="690" y="659" text-anchor="middle" class="node-title">configure_render_graph()</text>
+  <text x="690" y="684" text-anchor="middle" class="node-sub">后端补齐自定义 Pass 资源声明</text>
+
+  <rect class="node" x="525" y="770" width="330" height="116" rx="15" stroke="#a78bfa"/>
+  <text x="690" y="806" text-anchor="middle" class="node-title">compile_v2()</text>
+  <text x="690" y="833" text-anchor="middle" class="node-sub">拓扑排序 · Dead Pass Culling</text>
+  <text x="690" y="857" text-anchor="middle" class="node-sub">资源状态跟踪 · Barrier 推导</text>
+
+  <rect class="node" x="525" y="920" width="330" height="62" rx="15" stroke="#fbbf24"/>
+  <text x="690" y="946" text-anchor="middle" class="node-title">Renderer::upload_*()</text>
+  <text x="690" y="968" text-anchor="middle" class="node-sub">资源上传通道：校验 → BackendRenderer</text>
+
+  <!-- Renderer edges -->
+  <path class="data-edge" d="M425 540 C475 540 470 251 525 251"/>
+  <path class="edge" d="M690 292 L690 345"/>
+  <path class="edge" d="M690 427 L690 480"/>
+  <path class="edge" d="M690 568 L690 625"/>
+  <path class="edge" d="M690 707 L690 770"/>
+
+  <!-- Vulkan nodes -->
+  <rect class="node" x="955" y="195" width="360" height="96" rx="15" stroke="#f59e0b"/>
+  <text x="1135" y="229" text-anchor="middle" class="node-title">begin_frame()</text>
+  <text x="1135" y="256" text-anchor="middle" class="node-sub">Swapchain · Acquire Image · Command Buffer</text>
+  <text x="1135" y="277" text-anchor="middle" class="node-sub">更新 Camera / Frame UBO</text>
+
+  <rect class="node" x="1340" y="195" width="185" height="96" rx="15" stroke="#f59e0b"/>
+  <text x="1432" y="222" text-anchor="middle" class="node-title">SceneRenderer</text>
+  <text x="1432" y="245" text-anchor="middle" class="node-sub">upload_*() → GPU 缓存</text>
+  <text x="1432" y="267" text-anchor="middle" class="node-sub">Buffers · Images · Descriptors</text>
+
+  <rect class="node" x="955" y="340" width="360" height="78" rx="15" stroke="#f59e0b"/>
+  <text x="1135" y="372" text-anchor="middle" class="node-title">apply_pass_barriers()</text>
+  <text x="1135" y="397" text-anchor="middle" class="node-sub">Render Graph 状态 → Vulkan Barrier</text>
+
+  <rect class="node" x="955" y="465" width="360" height="92" rx="15" stroke="#f59e0b"/>
+  <text x="1135" y="499" text-anchor="middle" class="node-title">① Directional Shadow（可选）</text>
+  <text x="1135" y="526" text-anchor="middle" class="node-sub">3 级 CSM · 只绘制 Cast Shadows</text>
+  <text x="1135" y="547" text-anchor="middle" class="node-sub">无阴影方向光时跳过</text>
+
+  <rect x="1350" y="475" width="165" height="64" rx="32" fill="#3b2b0c" stroke="#fbbf24" stroke-width="2"/>
+  <text x="1432" y="514" text-anchor="middle" class="resource">Shadow Map Array</text>
+
+  <rect class="node" x="955" y="610" width="360" height="100" rx="15" stroke="#f59e0b"/>
+  <text x="1135" y="644" text-anchor="middle" class="node-title">② Opaque PBR Forward</text>
+  <text x="1135" y="671" text-anchor="middle" class="node-sub">Static + Skinned · Material · Lights</text>
+  <text x="1135" y="693" text-anchor="middle" class="node-sub">IBL · Shadow Descriptor</text>
+
+  <rect x="1350" y="628" width="165" height="64" rx="32" fill="#3b2b0c" stroke="#fbbf24" stroke-width="2"/>
+  <text x="1432" y="655" text-anchor="middle" class="resource">HDR Color</text>
+  <text x="1432" y="676" text-anchor="middle" class="node-sub">RGBA16F</text>
+
+  <rect class="node" x="955" y="765" width="360" height="88" rx="15" stroke="#f59e0b"/>
+  <text x="1135" y="799" text-anchor="middle" class="node-title">③ Tone Map</text>
+  <text x="1135" y="826" text-anchor="middle" class="node-sub">ACES / Reinhard / None · Exposure</text>
+
+  <rect x="1350" y="777" width="165" height="64" rx="32" fill="#3b2b0c" stroke="#fbbf24" stroke-width="2"/>
+  <text x="1432" y="804" text-anchor="middle" class="resource">Swapchain Image</text>
+  <text x="1432" y="825" text-anchor="middle" class="node-sub">LDR Output</text>
+
+  <rect class="node" x="955" y="905" width="360" height="88" rx="15" stroke="#f59e0b"/>
+  <text x="1135" y="939" text-anchor="middle" class="node-title">④ Present 节点</text>
+  <text x="1135" y="966" text-anchor="middle" class="node-sub">Load-Op UI Overlay（不是 queue_present）</text>
+
+  <rect class="node" x="1340" y="905" width="185" height="88" rx="15" stroke="#f59e0b"/>
+  <text x="1432" y="939" text-anchor="middle" class="node-title">end_frame()</text>
+  <text x="1432" y="966" text-anchor="middle" class="node-sub">结束 Command Buffer</text>
+
+  <rect class="node" x="1030" y="1032" width="455" height="48" rx="24" stroke="#fbbf24"/>
+  <text x="1257" y="1063" text-anchor="middle" class="node-title">queue_submit()  →  queue_present()  →  屏幕</text>
+
+  <!-- Vulkan edges -->
+  <path class="edge" d="M855 828 C915 828 900 243 955 243"/>
+  <path class="resource-edge" d="M425 858 C475 858 475 951 525 951"/>
+  <path class="resource-edge" d="M855 951 C915 951 900 245 1340 243"/>
+  <path class="edge" d="M1135 291 L1135 340"/>
+  <path class="edge" d="M1135 418 L1135 465"/>
+  <path class="edge" d="M1135 557 L1135 610"/>
+  <path class="resource-edge" d="M1315 511 L1350 507"/>
+  <path class="resource-edge" d="M1432 539 C1432 580 1325 598 1255 610"/>
+  <path class="resource-edge" d="M1315 660 L1350 660"/>
+  <path class="resource-edge" d="M1432 692 C1432 742 1325 757 1255 765"/>
+  <path class="edge" d="M1135 710 L1135 765"/>
+  <path class="resource-edge" d="M1315 809 L1350 809"/>
+  <path class="resource-edge" d="M1432 841 C1432 878 1322 894 1250 905"/>
+  <path class="edge" d="M1135 853 L1135 905"/>
+  <path class="edge" d="M1315 949 L1340 949"/>
+  <path class="edge" d="M1432 993 L1432 1008 C1432 1024 1380 1032 1340 1032"/>
+
+  <!-- Legend -->
+  <line x1="70" y1="1060" x2="125" y2="1060" class="edge"/>
+  <text x="142" y="1065" class="edge-label">调用 / 执行顺序</text>
+  <line x1="270" y1="1060" x2="325" y2="1060" class="data-edge"/>
+  <text x="342" y="1065" class="edge-label">帧数据流</text>
+  <line x1="450" y1="1060" x2="505" y2="1060" class="resource-edge"/>
+  <text x="522" y="1065" class="edge-label">GPU 资源流</text>
+  <text x="50" y="1125" class="subtitle">说明：所有 BackendRenderer 强制执行 Render Graph 生命周期；Present 节点负责 UI Overlay，真正的 Vulkan Present 在 end_frame 之后执行。</text>
+</svg>

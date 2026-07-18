@@ -128,29 +128,6 @@ impl SandboxDiagnostics {
 
         all
     }
-
-    /// Total number of diagnostics across all categories (excluding frame snapshot).
-    #[expect(dead_code)]
-    pub fn len(&self) -> usize {
-        let mut count = self.scene_validation.len()
-            + self.reload_status.len()
-            + self.script_diagnostics.len()
-            + self.asset_diagnostics.len();
-        if self.frame_snapshot.is_some() {
-            count += 4; // four frame stats info diagnostics
-        }
-        count
-    }
-
-    /// Returns `true` if no diagnostics are present.
-    #[expect(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.scene_validation.is_empty()
-            && self.reload_status.is_empty()
-            && self.script_diagnostics.is_empty()
-            && self.asset_diagnostics.is_empty()
-            && self.frame_snapshot.is_none()
-    }
 }
 
 impl Default for SandboxDiagnostics {

@@ -1,0 +1,30 @@
+{
+  "name": "engine-editor-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "npm run check && vite build && node scripts/write-dist-manifest.mjs",
+    "check": "npm run check:contract && npm run check:ui && npm run check:context-menu && npm run test:context-menu-geometry && npm run check:keyboard && npm run check:state && npm run check:telemetry && tsc --noEmit -p tsconfig.app.json --pretty false && tsc --noEmit -p tsconfig.node.json --pretty false",
+    "check:contract": "node scripts/check-protocol-contract.mjs",
+    "check:ui": "node scripts/check-ui-controls.mjs",
+    "check:context-menu": "node scripts/check-context-menu-semantics.mjs",
+    "test:context-menu-geometry": "node --test src/components/ContextMenuGeometry.test.mjs",
+    "check:keyboard": "node scripts/check-keyboard-routing.mjs",
+    "check:state": "node scripts/check-editor-state.mjs",
+    "check:telemetry": "node scripts/check-telemetry-state.mjs"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.1.0",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.2"
+  }
+}

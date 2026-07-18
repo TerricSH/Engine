@@ -2,7 +2,6 @@
 
 use glam::{Vec2, Vec3};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 /// A single mesh with vertex/index data, ready for GPU upload.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -21,49 +20,6 @@ pub struct MeshData {
     pub joints: Vec<[u32; 4]>,
     /// Skinning blend weights (4 per vertex), empty if not skinned.
     pub weights: Vec<[f32; 4]>,
-}
-
-/// Errors from mesh loading.
-#[derive(Debug, Error)]
-pub enum MeshError {
-    #[error("glTF load failed: {0}")]
-    GltfLoad(String),
-    #[error("unsupported mesh format: {0}")]
-    UnsupportedFormat(String),
-    #[error("mesh has no positions")]
-    NoPositions,
-    #[error("joints and weights count mismatch")]
-    JointsWeightsMismatch,
-}
-
-/// Load a mesh from a glTF 2.0 file.
-///
-/// Returns the first mesh found in the file.  If the file contains multiple
-/// meshes, use [`load_meshes`] instead.
-pub fn load_mesh_from_gltf(path: &std::path::Path) -> Result<MeshData, MeshError> {
-    crate::gltf::load_gltf_scene(path)
-        .map_err(|error| MeshError::GltfLoad(error.to_string()))?
-        .primitives
-        .into_iter()
-        .next()
-        .map(|primitive| primitive.mesh)
-        .ok_or_else(|| MeshError::UnsupportedFormat("no primitives found".into()))
-}
-
-/// Load all meshes from a glTF file, returning (name, MeshData) pairs.
-pub fn load_meshes_from_gltf(path: &std::path::Path) -> Result<Vec<(String, MeshData)>, MeshError> {
-    let out: Vec<_> = crate::gltf::load_gltf_scene(path)
-        .map_err(|error| MeshError::GltfLoad(error.to_string()))?
-        .primitives
-        .into_iter()
-        .map(|primitive| (primitive.name, primitive.mesh))
-        .collect();
-
-    if out.is_empty() {
-        Err(MeshError::UnsupportedFormat("no primitives found".into()))
-    } else {
-        Ok(out)
-    }
 }
 
 /// Create a unit cube mesh (useful as a fallback test model).

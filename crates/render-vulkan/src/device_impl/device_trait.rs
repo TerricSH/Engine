@@ -16,7 +16,7 @@ use render_core::{
     SwapchainHandle, TextureDescriptor, TextureFormat, TextureHandle, TextureUsage,
 };
 
-use crate::allocator::{AllocationCreateDesc, AllocationScheme, MemoryLocation};
+use crate::allocator::{AllocationCreateDesc, MemoryLocation};
 
 use super::{
     blend_attachment_from_mode, compare_op, default_dep,
@@ -351,7 +351,7 @@ impl render_core::Device for VulkanDevice {
             return;
         }
         self.wait_idle();
-        self.destroy_mvp();
+        self.destroy_swapchain_resources();
     }
 
     fn destroy_surface(&mut self, surface: SurfaceHandle) {
@@ -359,7 +359,7 @@ impl render_core::Device for VulkanDevice {
             return;
         }
         self.wait_idle();
-        self.destroy_mvp();
+        self.destroy_swapchain_resources();
         drop(self.surface.take());
     }
 
@@ -436,8 +436,6 @@ impl render_core::Device for VulkanDevice {
                 name: "device-buffer",
                 requirements: req,
                 location,
-                linear: true,
-                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
             }),
             Err(error) => {
                 // SAFETY: no allocation was made, so the buffer is unbound and
@@ -639,8 +637,6 @@ impl render_core::Device for VulkanDevice {
                 name: "rhi-texture",
                 requirements,
                 location: MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
             }),
             Err(error) => {
                 unsafe { d.destroy_image(image, None) };
@@ -1789,8 +1785,6 @@ impl render_core::Device for VulkanDevice {
                 name: "read_pixels staging",
                 requirements: req,
                 location: MemoryLocation::GpuToCpu,
-                linear: true,
-                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| {
                 // SAFETY: buffer was just created by this device and is not
@@ -1892,7 +1886,7 @@ impl render_core::Device for VulkanDevice {
             }
         })?;
 
-        // Use the last acquired image index (tracked from render_model_frame).
+        // Use the last image acquired by the canonical frame lifecycle.
         let img_idx = self.last_image_index.min(sc.images.len() as u32 - 1);
         let swapchain_image = sc.images[img_idx as usize];
 

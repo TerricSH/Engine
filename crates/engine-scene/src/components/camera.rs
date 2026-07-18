@@ -25,7 +25,8 @@ pub struct Camera {
     pub viewport_rect: Option<[f32; 4]>,
     /// Bitmask of render layers this camera renders.
     pub render_layer_mask: u32,
-    /// Bitmask: 1 = color, 2 = depth.
+    /// Clear mode bitmask: 1 = color, 2 = depth, 4 = skybox + depth.
+    /// Skybox takes precedence when bit 4 is set.
     pub clear_flags: u8,
     /// Clear colour (RGBA).
     pub clear_color: [f32; 4],

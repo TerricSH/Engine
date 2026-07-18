@@ -149,7 +149,7 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         // SAFETY: caller has already waited for in-flight frames to finish
-        // (VulkanRenderer drop path / resize path call device_wait_idle).
+        // (VulkanDevice drop and resize paths call device_wait_idle).
         unsafe {
             for &view in &self.image_views {
                 self.device.destroy_image_view(view, None);

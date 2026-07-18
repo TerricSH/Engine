@@ -372,8 +372,6 @@ impl VulkanDevice {
                 name: "env-cubemap",
                 requirements: req,
                 location: crate::allocator::MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         pending.image_allocation = Some(allocation);
@@ -486,8 +484,6 @@ impl VulkanDevice {
                 name: "env-staging",
                 requirements: req,
                 location: crate::allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         pending.staging_allocation = Some(staging_allocation);

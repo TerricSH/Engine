@@ -46,6 +46,8 @@ pub enum AssetType {
     NavMesh,
     /// Logic asset (behavior graph / state machine / skill graph / quest dialogue).
     Logic,
+    /// Reusable entity hierarchy authored as `*.prefab.ron`.
+    Prefab,
     /// Catch-all for unknown or user-defined asset types.
     Unknown,
 }
@@ -69,6 +71,7 @@ impl AssetType {
             AssetType::Skeleton => 11,
             AssetType::NavMesh => 12,
             AssetType::Logic => 13,
+            AssetType::Prefab => 14,
             AssetType::Unknown => 0xFFFF,
         }
     }
@@ -89,6 +92,7 @@ impl AssetType {
             11 => AssetType::Skeleton,
             12 => AssetType::NavMesh,
             13 => AssetType::Logic,
+            14 => AssetType::Prefab,
             _ => AssetType::Unknown,
         }
     }
@@ -155,6 +159,7 @@ mod tests {
             AssetType::Skeleton,
             AssetType::NavMesh,
             AssetType::Logic,
+            AssetType::Prefab,
             AssetType::Unknown,
         ];
         for ty in cases {

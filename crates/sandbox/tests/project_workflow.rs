@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use engine_asset::cook::{read_cooked_artifact, AssetType, SourceManifest};
+use engine_asset::project::GameProject;
+use engine_scene::Scene;
 
 fn sandbox() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sandbox"))
@@ -60,6 +62,101 @@ fn stdout_json(output: &Output) -> serde_json::Value {
         .collect::<Vec<_>>()
         .join("\n");
     serde_json::from_str(&json).expect("parse command JSON report")
+}
+
+#[cfg(feature = "subsystem-scripting-csharp")]
+const MANAGED_WORKFLOW_BEHAVIOUR: &str = r#"using Engine;
+
+namespace GameScripts;
+
+public sealed class WorkflowBehaviour : EngineBehaviour
+{
+    public float Speed = 3.0f;
+    public int UpdateCount = 0;
+    public float ElapsedSeconds = 0.0f;
+    public bool LastJump = false;
+
+    public void OnCreate()
+    {
+        UpdateCount = 0;
+        ElapsedSeconds = 0.0f;
+    }
+
+    public void OnStart()
+    {
+    }
+
+    public void OnUpdate(float deltaTime)
+    {
+        UpdateCount += 1;
+        ElapsedSeconds += deltaTime;
+        LastJump = Input.GetBool("jump");
+        var translation = Transform.Translation;
+        Transform.Translation = new Vector3(
+            translation.X + Speed * deltaTime,
+            translation.Y,
+            translation.Z);
+    }
+}
+"#;
+
+#[cfg(feature = "subsystem-scripting-csharp")]
+fn install_managed_workflow_behaviour(root: &Path) -> PathBuf {
+    let source = root.join("scripts/GameScripts/WorkflowBehaviour.cs");
+    std::fs::write(&source, MANAGED_WORKFLOW_BEHAVIOUR).expect("write managed test behaviour");
+
+    let scene_path = root.join("assets/scenes/main.scene.ron");
+    let mut scene = Scene::load_from_file(&scene_path).expect("load managed fixture scene");
+    let entity = scene
+        .entities
+        .iter_mut()
+        .find(|entity| entity.persistent_id == "cube-01")
+        .expect("managed fixture entity");
+    entity
+        .components
+        .entry("engine.transform".into())
+        .or_insert_with(|| engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: std::collections::BTreeMap::from([
+                (
+                    "translation".into(),
+                    engine_serialize::Value::Vec3([0.0; 3]),
+                ),
+                (
+                    "rotation".into(),
+                    engine_serialize::Value::Quat([0.0, 0.0, 0.0, 1.0]),
+                ),
+                ("scale".into(), engine_serialize::Value::Vec3([1.0; 3])),
+            ]),
+        });
+    entity.components.insert(
+        "engine.script".into(),
+        engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: std::collections::BTreeMap::from([
+                (
+                    "assembly_id".into(),
+                    engine_serialize::Value::Str("GameScripts".into()),
+                ),
+                (
+                    "class_name".into(),
+                    engine_serialize::Value::Str("GameScripts.WorkflowBehaviour".into()),
+                ),
+                ("Speed".into(), engine_serialize::Value::Float32(3.0)),
+                ("UpdateCount".into(), engine_serialize::Value::Int(0)),
+                (
+                    "ElapsedSeconds".into(),
+                    engine_serialize::Value::Float32(0.0),
+                ),
+            ]),
+        },
+    );
+    scene
+        .save_to_file(&scene_path)
+        .expect("save managed fixture scene");
+    source
 }
 
 #[test]
@@ -147,8 +244,8 @@ fn creates_lists_validates_and_runs_multiple_project_scenes() {
     let check: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&check_report).unwrap()).unwrap();
     assert_eq!(check["scenes"], 2);
-    assert_eq!(check["scene_entities"]["main"], 2);
-    assert_eq!(check["scene_entities"]["level_two"], 2);
+    assert_eq!(check["scene_entities"]["main"], 3);
+    assert_eq!(check["scene_entities"]["level_two"], 3);
 
     let output = run(&[
         "project",
@@ -187,6 +284,101 @@ fn creates_lists_validates_and_runs_multiple_project_scenes() {
 }
 
 #[test]
+fn renames_and_recoverably_deletes_project_scenes_from_the_formal_workflow() {
+    let root = unique_project_root();
+    let output = run(&[
+        "project",
+        "new",
+        path_text(&root),
+        "--name",
+        "Scene Mutation Game",
+    ]);
+    assert_success(&output, "project new for scene mutation");
+    let output = run(&["project", "scene", "new", path_text(&root), "level_old"]);
+    assert_success(&output, "project scene new for rename");
+    let output = run(&[
+        "project",
+        "scene",
+        "set-startup",
+        path_text(&root),
+        "level_old",
+    ]);
+    assert_success(&output, "project scene startup before rename");
+
+    let output = run(&[
+        "project",
+        "scene",
+        "rename",
+        path_text(&root),
+        "level_old",
+        "level_new",
+    ]);
+    assert_success(&output, "project scene rename");
+    let rename_report = stdout_json(&output);
+    assert_eq!(rename_report["schema"], "ProjectSceneRenameReport-v0");
+    assert_eq!(rename_report["old_scene_id"], "level_old");
+    assert_eq!(rename_report["scene_id"], "level_new");
+    assert_eq!(rename_report["renamed"], true);
+    assert!(!root.join("assets/scenes/level_old.scene.ron").exists());
+    let renamed_path = root.join("assets/scenes/level_new.scene.ron");
+    let renamed = Scene::load_from_file(&renamed_path).expect("load renamed scene");
+    assert_eq!(renamed.scene_id, "level_new");
+    assert_eq!(renamed.name, "level_new");
+    let project = GameProject::load(&root).expect("load project after scene rename");
+    assert_eq!(project.startup_scene_id(), "level_new");
+    assert!(project.scene_path("level_old").is_none());
+
+    let output = run(&["project", "scene", "delete", path_text(&root), "level_new"]);
+    assert_failure(&output, "startup scene delete without replacement");
+    assert!(renamed_path.is_file());
+
+    let output = run(&[
+        "project",
+        "scene",
+        "delete",
+        path_text(&root),
+        "level_new",
+        "--replacement-startup",
+        "main",
+    ]);
+    assert_success(&output, "recoverable project scene delete");
+    let delete_report = stdout_json(&output);
+    assert_eq!(delete_report["schema"], "ProjectSceneDeleteReport-v0");
+    assert_eq!(delete_report["scene_id"], "level_new");
+    assert_eq!(delete_report["replacement_startup"], "main");
+    assert_eq!(delete_report["recoverable"], true);
+    let trash_directory = PathBuf::from(
+        delete_report["trash_directory"]
+            .as_str()
+            .expect("scene trash directory path"),
+    );
+    let metadata_path = PathBuf::from(
+        delete_report["metadata"]
+            .as_str()
+            .expect("scene trash metadata path"),
+    );
+    assert!(!renamed_path.exists());
+    assert!(trash_directory.join("scene.scene.ron").is_file());
+    assert!(metadata_path.is_file());
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(metadata_path).expect("read scene trash metadata"))
+            .expect("parse scene trash metadata");
+    assert_eq!(metadata["schema"], "EditorSceneTrash-v0");
+    assert_eq!(metadata["scene_id"], "level_new");
+    assert_eq!(
+        metadata["original_scene_path"],
+        "assets/scenes/level_new.scene.ron"
+    );
+    assert_eq!(metadata["was_startup"], true);
+    assert_eq!(metadata["replacement_startup"], "main");
+    let project = GameProject::load(&root).expect("load project after scene delete");
+    assert_eq!(project.startup_scene_id(), "main");
+    assert_eq!(project.scenes().len(), 1);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn imports_texture_and_rolls_back_every_rejected_or_failed_import() {
     let root = unique_project_root();
     let external = root.with_extension("import-sources");
@@ -196,6 +388,8 @@ fn imports_texture_and_rolls_back_every_rejected_or_failed_import() {
     assert_success(&output, "project new for import");
 
     let texture_source = external.join("checker.ppm");
+    std::fs::create_dir_all(root.join("assets/source/Textures"))
+        .expect("create texture import folder");
     std::fs::write(
         &texture_source,
         b"P3\n2 2\n255\n255 0 0  0 255 0\n0 0 255  255 255 255\n",
@@ -208,6 +402,8 @@ fn imports_texture_and_rolls_back_every_rejected_or_failed_import() {
         path_text(&texture_source),
         "--id",
         "imported-checker",
+        "--folder",
+        "Textures",
     ]);
     assert_success(&output, "project texture import");
     let import_report = String::from_utf8_lossy(&output.stdout);
@@ -215,7 +411,7 @@ fn imports_texture_and_rolls_back_every_rejected_or_failed_import() {
     assert!(import_report.contains("\"asset_type\": \"texture\""));
     assert!(import_report.contains("\"imported\": true"));
 
-    let copied_source = root.join("assets/source/checker.ppm");
+    let copied_source = root.join("assets/source/Textures/checker.ppm");
     let manifest_path = root.join("assets/source/game.manifest");
     let cooked_path = root.join("build/cooked/imported-checker.cooked");
     assert_eq!(
@@ -229,7 +425,7 @@ fn imports_texture_and_rolls_back_every_rejected_or_failed_import() {
     assert_eq!(manifest.assets.len(), 1);
     assert_eq!(manifest.assets[0].id.id, "imported-checker");
     assert_eq!(manifest.assets[0].asset_type, AssetType::Texture);
-    assert_eq!(manifest.assets[0].source_path, "checker.ppm");
+    assert_eq!(manifest.assets[0].source_path, "Textures/checker.ppm");
     let cooked = read_cooked_artifact(&cooked_path).expect("validate imported cooked texture");
     assert_eq!(cooked.header.asset_kind, AssetType::Texture.kind_code());
 
@@ -277,6 +473,8 @@ fn imports_texture_and_rolls_back_every_rejected_or_failed_import() {
         path_text(&texture_source),
         "--id",
         "second-checker",
+        "--folder",
+        "Textures",
     ]);
     assert_failure(&output, "source target conflict import");
     assert!(!root.join("build/cooked/second-checker.cooked").exists());
@@ -307,18 +505,6 @@ fn imports_texture_and_rolls_back_every_rejected_or_failed_import() {
     let _ = std::fs::remove_dir_all(external);
 }
 
-#[test]
-fn placeholder_workspace_command_is_not_a_successful_game_launch() {
-    let output = run(&["workspace"]);
-    assert_eq!(output.status.code(), Some(2));
-    let messages = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(messages.contains("placeholder"));
-}
-
 #[cfg(feature = "subsystem-scripting-csharp")]
 #[test]
 fn csharp_scene_load_transitions_to_catalog_scene() {
@@ -345,15 +531,16 @@ fn csharp_scene_load_transitions_to_catalog_scene() {
     ]);
     assert_success(&output, "managed project scene new");
 
-    let script_source = root.join("scripts/GameScripts/Main.cs");
-    let starter_source = std::fs::read_to_string(&script_source).expect("read starter script");
+    let script_source = install_managed_workflow_behaviour(&root);
+    let starter_source =
+        std::fs::read_to_string(&script_source).expect("read managed workflow behaviour");
     let scene_loading_source = starter_source.replace(
         "    public void OnStart()\n    {\n    }",
         "    public void OnStart()\n    {\n        Scene.Load(\"level_two\");\n    }",
     );
     assert_ne!(
         scene_loading_source, starter_source,
-        "starter OnStart method changed unexpectedly"
+        "workflow fixture OnStart method changed unexpectedly"
     );
     std::fs::write(&script_source, scene_loading_source).expect("write scene-loading script");
 
@@ -383,6 +570,63 @@ fn csharp_scene_load_transitions_to_catalog_scene() {
 
 #[cfg(feature = "subsystem-scripting-csharp")]
 #[test]
+fn csharp_script_api_sync_restores_engine_owned_contract() {
+    let root = unique_project_root();
+    let output = run(&[
+        "project",
+        "new",
+        path_text(&root),
+        "--name",
+        "Managed Contract",
+        "--with-csharp",
+    ]);
+    assert_success(&output, "managed contract project new");
+
+    let legacy_source = root.join("scripts/GameScripts/EngineGameplay.cs");
+    let source = root.join("build/script-sdk-source/EngineGameplay.cs");
+    let contract = root.join("scripts/GameScripts/EngineGameplay.contract.json");
+    let targets = root.join("scripts/GameScripts/EngineGameplay.targets");
+    assert!(source.is_file());
+    assert!(contract.is_file());
+    assert!(targets.is_file());
+    assert!(!legacy_source.exists());
+
+    std::fs::write(&legacy_source, "// legacy generated gameplay API\n")
+        .expect("restore legacy generated gameplay API");
+    let output = run(&["project", "build-scripts", path_text(&root)]);
+    assert_failure(&output, "stale managed contract build");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("sync-script-api"));
+
+    let output = run(&["project", "sync-script-api", path_text(&root)]);
+    assert_success(&output, "managed contract sync");
+    let report = stdout_json(&output);
+    assert_eq!(report["schema"], "ProjectScriptApiSyncReport-v0");
+    assert_eq!(
+        report["script_api"],
+        engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA
+    );
+    assert_eq!(
+        report["version"],
+        engine_script_api::GAMEPLAY_SCRIPT_API_VERSION
+    );
+    assert_eq!(report["passed"], true);
+    assert!(!legacy_source.exists());
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&contract).expect("read generated gameplay contract"),
+    )
+    .expect("parse generated gameplay contract");
+    assert_eq!(manifest["owner"], "engine");
+    assert_eq!(manifest["sha256"], report["sha256"]);
+    assert!(std::fs::read_to_string(&source)
+        .expect("read synchronized gameplay API")
+        .contains("public static class ScriptApiContract"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "subsystem-scripting-csharp")]
+#[test]
 fn csharp_project_builds_and_runs_managed_lifecycle() {
     let root = unique_project_root();
     let run_report = root.join("build/csharp-run.json");
@@ -396,12 +640,22 @@ fn csharp_project_builds_and_runs_managed_lifecycle() {
         "--with-csharp",
     ]);
     assert_success(&output, "managed project new");
+    let script_source = install_managed_workflow_behaviour(&root);
     let output = run(&["project", "check", path_text(&root)]);
     assert_success(&output, "managed project check");
     let output = run(&["project", "build-scripts", path_text(&root)]);
     assert_success(&output, "managed project script build");
+    let build_report = stdout_json(&output);
+    assert_eq!(build_report["schema"], "ProjectScriptBuildReport-v0");
+    assert_eq!(build_report["dependency_assemblies"], 1);
+    assert!(build_report["sdk_assembly"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("build/script-sdk/EngineGameplay.dll")));
 
     assert!(root.join("build/scripts/GameScripts.dll").is_file());
+    assert!(root.join("build/scripts/EngineGameplay.dll").is_file());
+    assert!(root.join("build/script-sdk/EngineGameplay.dll").is_file());
+    assert!(!root.join("scripts/GameScripts/EngineGameplay.cs").exists());
     let host_name = if cfg!(windows) {
         "EngineScriptHost.exe"
     } else {
@@ -411,8 +665,8 @@ fn csharp_project_builds_and_runs_managed_lifecycle() {
 
     // A gameplay API contract error must fail closed and preserve the useful
     // managed exception instead of surfacing only TargetInvocationException.
-    let script_source = root.join("scripts/GameScripts/Main.cs");
-    let valid_source = std::fs::read_to_string(&script_source).expect("read starter script");
+    let valid_source =
+        std::fs::read_to_string(&script_source).expect("read managed workflow behaviour");
 
     // Exercise the generated managed Entity API through the real process
     // host: query another World entity's snapshot, then use the explicit
@@ -583,7 +837,7 @@ fn csharp_project_builds_and_runs_managed_lifecycle() {
         messages.contains("Input action 'missing-action' is not configured"),
         "managed error lost its actionable cause: {messages}"
     );
-    std::fs::write(&script_source, valid_source).expect("restore valid starter script");
+    std::fs::write(&script_source, valid_source).expect("restore valid workflow script");
     let output = run(&["project", "build-scripts", path_text(&root)]);
     assert_success(&output, "restore managed project script build");
 
@@ -605,16 +859,17 @@ fn csharp_project_builds_and_runs_managed_lifecycle() {
         serde_json::from_slice(&std::fs::read(&run_report).expect("read managed run report"))
             .expect("parse managed run report");
     assert_eq!(report["passed"], true);
-    assert_eq!(report["script_assemblies"], 1);
+    // The runtime loads the engine SDK dependency before the game assembly.
+    assert_eq!(report["script_assemblies"], 2);
     assert_eq!(report["script_instances"], 1);
     assert_eq!(report["script_started_instances"], 1);
     assert_eq!(report["script_update_count"], 3);
     let translation = report["script_entity_translations"]["cube-01"]
         .as_array()
-        .expect("starter script entity translation");
+        .expect("workflow script entity translation");
     assert!(
         translation[0].as_f64().expect("translation x") > 0.14,
-        "starter C# script must move its owning ECS Transform: {translation:?}"
+        "workflow C# script must move its owning ECS Transform: {translation:?}"
     );
     assert_eq!(translation[1], 0.0);
     assert_eq!(translation[2], 0.0);

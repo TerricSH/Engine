@@ -101,7 +101,7 @@ impl Drop for Device {
     fn drop(&mut self) {
         drop(self.allocator.take());
         // SAFETY: pipeline/swapchain/frames are dropped before Device per
-        // VulkanRenderer field order.
+        // VulkanDevice field order.
         unsafe { self.device.destroy_device(None) }
     }
 }

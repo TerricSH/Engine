@@ -27,7 +27,8 @@ use engine_editor::io;
 use engine_editor::{EditorError, EditorPlayMode, EditorPlaySession, EditorScene};
 use engine_renderer::{validate_frame_input, RenderFrameInput};
 use engine_scene::{
-    extract_renderer_input, sample_scene, validate_scene, ComponentRecord, EntityRecord, Scene,
+    extract_renderer_input_from_world, sample_scene, validate_scene, ComponentRecord, EntityRecord,
+    Scene,
 };
 use engine_serialize::{AssetId, SchemaVersion, Value};
 
@@ -80,7 +81,7 @@ fn make_camera() -> ComponentRecord {
     let mut fields = BTreeMap::new();
     fields.insert(
         "projection".to_string(),
-        Value::Str("perspective".to_string()),
+        Value::Enum("Perspective".to_string()),
     );
     fields.insert("near".to_string(), Value::Float32(0.1));
     fields.insert("far".to_string(), Value::Float32(100.0));
@@ -101,7 +102,18 @@ fn make_camera() -> ComponentRecord {
 
 /// Extract renderer input from an EditorScene.
 fn extract(scene: &Scene) -> Result<RenderFrameInput, Vec<engine_serialize::Diagnostic>> {
-    extract_renderer_input(scene, 0)
+    let diagnostics = engine_scene::validate_scene(scene);
+    if diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.severity,
+            engine_serialize::DiagnosticSeverity::Error
+                | engine_serialize::DiagnosticSeverity::Fatal
+        )
+    }) {
+        return Err(diagnostics);
+    }
+    let world = engine_scene::World::from_scene(scene);
+    extract_renderer_input_from_world(&world, 0)
 }
 
 // ============================================================================
@@ -261,7 +273,7 @@ fn remove_entity_execute_undo_redo() {
     let mut es = EditorScene::new(sample_scene());
     let count_before = es.scene.entities.len();
 
-    let cmd = Box::new(RemoveEntity::new(&"cube-01".to_string(), &es.scene));
+    let cmd = Box::new(RemoveEntity::new("cube-01".to_string()));
     es.execute(cmd).unwrap();
 
     assert_eq!(

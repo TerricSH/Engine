@@ -16,17 +16,6 @@ pub(crate) struct QaBackend {
 }
 
 impl BackendRenderer for QaBackend {
-    fn frame_mode(&self) -> engine_renderer::BackendFrameMode {
-        engine_renderer::BackendFrameMode::RenderGraph
-    }
-
-    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        Err(vec![qa_error(
-            "QA0001",
-            "headless QA requires the render-graph lifecycle",
-        )])
-    }
-
     fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
         if self.frame_active {
             return Err(vec![qa_error("QA0002", "frame already active")]);
@@ -38,8 +27,8 @@ impl BackendRenderer for QaBackend {
     fn apply_pass_barriers(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &engine_renderer::render_graph::PassNode,
-        barriers: &[engine_renderer::render_graph::CompiledBarrier],
+        _pass: &engine_renderer::render_graph2::PassNode,
+        barriers: &[engine_renderer::render_graph2::CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
         if let Some(unsupported) = barriers.iter().find(|barrier| {
             !matches!(
@@ -65,13 +54,13 @@ impl BackendRenderer for QaBackend {
     fn execute_pass(
         &mut self,
         input: &RenderFrameInput,
-        pass: &engine_renderer::render_graph::PassNode,
+        pass: &engine_renderer::render_graph2::PassNode,
         stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
         if !self.frame_active {
             return Err(vec![qa_error("QA0003", "render pass outside a frame")]);
         }
-        if pass.kind == engine_renderer::render_graph::PassKind::OpaquePbrForward {
+        if pass.kind == engine_renderer::render_graph2::PassKind::OpaquePbrForward {
             let meshes = input
                 .drawables
                 .iter()
@@ -208,9 +197,7 @@ fn parse_f64(label: &str, value: Option<String>) -> Result<f64, String> {
 
 fn run(options: &QaOptions) -> Result<(), String> {
     let mut runtime = engine_core::EngineRuntime::new(engine_core::EngineConfig::default());
-    runtime
-        .renderer_mut()
-        .set_backend(Box::<QaBackend>::default());
+    runtime.set_renderer_backend(Box::<QaBackend>::default());
 
     let load_started = Instant::now();
     runtime

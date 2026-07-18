@@ -17,7 +17,7 @@ mod tests {
 
     // --- Dummy component for testing ---
 
-    struct DummyComponent(#[expect(dead_code)] u32);
+    struct DummyComponent;
 
     impl Component for DummyComponent {
         const TYPE_ID: &'static str = "test.dummy";
@@ -81,13 +81,14 @@ mod tests {
         let mut reg = ComponentRegistry::new();
         reg.register_core();
 
-        // All six core components should be present.
+        // All core components should be present.
         assert!(reg.is_registered("engine.name"));
         assert!(reg.is_registered("engine.transform"));
         assert!(reg.is_registered("engine.renderable"));
         assert!(reg.is_registered("engine.camera"));
         assert!(reg.is_registered("engine.light"));
         assert!(reg.is_registered("engine.bounds"));
+        assert!(reg.is_registered("engine.prefab_instance_ref"));
 
         // They should appear in the expected order.
         let ids: Vec<&str> = reg.iter().map(|e| e.meta.type_id).collect();
@@ -100,6 +101,7 @@ mod tests {
                 "engine.camera",
                 "engine.light",
                 "engine.bounds",
+                "engine.prefab_instance_ref",
             ]
         );
     }
@@ -110,13 +112,14 @@ mod tests {
         reg.register_core();
 
         let storages = reg.create_storages();
-        assert_eq!(storages.len(), 6);
+        assert_eq!(storages.len(), 7);
         assert!(storages.contains_key("engine.name"));
         assert!(storages.contains_key("engine.transform"));
         assert!(storages.contains_key("engine.renderable"));
         assert!(storages.contains_key("engine.camera"));
         assert!(storages.contains_key("engine.light"));
         assert!(storages.contains_key("engine.bounds"));
+        assert!(storages.contains_key("engine.prefab_instance_ref"));
 
         // Each storage should be empty.
         for storage in storages.values() {

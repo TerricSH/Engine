@@ -3,21 +3,9 @@ use engine_editor::*;
 // ── EditorError tests ────────────────────────────────────────────────
 
 #[test]
-fn editor_error_panel_not_found_display() {
-    let err = EditorError::PanelNotFound("SceneView".to_string());
-    assert_eq!(err.to_string(), "panel not found: SceneView");
-}
-
-#[test]
 fn editor_error_scene_not_found_display() {
     let err = EditorError::SceneNotFound;
     assert_eq!(err.to_string(), "scene not found");
-}
-
-#[test]
-fn editor_error_asset_not_found_display() {
-    let err = EditorError::AssetNotFound;
-    assert_eq!(err.to_string(), "asset not found");
 }
 
 #[test]
@@ -26,138 +14,22 @@ fn editor_error_init_failed_display() {
     assert_eq!(err.to_string(), "init failed: missing config");
 }
 
-// ── EditorDisabled tests ─────────────────────────────────────────────
-
-#[test]
-fn editor_disabled_is_non_exhaustive() {
-    // EditorDisabled is a #[non_exhaustive] placeholder that cannot
-    // be constructed via struct literal from outside the crate.
-    // It is used as a compile-time sentinel when tooling-editor
-    // is disabled.  Verify the type can at least be named.
-    fn _assert_type_exists(_: EditorDisabled) {}
-}
-
-// ── EditorUi tests (behind tooling-editor feature) ───────────────────
+// Cross-platform editor state tests
 
 #[cfg(feature = "tooling-editor")]
 #[test]
-fn editor_ui_new_creates_context() {
-    let mut ui = EditorUi::new();
-    // Can't inspect fields directly, but reset should not panic
-    ui.reset();
+fn scene_view_state_is_model_only() {
+    let mut panel = SceneViewPanel::new("Scene");
+    panel.apply_action(SceneViewAction::SetDistance(25.0));
+    assert_eq!(panel.camera_orbit().2, 25.0);
 }
 
 #[cfg(feature = "tooling-editor")]
 #[test]
-fn editor_ui_text_field_returns_none() {
-    let mut ui = EditorUi::new();
-    assert_eq!(ui.text_field("label", "value"), None);
+fn project_asset_browser_model_starts_empty() {
+    let panel = engine_editor::asset_browser::AssetBrowserPanel::new();
+    assert!(panel.assets().is_empty());
 }
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn editor_ui_button_returns_false() {
-    let mut ui = EditorUi::new();
-    assert!(!ui.button("Click me"));
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn editor_ui_slider_f32_returns_none() {
-    let mut ui = EditorUi::new();
-    assert_eq!(ui.slider_f32("slider", 0.5, 0.0, 1.0), None);
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn editor_ui_checkbox_passthrough() {
-    let mut ui = EditorUi::new();
-    assert!(ui.checkbox("check", true));
-    assert!(!ui.checkbox("check", false));
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn editor_ui_color_edit_returns_none() {
-    let mut ui = EditorUi::new();
-    assert_eq!(ui.color_edit("color", [1.0, 0.0, 0.0, 1.0]), None);
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn editor_ui_separator_does_not_panic() {
-    let mut ui = EditorUi::new();
-    ui.separator();
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn editor_ui_collapsing_header_returns_default() {
-    let mut ui = EditorUi::new();
-    assert!(ui.collapsing_header("header", true));
-    assert!(!ui.collapsing_header("header2", false));
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn editor_ui_reset_does_not_panic() {
-    let mut ui = EditorUi::new();
-    ui.text_field("a", "1");
-    ui.button("b");
-    ui.separator();
-    ui.reset(); // Should reset without error
-                // After reset, should behave like new
-    assert_eq!(ui.text_field("c", "3"), None);
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn editor_ui_default() {
-    let ui = EditorUi::default();
-    let _ = ui; // Just verify Default impl compiles
-}
-
-// ── Editor panel tests (behind tooling-editor feature) ───────────────
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn scene_view_panel_new() {
-    let panel = SceneViewPanel::new("Scene");
-    assert_eq!(panel.name(), "Scene");
-    assert!(panel.visible());
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn legacy_inspector_panel_new() {
-    let panel = LegacyInspectorPanel::new("Inspector");
-    assert_eq!(panel.name(), "Inspector");
-    assert!(panel.visible());
-    assert!(panel.selected_entity().is_none());
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn new_inspector_panel_new() {
-    let mut panel = InspectorPanel::new("Inspector");
-    assert_eq!(panel.name(), "Inspector");
-    assert!(panel.visible());
-    // ui() should not panic even with no selected entity
-    let mut ui = EditorUi::new();
-    let scene = engine_scene::sample_scene();
-    let cmds = panel.ui(&mut ui, &scene, None);
-    assert!(cmds.is_empty());
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn asset_browser_panel_new() {
-    let panel = AssetBrowserPanel::new("Browser");
-    assert_eq!(panel.name(), "Browser");
-    assert_eq!(panel.current_path(), "/");
-    assert!(panel.entries().is_empty());
-}
-
 // ── Command tests ───────────────────────────────────────────────────
 
 #[cfg(feature = "tooling-editor")]
@@ -268,7 +140,7 @@ fn remove_entity_execute_and_undo() {
     let mut scene = engine_scene::sample_scene();
     let count_before = scene.entities.len();
 
-    let mut cmd = RemoveEntity::new(&"cube-01".to_string(), &scene);
+    let mut cmd = RemoveEntity::new("cube-01".to_string());
     cmd.execute(&mut scene).unwrap();
     assert_eq!(scene.entities.len(), count_before - 1);
     assert!(!scene.entities.iter().any(|e| e.persistent_id == "cube-01"));
@@ -485,30 +357,6 @@ fn editor_scene_execute_and_undo() {
         .find(|e| e.persistent_id == "camera-main")
         .unwrap();
     assert_eq!(entity.name.as_deref(), Some("Renamed"));
-}
-
-// ── Hierarchy panel tests ────────────────────────────────────────────
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn hierarchy_panel_new() {
-    let panel = HierarchyPanel::new("Hierarchy");
-    assert_eq!(panel.name(), "Hierarchy");
-    assert!(panel.visible());
-    assert!(panel.selected().is_none());
-}
-
-#[cfg(feature = "tooling-editor")]
-#[test]
-fn hierarchy_panel_ui_returns_commands() {
-    let mut panel = HierarchyPanel::new("Hierarchy");
-    let mut ui = EditorUi::new();
-    let scene = engine_scene::sample_scene();
-
-    let cmds = panel.ui(&mut ui, &scene);
-    // ui() on a scene with entities should return at least create/delete buttons
-    // but no mutation commands without user interaction
-    assert!(cmds.is_empty());
 }
 
 // ── EditorError extra variant tests ──────────────────────────────────

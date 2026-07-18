@@ -1,4 +1,4 @@
-//! Shadow mapping for VulkanDevice (directional light CSM, 2048×2048, 3 cascades).
+//! Shadow mapping for VulkanDevice (directional light CSM, 2048 x 2048, 3 cascades).
 
 use ash::vk;
 
@@ -38,7 +38,98 @@ impl VulkanDevice {
         self.create_shadow_resources()
     }
 
-    /// Create 2048×2048 directional-light CSM shadow resources (3 cascades).
+    /// Establish the descriptor-declared layout even when the current frame
+    /// has no shadow-casting light and therefore omits the shadow render pass.
+    /// The forward pipeline keeps a shadow descriptor bound unconditionally,
+    /// so leaving a newly allocated image in `UNDEFINED` makes the entire
+    /// command buffer invalid before the shader can branch on the light count.
+    fn initialize_shadow_image_layout(&self, image: vk::Image, layer_count: u32) -> VkResult<()> {
+        let d = &self.logical_device.device;
+        let pool = unsafe {
+            d.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+                    .queue_family_index(self.logical_device.queue_family_index),
+                None,
+            )
+        }
+        .map_err(|result| VulkanError::vk("create_shadow_init_command_pool", result))?;
+
+        let result = (|| {
+            let command_buffer = unsafe {
+                d.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+            }
+            .map_err(|result| VulkanError::vk("allocate_shadow_init_command_buffer", result))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                VulkanError::Loader(
+                    "Vulkan returned no command buffer for shadow initialization".into(),
+                )
+            })?;
+
+            unsafe {
+                d.begin_command_buffer(
+                    command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+            }
+            .map_err(|result| VulkanError::vk("begin_shadow_init_command_buffer", result))?;
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count,
+                })
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+            unsafe {
+                d.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                d.end_command_buffer(command_buffer)
+            }
+            .map_err(|result| VulkanError::vk("end_shadow_init_command_buffer", result))?;
+
+            let fence = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }
+                .map_err(|result| VulkanError::vk("create_shadow_init_fence", result))?;
+            let command_buffers = [command_buffer];
+            let submit = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+            let completion =
+                match unsafe { d.queue_submit(self.logical_device.queue, &submit, fence) } {
+                    Ok(()) => unsafe { d.wait_for_fences(&[fence], true, u64::MAX) }
+                        .map_err(|result| VulkanError::vk("wait_shadow_init_fence", result)),
+                    Err(result) => Err(VulkanError::vk("submit_shadow_init", result)),
+                };
+            if completion.is_err() {
+                let _ = unsafe { d.queue_wait_idle(self.logical_device.queue) };
+            }
+            unsafe { d.destroy_fence(fence, None) };
+            completion
+        })();
+
+        unsafe { d.destroy_command_pool(pool, None) };
+        result
+    }
+
+    /// Create 2048 x 2048 directional-light CSM shadow resources (3 cascades).
     fn create_shadow_resources(&mut self) -> VkResult<()> {
         let d = &self.logical_device.device;
         let allocator = self.logical_device.allocator();
@@ -74,14 +165,13 @@ impl VulkanDevice {
                 name: "shadow-map",
                 requirements: req,
                 location: crate::allocator::MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         // SAFETY: `image` was created by this device; `allocation` was created
         // for this image's memory requirements; the memory and offset are valid.
         unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
             .map_err(|r| VulkanError::vk("bind_shadow_image", r))?;
+        self.initialize_shadow_image_layout(image, CASCADE_COUNT)?;
 
         // ---- 2. Layered image view (for descriptor / shader sampling) ----
         let array_view_info = vk::ImageViewCreateInfo::default()
@@ -156,7 +246,7 @@ impl VulkanDevice {
         let subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .depth_stencil_attachment(&depth_ref);
-        // Subpass dependencies: external → shadow (write), shadow → external (read)
+        // Subpass dependencies: external 鈫?shadow (write), shadow 鈫?external (read)
         let deps = [
             vk::SubpassDependency::default()
                 .src_subpass(vk::SUBPASS_EXTERNAL)
@@ -239,7 +329,7 @@ impl VulkanDevice {
             .depth_bias_slope_factor(1.5);
         let ms = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        // No color attachments – empty blend state
+        // No color attachments, so use an empty blend state.
         let cba: [vk::PipelineColorBlendAttachmentState; 0] = [];
         let cb = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
@@ -301,7 +391,7 @@ impl VulkanDevice {
         // ---- 9. Descriptor set layout (set=1) ----
         // binding=0: COMBINED_IMAGE_SAMPLER, VERTEX+FRAGMENT (shadow map array)
         // binding=1: COMBINED_IMAGE_SAMPLER, FRAGMENT (env cubemap)
-        // binding=2: STORAGE_BUFFER, FRAGMENT (light SSBO — Phase 4.3)
+        // binding=2: STORAGE_BUFFER, FRAGMENT (light SSBO, phase 4.3)
         let ds_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -576,7 +666,7 @@ impl VulkanDevice {
     ///
     /// Given the camera's view and projection matrices, and the near/far
     /// plane distances, returns:
-    /// - `cascade_splits`: `[split0, split1, split2, far]` — split distances
+    /// - `cascade_splits`: `[split0, split1, split2, far]` split distances
     ///   in view-space z
     /// - `light_vps`: 3 light view-projection matrices, one per cascade
     ///
@@ -779,147 +869,6 @@ impl VulkanDevice {
         }
 
         Ok((splits4, light_vps))
-    }
-
-    /// Compute a single light view-projection matrix for directional shadow mapping.
-    ///
-    /// This is an explicit fixed-camera fallback for the legacy
-    /// `render_model_frame` demo path. Scene rendering must use
-    /// [`Self::compute_cascade_data`] with its actual camera and light.
-    pub(crate) fn compute_legacy_fallback_light_mvp(&self) -> [[f32; 4]; 4] {
-        let light_dir = glam::Vec3::new(0.5, -0.707, 0.5).normalize();
-        let light_pos = -light_dir * 10.0;
-        let view = glam::Mat4::look_at_rh(light_pos, glam::Vec3::ZERO, glam::Vec3::Y);
-        let ortho = glam::Mat4::orthographic_rh(-5.0, 5.0, -5.0, 5.0, 0.1, 20.0);
-        let light_mvp = ortho * view;
-        light_mvp.to_cols_array_2d()
-    }
-
-    /// Record a shadow-mapping render pass for the given cascade layer.
-    ///
-    /// The command buffer MUST have been started via [`begin_cb`] before calling
-    /// this method. The shadow map layer is bound as a depth attachment and the
-    /// scene is rendered from the light's point of view using the given `light_mvp`
-    /// push constant.
-    pub(crate) fn record_shadow_pass(
-        &self,
-        fi: usize,
-        cascade_index: usize,
-        light_mvp: &[[f32; 4]; 4],
-        vertex_buf: render_core::BufferHandle,
-        index_buf: render_core::BufferHandle,
-        index_count: u32,
-    ) -> VkResult<()> {
-        let d = &self.logical_device.device;
-        let f = &self.frame_sync[fi];
-        let rp = self.shadow_rp.ok_or(VulkanError::Loader(
-            "shadow render pass not initialized".into(),
-        ))?;
-        let pl = self.shadow_pipeline.ok_or(VulkanError::Loader(
-            "shadow pipeline not initialized".into(),
-        ))?;
-        let pll = self.shadow_pipeline_layout.ok_or(VulkanError::Loader(
-            "shadow pipeline layout not initialized".into(),
-        ))?;
-        const SHADOW_SIZE: u32 = 2048;
-
-        let fb = self
-            .shadow_fbs
-            .get(cascade_index)
-            .copied()
-            .ok_or(VulkanError::Loader("shadow framebuffer not found".into()))?;
-
-        // Look up Vulkan buffer handles
-        let vk_vb = self
-            .buffers
-            .get(vertex_buf.index, vertex_buf.generation)
-            .map(|e| e.buffer)
-            .ok_or(VulkanError::Loader("vertex buffer not found".into()))?;
-        let vk_ib = self
-            .buffers
-            .get(index_buf.index, index_buf.generation)
-            .map(|e| e.buffer)
-            .ok_or(VulkanError::Loader("index buffer not found".into()))?;
-
-        // Begin shadow render pass
-        let clear_depth = vk::ClearValue {
-            depth_stencil: vk::ClearDepthStencilValue {
-                depth: 1.0,
-                stencil: 0,
-            },
-        };
-        let clear_values = [clear_depth];
-        let rpbi = vk::RenderPassBeginInfo::default()
-            .render_pass(rp)
-            .framebuffer(fb)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: SHADOW_SIZE,
-                    height: SHADOW_SIZE,
-                },
-            })
-            .clear_values(&clear_values);
-
-        // SAFETY: command buffer is in recording state; render pass and
-        // framebuffer are valid; `SubpassContents::INLINE` is correct.
-        unsafe {
-            d.cmd_begin_render_pass(f.command_buffer, &rpbi, vk::SubpassContents::INLINE);
-        }
-
-        // Viewport + scissor
-        let vp = vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: SHADOW_SIZE as f32,
-            height: SHADOW_SIZE as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
-        // SAFETY: command buffer is inside a render pass instance; all handles
-        // (pipeline, push constants, buffers) are valid; `light_mvp` is a
-        // stack-local array valid for the duration of the unsafe block.
-        unsafe {
-            d.cmd_set_viewport(f.command_buffer, 0, &[vp]);
-            d.cmd_set_scissor(
-                f.command_buffer,
-                0,
-                &[vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: vk::Extent2D {
-                        width: SHADOW_SIZE,
-                        height: SHADOW_SIZE,
-                    },
-                }],
-            );
-            d.cmd_bind_pipeline(f.command_buffer, vk::PipelineBindPoint::GRAPHICS, pl);
-
-            // Push constant: mat4 light MVP (64 bytes)
-            // SAFETY: `light_mvp` pointer is valid for the size of the matrix;
-            // push constant range (64 bytes at offset 0) matches the pipeline
-            // layout declaration.
-            let mvp_bytes: &[u8] = std::slice::from_raw_parts(
-                light_mvp.as_ptr() as *const u8,
-                std::mem::size_of::<[[f32; 4]; 4]>(),
-            );
-            d.cmd_push_constants(
-                f.command_buffer,
-                pll,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                mvp_bytes,
-            );
-
-            // Vertex + index buffers
-            let vbs = [vk_vb];
-            let offsets = [0u64];
-            d.cmd_bind_vertex_buffers(f.command_buffer, 0, &vbs, &offsets);
-            d.cmd_bind_index_buffer(f.command_buffer, vk_ib, 0, vk::IndexType::UINT32);
-            d.cmd_draw_indexed(f.command_buffer, index_count, 1, 0, 0, 0);
-            d.cmd_end_render_pass(f.command_buffer);
-        }
-
-        Ok(())
     }
 }
 

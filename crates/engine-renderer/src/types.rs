@@ -92,6 +92,26 @@ impl Rect {
         min: [0.0, 0.0],
         max: [1.0, 1.0],
     };
+
+    /// Returns whether this rectangle is a finite, positive normalized
+    /// viewport fully contained by the render surface.
+    pub fn is_valid_normalized(self) -> bool {
+        self.min.into_iter().chain(self.max).all(f32::is_finite)
+            && self.min[0] >= 0.0
+            && self.min[1] >= 0.0
+            && self.max[0] <= 1.0
+            && self.max[1] <= 1.0
+            && self.max[0] > self.min[0]
+            && self.max[1] > self.min[1]
+    }
+
+    pub fn width(self) -> f32 {
+        self.max[0] - self.min[0]
+    }
+
+    pub fn height(self) -> f32 {
+        self.max[1] - self.min[1]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

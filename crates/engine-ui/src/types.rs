@@ -14,6 +14,12 @@ pub enum UiError {
     #[error("element not found: {0:?}")]
     ElementNotFound(ElementId),
 
+    #[error("invalid element id: {0:?}")]
+    InvalidElementId(ElementId),
+
+    #[error("duplicate element id: {0:?}")]
+    DuplicateElementId(ElementId),
+
     #[error("canvas has no elements")]
     EmptyCanvas,
 }
@@ -92,8 +98,7 @@ pub enum UiElementKind {
     Panel { color: Color },
     /// A texture-backed image.
     Image { texture_id: String, color: Color },
-    /// Text content (rendered as a placeholder quad without actual font
-    /// rasterisation).
+    /// Text content rasterised into the shared runtime font atlas.
     Text {
         content: String,
         font_size: f32,

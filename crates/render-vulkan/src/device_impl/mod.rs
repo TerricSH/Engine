@@ -1,4 +1,4 @@
-//! VulkanDevice — implements `render_core::Device` plus MVP triangle path.
+//! VulkanDevice — implements the Vulkan `render_core::Device` backend.
 
 pub(crate) mod depth;
 pub(crate) mod descriptor;
@@ -9,9 +9,7 @@ pub(crate) mod env;
 pub(crate) mod frame;
 pub(crate) mod graph_barriers;
 pub(crate) mod hdr;
-pub(crate) mod pipeline;
 pub(crate) mod reload;
-pub(crate) mod rendering;
 pub(crate) mod shadow;
 pub(crate) mod slab;
 pub(crate) mod texture;
@@ -76,20 +74,12 @@ pub struct VulkanDevice {
     /// can first destroy framebuffers that reference its image views.
     pub(crate) swapchain_recreate_pending: bool,
 
-    // MVP triangle
-    pub(crate) mvp_framebuffers: Vec<vk::Framebuffer>,
-    pub(crate) mvp_rp: Option<vk::RenderPass>,
-    pub(crate) mvp_pipeline_layout: Option<vk::PipelineLayout>,
-    pub(crate) mvp_pipeline: Option<vk::Pipeline>,
-    pub(crate) mvp_vert_spv: Option<Vec<u8>>,
-    pub(crate) mvp_frag_spv: Option<Vec<u8>>,
+    // Canonical SceneRenderer shaders used by the HDR forward path.
+    pub(crate) forward_vert_spv: Option<Vec<u8>>,
+    pub(crate) forward_frag_spv: Option<Vec<u8>>,
     pub(crate) skinned_vert_spv: Option<Vec<u8>>,
-
-    // Model rendering pipeline (forward shaders + vertex input state)
-    pub(crate) model_pipeline: Option<vk::Pipeline>,
-    pub(crate) model_pipeline_layout: Option<vk::PipelineLayout>,
-    pub(crate) model_rp: Option<vk::RenderPass>,
-    pub(crate) model_framebuffers: Vec<vk::Framebuffer>,
+    pub(crate) skybox_vert_spv: Option<Vec<u8>>,
+    pub(crate) skybox_frag_spv: Option<Vec<u8>>,
 
     // Phase 5.2: Async compute queue
     pub(crate) compute_queue: Option<vk::Queue>,
@@ -199,6 +189,8 @@ pub struct VulkanDevice {
     pub(crate) hdr_forward_rp: Option<vk::RenderPass>,
     /// Forward HDR pipeline (targets hdr_forward_rp).
     pub(crate) hdr_forward_pipeline: Option<vk::Pipeline>,
+    /// Skybox pipeline rendered before opaque geometry in the HDR pass.
+    pub(crate) hdr_skybox_pipeline: Option<vk::Pipeline>,
     pub(crate) hdr_forward_pipeline_layout: Option<vk::PipelineLayout>,
     /// Framebuffer for forward HDR pass (HDR color view + depth view).
     pub(crate) hdr_forward_fb: Option<vk::Framebuffer>,
@@ -208,7 +200,6 @@ pub struct VulkanDevice {
 
     // MSAA resources (Phase 4.2)
     /// Maximum sample count supported by the device.
-    pub(crate) max_msaa_samples: vk::SampleCountFlags,
 
     // Material texture cache (Phase 3.1)
     /// Uploaded GPU textures indexed by asset ID string.
@@ -317,17 +308,11 @@ impl VulkanDevice {
             window_height: height.max(1),
             minimized: width == 0 || height == 0,
             swapchain_recreate_pending: false,
-            mvp_framebuffers: Vec::new(),
-            mvp_rp: None,
-            mvp_pipeline_layout: None,
-            mvp_pipeline: None,
-            mvp_vert_spv: None,
-            mvp_frag_spv: None,
+            forward_vert_spv: None,
+            forward_frag_spv: None,
             skinned_vert_spv: None,
-            model_pipeline: None,
-            model_pipeline_layout: None,
-            model_rp: None,
-            model_framebuffers: Vec::new(),
+            skybox_vert_spv: None,
+            skybox_frag_spv: None,
             compute_queue: None,
             compute_pool: None,
             compute_cmd_buffer: None,
@@ -399,12 +384,10 @@ impl VulkanDevice {
             tone_desc_layout: None,
             hdr_forward_rp: None,
             hdr_forward_pipeline: None,
+            hdr_skybox_pipeline: None,
             hdr_forward_pipeline_layout: None,
             hdr_forward_fb: None,
             hdr_msaa_samples: vk::SampleCountFlags::TYPE_1,
-
-            // MSAA resources (Phase 4.2)
-            max_msaa_samples: max_msaa,
 
             // Material texture cache (Phase 3.1)
             textures: HashMap::new(),
@@ -552,13 +535,18 @@ impl VulkanDevice {
         }
     }
 
-    pub fn set_mvp_shaders(&mut self, vert: &[u8], frag: &[u8]) {
-        self.mvp_vert_spv = Some(vert.to_vec());
-        self.mvp_frag_spv = Some(frag.to_vec());
+    pub fn set_forward_shaders(&mut self, vert: &[u8], frag: &[u8]) {
+        self.forward_vert_spv = Some(vert.to_vec());
+        self.forward_frag_spv = Some(frag.to_vec());
     }
 
     pub fn set_skinned_vertex_shader(&mut self, vert: &[u8]) {
         self.skinned_vert_spv = Some(vert.to_vec());
+    }
+
+    pub fn set_skybox_shaders(&mut self, vert: &[u8], frag: &[u8]) {
+        self.skybox_vert_spv = Some(vert.to_vec());
+        self.skybox_frag_spv = Some(frag.to_vec());
     }
 
     /// Returns the index of the current in-flight frame (0 or 1 for double
@@ -677,6 +665,16 @@ impl VulkanDevice {
         }
     }
 
+    /// Tear down resources that reference the current swapchain images.
+    pub(crate) fn destroy_swapchain_resources(&mut self) {
+        self.destroy_ui_overlay_resources();
+        self.destroy_descriptor_infra();
+        self.destroy_depth_texture();
+        self.destroy_hdr_resources();
+        self.swapchain = None;
+        self.swapchain_recreate_pending = false;
+    }
+
     /// Create (or recreate) the indirect draw and cull-args buffers.
     ///
     /// `max_draws` is the maximum number of `VkDrawIndexedIndirectCommand`
@@ -709,8 +707,6 @@ impl VulkanDevice {
                 name: "indirect-draw-buffer",
                 requirements: req,
                 location: crate::allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         unsafe {
@@ -737,8 +733,6 @@ impl VulkanDevice {
                 name: "cull-args-buffer",
                 requirements: cull_req,
                 location: crate::allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         unsafe { d.bind_buffer_memory(cull_buf, cull_alloc.memory(), cull_alloc.offset()) }
@@ -777,23 +771,6 @@ impl VulkanDevice {
         }
     }
 
-    /// Return the MSAA sample count flags for the given requested count,
-    /// capped to the device's maximum.
-    pub(crate) fn msaa_samples(&self, requested: u8) -> vk::SampleCountFlags {
-        let capped = match requested {
-            8 if self.max_msaa_samples.contains(vk::SampleCountFlags::TYPE_8) => 8,
-            4 if self.max_msaa_samples.contains(vk::SampleCountFlags::TYPE_4) => 4,
-            2 if self.max_msaa_samples.contains(vk::SampleCountFlags::TYPE_2) => 2,
-            _ => 1,
-        };
-        match capped {
-            8 => vk::SampleCountFlags::TYPE_8,
-            4 => vk::SampleCountFlags::TYPE_4,
-            2 => vk::SampleCountFlags::TYPE_2,
-            _ => vk::SampleCountFlags::TYPE_1,
-        }
-    }
-
     pub fn resize(&mut self, w: u32, h: u32) {
         self.window_width = w.max(1);
         self.window_height = h.max(1);
@@ -803,7 +780,7 @@ impl VulkanDevice {
         unsafe {
             let _ = self.logical_device.device.device_wait_idle();
         };
-        self.destroy_mvp();
+        self.destroy_swapchain_resources();
     }
     pub fn wait_idle(&self) {
         // SAFETY: `self.logical_device` is alive by type invariant (ManuallyDrop

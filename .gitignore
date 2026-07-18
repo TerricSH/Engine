@@ -2,6 +2,8 @@
 /artifacts/
 /assets/cooked/
 /pso_cache/
+/.pnpm-store/
+**/node_modules/
 **/*.rs.bk
 
 # Project memory

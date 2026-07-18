@@ -32,6 +32,7 @@ pub type LoaderFn = fn(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + S
 // ---------------------------------------------------------------------------
 
 /// A registered asset type extension.
+#[derive(Clone)]
 pub struct AssetTypeExtension {
     pub meta: AssetTypeMeta,
     pub cooker: Option<CookerFn>,
@@ -56,6 +57,7 @@ impl std::fmt::Debug for AssetTypeExtension {
 ///
 /// Allows subsystems to register asset types (mesh, texture, audio, …) with
 /// their own cooker and loader functions.
+#[derive(Clone)]
 pub struct AssetTypeRegistry {
     extensions: BTreeMap<&'static str, AssetTypeExtension>,
 }

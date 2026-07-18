@@ -10,8 +10,8 @@ default = []
 tooling-editor = ["engine-audio"]
 
 [dependencies]
-crossbeam-channel.workspace = true
 engine-animation = { path = "../engine-animation" }
+engine-character = { path = "../engine-character" }
 engine-asset = { path = "../engine-asset" }
 engine-audio = { path = "../engine-audio", optional = true }
 engine-nav = { path = "../engine-nav" }
@@ -25,5 +25,6 @@ glam.workspace = true
 ron.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -1,314 +1,218 @@
-//! File watcher coordinator with event debouncing.
+//! Filesystem watch coordination with quiet-period debouncing.
 //!
-//! Wraps the existing [`FileWatcher`](crate::watcher::FileWatcher) and adds
-//! per-path debouncing: multiple filesystem events for the same path arriving
-//! within the debounce window (200 ms) are coalesced into a single
-//! [`WatchEvent`].
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use engine_asset::reload::watch::WatchCoordinator;
-//!
-//! let mut coord = WatchCoordinator::new("assets/source").unwrap();
-//! coord.set_enabled(true);
-//!
-//! loop {
-//!     for event in coord.poll_events() {
-//!         println!("{:?} changed", event.path);
-//!     }
-//! }
-//! ```
+//! A path is emitted only after it receives no new create or modify event for
+//! the configured interval. Disabling the coordinator clears both debounced
+//! and raw operating-system events.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::watcher::FileWatcher;
 use crate::AssetError;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Debounce window in milliseconds.  Multiple events for the same path
-/// within this window are coalesced into a single event.
 const DEBOUNCE_MS: u64 = 200;
 
-// ---------------------------------------------------------------------------
-// WatchEventKind
-// ---------------------------------------------------------------------------
-
-/// The kind of filesystem change detected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchEventKind {
-    /// File was modified (content changed).
     Modified,
-    /// File was created.
     Created,
 }
 
-// ---------------------------------------------------------------------------
-// WatchEvent
-// ---------------------------------------------------------------------------
-
-/// A debounced filesystem event.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchEvent {
-    /// Path to the file that changed.
     pub path: PathBuf,
-    /// The kind of change detected.
     pub kind: WatchEventKind,
 }
 
-// ---------------------------------------------------------------------------
-// WatchCoordinator
-// ---------------------------------------------------------------------------
-
-/// Debouncing file-watcher coordinator.
-///
-/// Owns a [`FileWatcher`] and buffers incoming notify events, coalescing
-/// duplicate paths within a configurable debounce window (default 200 ms).
-///
-/// Call [`poll_events`](Self::poll_events) once per frame to drain
-/// buffered events.
+/// Owns the one low-level watcher and turns raw events into debounced changes.
 pub struct WatchCoordinator {
-    /// Underlying recursive file watcher (None when disabled).
     watcher: Option<FileWatcher>,
-    /// Event buffer for debouncing: maps path → (timestamp, kind).
+    watch_dir: PathBuf,
     buffer: HashMap<PathBuf, (Instant, WatchEventKind)>,
-    /// Whether event delivery is enabled.
     enabled: bool,
-    /// Debounce window in milliseconds.
-    debounce_ms: u64,
+    debounce: Duration,
 }
 
 impl WatchCoordinator {
-    /// Create a new watch coordinator watching `watch_dir` recursively.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AssetError::WatcherFailed`] if the underlying
-    /// [`FileWatcher`] cannot be created (e.g. directory does not exist).
     pub fn new(watch_dir: &Path) -> Result<Self, AssetError> {
         let watcher = FileWatcher::watch(watch_dir)?;
-        tracing::info!(dir = %watch_dir.display(), "watch coordinator started");
         Ok(Self {
             watcher: Some(watcher),
+            watch_dir: watch_dir.to_path_buf(),
             buffer: HashMap::new(),
             enabled: true,
-            debounce_ms: DEBOUNCE_MS,
+            debounce: Duration::from_millis(DEBOUNCE_MS),
         })
     }
 
-    /// Create a disabled coordinator that returns no events.
     pub fn new_disabled() -> Self {
         Self {
             watcher: None,
+            watch_dir: PathBuf::new(),
             buffer: HashMap::new(),
             enabled: false,
-            debounce_ms: DEBOUNCE_MS,
+            debounce: Duration::from_millis(DEBOUNCE_MS),
         }
     }
 
-    /// Drain pending events from the file watcher, coalesce duplicates
-    /// within the debounce window, and return the resulting [`WatchEvent`]
-    /// vec.
-    ///
-    /// Call this once per frame.
+    /// Drain raw events and return paths whose quiet period has elapsed.
     pub fn poll_events(&mut self) -> Vec<WatchEvent> {
+        let raw_events = self.drain_raw_events();
         if !self.enabled {
+            self.buffer.clear();
             return Vec::new();
         }
 
-        let Some(ref watcher) = self.watcher else {
-            return Vec::new();
-        };
-
-        // Drain all available events from the watcher channel.
-        while let Ok(notify_event) = watcher.event_receiver().try_recv() {
+        for notify_event in raw_events {
             use notify::EventKind;
 
-            let should_buffer = matches!(
-                notify_event.kind,
-                EventKind::Modify(_) | EventKind::Create(_)
-            );
-            if !should_buffer {
-                continue;
+            let kind = match notify_event.kind {
+                EventKind::Create(_) => WatchEventKind::Created,
+                EventKind::Modify(_) => WatchEventKind::Modified,
+                _ => continue,
+            };
+            let observed_at = Instant::now();
+            for path in notify_event.paths {
+                self.buffer_event(path, kind, observed_at);
             }
+        }
 
-            for path in &notify_event.paths {
-                let kind = if matches!(notify_event.kind, EventKind::Create(_)) {
-                    WatchEventKind::Created
-                } else {
-                    WatchEventKind::Modified
-                };
+        self.drain_ready(Instant::now())
+    }
 
-                let now = Instant::now();
+    fn drain_raw_events(&self) -> Vec<notify::Event> {
+        self.watcher
+            .as_ref()
+            .map(|watcher| watcher.event_receiver().try_iter().collect())
+            .unwrap_or_default()
+    }
 
-                // Coalesce: if we already have a buffered event for this
-                // path within the debounce window, keep the existing kind
-                // and just refresh the timestamp.
-                let is_coalesced = self
-                    .buffer
-                    .get(path)
-                    .is_some_and(|(prev_time, _prev_kind)| {
-                        let elapsed = now.duration_since(*prev_time).as_millis() as u64;
-                        elapsed < self.debounce_ms
-                    });
-                if !is_coalesced {
-                    self.buffer.insert(path.clone(), (now, kind));
+    fn buffer_event(&mut self, path: PathBuf, kind: WatchEventKind, observed_at: Instant) {
+        self.buffer
+            .entry(path)
+            .and_modify(|(last_observed, buffered_kind)| {
+                *last_observed = observed_at;
+                if kind == WatchEventKind::Created {
+                    *buffered_kind = WatchEventKind::Created;
                 }
-            }
-        }
+            })
+            .or_insert((observed_at, kind));
+    }
 
-        // Return all buffered events and clear the buffer.
-        let mut events: Vec<WatchEvent> = self
+    fn drain_ready(&mut self, now: Instant) -> Vec<WatchEvent> {
+        let mut ready_paths = self
             .buffer
-            .drain()
-            .map(|(path, (_, kind))| WatchEvent { path, kind })
-            .collect();
-
-        // Sort by path for deterministic ordering.
-        events.sort_by(|a, b| a.path.cmp(&b.path));
-
-        if !events.is_empty() {
-            tracing::debug!(count = events.len(), "watch coordinator events");
-        }
-
-        events
+            .iter()
+            .filter_map(|(path, (last_observed, _))| {
+                (now.saturating_duration_since(*last_observed) >= self.debounce)
+                    .then(|| path.clone())
+            })
+            .collect::<Vec<_>>();
+        ready_paths.sort();
+        ready_paths
+            .into_iter()
+            .filter_map(|path| {
+                self.buffer
+                    .remove(&path)
+                    .map(|(_, kind)| WatchEvent { path, kind })
+            })
+            .collect()
     }
 
-    /// Enable or disable event delivery.
-    ///
-    /// When disabled, [`poll_events`](Self::poll_events) returns an empty
-    /// vec and all incoming events are discarded.
+    /// Enable or disable event delivery. Events accumulated while disabled
+    /// are discarded before the coordinator can be re-enabled.
     pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-        if !enabled {
+        if !enabled || !self.enabled {
             self.buffer.clear();
+            let _ = self.drain_raw_events();
         }
+        self.enabled = enabled;
     }
 
-    /// Returns `true` if event delivery is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Override the debounce window (in milliseconds).
-    ///
-    /// The default is 200 ms.
-    pub fn set_debounce_ms(&mut self, ms: u64) {
-        self.debounce_ms = ms;
+    pub fn set_debounce_ms(&mut self, milliseconds: u64) {
+        self.debounce = Duration::from_millis(milliseconds);
     }
 
-    /// Access the underlying file watcher's watch directory.
     pub fn watch_dir(&self) -> &Path {
-        // FileWatcher doesn't expose the watched path, so we return
-        // a stub.  This method exists for diagnostic purposes.
-        Path::new("")
+        &self.watch_dir
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    fn make_event(path: &str, kind: WatchEventKind) -> WatchEvent {
-        WatchEvent {
-            path: PathBuf::from(path),
-            kind,
-        }
+    #[test]
+    fn missing_directory_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(WatchCoordinator::new(&root.path().join("missing")).is_err());
     }
 
     #[test]
-    fn watch_event_construction() {
-        let ev = make_event("assets/meshes/cube.asset", WatchEventKind::Modified);
-        assert_eq!(ev.path, PathBuf::from("assets/meshes/cube.asset"));
-        assert_eq!(ev.kind, WatchEventKind::Modified);
+    fn disabling_clears_debounced_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let mut coordinator = WatchCoordinator::new(root.path()).unwrap();
+        coordinator.buffer_event(
+            root.path().join("queued.asset"),
+            WatchEventKind::Modified,
+            Instant::now(),
+        );
+        coordinator.set_enabled(false);
+        assert!(!coordinator.is_enabled());
+        assert!(coordinator.poll_events().is_empty());
+        assert!(coordinator.buffer.is_empty());
     }
 
     #[test]
-    fn watch_event_kind_equality() {
-        assert_eq!(WatchEventKind::Modified, WatchEventKind::Modified);
-        assert_ne!(WatchEventKind::Modified, WatchEventKind::Created);
+    fn debounce_uses_quiet_period_and_preserves_create() {
+        let root = tempfile::tempdir().unwrap();
+        let mut coordinator = WatchCoordinator::new(root.path()).unwrap();
+        coordinator.set_debounce_ms(200);
+        let path = root.path().join("asset.bin");
+        let first = Instant::now();
+        coordinator.buffer_event(path.clone(), WatchEventKind::Modified, first);
+        let second = first + Duration::from_millis(50);
+        coordinator.buffer_event(path.clone(), WatchEventKind::Created, second);
+
+        assert!(coordinator
+            .drain_ready(second + Duration::from_millis(199))
+            .is_empty());
+        assert_eq!(
+            coordinator.drain_ready(second + Duration::from_millis(200)),
+            vec![WatchEvent {
+                path,
+                kind: WatchEventKind::Created,
+            }]
+        );
     }
 
     #[test]
-    fn watch_coordinator_new_fails_on_bad_path() {
-        // A non-existent directory should produce an error.
-        let result = WatchCoordinator::new(Path::new(r"\\?\__nonexistent__\__test__"));
-        assert!(result.is_err());
-    }
+    fn real_watch_directory_emits_after_quiet_period() {
+        let root = tempfile::tempdir().unwrap();
+        let mut coordinator = WatchCoordinator::new(root.path()).unwrap();
+        coordinator.set_debounce_ms(25);
+        let changed_path = root.path().join("changed.material.json");
+        std::fs::write(&changed_path, b"first").unwrap();
+        std::fs::write(&changed_path, b"second").unwrap();
 
-    #[test]
-    fn watch_coordinator_disabled_returns_empty() {
-        // This test verifies that when disabled, poll_events is empty.
-        // We can't easily construct a WatchCoordinator without a real
-        // directory, so we test the set_enabled contract indirectly
-        // by verifying the is_enabled flag.
-        let dir = std::env::temp_dir().join("watch_test_disabled");
-        let _ = std::fs::create_dir_all(&dir);
-        let mut coord = WatchCoordinator::new(&dir).unwrap();
-        assert!(coord.is_enabled());
-        coord.set_enabled(false);
-        assert!(!coord.is_enabled());
-        assert!(coord.poll_events().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn set_debounce_ms() {
-        let dir = std::env::temp_dir().join("watch_test_debounce");
-        let _ = std::fs::create_dir_all(&dir);
-        let mut coord = WatchCoordinator::new(&dir).unwrap();
-        coord.set_debounce_ms(500);
-        // Private field — just verify no crash; poll returns empty
-        // because no events were generated.
-        assert!(coord.poll_events().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn debounce_coalesces_same_path() {
-        // Unit test for the buffer logic: simulate events being added
-        // to the buffer and verify coalescing.
-        let dir = std::env::temp_dir().join("watch_test_coalesce");
-        let _ = std::fs::create_dir_all(&dir);
-        let mut coord = WatchCoordinator::new(&dir).unwrap();
-
-        let p = PathBuf::from("assets/test.asset");
-
-        // Simulate two rapid events being buffered manually (the buffer
-        // is ordinarily populated by poll_events draining the watcher).
-        let now = Instant::now();
-        coord
-            .buffer
-            .insert(p.clone(), (now, WatchEventKind::Modified));
-
-        // A second event within the debounce window should be coalesced
-        // (not replace the existing entry).
-        let later = now + Duration::from_millis(50);
-        match coord.buffer.get(&p) {
-            Some((prev_time, _)) if later.duration_since(*prev_time).as_millis() < 200 => {
-                // Coalesced — keep existing entry.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed = Vec::new();
+        while Instant::now() < deadline {
+            observed.extend(coordinator.poll_events());
+            if observed.iter().any(|event| event.path == changed_path) {
+                break;
             }
-            _ => {
-                coord
-                    .buffer
-                    .insert(p.clone(), (later, WatchEventKind::Created));
-            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-
-        assert_eq!(coord.buffer.len(), 1);
-        // The original Modified kind should be preserved.
-        assert_eq!(coord.buffer.get(&p).unwrap().1, WatchEventKind::Modified);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            observed.iter().any(|event| event.path == changed_path),
+            "the operating-system watcher did not report {}",
+            changed_path.display()
+        );
     }
 }

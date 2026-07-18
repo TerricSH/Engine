@@ -7,11 +7,12 @@ pub use cooked_assets::*;
 
 use engine_asset::{AssetHandle, AssetRegistry};
 use engine_renderer::{
-    AssetId, DebugDrawRegistry, FrameStats, MaterialUpload, MeshUpload, MeshVertexFormat,
-    RenderExtensionRegistry, Renderer, TextureUpload,
+    AssetId, BackendRenderer, DebugDrawRegistry, FrameStats, MaterialUpload, MeshUpload,
+    MeshVertexFormat, RenderExtensionRegistry, Renderer, TextureUpload,
 };
 use engine_scene::{
-    extract_renderer_input_from_world, validate_scene, AssetTypeRegistry, ComponentRegistry, Scene,
+    extract_renderer_input_from_world, extract_renderer_input_from_world_with_viewport,
+    validate_scene, AssetTypeRegistry, ComponentRegistry, RenderViewportContext, Scene,
     SceneLoadDiagnostic, World, WorldSlot,
 };
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
@@ -21,7 +22,7 @@ use std::sync::Arc;
 pub mod ffi_init;
 pub mod game_loop;
 #[cfg(feature = "runtime-subsystems")]
-pub use game_loop::RuntimeUiEvent;
+pub use game_loop::{RuntimeUiEvent, RuntimeUiValue};
 
 // ── Optional script subsystem ─────────────────────────────────────────────
 
@@ -81,16 +82,14 @@ pub struct EngineRuntimeBuilder {
 impl EngineRuntimeBuilder {
     pub fn new(config: EngineConfig) -> Self {
         let mut component_registry = ComponentRegistry::new();
-        #[cfg(feature = "runtime-subsystems")]
         let mut asset_type_registry = AssetTypeRegistry::new();
-        #[cfg(not(feature = "runtime-subsystems"))]
-        let asset_type_registry = AssetTypeRegistry::new();
         #[cfg(feature = "runtime-subsystems")]
         let mut render_extension_registry = RenderExtensionRegistry::new();
         #[cfg(not(feature = "runtime-subsystems"))]
         let render_extension_registry = RenderExtensionRegistry::new();
         let mut debug_draw_registry = DebugDrawRegistry::new();
         component_registry.register_core();
+        engine_scene::register_prefab_asset_type(&mut asset_type_registry);
         engine_character::register_character_extensions(
             &mut component_registry,
             Some(&mut debug_draw_registry),
@@ -344,20 +343,8 @@ impl EngineRuntime {
         &self.animation_extensions
     }
 
-    /// Load a scene into the runtime ECS World.
-    ///
-    /// This compatibility name now delegates to the strict transactional
-    /// loader. Keeping a Scene-only fallback produced identity transforms and
-    /// made normal cameras and positioned objects render incorrectly.
+    /// Transactionally validate and load a scene into the canonical ECS World.
     pub fn load_scene(&mut self, scene: Scene) -> Result<(), Vec<Diagnostic>> {
-        self.load_scene_to_world(scene)
-    }
-
-    /// Load a scene and also build the ECS World from it.
-    ///
-    /// This is the recommended entry point for runtime games that need
-    /// transforms, physics, and gameplay logic in addition to rendering.
-    pub fn load_scene_to_world(&mut self, scene: Scene) -> Result<(), Vec<Diagnostic>> {
         let validation_diagnostics = validate_scene(&scene);
         let validation_failed = validation_diagnostics.iter().any(|diagnostic| {
             matches!(
@@ -373,21 +360,18 @@ impl EngineRuntime {
             return Err(validation_diagnostics);
         }
 
-        #[cfg(feature = "subsystem-scripting-csharp")]
         let world_scene = {
             // `engine.script` is scene-only metadata consumed by the script
             // subsystem. Keep it in the retained Scene, but do not ask the ECS
-            // component registry to materialise it. No other type is ignored.
+            // component registry to materialise it, even when the optional
+            // scripting runtime is not compiled in. No other type is ignored.
             let mut world_scene = scene.clone();
             for entity in &mut world_scene.entities {
-                entity.components.remove(script::SCRIPT_COMPONENT_TYPE);
+                entity.components.remove("engine.script");
             }
             world_scene
         };
-        #[cfg(feature = "subsystem-scripting-csharp")]
         let world_scene = &world_scene;
-        #[cfg(not(feature = "subsystem-scripting-csharp"))]
-        let world_scene = &scene;
 
         // Build outside the WorldSlot lock. A failed load leaves the currently
         // active World, Scene, and FFI binding untouched.
@@ -429,7 +413,7 @@ impl EngineRuntime {
     ///
     /// This is the preferred entry point when building a World manually
     /// via `World::new()` + `create_entity()` + `add_component()`.
-    /// Unlike `load_scene_to_world` it avoids the `to_scene()/from_scene()`
+    /// Unlike `load_scene` it avoids the `to_scene()/from_scene()`
     /// serialisation round-trip.
     ///
     /// The world must contain at least one enabled [`Camera`] component
@@ -438,7 +422,7 @@ impl EngineRuntime {
     pub fn set_world(&mut self, mut world: World) {
         // A caller-provided registry is authoritative. Otherwise install the
         // runtime registry before serialising so external components survive
-        // the Scene snapshot used by legacy rendering and scripts.
+        // the Scene snapshot used by inspection and script attachment.
         let effective_registry = if let Some(registry) = world.component_registry() {
             Arc::clone(registry)
         } else {
@@ -487,9 +471,45 @@ impl EngineRuntime {
         self.world_slot.has_world()
     }
 
-    /// Mutable access to the renderer for backend configuration and mesh uploads.
-    pub fn renderer_mut(&mut self) -> &mut Renderer {
-        &mut self.renderer
+    /// Install the backend used by the runtime's sole render pipeline.
+    pub fn set_renderer_backend(&mut self, backend: Box<dyn BackendRenderer>) {
+        self.renderer.set_backend(backend);
+    }
+
+    /// Resize the active backend without exposing unrestricted renderer access.
+    pub fn resize_renderer(&mut self, width: u32, height: u32) -> Result<(), Vec<Diagnostic>> {
+        self.renderer.resize(width, height)
+    }
+
+    /// Upload an editor-owned, short-lived preview texture.
+    ///
+    /// Persistent scene resources must be registered in [`AssetRegistry`].
+    /// This deliberately narrow entry point is reserved for generated tooling
+    /// previews that do not participate in scene asset ownership.
+    pub fn upload_temporary_preview_texture(
+        &mut self,
+        upload: TextureUpload,
+    ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+        let id = upload.texture_id.clone();
+        self.asset_registry.insert_typed(id, upload);
+        Ok(engine_renderer::UploadReceipt {
+            revision: 1,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Release an editor-owned texture previously uploaded through
+    /// [`Self::upload_temporary_preview_texture`].
+    pub fn remove_temporary_preview_texture(
+        &mut self,
+        texture_id: engine_renderer::AssetId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        self.asset_registry.unload(&texture_id);
+        self.renderer
+            .remove_resource(engine_renderer::ResourceRemoval {
+                kind: engine_renderer::ResourceKind::Texture,
+                resource_id: texture_id,
+            })
     }
 
     /// Runtime asset cache used by automatic renderer-resource synchronisation.
@@ -578,10 +598,37 @@ impl EngineRuntime {
         frame_index: u64,
         ui_batches: Vec<engine_renderer::UiBatch>,
     ) -> Result<FrameStats, Vec<Diagnostic>> {
-        let mut input = if let Some(result) = self
-            .world_slot
-            .with_world(|world| extract_renderer_input_from_world(world, frame_index))
-        {
+        self.render_frame_submission(frame_index, ui_batches, None)
+    }
+
+    /// Render a scene into a normalized sub-region of a concrete surface and
+    /// composite caller-produced UI over the complete surface.
+    ///
+    /// Camera-authored viewports are composed inside `viewport`; extraction,
+    /// asset synchronization, render-graph execution, and presentation remain
+    /// on the exact same EngineRuntime -> Renderer -> backend path as a
+    /// full-screen frame.
+    pub fn render_frame_with_ui_in_viewport(
+        &mut self,
+        frame_index: u64,
+        ui_batches: Vec<engine_renderer::UiBatch>,
+        viewport: RenderViewportContext,
+    ) -> Result<FrameStats, Vec<Diagnostic>> {
+        self.render_frame_submission(frame_index, ui_batches, Some(viewport))
+    }
+
+    fn render_frame_submission(
+        &mut self,
+        frame_index: u64,
+        ui_batches: Vec<engine_renderer::UiBatch>,
+        viewport: Option<RenderViewportContext>,
+    ) -> Result<FrameStats, Vec<Diagnostic>> {
+        let mut input = if let Some(result) = self.world_slot.with_world(|world| match viewport {
+            Some(viewport) => {
+                extract_renderer_input_from_world_with_viewport(world, frame_index, viewport)
+            }
+            None => extract_renderer_input_from_world(world, frame_index),
+        }) {
             result?
         } else if self.scene.is_some() {
             return Err(vec![Diagnostic::new(
@@ -601,6 +648,7 @@ impl EngineRuntime {
         self.render_extension_registry
             .produce_all(&mut input, frame_index);
         input.ui_batches.extend(ui_batches);
+        self.refresh_generated_ui_assets();
         if let Err(diagnostics) = self.sync_render_assets(&input) {
             self.collector.push_asset_diags(diagnostics.clone());
             return Err(diagnostics);
@@ -630,11 +678,10 @@ impl EngineRuntime {
         let mut materials = Vec::new();
         let mut texture_ids = std::collections::BTreeMap::new();
         for id in material_ids.values() {
-            let Some(handle) = self.asset_registry.get::<MaterialUpload>(id) else {
-                // A backend-provided or manually uploaded material remains a
-                // valid source; Vulkan also has an explicit fallback material.
-                continue;
-            };
+            let handle = self
+                .asset_registry
+                .get::<MaterialUpload>(id)
+                .ok_or_else(|| missing_registered_render_asset("material", id))?;
             let upload = handle.get().clone();
             validate_registered_asset_id("material", id, &upload.material_id)?;
             if let Some(texture) = &upload.base_color_texture {
@@ -650,11 +697,10 @@ impl EngineRuntime {
 
         let mut textures = Vec::new();
         for id in texture_ids.values() {
-            let Some(handle) = self.asset_registry.get::<TextureUpload>(id) else {
-                // The texture may have been uploaded directly by an embedding
-                // application; the backend validates that dependency.
-                continue;
-            };
+            let handle = self
+                .asset_registry
+                .get::<TextureUpload>(id)
+                .ok_or_else(|| missing_registered_render_asset("texture", id))?;
             let upload = handle.get().clone();
             validate_registered_asset_id("texture", id, &upload.texture_id)?;
             textures.push(upload);
@@ -662,11 +708,10 @@ impl EngineRuntime {
 
         let mut meshes = Vec::new();
         for id in mesh_ids.values() {
-            let Some(handle) = self.asset_registry.get::<MeshUpload>(id) else {
-                // Preserve explicit low-level uploads. Missing meshes still
-                // fail closed in the backend before command recording.
-                continue;
-            };
+            let handle = self
+                .asset_registry
+                .get::<MeshUpload>(id)
+                .ok_or_else(|| missing_registered_render_asset("mesh", id))?;
             let upload = handle.get().clone();
             validate_registered_asset_id("mesh", id, &upload.mesh_id)?;
             meshes.push(upload);
@@ -687,6 +732,20 @@ impl EngineRuntime {
         Ok(())
     }
 
+    fn refresh_generated_ui_assets(&mut self) {
+        #[cfg(feature = "runtime-subsystems")]
+        if let Some(upload) = engine_ui::font_atlas_texture_upload() {
+            let changed = self
+                .asset_registry
+                .get::<TextureUpload>(&upload.texture_id)
+                .is_none_or(|current| current.get().content_hash != upload.content_hash);
+            if changed {
+                self.asset_registry
+                    .insert_typed(upload.texture_id.clone(), upload);
+            }
+        }
+    }
+
     // ── Script subsystem public API (only when feature is enabled) ─────
 
     /// Register a script backend host (e.g. `ProcessHost` for C#).
@@ -705,6 +764,16 @@ impl EngineRuntime {
     ) -> Result<(), ScriptError> {
         self.script_engine.load_script(id, host_name, data)?;
         Ok(())
+    }
+
+    /// Return the concrete managed behaviour classes verified by the active
+    /// script hosts when their assemblies were loaded.
+    ///
+    /// This is the sole editor-facing discovery path: callers receive no
+    /// source-derived or conventional default class names.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn verified_script_classes(&self) -> Vec<engine_script::VerifiedScriptClass> {
+        self.script_engine.verified_classes()
     }
 
     /// Direct access to the script engine.
@@ -965,6 +1034,7 @@ impl EngineRuntime {
             .into_iter()
             .map(|entity_id| {
                 let context = GameplayContext {
+                    script_api: engine_script::GAMEPLAY_SCRIPT_API_SCHEMA.to_owned(),
                     transform: entities
                         .get(&entity_id)
                         .and_then(|snapshot| snapshot.transform.clone()),
@@ -1181,6 +1251,36 @@ impl EngineRuntime {
                         scene_request = Some(request);
                     }
                 }
+                GameplayCommand::Ui { command } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "mutate runtime UI",
+                        ));
+                        continue;
+                    }
+                    #[cfg(feature = "runtime-subsystems")]
+                    apply_script_ui_command(
+                        &self.world_slot,
+                        &entity_id,
+                        command,
+                        &mut diagnostics,
+                    );
+                    #[cfg(not(feature = "runtime-subsystems"))]
+                    {
+                        let _ = command;
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_UI_UNAVAILABLE",
+                            DiagnosticSeverity::Error,
+                            "script",
+                            format!(
+                                "script entity '{entity_id}' requested runtime UI, but engine-core was built without runtime-subsystems"
+                            ),
+                        );
+                        diagnostic.entity = Some(entity_id);
+                        diagnostics.push(diagnostic);
+                    }
+                }
             }
         }
 
@@ -1221,6 +1321,426 @@ fn validate_script_transform(transform: &ScriptTransform) -> Result<(), &'static
         }
         _ => "Transform is invalid",
     })
+}
+
+#[cfg(all(feature = "subsystem-scripting-csharp", feature = "runtime-subsystems"))]
+fn apply_script_ui_command(
+    world_slot: &WorldSlot,
+    requested_by: &str,
+    command: engine_script::GameplayUiCommand,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Err(reason) = command.validate() {
+        let mut diagnostic = Diagnostic::new(
+            "SCRIPT_UI_COMMAND_INVALID",
+            DiagnosticSeverity::Error,
+            "script",
+            format!("script entity '{requested_by}' produced an invalid UI command: {reason}"),
+        );
+        diagnostic.entity = Some(requested_by.to_owned());
+        diagnostics.push(diagnostic);
+        return;
+    }
+
+    let canvas_id = match &command {
+        engine_script::GameplayUiCommand::CreateCanvas { canvas_id, .. }
+        | engine_script::GameplayUiCommand::RemoveCanvas { canvas_id }
+        | engine_script::GameplayUiCommand::ResizeCanvas { canvas_id, .. }
+        | engine_script::GameplayUiCommand::SetCanvasScaleMode { canvas_id, .. }
+        | engine_script::GameplayUiCommand::ClearCanvas { canvas_id }
+        | engine_script::GameplayUiCommand::AddElement { canvas_id, .. }
+        | engine_script::GameplayUiCommand::RemoveElement { canvas_id, .. }
+        | engine_script::GameplayUiCommand::SetElementEnabled { canvas_id, .. }
+        | engine_script::GameplayUiCommand::SetText { canvas_id, .. }
+        | engine_script::GameplayUiCommand::SetToggleValue { canvas_id, .. }
+        | engine_script::GameplayUiCommand::SetCheckboxValue { canvas_id, .. }
+        | engine_script::GameplayUiCommand::SetSliderValue { canvas_id, .. } => canvas_id.clone(),
+    };
+
+    let applied = world_slot.with_world_mut(|world| -> Result<(), String> {
+        match command {
+            engine_script::GameplayUiCommand::CreateCanvas {
+                canvas_id,
+                width,
+                height,
+            } => {
+                if world.entity_by_persistent_id(&canvas_id).is_some() {
+                    return Err(format!(
+                        "canvas '{canvas_id}' cannot be created because that persistent entity already exists"
+                    ));
+                }
+                let entity = world
+                    .create_persistent_entity(canvas_id.clone())
+                    .map_err(|error| format!("create canvas entity '{canvas_id}': {error}"))?;
+                world.add_component(entity, engine_ui::Canvas::new(width, height));
+                Ok(())
+            }
+            engine_script::GameplayUiCommand::RemoveCanvas { canvas_id } => {
+                let entity = world
+                    .entity_by_persistent_id(&canvas_id)
+                    .ok_or_else(|| format!("canvas '{canvas_id}' does not exist"))?;
+                world
+                    .remove_component::<engine_ui::Canvas>(entity)
+                    .map(|_| ())
+                    .ok_or_else(|| format!("entity '{canvas_id}' has no UI Canvas"))
+            }
+            engine_script::GameplayUiCommand::ResizeCanvas {
+                canvas_id,
+                width,
+                height,
+            } => {
+                let canvas = script_ui_canvas_mut(world, &canvas_id)?;
+                canvas.resize(width, height);
+                Ok(())
+            }
+            engine_script::GameplayUiCommand::SetCanvasScaleMode {
+                canvas_id,
+                scale_mode,
+            } => {
+                script_ui_canvas_mut(world, &canvas_id)?.scale_mode = match scale_mode {
+                    engine_script::GameplayUiScaleMode::Fixed => engine_ui::ScaleMode::Fixed,
+                    engine_script::GameplayUiScaleMode::FitWidth => {
+                        engine_ui::ScaleMode::FitWidth
+                    }
+                    engine_script::GameplayUiScaleMode::FitHeight => {
+                        engine_ui::ScaleMode::FitHeight
+                    }
+                };
+                Ok(())
+            }
+            engine_script::GameplayUiCommand::ClearCanvas { canvas_id } => {
+                script_ui_canvas_mut(world, &canvas_id)?.clear();
+                Ok(())
+            }
+            engine_script::GameplayUiCommand::AddElement {
+                canvas_id,
+                element_id,
+                element,
+            } => {
+                let canvas = script_ui_canvas_mut(world, &canvas_id)?;
+                canvas
+                    .insert_element(
+                        engine_ui::ElementId(element_id),
+                        script_ui_runtime_element(element),
+                    )
+                    .map(|_| ())
+                    .map_err(|error| format!("canvas '{canvas_id}': {error}"))
+            }
+            engine_script::GameplayUiCommand::RemoveElement {
+                canvas_id,
+                element_id,
+            } => {
+                let canvas = script_ui_canvas_mut(world, &canvas_id)?;
+                if canvas.remove_element(engine_ui::ElementId(element_id)) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "canvas '{canvas_id}' has no element with id {element_id}"
+                    ))
+                }
+            }
+            engine_script::GameplayUiCommand::SetElementEnabled {
+                canvas_id,
+                element_id,
+                enabled,
+            } => {
+                let canvas = script_ui_canvas_mut(world, &canvas_id)?;
+                let element = canvas
+                    .get_element_mut(engine_ui::ElementId(element_id))
+                    .ok_or_else(|| {
+                        format!("canvas '{canvas_id}' has no element with id {element_id}")
+                    })?;
+                element.enabled = enabled;
+                Ok(())
+            }
+            engine_script::GameplayUiCommand::SetText {
+                canvas_id,
+                element_id,
+                text,
+            } => {
+                let canvas = script_ui_canvas_mut(world, &canvas_id)?;
+                let element = canvas
+                    .get_element_mut(engine_ui::ElementId(element_id))
+                    .ok_or_else(|| {
+                        format!("canvas '{canvas_id}' has no element with id {element_id}")
+                    })?;
+                match &mut element.kind {
+                    engine_ui::UiElementKind::Text { content, .. } => {
+                        *content = text;
+                        Ok(())
+                    }
+                    _ => Err(format!(
+                        "canvas '{canvas_id}' element {element_id} is not a Text element"
+                    )),
+                }
+            }
+            engine_script::GameplayUiCommand::SetToggleValue {
+                canvas_id,
+                element_id,
+                is_on,
+            } => {
+                let canvas = script_ui_canvas_mut(world, &canvas_id)?;
+                let element = canvas
+                    .get_element_mut(engine_ui::ElementId(element_id))
+                    .ok_or_else(|| {
+                        format!("canvas '{canvas_id}' has no element with id {element_id}")
+                    })?;
+                match &mut element.kind {
+                    engine_ui::UiElementKind::Toggle {
+                        is_on: current, ..
+                    } => {
+                        *current = is_on;
+                        Ok(())
+                    }
+                    _ => Err(format!(
+                        "canvas '{canvas_id}' element {element_id} is not a Toggle element"
+                    )),
+                }
+            }
+            engine_script::GameplayUiCommand::SetCheckboxValue {
+                canvas_id,
+                element_id,
+                checked,
+            } => {
+                let canvas = script_ui_canvas_mut(world, &canvas_id)?;
+                let element = canvas
+                    .get_element_mut(engine_ui::ElementId(element_id))
+                    .ok_or_else(|| {
+                        format!("canvas '{canvas_id}' has no element with id {element_id}")
+                    })?;
+                match &mut element.kind {
+                    engine_ui::UiElementKind::Checkbox {
+                        checked: current, ..
+                    } => {
+                        *current = checked;
+                        Ok(())
+                    }
+                    _ => Err(format!(
+                        "canvas '{canvas_id}' element {element_id} is not a Checkbox element"
+                    )),
+                }
+            }
+            engine_script::GameplayUiCommand::SetSliderValue {
+                canvas_id,
+                element_id,
+                value,
+            } => {
+                let canvas = script_ui_canvas_mut(world, &canvas_id)?;
+                let element = canvas
+                    .get_element_mut(engine_ui::ElementId(element_id))
+                    .ok_or_else(|| {
+                        format!("canvas '{canvas_id}' has no element with id {element_id}")
+                    })?;
+                match &mut element.kind {
+                    engine_ui::UiElementKind::Slider {
+                        value: current,
+                        min,
+                        max,
+                        ..
+                    } if value >= *min && value <= *max => {
+                        *current = value;
+                        Ok(())
+                    }
+                    engine_ui::UiElementKind::Slider { min, max, .. } => Err(format!(
+                        "canvas '{canvas_id}' slider {element_id} value {value} is outside [{min}, {max}]"
+                    )),
+                    _ => Err(format!(
+                        "canvas '{canvas_id}' element {element_id} is not a Slider element"
+                    )),
+                }
+            }
+        }
+    });
+
+    match applied {
+        Some(Ok(())) => {}
+        Some(Err(reason)) => {
+            let mut diagnostic = Diagnostic::new(
+                "SCRIPT_UI_COMMAND_FAILED",
+                DiagnosticSeverity::Error,
+                "script",
+                format!(
+                    "script entity '{requested_by}' could not mutate canvas '{canvas_id}': {reason}"
+                ),
+            );
+            diagnostic.entity = Some(canvas_id);
+            diagnostics.push(diagnostic);
+        }
+        None => diagnostics.push(Diagnostic::new(
+            "SCRIPT_WORLD_MISSING",
+            DiagnosticSeverity::Error,
+            "script",
+            format!(
+                "script entity '{requested_by}' could not mutate canvas '{canvas_id}' because no World is active"
+            ),
+        )),
+    }
+}
+
+#[cfg(all(feature = "subsystem-scripting-csharp", feature = "runtime-subsystems"))]
+fn script_ui_canvas_mut<'a>(
+    world: &'a mut World,
+    canvas_id: &str,
+) -> Result<&'a mut engine_ui::Canvas, String> {
+    let entity = world
+        .entity_by_persistent_id(canvas_id)
+        .ok_or_else(|| format!("canvas '{canvas_id}' does not exist"))?;
+    world
+        .get_mut::<engine_ui::Canvas>(entity)
+        .ok_or_else(|| format!("entity '{canvas_id}' has no UI Canvas"))
+}
+
+#[cfg(all(feature = "subsystem-scripting-csharp", feature = "runtime-subsystems"))]
+fn script_ui_runtime_element(element: engine_script::GameplayUiElement) -> engine_ui::UiElement {
+    use engine_script::GameplayUiElement as WireElement;
+    use engine_ui::UiElementKind;
+
+    let color = |value: engine_script::GameplayUiColor| {
+        engine_ui::Color::new(value.r, value.g, value.b, value.a)
+    };
+    let layout = |value: engine_script::GameplayUiLayout| {
+        engine_ui::Layout::new(
+            glam::Vec2::from_array(value.anchor_min),
+            glam::Vec2::from_array(value.anchor_max),
+            glam::Vec2::from_array(value.offset_min),
+            glam::Vec2::from_array(value.offset_max),
+        )
+    };
+
+    let (kind, layout, z_order) = match element {
+        WireElement::Panel {
+            layout: element_layout,
+            color: element_color,
+            z_order,
+        } => (
+            UiElementKind::Panel {
+                color: color(element_color),
+            },
+            layout(element_layout),
+            z_order,
+        ),
+        WireElement::Image {
+            layout: element_layout,
+            texture_id,
+            color: element_color,
+            z_order,
+        } => (
+            UiElementKind::Image {
+                texture_id,
+                color: color(element_color),
+            },
+            layout(element_layout),
+            z_order,
+        ),
+        WireElement::Text {
+            layout: element_layout,
+            text,
+            font_size,
+            color: element_color,
+            z_order,
+        } => (
+            UiElementKind::Text {
+                content: text,
+                font_size,
+                color: color(element_color),
+            },
+            layout(element_layout),
+            z_order,
+        ),
+        WireElement::Button {
+            layout: element_layout,
+            label,
+            normal_color,
+            hover_color,
+            pressed_color,
+            callback_id,
+            z_order,
+        } => (
+            UiElementKind::Button {
+                label,
+                normal_color: color(normal_color),
+                hover_color: color(hover_color),
+                pressed_color: color(pressed_color),
+                callback_id,
+            },
+            layout(element_layout),
+            z_order,
+        ),
+        WireElement::Toggle {
+            layout: element_layout,
+            label,
+            is_on,
+            color_on,
+            color_off,
+            callback_id,
+            z_order,
+        } => (
+            UiElementKind::Toggle {
+                label,
+                is_on,
+                color_on: color(color_on),
+                color_off: color(color_off),
+                callback_id,
+            },
+            layout(element_layout),
+            z_order,
+        ),
+        WireElement::Checkbox {
+            layout: element_layout,
+            label,
+            checked,
+            color: element_color,
+            callback_id,
+            z_order,
+        } => (
+            UiElementKind::Checkbox {
+                label,
+                checked,
+                color: color(element_color),
+                callback_id,
+            },
+            layout(element_layout),
+            z_order,
+        ),
+        WireElement::Slider {
+            layout: element_layout,
+            label,
+            value,
+            min,
+            max,
+            callback_id,
+            z_order,
+        } => (
+            UiElementKind::Slider {
+                label,
+                value,
+                min,
+                max,
+                callback_id,
+            },
+            layout(element_layout),
+            z_order,
+        ),
+        WireElement::ScrollView {
+            layout: element_layout,
+            content_width,
+            content_height,
+            color: element_color,
+            z_order,
+        } => (
+            UiElementKind::ScrollView {
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                content_width,
+                content_height,
+                color: color(element_color),
+            },
+            layout(element_layout),
+            z_order,
+        ),
+    };
+
+    engine_ui::UiElement::new(kind, layout).with_z_order(z_order)
 }
 
 #[cfg(feature = "subsystem-scripting-csharp")]
@@ -1453,6 +1973,20 @@ fn scene_load_diagnostic(diagnostic: SceneLoadDiagnostic) -> Diagnostic {
     mapped
 }
 
+fn missing_registered_render_asset(kind: &str, requested: &AssetId) -> Vec<Diagnostic> {
+    let mut diagnostic = Diagnostic::new(
+        "AS0002",
+        DiagnosticSeverity::Error,
+        "engine-core.assets",
+        format!(
+            "{kind} asset '{}' is referenced by the frame but is not registered in AssetRegistry",
+            requested.id
+        ),
+    );
+    diagnostic.asset = Some(requested.clone());
+    vec![diagnostic]
+}
+
 fn validate_registered_asset_id(
     kind: &str,
     requested: &AssetId,
@@ -1582,23 +2116,26 @@ mod tests {
     }
 
     impl engine_renderer::BackendRenderer for RecordingBackend {
-        fn render_frame(
+        fn begin_frame(
             &mut self,
-            input: &engine_renderer::RenderFrameInput,
-        ) -> Result<FrameStats, Vec<Diagnostic>> {
-            if let Some(counts) = &self.rendered_ui_batch_counts {
-                counts
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(input.ui_batches.len());
-            }
-            Ok(FrameStats::default())
+            _input: &engine_renderer::RenderFrameInput,
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn apply_pass_barriers(
+            &mut self,
+            _input: &engine_renderer::RenderFrameInput,
+            _pass: &engine_renderer::render_graph2::PassNode,
+            _barriers: &[engine_renderer::render_graph2::CompiledBarrier],
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
         }
 
         fn execute_pass(
             &mut self,
             input: &engine_renderer::RenderFrameInput,
-            _pass: &engine_renderer::render_graph::PassNode,
+            _pass: &engine_renderer::render_graph2::PassNode,
             _frame_stats: &mut FrameStats,
         ) -> Result<(), Vec<Diagnostic>> {
             if let Some(counts) = &self.rendered_ui_batch_counts {
@@ -1611,6 +2148,10 @@ mod tests {
         }
 
         fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
             Ok(())
         }
 
@@ -1866,7 +2407,7 @@ mod tests {
 
         let mut runtime = EngineRuntime::new(EngineConfig::default());
         runtime
-            .load_scene_to_world(scene)
+            .load_scene(scene)
             .expect("registered runtime subsystem components should load strictly");
 
         runtime
@@ -1916,14 +2457,12 @@ mod tests {
                 calls: std::sync::Arc::clone(&calls),
             }));
         let mut runtime = builder.build();
+        runtime.set_renderer_backend(Box::new(RecordingBackend {
+            uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            rendered_ui_batch_counts: None,
+        }));
         runtime
-            .renderer_mut()
-            .set_backend(Box::new(RecordingBackend {
-                uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-                rendered_ui_batch_counts: None,
-            }));
-        runtime
-            .load_scene_to_world(engine_scene::sample_scene())
+            .load_scene(engine_scene::sample_scene())
             .expect("sample scene should load");
 
         runtime.render_frame(17).expect("frame should render");
@@ -2045,14 +2584,12 @@ mod tests {
         let _guard = serial_ffi_world_test();
         let ui_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_renderer_backend(Box::new(RecordingBackend {
+            uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            rendered_ui_batch_counts: Some(std::sync::Arc::clone(&ui_counts)),
+        }));
         runtime
-            .renderer_mut()
-            .set_backend(Box::new(RecordingBackend {
-                uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-                rendered_ui_batch_counts: Some(std::sync::Arc::clone(&ui_counts)),
-            }));
-        runtime
-            .load_scene_to_world(engine_scene::sample_scene())
+            .load_scene(engine_scene::sample_scene())
             .expect("sample scene should load");
 
         let batch = engine_renderer::UiBatch {
@@ -2101,14 +2638,68 @@ mod tests {
 
     #[cfg(feature = "runtime-subsystems")]
     #[test]
+    fn runtime_refreshes_generated_font_atlas_after_ui_batch_build() {
+        if engine_ui::font_atlas_texture_upload().is_none() {
+            return;
+        }
+        let _guard = serial_ffi_world_test();
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_renderer_backend(Box::new(RecordingBackend {
+            uploads: std::sync::Arc::clone(&uploads),
+            rendered_ui_batch_counts: None,
+        }));
+        runtime
+            .load_scene(engine_scene::sample_scene())
+            .expect("sample scene should load");
+
+        let mut canvas = engine_ui::Canvas::new(320.0, 180.0);
+        canvas.add_element(engine_ui::UiElement::new(
+            engine_ui::UiElementKind::Text {
+                content: "Editor text".into(),
+                font_size: 18.0,
+                color: engine_ui::Color::WHITE,
+            },
+            engine_ui::Layout::FILL,
+        ));
+        canvas.layout_all();
+        let batches = canvas.build_batches();
+        assert!(batches.iter().any(|batch| {
+            batch
+                .texture
+                .as_ref()
+                .is_some_and(|texture| texture.id == engine_ui::FONT_ATLAS_ASSET)
+        }));
+
+        runtime
+            .render_frame_with_ui(0, batches)
+            .expect("generated font atlas should be registered before rendering");
+
+        let texture_id = AssetId::new(engine_ui::FONT_ATLAS_ASSET);
+        let atlas = runtime
+            .asset_registry()
+            .get::<TextureUpload>(&texture_id)
+            .expect("font atlas must be owned by AssetRegistry");
+        assert!(atlas.get().mip_levels[0]
+            .bytes
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] != 0));
+        assert!(uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|upload| upload == "texture:engine/font-atlas"));
+    }
+
+    #[cfg(feature = "runtime-subsystems")]
+    #[test]
     fn game_loop_submits_retained_scene_canvas_batches_automatically() {
         let _guard = serial_ffi_world_test();
         let ui_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut game_loop = game_loop::GameLoop::new(EngineConfig::default());
         game_loop
             .runtime
-            .renderer_mut()
-            .set_backend(Box::new(RecordingBackend {
+            .set_renderer_backend(Box::new(RecordingBackend {
                 uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 rendered_ui_batch_counts: Some(std::sync::Arc::clone(&ui_counts)),
             }));
@@ -2146,12 +2737,10 @@ mod tests {
         let _guard = serial_ffi_world_test();
         let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut runtime = EngineRuntime::new(EngineConfig::default());
-        runtime
-            .renderer_mut()
-            .set_backend(Box::new(RecordingBackend {
-                uploads: std::sync::Arc::clone(&uploads),
-                rendered_ui_batch_counts: None,
-            }));
+        runtime.set_renderer_backend(Box::new(RecordingBackend {
+            uploads: std::sync::Arc::clone(&uploads),
+            rendered_ui_batch_counts: None,
+        }));
 
         let texture_id = AssetId::new("texture-ui-atlas");
         runtime.register_texture_asset(TextureUpload {
@@ -2169,7 +2758,7 @@ mod tests {
             content_hash: [9; 32],
         });
         runtime
-            .load_scene_to_world(engine_scene::sample_scene())
+            .load_scene(engine_scene::sample_scene())
             .expect("sample scene should load");
         let batch = engine_renderer::UiBatch {
             canvas_id: "hud".into(),
@@ -2221,12 +2810,10 @@ mod tests {
         let _guard = serial_ffi_world_test();
         let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut runtime = EngineRuntime::new(EngineConfig::default());
-        runtime
-            .renderer_mut()
-            .set_backend(Box::new(RecordingBackend {
-                uploads: std::sync::Arc::clone(&uploads),
-                rendered_ui_batch_counts: None,
-            }));
+        runtime.set_renderer_backend(Box::new(RecordingBackend {
+            uploads: std::sync::Arc::clone(&uploads),
+            rendered_ui_batch_counts: None,
+        }));
 
         let texture_id = AssetId::new("texture-auto");
         runtime.register_texture_asset(TextureUpload {
@@ -2309,7 +2896,7 @@ mod tests {
         let runtime_registry = std::sync::Arc::clone(runtime.component_registry());
 
         runtime
-            .load_scene_to_world(engine_scene::sample_scene())
+            .load_scene(engine_scene::sample_scene())
             .expect("sample scene should load");
 
         assert_eq!(
@@ -2335,7 +2922,7 @@ mod tests {
         let mut invalid_scene = engine_scene::sample_scene();
         let entity_id = insert_empty_component(&mut invalid_scene, "third.party.missing");
         let diagnostics = runtime
-            .load_scene_to_world(invalid_scene)
+            .load_scene(invalid_scene)
             .expect_err("unknown component must fail strict loading");
 
         assert_eq!(runtime.with_world(World::alive_count), Some(1));
@@ -2375,7 +2962,7 @@ mod tests {
         let mut duplicate = engine_scene::sample_scene();
         duplicate.entities.push(duplicate.entities[0].clone());
         let duplicate_diagnostics = runtime
-            .load_scene_to_world(duplicate)
+            .load_scene(duplicate)
             .expect_err("duplicate entity must fail validation");
         assert!(duplicate_diagnostics
             .iter()
@@ -2389,7 +2976,7 @@ mod tests {
         orphan.parent = Some("missing-parent".to_string());
         missing_parent.entities.push(orphan);
         let parent_diagnostics = runtime
-            .load_scene_to_world(missing_parent)
+            .load_scene(missing_parent)
             .expect_err("missing parent must fail validation");
         assert!(parent_diagnostics
             .iter()
@@ -2500,7 +3087,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_scene_load_replaces_and_activates_the_world() {
+    fn canonical_scene_load_replaces_and_activates_the_world() {
         let _guard = serial_ffi_world_test();
         let mut runtime = EngineRuntime::new(EngineConfig::default());
         runtime.set_world(World::new());
@@ -2548,6 +3135,25 @@ mod tests {
         assert_eq!(runtime.script_engine.host_count(), 0);
         runtime.register_script_host(Box::new(MockHost::new()));
         assert_eq!(runtime.script_engine.host_count(), 1);
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn engine_runtime_exposes_only_host_verified_script_classes() {
+        use engine_script::MockHost;
+
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.register_script_host(Box::new(
+            MockHost::new().with_verified_classes("game", ["Game.Player"]),
+        ));
+        runtime
+            .load_script_assembly("game", "mock", b"managed")
+            .unwrap();
+
+        let classes = runtime.verified_script_classes();
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].assembly_id, "game");
+        assert_eq!(classes[0].class_name, "Game.Player");
     }
 
     #[cfg(feature = "subsystem-scripting-csharp")]
@@ -2765,6 +3371,229 @@ mod tests {
             .expect("runtime must keep an active World");
     }
 
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "runtime-subsystems"))]
+    #[test]
+    fn managed_ui_commands_create_and_mutate_retained_canvas_components() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::from_scene(&engine_scene::sample_scene()));
+        let layout = engine_script::GameplayUiLayout {
+            anchor_min: [0.0, 0.0],
+            anchor_max: [0.0, 0.0],
+            offset_min: [24.0, 24.0],
+            offset_max: [344.0, 56.0],
+        };
+        let commands = vec![
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::CreateCanvas {
+                        canvas_id: "hud".into(),
+                        width: 1280.0,
+                        height: 720.0,
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::SetCanvasScaleMode {
+                        canvas_id: "hud".into(),
+                        scale_mode: engine_script::GameplayUiScaleMode::FitWidth,
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::AddElement {
+                        canvas_id: "hud".into(),
+                        element_id: 1,
+                        element: engine_script::GameplayUiElement::Panel {
+                            layout,
+                            color: engine_script::GameplayUiColor {
+                                r: 20,
+                                g: 20,
+                                b: 20,
+                                a: 210,
+                            },
+                            z_order: 10,
+                        },
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::AddElement {
+                        canvas_id: "hud".into(),
+                        element_id: 2,
+                        element: engine_script::GameplayUiElement::Text {
+                            layout,
+                            text: "Score: 0".into(),
+                            font_size: 24.0,
+                            color: engine_script::GameplayUiColor {
+                                r: 255,
+                                g: 255,
+                                b: 255,
+                                a: 255,
+                            },
+                            z_order: 11,
+                        },
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::AddElement {
+                        canvas_id: "hud".into(),
+                        element_id: 3,
+                        element: engine_script::GameplayUiElement::Toggle {
+                            layout,
+                            label: "Music".into(),
+                            is_on: false,
+                            color_on: engine_script::GameplayUiColor {
+                                r: 0,
+                                g: 200,
+                                b: 80,
+                                a: 255,
+                            },
+                            color_off: engine_script::GameplayUiColor {
+                                r: 80,
+                                g: 80,
+                                b: 80,
+                                a: 255,
+                            },
+                            callback_id: Some("music".into()),
+                            z_order: 12,
+                        },
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::AddElement {
+                        canvas_id: "hud".into(),
+                        element_id: 4,
+                        element: engine_script::GameplayUiElement::Checkbox {
+                            layout,
+                            label: "Hints".into(),
+                            checked: false,
+                            color: engine_script::GameplayUiColor {
+                                r: 200,
+                                g: 200,
+                                b: 200,
+                                a: 255,
+                            },
+                            callback_id: Some("hints".into()),
+                            z_order: 12,
+                        },
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::AddElement {
+                        canvas_id: "hud".into(),
+                        element_id: 5,
+                        element: engine_script::GameplayUiElement::Slider {
+                            layout,
+                            label: "Volume".into(),
+                            value: 0.2,
+                            min: 0.0,
+                            max: 1.0,
+                            callback_id: Some("volume".into()),
+                            z_order: 12,
+                        },
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::SetText {
+                        canvas_id: "hud".into(),
+                        element_id: 2,
+                        text: "Score: 10".into(),
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::SetElementEnabled {
+                        canvas_id: "hud".into(),
+                        element_id: 1,
+                        enabled: false,
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::SetToggleValue {
+                        canvas_id: "hud".into(),
+                        element_id: 3,
+                        is_on: true,
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::SetCheckboxValue {
+                        canvas_id: "hud".into(),
+                        element_id: 4,
+                        checked: true,
+                    },
+                },
+            },
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::Ui {
+                    command: engine_script::GameplayUiCommand::SetSliderValue {
+                        canvas_id: "hud".into(),
+                        element_id: 5,
+                        value: 0.8,
+                    },
+                },
+            },
+        ];
+
+        let diagnostics = runtime.apply_script_gameplay_commands(commands);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        runtime
+            .with_world(|world| {
+                let hud = world.entity_by_persistent_id("hud").expect("HUD entity");
+                let canvas = world
+                    .get::<engine_ui::Canvas>(hud)
+                    .expect("Canvas component");
+                assert_eq!((canvas.width, canvas.height), (1280.0, 720.0));
+                assert_eq!(canvas.scale_mode, engine_ui::ScaleMode::FitWidth);
+                assert!(!canvas.get_element(engine_ui::ElementId(1)).unwrap().enabled);
+                assert!(matches!(
+                    &canvas.get_element(engine_ui::ElementId(2)).unwrap().kind,
+                    engine_ui::UiElementKind::Text { content, .. } if content == "Score: 10"
+                ));
+                assert!(matches!(
+                    &canvas.get_element(engine_ui::ElementId(3)).unwrap().kind,
+                    engine_ui::UiElementKind::Toggle { is_on: true, .. }
+                ));
+                assert!(matches!(
+                    &canvas.get_element(engine_ui::ElementId(4)).unwrap().kind,
+                    engine_ui::UiElementKind::Checkbox { checked: true, .. }
+                ));
+                assert!(matches!(
+                    &canvas.get_element(engine_ui::ElementId(5)).unwrap().kind,
+                    engine_ui::UiElementKind::Slider { value, .. } if (*value - 0.8).abs() < f32::EPSILON
+                ));
+            })
+            .expect("runtime must keep an active World");
+    }
+
     #[cfg(feature = "subsystem-scripting-csharp")]
     #[test]
     fn engine_runtime_load_scene_with_scripts() {
@@ -2825,7 +3654,7 @@ mod tests {
 
         // Load scene — should attach scripts
         runtime
-            .load_scene_to_world(scene.clone())
+            .load_scene(scene.clone())
             .expect("engine.script metadata should be allowed");
 
         // After load_scene, the script engine should have an instance
@@ -2834,7 +3663,7 @@ mod tests {
         assert_eq!(after, 1, "script instance should have been created");
 
         runtime
-            .load_scene_to_world(scene)
+            .load_scene(scene)
             .expect("reloading a scripted scene should replace its instances");
         assert_eq!(
             runtime.script_engine.managers()[0].instance_count(),
@@ -2855,7 +3684,7 @@ mod tests {
         insert_empty_component(&mut scene, "engine.script::assembly");
 
         let diagnostics = runtime
-            .load_scene_to_world(scene)
+            .load_scene(scene)
             .expect_err("only the exact engine.script type is scene-only");
 
         assert!(diagnostics.iter().any(|diagnostic| {

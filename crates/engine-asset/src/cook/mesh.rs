@@ -1,7 +1,7 @@
 //! Mesh cooking pipeline.
 //!
-//! Loads glTF 2.0 files via the existing `crate::mesh` module and serialises
-//! the extracted [`MeshData`] as a cooked artifact.
+//! Loads the canonical glTF primitive graph and serialises selected
+//! [`crate::mesh::MeshData`] values as cooked artifacts.
 
 use std::path::Path;
 
@@ -12,21 +12,24 @@ use super::{write_cooked_artifact, AssetType, CookResult};
 
 /// Cook a mesh from a glTF 2.0 source file.
 ///
-/// The source path should point to a `.gltf` or `.glb` file.  The first
-/// mesh primitive is extracted using [`crate::mesh::load_mesh_from_gltf`],
-/// serialized with bincode, and written as a cooked artifact.
+/// The source path should point to a `.gltf` or `.glb` file containing exactly
+/// one primitive. Multi-primitive sources must use [`cook_meshes`] so cooking
+/// never silently aliases the first primitive.
 pub fn cook_mesh(source: &Path, output: &Path) -> Result<CookResult, CookError> {
-    // 1. Load via existing glTF loader.
-    let mesh_data = crate::mesh::load_mesh_from_gltf(source).map_err(|e| match e {
-        crate::mesh::MeshError::GltfLoad(msg) => CookError::Parse(msg),
-        crate::mesh::MeshError::UnsupportedFormat(msg) => CookError::UnsupportedFormat(msg),
-        crate::mesh::MeshError::NoPositions => {
-            CookError::InvalidAsset("mesh has no positions".into())
-        }
-        crate::mesh::MeshError::JointsWeightsMismatch => {
-            CookError::InvalidAsset("joints and weights count mismatch".into())
-        }
-    })?;
+    let scene = crate::gltf::load_gltf_scene(source)
+        .map_err(|error| CookError::Parse(error.to_string()))?;
+    if scene.primitives.len() != 1 {
+        return Err(CookError::InvalidAsset(format!(
+            "single mesh asset requires exactly one glTF primitive, found {}; use multi-mesh import for this source",
+            scene.primitives.len()
+        )));
+    }
+    let mesh_data = scene
+        .primitives
+        .into_iter()
+        .next()
+        .expect("primitive count validated")
+        .mesh;
 
     // 2. Serialize with bincode.
     let payload =
@@ -49,16 +52,13 @@ pub fn cook_mesh(source: &Path, output: &Path) -> Result<CookResult, CookError> 
 /// Output names are derived from the base output path with a suffix:
 /// `<output_stem>_<mesh_name>.cooked`.
 pub fn cook_meshes(source: &Path, output_base: &Path) -> Result<Vec<CookResult>, CookError> {
-    let meshes = crate::mesh::load_meshes_from_gltf(source).map_err(|e| match e {
-        crate::mesh::MeshError::GltfLoad(msg) => CookError::Parse(msg),
-        crate::mesh::MeshError::UnsupportedFormat(msg) => CookError::UnsupportedFormat(msg),
-        crate::mesh::MeshError::NoPositions => {
-            CookError::InvalidAsset("mesh has no positions".into())
-        }
-        crate::mesh::MeshError::JointsWeightsMismatch => {
-            CookError::InvalidAsset("joints and weights count mismatch".into())
-        }
-    })?;
+    let scene = crate::gltf::load_gltf_scene(source)
+        .map_err(|error| CookError::Parse(error.to_string()))?;
+    if scene.primitives.is_empty() {
+        return Err(CookError::InvalidAsset(
+            "glTF source contains no mesh primitives".into(),
+        ));
+    }
 
     let mut results = Vec::new();
     let parent = output_base.parent().unwrap_or(Path::new(""));
@@ -67,16 +67,16 @@ pub fn cook_meshes(source: &Path, output_base: &Path) -> Result<Vec<CookResult>,
         .unwrap_or_default()
         .to_string_lossy();
 
-    for (i, (name, mesh_data)) in meshes.iter().enumerate() {
-        let safe_name = if name.is_empty() {
+    for (i, primitive) in scene.primitives.iter().enumerate() {
+        let safe_name = if primitive.name.is_empty() {
             format!("{stem}_{i}")
         } else {
-            format!("{stem}_{name}")
+            format!("{stem}_{}", primitive.name)
         };
         let output_path = parent.join(format!("{safe_name}.cooked"));
 
-        let payload =
-            bincode::serialize(mesh_data).map_err(|e| CookError::InvalidAsset(e.to_string()))?;
+        let payload = bincode::serialize(&primitive.mesh)
+            .map_err(|e| CookError::InvalidAsset(e.to_string()))?;
 
         let result = write_cooked_artifact(
             &output_path,

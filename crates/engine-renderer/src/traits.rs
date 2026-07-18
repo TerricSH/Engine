@@ -1,8 +1,7 @@
-use crate::render_graph::CompiledBarrier;
+use crate::render_graph2::{CompiledBarrier, PassNode};
 use crate::{
-    render_graph, validate_frame_input, AssetId, Diagnostic, DiagnosticSeverity, FrameStats,
-    MaterialUpload, MeshUpload, RenderFrameInput, ResourceRemoval, TextureUpload, Transparency,
-    UploadReceipt,
+    validate_frame_input, AssetId, Diagnostic, DiagnosticSeverity, FrameStats, MaterialUpload,
+    MeshUpload, RenderFrameInput, ResourceRemoval, TextureUpload, Transparency, UploadReceipt,
 };
 
 pub const DIAG_BACKEND_MISSING: &str = "RV0100";
@@ -25,27 +24,8 @@ pub const DIAG_BARRIERS_UNSUPPORTED: &str = "RV0141";
 pub const DIAG_RENDER_GRAPH_UNSUPPORTED: &str = "RV0142";
 pub const DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED: &str = "RV0143";
 
-/// Selects whether [`Renderer`] invokes the legacy whole-frame entry point or
-/// the explicit render-graph lifecycle.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BackendFrameMode {
-    /// Call `render_frame` exactly once. This keeps small/headless backends
-    /// correct without pretending they implement individual graph passes.
-    #[default]
-    LegacySinglePass,
-    /// Execute begin/barrier/pass/end callbacks for the compiled graph.
-    RenderGraph,
-}
-
 /// Backend renderer trait implemented by concrete GPU backends.
 pub trait BackendRenderer: Send {
-    /// Render one frame from the given scene input (legacy single-pass path).
-    fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>>;
-
-    fn frame_mode(&self) -> BackendFrameMode {
-        BackendFrameMode::LegacySinglePass
-    }
-
     /// Let a graph-capable backend replace frontend placeholder declarations
     /// for its registered custom passes before dependency compilation.
     ///
@@ -106,7 +86,7 @@ pub trait BackendRenderer: Send {
     fn apply_pass_barriers(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &render_graph::PassNode,
+        _pass: &PassNode,
         barriers: &[CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
         if barriers.is_empty() {
@@ -123,7 +103,7 @@ pub trait BackendRenderer: Send {
     fn execute_pass(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &render_graph::PassNode,
+        _pass: &PassNode,
         _frame_stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
         Err(unsupported_backend_operation(
@@ -281,21 +261,17 @@ impl Renderer {
             .as_mut()
             .ok_or_else(|| missing_backend("draw"))?;
 
-        if backend.frame_mode() == BackendFrameMode::LegacySinglePass {
-            return backend.render_frame(input);
-        }
-
         let mut graph = crate::render_graph2::RenderGraph::build_with_config(
             input,
             &input.render_options.pass_graph_config,
         );
         backend.configure_render_graph(input, &mut graph)?;
-        let compiled = graph.compile_v2().map_err(|error| {
+        let compiled = graph.compile().map_err(|error| {
             vec![Diagnostic::new(
                 "RV0020",
                 DiagnosticSeverity::Error,
                 "renderer.render_graph",
-                format!("render graph compile_v2 failed: {error}"),
+                format!("render graph compile failed: {error}"),
             )]
         })?;
 
@@ -317,18 +293,15 @@ impl Renderer {
                 .get(compiled_index)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let span = tracing::info_span!("frame.view.{}.{}", input.frame_index, pass.name);
+            let span = tracing::debug_span!("frame.view.{}.{}", input.frame_index, pass.name);
             let _guard = span.enter();
-            tracing::info!(pass = pass.name, "executing render pass");
+            tracing::debug!(pass = pass.name, "executing render pass");
 
-            if let Some(legacy_pass) = pass.to_legacy() {
-                if let Err(diagnostics) = backend.apply_pass_barriers(input, &legacy_pass, barriers)
-                {
-                    return Err(abort_after_failure(backend.as_mut(), diagnostics));
-                }
-                if let Err(diagnostics) = backend.execute_pass(input, &legacy_pass, &mut stats) {
-                    return Err(abort_after_failure(backend.as_mut(), diagnostics));
-                }
+            if let Err(diagnostics) = backend.apply_pass_barriers(input, pass, barriers) {
+                return Err(abort_after_failure(backend.as_mut(), diagnostics));
+            }
+            if let Err(diagnostics) = backend.execute_pass(input, pass, &mut stats) {
+                return Err(abort_after_failure(backend.as_mut(), diagnostics));
             }
         }
 

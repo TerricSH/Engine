@@ -1,10 +1,10 @@
 use super::{
-    validate_frame_input, AssetId, AxisAlignedBox, BackendFrameMode, BackendRenderer, BlendMode,
-    BonePaletteLayout, ClearFlags, Diagnostic, DiagnosticSeverity, FrameStats, IndexFormat,
-    LightItem, LightKind, MaterialUpload, MeshUpload, MeshVertexFormat, PassGraphOutputMode,
-    RenderFrameInput, RenderView, Renderer, ResourceKind, ResourceRemoval, SamplerDescriptor,
-    ShadowMode, SkinnedItem, TextureMipLevel, TextureUpload, TextureUploadFormat, ToneMapping,
-    Transparency, UploadReceipt, ViewCompose, DIAG_ABORT_UNSUPPORTED, DIAG_BACKEND_MISSING,
+    validate_frame_input, AssetId, AxisAlignedBox, BackendRenderer, BlendMode, BonePaletteLayout,
+    ClearFlags, Diagnostic, DiagnosticSeverity, FrameStats, IndexFormat, LightItem, LightKind,
+    MaterialUpload, MeshUpload, MeshVertexFormat, PassGraphOutputMode, RenderFrameInput,
+    RenderView, Renderer, ResourceKind, ResourceRemoval, SamplerDescriptor, ShadowMode,
+    SkinnedItem, TextureMipLevel, TextureUpload, TextureUploadFormat, ToneMapping, Transparency,
+    UploadReceipt, ViewCompose, DIAG_ABORT_UNSUPPORTED, DIAG_BACKEND_MISSING,
     DIAG_BARRIERS_UNSUPPORTED, DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED, DIAG_INVALID_MATERIAL_VALUES,
     DIAG_INVALID_MESH_VERTICES, DIAG_INVALID_TEXTURE_MIPS, DIAG_MATERIAL_UPLOAD_UNSUPPORTED,
     DIAG_MESH_UPLOAD_UNSUPPORTED, DIAG_TEXTURE_UPLOAD_UNSUPPORTED, IDENTITY_MAT4,
@@ -16,8 +16,30 @@ use std::sync::Arc;
 struct NullBackend;
 
 impl BackendRenderer for NullBackend {
-    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        Ok(FrameStats::default())
+    fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+
+    fn apply_pass_barriers(
+        &mut self,
+        _input: &RenderFrameInput,
+        _pass: &super::render_graph2::PassNode,
+        _barriers: &[super::render_graph2::CompiledBarrier],
+    ) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+
+    fn execute_pass(
+        &mut self,
+        _input: &RenderFrameInput,
+        _pass: &super::render_graph2::PassNode,
+        _frame_stats: &mut FrameStats,
+    ) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+
+    fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
     }
 
     fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
@@ -84,30 +106,60 @@ fn valid_frame_with_view_succeeds() {
     assert!(renderer.draw_scene(&input).is_ok());
 }
 
-struct LegacyCountingBackend {
-    calls: Arc<AtomicUsize>,
+struct GraphCountingBackend {
+    begin_calls: Arc<AtomicUsize>,
+    pass_calls: Arc<AtomicUsize>,
+    end_calls: Arc<AtomicUsize>,
 }
 
-impl BackendRenderer for LegacyCountingBackend {
-    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(FrameStats {
-            draw_calls: 7,
-            ..FrameStats::default()
-        })
+impl BackendRenderer for GraphCountingBackend {
+    fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        self.begin_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn apply_pass_barriers(
+        &mut self,
+        _input: &RenderFrameInput,
+        _pass: &super::render_graph2::PassNode,
+        _barriers: &[super::render_graph2::CompiledBarrier],
+    ) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+
+    fn execute_pass(
+        &mut self,
+        _input: &RenderFrameInput,
+        _pass: &super::render_graph2::PassNode,
+        stats: &mut FrameStats,
+    ) -> Result<(), Vec<Diagnostic>> {
+        self.pass_calls.fetch_add(1, Ordering::SeqCst);
+        stats.draw_calls = 7;
+        Ok(())
+    }
+
+    fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
+        self.end_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
 #[test]
-fn legacy_backend_renders_exactly_once_instead_of_once_per_pass() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut renderer = Renderer::new_with_backend(Box::new(LegacyCountingBackend {
-        calls: Arc::clone(&calls),
+fn backend_always_uses_the_render_graph_lifecycle() {
+    let begin_calls = Arc::new(AtomicUsize::new(0));
+    let pass_calls = Arc::new(AtomicUsize::new(0));
+    let end_calls = Arc::new(AtomicUsize::new(0));
+    let mut renderer = Renderer::new_with_backend(Box::new(GraphCountingBackend {
+        begin_calls: Arc::clone(&begin_calls),
+        pass_calls: Arc::clone(&pass_calls),
+        end_calls: Arc::clone(&end_calls),
     }));
 
     let stats = renderer.draw_scene(&valid_frame()).unwrap();
 
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(pass_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(end_calls.load(Ordering::SeqCst), 1);
     assert_eq!(stats.draw_calls, 7);
 }
 
@@ -131,6 +183,31 @@ fn non_finite_exposure_override_is_rejected_before_backend_execution() {
         diagnostic.code == "RV0022"
             && diagnostic.path.as_deref() == Some("render_options.exposure_ev100")
     }));
+}
+
+#[test]
+fn normalized_sub_viewports_are_valid_but_empty_or_out_of_surface_rects_are_rejected() {
+    let mut input = valid_frame();
+    let embedded = super::Rect {
+        min: [0.2, 0.1],
+        max: [0.8, 0.9],
+    };
+    input.views[0].viewport = embedded;
+    input.views[0].viewport_rect_normalized = embedded;
+    assert!(!validate_frame_input(&input)
+        .iter()
+        .any(|diagnostic| diagnostic.code == "RV0023"));
+
+    input.views[0].viewport.max[0] = input.views[0].viewport.min[0];
+    input.views[0].viewport_rect_normalized.min[1] = -0.01;
+    let diagnostics = validate_frame_input(&input);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "RV0023")
+            .count(),
+        2
+    );
 }
 
 // ============================================================================
@@ -737,11 +814,7 @@ fn no_backend_fails_closed_for_draw_resize_uploads_and_removal() {
 #[derive(Default)]
 struct UnsupportedBackend;
 
-impl BackendRenderer for UnsupportedBackend {
-    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        Ok(FrameStats::default())
-    }
-}
+impl BackendRenderer for UnsupportedBackend {}
 
 #[test]
 fn backend_default_uploads_report_stable_unsupported_diagnostics() {
@@ -765,7 +838,7 @@ fn backend_default_uploads_report_stable_unsupported_diagnostics() {
 
 #[test]
 fn backend_default_barriers_fail_closed_when_work_is_required() {
-    use crate::render_graph::{CompiledBarrier, PassKind, PassNode, PipeStage, ResourceState};
+    use crate::render_graph2::{CompiledBarrier, PassKind, PassNode, PipeStage, ResourceState};
 
     let mut backend = UnsupportedBackend;
     let input = valid_frame();
@@ -773,8 +846,9 @@ fn backend_default_barriers_fail_closed_when_work_is_required() {
         kind: PassKind::ToneMap,
         name: "tone_map_pass",
         view_id: 0,
-        reads_depth: false,
-        writes_swapchain: true,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        depth_stencil: None,
     };
     let barrier = CompiledBarrier {
         resource_name: "hdr_color".into(),
@@ -821,10 +895,6 @@ struct CountingBackend {
 }
 
 impl BackendRenderer for CountingBackend {
-    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        Ok(FrameStats::default())
-    }
-
     fn upload_mesh(&mut self, _upload: MeshUpload) -> Result<UploadReceipt, Vec<Diagnostic>> {
         self.upload_calls.fetch_add(1, Ordering::SeqCst);
         Ok(UploadReceipt::new(1))
@@ -900,14 +970,6 @@ impl FailingFrameBackend {
 }
 
 impl BackendRenderer for FailingFrameBackend {
-    fn frame_mode(&self) -> BackendFrameMode {
-        BackendFrameMode::RenderGraph
-    }
-
-    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        Ok(FrameStats::default())
-    }
-
     fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
         Ok(())
     }
@@ -915,8 +977,8 @@ impl BackendRenderer for FailingFrameBackend {
     fn apply_pass_barriers(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &super::render_graph::PassNode,
-        _barriers: &[super::render_graph::CompiledBarrier],
+        _pass: &super::render_graph2::PassNode,
+        _barriers: &[super::render_graph2::CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
         if matches!(self.stage, FailureStage::Barrier) {
             Err(self.stage_error())
@@ -928,7 +990,7 @@ impl BackendRenderer for FailingFrameBackend {
     fn execute_pass(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &super::render_graph::PassNode,
+        _pass: &super::render_graph2::PassNode,
         _frame_stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
         if matches!(self.stage, FailureStage::Pass) {

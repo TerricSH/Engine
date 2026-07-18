@@ -11,6 +11,18 @@ use thiserror::Error;
 use crate::value::ScriptValue;
 use crate::{GameplayCommand, GameplayContext};
 
+/// One script class proven by a loaded host assembly to be a concrete
+/// `Engine.EngineBehaviour` implementation.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VerifiedScriptClass {
+    /// Host that performed the reflection check.
+    pub host_name: String,
+    /// Loaded assembly identifier accepted by [`ScriptComponent`](crate::ScriptComponent).
+    pub assembly_id: String,
+    /// Fully-qualified managed class name.
+    pub class_name: String,
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -163,6 +175,14 @@ pub trait ScriptHost {
     /// All instances created from this assembly should be considered
     /// invalidated.
     fn unload(&mut self, handle: &ScriptHandle) -> Result<(), ScriptError>;
+
+    /// Return the reflection-verified behaviour classes for a loaded assembly.
+    ///
+    /// `None` means the assembly is not loaded by this host. An empty slice is
+    /// a valid verified result for an assembly containing no behaviours.
+    fn verified_classes(&self, _assembly_id: &str) -> Option<&[String]> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +242,12 @@ impl ScriptHost for NullScriptHost {
     fn unload(&mut self, handle: &ScriptHandle) -> Result<(), ScriptError> {
         self.assemblies.remove(handle.id());
         Ok(())
+    }
+
+    fn verified_classes(&self, assembly_id: &str) -> Option<&[String]> {
+        self.assemblies
+            .contains_key(assembly_id)
+            .then_some(&[] as &[String])
     }
 }
 
@@ -286,6 +312,7 @@ impl ScriptInstance for MockScriptInstance {
 /// [`ScriptEngine`].
 pub struct MockHost {
     assemblies: HashMap<String, Vec<u8>>,
+    verified_classes: HashMap<String, Vec<String>>,
 }
 
 impl MockHost {
@@ -293,7 +320,23 @@ impl MockHost {
     pub fn new() -> Self {
         Self {
             assemblies: HashMap::new(),
+            verified_classes: HashMap::new(),
         }
+    }
+
+    /// Configure the exact class list the mock host will report for an
+    /// assembly after it is loaded. The list is normalized like ProcessHost's
+    /// protocol response so tests exercise the same contract.
+    pub fn with_verified_classes(
+        mut self,
+        assembly_id: impl Into<String>,
+        classes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let mut classes = classes.into_iter().map(Into::into).collect::<Vec<_>>();
+        classes.sort();
+        classes.dedup();
+        self.verified_classes.insert(assembly_id.into(), classes);
+        self
     }
 }
 
@@ -329,6 +372,17 @@ impl ScriptHost for MockHost {
     fn unload(&mut self, handle: &ScriptHandle) -> Result<(), ScriptError> {
         self.assemblies.remove(handle.id());
         Ok(())
+    }
+
+    fn verified_classes(&self, assembly_id: &str) -> Option<&[String]> {
+        if !self.assemblies.contains_key(assembly_id) {
+            return None;
+        }
+        Some(
+            self.verified_classes
+                .get(assembly_id)
+                .map_or(&[], Vec::as_slice),
+        )
     }
 }
 
@@ -488,6 +542,20 @@ mod tests {
         let mut host = MockHost::new();
         let handle = host.load_assembly("asm", b"data").unwrap();
         assert!(host.unload(&handle).is_ok());
+    }
+
+    #[test]
+    fn mock_host_verified_classes_follow_loaded_assembly_contract() {
+        let mut host = MockHost::new()
+            .with_verified_classes("game", ["Game.Zed", "Game.Player", "Game.Player"]);
+        assert!(host.verified_classes("game").is_none());
+        let handle = host.load_assembly("game", b"managed").unwrap();
+        assert_eq!(
+            host.verified_classes("game").unwrap(),
+            ["Game.Player", "Game.Zed"]
+        );
+        host.unload(&handle).unwrap();
+        assert!(host.verified_classes("game").is_none());
     }
 
     #[test]

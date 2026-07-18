@@ -3,21 +3,6 @@
 //! Transforms raw source assets (glTF, GLSL, PNG, etc.) into optimised
 //! cooked artifacts in the `.cooked` format (see [`CookedAssetHeader`]).
 //!
-//! # Architecture
-//!
-//! ```text
-//! assets/source/*.manifest  ──→  cook_orchestrate()
-//!                                       │
-//!                          ┌────────────┼────────────┐
-//!                          ▼            ▼            ▼
-//!                    cook_mesh()  cook_texture()  cook_shader()  …
-//!                          │            │            │
-//!                          └────────────┼────────────┘
-//!                                       ▼
-//!                              write_cooked_artifact()
-//!                                       │
-//!                              assets/cooked/*.cooked
-//! ```
 
 pub mod cooked_shader;
 pub mod dependency;
@@ -26,20 +11,20 @@ pub mod logic_asset;
 pub mod manifest;
 pub mod material;
 pub mod mesh;
+pub mod prefab;
 pub mod scene;
 pub mod texture;
 pub mod validate;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use engine_scene::registry::AssetTypeRegistry;
 use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, HashDigest, SchemaVersion};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-// Re-exports ──────────────────────────────────────────────────────────────
 
 pub use cooked_shader::{
     cook_shader, CookedShader, DescriptorBinding, ShaderReflection, VertexInputReflection,
@@ -53,19 +38,16 @@ pub use material::{
     COOKED_MATERIAL_SCHEMA_VERSION, MATERIAL_SOURCE_SCHEMA,
 };
 pub use mesh::cook_mesh;
+pub use prefab::cook_prefab;
 pub use scene::cook_scene;
 pub use texture::{cook_texture, CookedTexture, TextureFormat};
 pub use validate::validate_assets;
-
-// ── Constants ────────────────────────────────────────────────────────────
 
 /// Magic bytes at the start of every cooked asset file.
 pub const COOKED_MAGIC: &[u8; 8] = b"ENGCOOK\0";
 
 /// Current version of the cooked asset header format.
 pub const COOKED_HEADER_VERSION: u16 = 1;
-
-// ── CookedAssetHeader (FD-006) ───────────────────────────────────────────
 
 /// On-disk header written before every cooked payload.
 ///
@@ -214,8 +196,6 @@ pub fn decode_cooked_texture(artifact: &CookedArtifact) -> Result<CookedTexture,
     })
 }
 
-// ── CookResult ──────────────────────────────────────────────────────────
-
 /// The result of cooking a single asset.
 #[derive(Clone, Debug, Serialize)]
 pub struct CookResult {
@@ -284,16 +264,14 @@ impl CookReport {
     }
 }
 
-// ── write_cooked_artifact ────────────────────────────────────────────────
-
 /// Write a payload as a cooked artifact with its header.
 ///
 /// # Parameters
 ///
-/// * `output`         – path for the `.cooked` output file.
-/// * `asset_kind`     – numeric kind code (see [`AssetType::kind_code`]).
-/// * `payload`        – the serialised asset data.
-/// * `schema_version` – schema version for the payload format.
+/// * `output` - path for the `.cooked` output file.
+/// * `asset_kind` - numeric kind code (see [`AssetType::kind_code`]).
+/// * `payload` - serialized asset data.
+/// * `schema_version` - schema version for the payload format.
 ///
 /// # Returns
 ///
@@ -344,184 +322,6 @@ pub fn write_cooked_artifact(
     })
 }
 
-// ── cook_orchestrate ─────────────────────────────────────────────────────
-
-/// Legacy best-effort cook implementation retained for source compatibility.
-///
-/// # Parameters
-///
-/// * `source_dir` – directory containing source manifests (`.manifest` files)
-///   and referenced source assets.
-/// * `cooked_dir` – directory where cooked `.cooked` artifacts are written.
-/// * `graph`      – mutable [`DependencyGraph`] that is populated during
-///   cooking.
-///
-/// # Returns
-///
-/// This function can hide manifest and directory failures. New callers must
-/// use [`cook_orchestrate`] or [`cook_orchestrate_checked`].
-#[deprecated(note = "use cook_orchestrate_checked so failures cannot be hidden")]
-pub fn cook_orchestrate_unchecked(
-    source_dir: &Path,
-    cooked_dir: &Path,
-    graph: &mut DependencyGraph,
-) -> Vec<CookResult> {
-    let mut results = Vec::new();
-
-    // Read the source directory.
-    let entries = match std::fs::read_dir(source_dir) {
-        Ok(e) => e.filter_map(|r| r.ok()).collect::<Vec<_>>(),
-        Err(e) => {
-            tracing::error!("failed to read source directory {:?}: {e}", source_dir);
-            return results;
-        }
-    };
-
-    for entry in &entries {
-        let path = entry.path();
-
-        // Only process .manifest files.
-        if path.extension().is_none_or(|e| e != "manifest") {
-            continue;
-        }
-
-        // Read manifest content.
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("failed to read manifest {:?}: {e}", path);
-                continue;
-            }
-        };
-
-        // Parse manifest (JSON format).
-        let manifest: SourceManifest = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!("failed to parse manifest {:?}: {e}", path);
-                continue;
-            }
-        };
-
-        tracing::info!(
-            manifest = %path.display(),
-            asset_count = manifest.assets.len(),
-            "processing source manifest"
-        );
-
-        // Process each asset entry.
-        for asset_entry in &manifest.assets {
-            let source_path = source_dir.join(&asset_entry.source_path);
-            let output_path = cooked_dir.join(format!("{}.cooked", asset_entry.id.id));
-
-            // Register in dependency graph.
-            graph.register(asset_entry.id.clone());
-
-            // Process cook rules for dependency tracking.
-            for variant_key in &asset_entry.cook_rules.variant_keys {
-                // Variants are tracked by registering a synthetic dependency.
-                let variant_id =
-                    AssetId::new(format!("{}-variant-{variant_key}", asset_entry.id.id));
-                graph.register(variant_id);
-            }
-
-            // Dispatch to the appropriate cooker based on asset type.
-            let result = match asset_entry.asset_type {
-                AssetType::Mesh => match mesh::cook_mesh(&source_path, &output_path) {
-                    Ok(r) => {
-                        graph.mark_cooked(&asset_entry.id, compute_file_hash(&source_path));
-                        r
-                    }
-                    Err(e) => {
-                        graph.mark_failed(&asset_entry.id, e.to_string());
-                        tracing::error!("mesh cook failed: {:?}: {e}", asset_entry.id.id);
-                        continue;
-                    }
-                },
-                AssetType::Texture => match texture::cook_texture(&source_path, &output_path) {
-                    Ok(r) => {
-                        graph.mark_cooked(&asset_entry.id, compute_file_hash(&source_path));
-                        r
-                    }
-                    Err(e) => {
-                        graph.mark_failed(&asset_entry.id, e.to_string());
-                        tracing::error!("texture cook failed: {:?}: {e}", asset_entry.id.id);
-                        continue;
-                    }
-                },
-                AssetType::Material => match material::cook_material(&source_path, &output_path) {
-                    Ok(r) => {
-                        graph.mark_cooked(&asset_entry.id, compute_file_hash(&source_path));
-                        r
-                    }
-                    Err(e) => {
-                        graph.mark_failed(&asset_entry.id, e.to_string());
-                        tracing::error!("material cook failed: {:?}: {e}", asset_entry.id.id);
-                        continue;
-                    }
-                },
-                AssetType::Shader => {
-                    let stage = determine_shader_stage(&source_path);
-                    match cooked_shader::cook_shader(&source_path, &output_path, 0, &stage) {
-                        Ok(r) => {
-                            graph.mark_cooked(&asset_entry.id, compute_file_hash(&source_path));
-                            r
-                        }
-                        Err(e) => {
-                            graph.mark_failed(&asset_entry.id, e.to_string());
-                            tracing::error!("shader cook failed: {:?}: {e}", asset_entry.id.id);
-                            continue;
-                        }
-                    }
-                }
-                AssetType::Scene => match scene::cook_scene(&source_path, &output_path, 0) {
-                    Ok(r) => {
-                        graph.mark_cooked(&asset_entry.id, compute_file_hash(&source_path));
-                        r
-                    }
-                    Err(e) => {
-                        graph.mark_failed(&asset_entry.id, e.to_string());
-                        tracing::error!("scene cook failed: {:?}: {e}", asset_entry.id.id);
-                        continue;
-                    }
-                },
-                AssetType::Logic => match logic_asset::cook_logic_asset(&source_path, &output_path)
-                {
-                    Ok(r) => {
-                        graph.mark_cooked(&asset_entry.id, compute_file_hash(&source_path));
-                        r
-                    }
-                    Err(e) => {
-                        graph.mark_failed(&asset_entry.id, e.to_string());
-                        tracing::error!("logic asset cook failed: {:?}: {e}", asset_entry.id.id);
-                        continue;
-                    }
-                },
-                _ => {
-                    // Unsupported asset type — emit diagnostic and skip.
-                    graph.mark_failed(
-                        &asset_entry.id,
-                        format!("unsupported asset type: {:?}", asset_entry.asset_type),
-                    );
-                    tracing::warn!(
-                        "unsupported asset type {:?} for {:?}",
-                        asset_entry.asset_type,
-                        asset_entry.id.id
-                    );
-                    continue;
-                }
-            };
-
-            results.push(result);
-        }
-    }
-
-    results
-}
-
-/// Cook all manifests, log every error diagnostic, and return successful assets.
-///
-/// Use [`cook_orchestrate_checked`] when the caller needs the full report.
 pub fn cook_orchestrate(
     source_dir: &Path,
     cooked_dir: &Path,
@@ -556,7 +356,8 @@ pub fn cook_orchestrate_checked(
     cooked_dir: &Path,
     graph: &mut DependencyGraph,
 ) -> CookReport {
-    let registry = AssetTypeRegistry::new();
+    let mut registry = AssetTypeRegistry::new();
+    engine_scene::register_prefab_asset_type(&mut registry);
     cook_orchestrate_checked_with_registry(source_dir, cooked_dir, graph, &registry)
 }
 
@@ -629,7 +430,7 @@ pub fn cook_orchestrate_checked_with_registry(
     }
     entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase());
 
-    let mut asset_ids = BTreeSet::new();
+    let mut declared_assets = Vec::new();
     for entry in entries {
         let path = entry.path();
         if !path
@@ -693,159 +494,224 @@ pub fn cook_orchestrate_checked_with_registry(
             continue;
         }
 
-        let mut assets = manifest.assets;
-        assets.sort_by(|left, right| {
-            left.id
-                .id
-                .cmp(&right.id.id)
-                .then_with(|| left.source_path.cmp(&right.source_path))
-        });
-        for asset_entry in &assets {
-            if let Err(message) = validate_asset_id(&asset_entry.id.id) {
-                record_asset_failure(
-                    &mut report,
-                    asset_entry,
-                    PathBuf::from("invalid-asset-id.cooked"),
-                    "COOK_ASSET_ID_INVALID",
-                    message,
-                );
-                continue;
-            }
+        declared_assets.extend(manifest.assets);
+    }
 
-            let relative_output = PathBuf::from(format!("{}.cooked", asset_entry.id.id));
-            let output_path = cooked_dir.join(&relative_output);
+    declared_assets.sort_by(|left, right| {
+        left.id
+            .id
+            .cmp(&right.id.id)
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+    let mut portable_id_counts = BTreeMap::<String, usize>::new();
+    for asset_entry in &declared_assets {
+        if validate_manifest_asset_id(&asset_entry.id.id).is_ok() {
+            *portable_id_counts
+                .entry(asset_entry.id.id.to_ascii_lowercase())
+                .or_default() += 1;
+        }
+    }
 
-            let portable_id = asset_entry.id.id.to_ascii_lowercase();
-            if !asset_ids.insert(portable_id) {
-                record_asset_failure(
-                    &mut report,
-                    asset_entry,
-                    relative_output,
-                    "COOK_ASSET_ID_DUPLICATE",
-                    format!(
-                        "asset id '{}' is duplicated or differs only by case",
-                        asset_entry.id.id
-                    ),
-                );
-                continue;
-            }
+    for asset_entry in &declared_assets {
+        if let Err(message) = validate_manifest_asset_id(&asset_entry.id.id) {
+            record_asset_failure(
+                &mut report,
+                asset_entry,
+                PathBuf::from("invalid-asset-id.cooked"),
+                "COOK_ASSET_ID_INVALID",
+                message,
+            );
+            continue;
+        }
 
-            graph.register(asset_entry.id.clone());
-            graph.mark_cooking(&asset_entry.id);
-
-            if !asset_entry.cook_rules.variant_keys.is_empty()
-                || !asset_entry.cook_rules.platform_overrides.is_empty()
-                || asset_entry.cook_rules.compression.is_some()
-            {
-                let message = format!(
-                    "asset '{}' requests cook rules that are not implemented by the current cooker",
+        let relative_output = PathBuf::from(format!("{}.cooked", asset_entry.id.id));
+        if portable_id_counts
+            .get(&asset_entry.id.id.to_ascii_lowercase())
+            .is_some_and(|count| *count > 1)
+        {
+            record_asset_failure(
+                &mut report,
+                asset_entry,
+                relative_output,
+                "COOK_ASSET_ID_DUPLICATE",
+                format!(
+                    "asset id '{}' is duplicated or differs only by case",
                     asset_entry.id.id
-                );
-                graph.mark_failed(&asset_entry.id, message.clone());
+                ),
+            );
+            continue;
+        }
+
+        graph.register(asset_entry.id.clone());
+        graph.mark_cooking(&asset_entry.id);
+
+        match cook_source_entry_atomic(source_dir, cooked_dir, asset_entry, asset_type_registry) {
+            Ok(cooked) => {
+                graph.mark_cooked(&asset_entry.id, cooked.source_hash);
+                report.succeeded_asset_count += 1;
+                report.results.push(cooked.result);
+            }
+            Err(error) => {
+                graph.mark_failed(&asset_entry.id, error.message.clone());
                 record_asset_failure(
                     &mut report,
                     asset_entry,
                     relative_output,
-                    "COOK_RULE_UNSUPPORTED",
-                    message,
+                    error.code,
+                    error.message,
                 );
-                continue;
-            }
-
-            let source_path = match resolve_source_path(source_dir, &asset_entry.source_path) {
-                Ok(source_path) => source_path,
-                Err(error) => {
-                    let message = error.to_string();
-                    graph.mark_failed(&asset_entry.id, message.clone());
-                    record_asset_failure(
-                        &mut report,
-                        asset_entry,
-                        relative_output,
-                        "COOK_SOURCE_PATH_INVALID",
-                        message,
-                    );
-                    continue;
-                }
-            };
-            let source_hash = match compute_file_hash_checked(&source_path) {
-                Ok(hash) => hash,
-                Err(error) => {
-                    let message = error.to_string();
-                    graph.mark_failed(&asset_entry.id, message.clone());
-                    record_asset_failure(
-                        &mut report,
-                        asset_entry,
-                        relative_output,
-                        "COOK_SOURCE_HASH_FAILED",
-                        message,
-                    );
-                    continue;
-                }
-            };
-
-            if output_path.exists() {
-                if let Err(error) = std::fs::remove_file(&output_path) {
-                    let message = format!("could not replace existing cooked artifact: {error}");
-                    graph.mark_failed(&asset_entry.id, message.clone());
-                    record_asset_failure(
-                        &mut report,
-                        asset_entry,
-                        relative_output,
-                        "COOK_OUTPUT_REPLACE_FAILED",
-                        message,
-                    );
-                    continue;
-                }
-            }
-
-            let cooked = match asset_entry.asset_type {
-                AssetType::Mesh => mesh::cook_mesh(&source_path, &output_path),
-                AssetType::Texture => texture::cook_texture(&source_path, &output_path),
-                AssetType::Material => material::cook_material(&source_path, &output_path),
-                AssetType::Shader => {
-                    let stage = determine_shader_stage(&source_path);
-                    cooked_shader::cook_shader(&source_path, &output_path, 0, &stage)
-                }
-                AssetType::Scene => scene::cook_scene(&source_path, &output_path, 0),
-                AssetType::Logic => logic_asset::cook_logic_asset(&source_path, &output_path),
-                _ => cook_registered_extension_asset(
-                    &source_path,
-                    &output_path,
-                    &asset_entry.asset_type,
-                    asset_type_registry,
-                ),
-            };
-
-            match cooked {
-                Ok(mut result) => {
-                    graph.mark_cooked(&asset_entry.id, source_hash);
-                    result.asset_id.clone_from(&asset_entry.id.id);
-                    result.asset_type = asset_entry.asset_type.clone();
-                    result.source_path = PathBuf::from(&asset_entry.source_path);
-                    result.output_path = relative_output;
-                    result.success = true;
-                    result.diagnostics.clear();
-                    report.succeeded_asset_count += 1;
-                    report.results.push(result);
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    graph.mark_failed(&asset_entry.id, message.clone());
-                    let _ = std::fs::remove_file(&output_path);
-                    record_asset_failure(
-                        &mut report,
-                        asset_entry,
-                        relative_output,
-                        "COOK_ASSET_FAILED",
-                        message,
-                    );
-                }
             }
         }
     }
 
     report.diagnostics.extend(graph.to_diagnostics());
     report
+}
+
+static COOK_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Successful output of the authoritative single-asset cook path.
+pub(crate) struct CookedSourceEntry {
+    pub result: CookResult,
+    pub source_hash: HashDigest,
+}
+
+/// Categorized failure from the authoritative single-asset cook path.
+pub(crate) struct SourceEntryCookError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// Cook one manifest entry through its real built-in or registered cooker,
+/// validate the staged artifact, and atomically replace the prior artifact.
+///
+/// Full project cooking and incremental reload both call this function. A
+/// failed source read, cooker, validation, or rename leaves the previous
+/// cooked artifact untouched.
+pub(crate) fn cook_source_entry_atomic(
+    source_dir: &Path,
+    cooked_dir: &Path,
+    entry: &SourceAssetEntry,
+    asset_type_registry: &AssetTypeRegistry,
+) -> Result<CookedSourceEntry, SourceEntryCookError> {
+    validate_manifest_asset_id(&entry.id.id).map_err(|message| SourceEntryCookError {
+        code: "COOK_ASSET_ID_INVALID",
+        message,
+    })?;
+    if !entry.cook_rules.variant_keys.is_empty()
+        || !entry.cook_rules.platform_overrides.is_empty()
+        || entry.cook_rules.compression.is_some()
+    {
+        return Err(SourceEntryCookError {
+            code: "COOK_RULE_UNSUPPORTED",
+            message: format!(
+                "asset '{}' requests cook rules that are not implemented by the current cooker",
+                entry.id.id
+            ),
+        });
+    }
+
+    let source_path = resolve_source_path(source_dir, &entry.source_path).map_err(|error| {
+        SourceEntryCookError {
+            code: "COOK_SOURCE_PATH_INVALID",
+            message: error.to_string(),
+        }
+    })?;
+    let source_hash =
+        compute_file_hash_checked(&source_path).map_err(|error| SourceEntryCookError {
+            code: "COOK_SOURCE_HASH_FAILED",
+            message: error.to_string(),
+        })?;
+    std::fs::create_dir_all(cooked_dir).map_err(|error| SourceEntryCookError {
+        code: "COOK_OUTPUT_CREATE_FAILED",
+        message: format!("could not create cooked output directory: {error}"),
+    })?;
+
+    let relative_output = PathBuf::from(format!("{}.cooked", entry.id.id));
+    let output_path = cooked_dir.join(&relative_output);
+    let sequence = COOK_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staging_path = cooked_dir.join(format!(
+        ".{}.{}.{}.cooked.tmp",
+        entry.id.id,
+        std::process::id(),
+        sequence
+    ));
+
+    let cooked = dispatch_source_entry(
+        &source_path,
+        &staging_path,
+        &entry.asset_type,
+        asset_type_registry,
+    );
+    let mut result = match cooked {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(SourceEntryCookError {
+                code: "COOK_ASSET_FAILED",
+                message: error.to_string(),
+            });
+        }
+    };
+    if let Err(error) = read_cooked_artifact(&staging_path) {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(SourceEntryCookError {
+            code: "COOK_STAGED_ARTIFACT_INVALID",
+            message: error.to_string(),
+        });
+    }
+    if let Err(error) = std::fs::rename(&staging_path, &output_path) {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(SourceEntryCookError {
+            code: "COOK_OUTPUT_REPLACE_FAILED",
+            message: format!(
+                "could not atomically replace {}: {error}",
+                output_path.display()
+            ),
+        });
+    }
+
+    result.asset_id.clone_from(&entry.id.id);
+    result.asset_type = entry.asset_type.clone();
+    result.source_path = PathBuf::from(&entry.source_path);
+    result.output_path = relative_output;
+    result.success = true;
+    result.diagnostics.clear();
+    Ok(CookedSourceEntry {
+        result,
+        source_hash,
+    })
+}
+
+fn dispatch_source_entry(
+    source_path: &Path,
+    output_path: &Path,
+    asset_type: &AssetType,
+    asset_type_registry: &AssetTypeRegistry,
+) -> Result<CookResult, CookError> {
+    match asset_type {
+        AssetType::Mesh => mesh::cook_mesh(source_path, output_path),
+        AssetType::Texture => texture::cook_texture(source_path, output_path),
+        AssetType::Material => material::cook_material(source_path, output_path),
+        AssetType::Shader => {
+            let stage = determine_shader_stage(source_path);
+            cooked_shader::cook_shader(source_path, output_path, 0, &stage)
+        }
+        AssetType::Scene => scene::cook_scene(source_path, output_path, 0),
+        AssetType::Logic => logic_asset::cook_logic_asset(source_path, output_path),
+        AssetType::Prefab => prefab::cook_prefab(source_path, output_path),
+        AssetType::Audio | AssetType::Animation | AssetType::Skeleton | AssetType::NavMesh => {
+            cook_registered_extension_asset(
+                source_path,
+                output_path,
+                asset_type,
+                asset_type_registry,
+            )
+        }
+        other => Err(CookError::UnsupportedFormat(format!(
+            "asset type {other:?} has no authoritative cooker"
+        ))),
+    }
 }
 
 /// Return the extension-registry type ID associated with a manifest asset
@@ -857,6 +723,7 @@ pub fn registered_asset_type_id(asset_type: &AssetType) -> Option<&'static str> 
         AssetType::Animation => Some("animation_clip"),
         AssetType::Skeleton => Some("skeleton"),
         AssetType::NavMesh => Some("navmesh"),
+        AssetType::Prefab => Some("prefab"),
         _ => None,
     }
 }
@@ -909,8 +776,6 @@ fn cook_registered_extension_asset(
     )
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────
-
 fn cook_diagnostic(
     code: &str,
     message: String,
@@ -948,7 +813,7 @@ fn record_asset_failure(
     report.diagnostics.push(diagnostic);
 }
 
-fn validate_asset_id(asset_id: &str) -> Result<(), String> {
+pub(crate) fn validate_manifest_asset_id(asset_id: &str) -> Result<(), String> {
     if asset_id.is_empty() || asset_id.len() > 128 {
         return Err("asset id must contain between 1 and 128 ASCII characters".into());
     }
@@ -971,7 +836,10 @@ fn validate_asset_id(asset_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_source_path(source_dir: &Path, relative_path: &str) -> Result<PathBuf, CookError> {
+pub(crate) fn resolve_source_path(
+    source_dir: &Path,
+    relative_path: &str,
+) -> Result<PathBuf, CookError> {
     let relative_path = Path::new(relative_path);
     if relative_path.as_os_str().is_empty()
         || !relative_path
@@ -1011,22 +879,12 @@ fn determine_shader_stage(path: &Path) -> String {
     }
 }
 
-/// Compute the SHA-256 hash of a file's contents.
-fn compute_file_hash(path: &Path) -> HashDigest {
-    let data = std::fs::read(path).unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    hasher.finalize().into()
-}
-
 fn compute_file_hash_checked(path: &Path) -> Result<HashDigest, CookError> {
     let data = std::fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
     Ok(hasher.finalize().into())
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1371,6 +1229,33 @@ mod tests {
         assert_eq!(ids, vec!["a", "m", "z"]);
         assert_eq!(report.declared_asset_count, 3);
         assert_eq!(report.failed_asset_count, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checked_cook_rejects_every_case_insensitive_duplicate_before_writing() {
+        let (root, source, cooked) = cook_case("duplicate_asset_ids");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("one.data"), b"one").unwrap();
+        std::fs::write(source.join("two.data"), b"two").unwrap();
+        write_manifest(
+            &source.join("assets.manifest"),
+            vec![
+                entry("Duplicate", AssetType::Material, "one.data"),
+                entry("duplicate", AssetType::Material, "two.data"),
+            ],
+        );
+        let mut graph = DependencyGraph::new();
+
+        let report = cook_orchestrate_checked(&source, &cooked, &mut graph);
+
+        assert_eq!(report.succeeded_asset_count, 0);
+        assert_eq!(report.failed_asset_count, 2);
+        assert!(report.results.iter().all(
+            |result| !result.success && result.diagnostics[0].code == "COOK_ASSET_ID_DUPLICATE"
+        ));
+        assert!(!cooked.join("Duplicate.cooked").exists());
+        assert!(!cooked.join("duplicate.cooked").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

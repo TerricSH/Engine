@@ -47,7 +47,7 @@ pub fn validate_frame_input(input: &RenderFrameInput) -> Vec<Diagnostic> {
     }
 
     let mut view_ids = BTreeSet::new();
-    for view in &input.views {
+    for (view_index, view) in input.views.iter().enumerate() {
         if !view_ids.insert(view.view_id) {
             diagnostics.push(
                 Diagnostic::new(
@@ -59,6 +59,23 @@ pub fn validate_frame_input(input: &RenderFrameInput) -> Vec<Diagnostic> {
                 .contract("RendererInput-v0", input.contract_version.clone())
                 .path("views.view_id"),
             );
+        }
+        for (field, rect) in [
+            ("viewport", view.viewport),
+            ("viewport_rect_normalized", view.viewport_rect_normalized),
+        ] {
+            if !rect.is_valid_normalized() {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "RV0023",
+                        DiagnosticSeverity::Error,
+                        "engine-renderer",
+                        "RenderView viewport rectangles must be finite, positive, and contained in [0, 1]",
+                    )
+                    .contract("RendererInput-v0", input.contract_version.clone())
+                    .path(format!("views[{view_index}].{field}")),
+                );
+            }
         }
     }
     for view in &input.views {
@@ -285,4 +302,22 @@ fn validate_pass_graph_config(input: &RenderFrameInput, diagnostics: &mut Vec<Di
             );
         }
     }
+}
+
+/// Validate the serialized render-graph portion of scene settings without
+/// requiring a fabricated camera or drawable frame.
+///
+/// Runtime frame validation calls the same implementation, so editor
+/// authoring and rendering cannot disagree about required passes or output
+/// mode/tone-mapping compatibility.
+pub fn validate_pass_graph_settings(
+    config: &crate::PassGraphConfig,
+    tone_mapping: ToneMapping,
+) -> Vec<Diagnostic> {
+    let mut input = RenderFrameInput::empty(0);
+    input.render_options.pass_graph_config = config.clone();
+    input.render_options.tone_mapping = tone_mapping;
+    let mut diagnostics = Vec::new();
+    validate_pass_graph_config(&input, &mut diagnostics);
+    diagnostics
 }

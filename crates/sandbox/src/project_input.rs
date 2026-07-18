@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use engine_asset::project::GameProject;
 #[cfg(any(test, feature = "backend-vulkan"))]
 use engine_gameplay::input::{resolve_action, set_current_value, RawInputEvent};
+#[cfg(test)]
+use engine_gameplay::input::{GamepadAxis, GamepadButton};
 use engine_gameplay::input::{
     InputAction, InputActionMap, InputBinding, InputDevice, InputModifier, InputValue,
     InputValueType, KeyCode,
@@ -77,14 +79,164 @@ pub(crate) fn load_project_input_map(project: &GameProject) -> Result<InputActio
     Ok(map)
 }
 
+#[cfg(any(feature = "tooling-editor", test))]
+pub(crate) fn save_project_input_map(
+    project: &GameProject,
+    map: &InputActionMap,
+) -> Result<(), String> {
+    validate_input_map(map)?;
+    let path = project
+        .input_actions
+        .as_ref()
+        .ok_or_else(|| "project has no input action document configured".to_string())?;
+    let mut persisted_map = map.clone();
+    reset_current_values(&mut persisted_map);
+    let document = InputActionsDocument {
+        schema: INPUT_ACTIONS_SCHEMA.to_string(),
+        map: persisted_map,
+    };
+    let mut json = serde_json::to_string_pretty(&document)
+        .map_err(|error| format!("could not serialize input action map: {error}"))?;
+    json.push('\n');
+    super::project_cli::atomic_write_bytes(path, json.as_bytes())
+}
+
 fn reset_current_values(map: &mut InputActionMap) {
     for action in &mut map.actions {
-        action.current_value = match action.value_type {
-            InputValueType::Digital => InputValue::Bool(false),
-            InputValueType::Analog1D => InputValue::Float(0.0),
-            InputValueType::Analog2D => InputValue::Vec2(glam::Vec2::ZERO),
-        };
+        action.current_value = default_input_value(action.value_type);
     }
+}
+
+fn default_input_value(value_type: InputValueType) -> InputValue {
+    match value_type {
+        InputValueType::Digital => InputValue::Bool(false),
+        InputValueType::Analog1D => InputValue::Float(0.0),
+        InputValueType::Analog2D => InputValue::Vec2(glam::Vec2::ZERO),
+    }
+}
+
+/// Physical source choices exposed by the project Input Actions editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
+pub(crate) enum EditableBindingSource {
+    KeyboardMouse,
+    GamepadButton,
+    GamepadAxis,
+}
+
+/// Build a complete, valid binding for an action instead of leaving a partially
+/// initialized binding in the runtime map while the editor is being used.
+#[cfg(test)]
+pub(crate) fn default_binding_for_source(
+    action_name: &str,
+    value_type: InputValueType,
+    source: EditableBindingSource,
+) -> Result<InputBinding, String> {
+    match source {
+        EditableBindingSource::KeyboardMouse => {
+            if value_type == InputValueType::Analog2D {
+                return Err(
+                    "InputActions-v0 does not support keyboard composites for Analog2D actions"
+                        .to_string(),
+                );
+            }
+            Ok(InputBinding::keyboard(action_name, vec![KeyCode::Space]))
+        }
+        EditableBindingSource::GamepadButton => {
+            Ok(InputBinding::gamepad_button(action_name, GamepadButton::A))
+        }
+        EditableBindingSource::GamepadAxis => Ok(InputBinding::gamepad_axis(
+            action_name,
+            match value_type {
+                InputValueType::Digital => GamepadAxis::LT,
+                InputValueType::Analog1D => GamepadAxis::LeftX,
+                InputValueType::Analog2D => GamepadAxis::LeftX,
+            },
+        )),
+    }
+}
+
+#[cfg(test)]
+fn default_bindings(action_name: &str, value_type: InputValueType) -> Vec<InputBinding> {
+    match value_type {
+        InputValueType::Digital => vec![InputBinding::keyboard(action_name, vec![KeyCode::Space])],
+        InputValueType::Analog1D => {
+            vec![InputBinding::gamepad_axis(action_name, GamepadAxis::LeftX)]
+        }
+        InputValueType::Analog2D => vec![
+            InputBinding::gamepad_axis(action_name, GamepadAxis::LeftX),
+            InputBinding::gamepad_axis(action_name, GamepadAxis::LeftY),
+        ],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn add_input_action(
+    map: &mut InputActionMap,
+    name: &str,
+    value_type: InputValueType,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("action name cannot be empty".to_string());
+    }
+    if map.actions.iter().any(|action| action.name == name) {
+        return Err(format!("duplicate action name '{name}'"));
+    }
+    let mut action = InputAction::new(name, value_type);
+    action.bindings = default_bindings(name, value_type);
+    map.actions.push(action);
+    validate_input_map(map)
+}
+
+#[cfg(test)]
+pub(crate) fn rename_input_action(
+    map: &mut InputActionMap,
+    action_index: usize,
+    name: &str,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("action name cannot be empty".to_string());
+    }
+    if map
+        .actions
+        .iter()
+        .enumerate()
+        .any(|(index, action)| index != action_index && action.name == name)
+    {
+        return Err(format!("duplicate action name '{name}'"));
+    }
+    let action = map
+        .actions
+        .get_mut(action_index)
+        .ok_or_else(|| format!("input action index {action_index} is out of range"))?;
+    action.name = name.to_string();
+    for binding in &mut action.bindings {
+        binding.action = name.to_string();
+    }
+    validate_input_map(map)
+}
+
+#[cfg(test)]
+pub(crate) fn set_input_action_value_type(
+    map: &mut InputActionMap,
+    action_index: usize,
+    value_type: InputValueType,
+) -> Result<(), String> {
+    let action = map
+        .actions
+        .get_mut(action_index)
+        .ok_or_else(|| format!("input action index {action_index} is out of range"))?;
+    action.value_type = value_type;
+    action.current_value = default_input_value(value_type);
+    if value_type == InputValueType::Analog2D {
+        action.bindings.retain(|binding| binding.keys.is_empty());
+    }
+    if action.bindings.is_empty() {
+        action.bindings = default_bindings(&action.name, value_type);
+    }
+    validate_input_map(map)
 }
 
 pub(crate) fn validate_input_map(map: &InputActionMap) -> Result<(), String> {
@@ -94,10 +246,6 @@ pub(crate) fn validate_input_map(map: &InputActionMap) -> Result<(), String> {
     if map.context.trim().is_empty() {
         return Err("map context cannot be empty".into());
     }
-    if map.actions.is_empty() {
-        return Err("at least one input action is required".into());
-    }
-
     let mut names = HashSet::new();
     for action in &map.actions {
         if action.name.trim().is_empty() {
@@ -435,5 +583,123 @@ mod tests {
             query_current_value(&map, "move_forward"),
             Some(&InputValue::Bool(true))
         );
+    }
+
+    #[test]
+    fn editor_input_action_save_roundtrips_through_project_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("input-editor");
+        super::super::project_cli::create_project(&root, Some("Input Editor"), false).unwrap();
+        let project = GameProject::load(&root).unwrap();
+        let mut map = load_project_input_map(&project).unwrap();
+        let mut dash = InputAction::new("dash", InputValueType::Digital);
+        dash.add_binding(InputBinding::keyboard("dash", vec![KeyCode::ShiftLeft]));
+        map.add_action(dash);
+
+        save_project_input_map(&project, &map).unwrap();
+        let reloaded = load_project_input_map(&project).unwrap();
+        assert!(reloaded.action("dash").is_some());
+    }
+
+    #[test]
+    fn editor_helpers_create_valid_defaults_for_every_value_type() {
+        let mut map = InputActionMap::new("player", "gameplay");
+        add_input_action(&mut map, "fire", InputValueType::Digital).unwrap();
+        add_input_action(&mut map, "throttle", InputValueType::Analog1D).unwrap();
+        add_input_action(&mut map, "move", InputValueType::Analog2D).unwrap();
+
+        validate_input_map(&map).unwrap();
+        assert!(matches!(
+            map.actions[0].current_value,
+            InputValue::Bool(false)
+        ));
+        assert!(matches!(
+            map.actions[1].current_value,
+            InputValue::Float(0.0)
+        ));
+        assert!(
+            matches!(map.actions[2].current_value, InputValue::Vec2(value) if value == glam::Vec2::ZERO)
+        );
+        assert_eq!(map.actions[2].bindings.len(), 2);
+        assert_eq!(
+            map.actions[2].bindings[0].gamepad_axis,
+            Some(GamepadAxis::LeftX)
+        );
+        assert_eq!(
+            map.actions[2].bindings[1].gamepad_axis,
+            Some(GamepadAxis::LeftY)
+        );
+    }
+
+    #[test]
+    fn renaming_an_action_updates_every_binding_owner() {
+        let mut map = starter_input_map();
+        let jump_index = map
+            .actions
+            .iter()
+            .position(|action| action.name == "jump")
+            .unwrap();
+        map.actions[jump_index]
+            .bindings
+            .push(InputBinding::gamepad_button("jump", GamepadButton::A));
+
+        rename_input_action(&mut map, jump_index, "confirm").unwrap();
+
+        assert_eq!(map.actions[jump_index].name, "confirm");
+        assert!(map.actions[jump_index]
+            .bindings
+            .iter()
+            .all(|binding| binding.action == "confirm"));
+        validate_input_map(&map).unwrap();
+    }
+
+    #[test]
+    fn changing_to_analog_2d_resets_value_and_replaces_incompatible_keys() {
+        let mut map = InputActionMap::new("player", "gameplay");
+        add_input_action(&mut map, "move", InputValueType::Digital).unwrap();
+        map.actions[0].current_value = InputValue::Bool(true);
+
+        set_input_action_value_type(&mut map, 0, InputValueType::Analog2D).unwrap();
+
+        assert!(
+            matches!(map.actions[0].current_value, InputValue::Vec2(value) if value == glam::Vec2::ZERO)
+        );
+        assert!(map.actions[0]
+            .bindings
+            .iter()
+            .all(|binding| binding.keys.is_empty()));
+        assert_eq!(map.actions[0].bindings.len(), 2);
+        validate_input_map(&map).unwrap();
+    }
+
+    #[test]
+    fn analog_2d_keyboard_binding_is_rejected_at_editor_boundary() {
+        let error = default_binding_for_source(
+            "move",
+            InputValueType::Analog2D,
+            EditableBindingSource::KeyboardMouse,
+        )
+        .unwrap_err();
+        assert!(error.contains("keyboard composites"));
+
+        let button = default_binding_for_source(
+            "move",
+            InputValueType::Analog2D,
+            EditableBindingSource::GamepadButton,
+        )
+        .unwrap();
+        let axis = default_binding_for_source(
+            "move",
+            InputValueType::Analog2D,
+            EditableBindingSource::GamepadAxis,
+        )
+        .unwrap();
+        assert_eq!(button.gamepad_button, Some(GamepadButton::A));
+        assert_eq!(axis.gamepad_axis, Some(GamepadAxis::LeftX));
+    }
+
+    #[test]
+    fn empty_action_map_is_a_valid_project_configuration() {
+        validate_input_map(&InputActionMap::new("player", "gameplay")).unwrap();
     }
 }

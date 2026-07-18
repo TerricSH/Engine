@@ -18,13 +18,10 @@
 //!     let delta = gizmo.take_delta();
 //!     apply_gizmo_drag(&gizmo, entity, &mut world, delta);
 //! }
-//!
-//! draw_gizmo(&mut debug_buffer, &gizmo, &entity_transform);
 //! ```
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 
-use engine_renderer::DebugDrawBuffer;
 use engine_scene::components::Transform;
 use engine_scene::{Entity, Scene, World};
 use engine_serialize::{PersistentId, Value};
@@ -42,17 +39,12 @@ const COLOR_X: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 const COLOR_Y: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
 /// Z-axis colour — blue.
 const COLOR_Z: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
-/// Highlight colour (dragged axis).
-const COLOR_HIGHLIGHT: [f32; 4] = [1.0, 1.0, 0.0, 1.0];
-
 /// Length of translate arrow and scale axis lines in world units.
 pub(crate) const GIZMO_LENGTH: f32 = 1.0;
 /// Radius of rotate rings.
 pub(crate) const GIZMO_RING_RADIUS: f32 = 0.8;
 /// Desired screen-space length of a translate/scale axis.
 const GIZMO_TARGET_LENGTH_PX: f32 = 88.0;
-/// Half-extent of scale cubes.
-const GIZMO_CUBE_HALF: f32 = 0.05;
 /// Number of line segments used to approximate rotation rings.
 pub(crate) const RING_SEGMENTS: u32 = 32;
 /// Screen-space hit-test threshold in pixels.
@@ -370,95 +362,6 @@ pub(crate) fn gizmo_axis_direction(
 }
 
 // ---------------------------------------------------------------------------
-// draw_gizmo
-// ---------------------------------------------------------------------------
-
-/// Draw the gizmo at the given transform's position.
-///
-/// Renders axis arrows (translate), rings (rotate), or cubes (scale)
-/// depending on the current mode.  The axis currently being dragged is
-/// drawn in the highlight colour.
-pub fn draw_gizmo(buffer: &mut DebugDrawBuffer, system: &GizmoSystem, transform: &Transform) {
-    let position = transform.translation;
-    let rotation = if system.mode == GizmoMode::Scale || system.space == GizmoSpace::Local {
-        transform.rotation
-    } else {
-        Quat::IDENTITY
-    };
-
-    match system.mode {
-        GizmoMode::Translate => draw_translate_gizmo(buffer, position, rotation, system),
-        GizmoMode::Rotate => draw_rotate_gizmo(buffer, position, rotation, system),
-        GizmoMode::Scale => draw_scale_gizmo(buffer, position, rotation, system),
-    }
-}
-
-/// Draw the translate gizmo (three axis arrows with spheres at tips).
-fn draw_translate_gizmo(
-    buffer: &mut DebugDrawBuffer,
-    position: Vec3,
-    rotation: Quat,
-    system: &GizmoSystem,
-) {
-    for axis in &[GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
-        let dir = rotation * axis.direction();
-        let color = if system.drag_axis == Some(*axis) {
-            COLOR_HIGHLIGHT
-        } else {
-            axis.color()
-        };
-        let tip = position + dir * GIZMO_LENGTH;
-        buffer.arrow(position, tip, color);
-        buffer.sphere_wireframe(tip, 0.06, color);
-    }
-}
-
-/// Draw the rotate gizmo (three orthogonal rings).
-fn draw_rotate_gizmo(
-    buffer: &mut DebugDrawBuffer,
-    position: Vec3,
-    rotation: Quat,
-    system: &GizmoSystem,
-) {
-    for axis in &[GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
-        let normal = rotation * axis.direction();
-        let color = if system.drag_axis == Some(*axis) {
-            COLOR_HIGHLIGHT
-        } else {
-            axis.color()
-        };
-        draw_circle(
-            buffer,
-            position,
-            normal,
-            GIZMO_RING_RADIUS,
-            color,
-            RING_SEGMENTS,
-        );
-    }
-}
-
-/// Draw the scale gizmo (three axis lines with cubes at tips).
-fn draw_scale_gizmo(
-    buffer: &mut DebugDrawBuffer,
-    position: Vec3,
-    rotation: Quat,
-    system: &GizmoSystem,
-) {
-    for axis in &[GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
-        let dir = rotation * axis.direction();
-        let color = if system.drag_axis == Some(*axis) {
-            COLOR_HIGHLIGHT
-        } else {
-            axis.color()
-        };
-        let tip = position + dir * GIZMO_LENGTH;
-        buffer.line(position, tip, color);
-        buffer.box_wireframe(tip, Vec3::splat(GIZMO_CUBE_HALF), color);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Scene-level undoable Transform gestures
 // ---------------------------------------------------------------------------
 
@@ -706,14 +609,15 @@ impl EditorScene {
         if current == session.original {
             return Ok(false);
         }
-        self.history.push(
-            Box::new(SetTransformGesture {
-                entity_id: session.entity_id,
-                before: session.original,
-                after: current,
-            }),
-            &mut self.scene,
-        )?;
+        // The pointer preview is not committed authoring state. Restore the
+        // exact gesture origin first so EditorScene::execute owns the complete
+        // atomic transition and can roll back to it on validation failure.
+        apply_transform_snapshot(&mut self.scene, &session.entity_id, &session.original)?;
+        self.execute(Box::new(SetTransformGesture {
+            entity_id: session.entity_id,
+            before: session.original,
+            after: current,
+        }))?;
         Ok(true)
     }
 
@@ -1271,32 +1175,6 @@ fn accumulate_gesture_amount(system: &mut GizmoSystem, raw_amount: f32) -> f32 {
     incremental
 }
 
-/// Draw a wireframe circle (ring) using line segments.
-fn draw_circle(
-    buffer: &mut DebugDrawBuffer,
-    center: Vec3,
-    normal: Vec3,
-    radius: f32,
-    color: [f32; 4],
-    segments: u32,
-) {
-    let tangent = if normal.x.abs() > 0.9 {
-        Vec3::Y.cross(normal).normalize()
-    } else {
-        Vec3::X.cross(normal).normalize()
-    };
-    let bitangent = normal.cross(tangent).normalize();
-    let seg = std::f32::consts::PI * 2.0 / segments as f32;
-
-    let mut prev = center + tangent * radius;
-    for i in 1..=segments {
-        let a = i as f32 * seg;
-        let curr = center + tangent * a.cos() * radius + bitangent * a.sin() * radius;
-        buffer.line(prev, curr, color);
-        prev = curr;
-    }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1429,63 +1307,6 @@ mod tests {
         assert_eq!(d, Vec3::new(1.0, 2.0, 3.0));
         // After take, delta is zero
         assert_eq!(g.take_delta(), Vec3::ZERO);
-    }
-
-    // ── Draw functions (must not panic with empty inputs) ──────────
-
-    #[test]
-    fn draw_gizmo_no_crash_empty() {
-        let mut buf = DebugDrawBuffer::new();
-        let g = GizmoSystem::new();
-        let t = Transform::default();
-        draw_gizmo(&mut buf, &g, &t);
-    }
-
-    #[test]
-    fn draw_gizmo_all_modes_no_crash() {
-        for mode in &[GizmoMode::Translate, GizmoMode::Rotate, GizmoMode::Scale] {
-            let mut buf = DebugDrawBuffer::new();
-            let mut g = GizmoSystem::new();
-            g.mode = *mode;
-            let t = Transform {
-                translation: Vec3::new(1.0, 2.0, 3.0),
-                rotation: Quat::IDENTITY,
-                scale: Vec3::ONE,
-                parent: None,
-            };
-            draw_gizmo(&mut buf, &g, &t);
-        }
-    }
-
-    #[test]
-    fn draw_translate_gizmo_produces_items() {
-        let mut buf = DebugDrawBuffer::new();
-        let g = GizmoSystem::new(); // default = Translate
-        let t = Transform::default();
-        draw_gizmo(&mut buf, &g, &t);
-        // Should have arrows (shapes) and tip spheres (shapes)
-        assert!(buf.shapes.len() >= 3);
-    }
-
-    #[test]
-    fn draw_rotate_gizmo_produces_lines() {
-        let mut buf = DebugDrawBuffer::new();
-        let mut g = GizmoSystem::new();
-        g.mode = GizmoMode::Rotate;
-        let t = Transform::default();
-        draw_gizmo(&mut buf, &g, &t);
-        // Rings produce many line segments
-        assert!(!buf.lines.is_empty());
-    }
-
-    #[test]
-    fn draw_gizmo_with_drag_axis_highlights() {
-        let mut buf = DebugDrawBuffer::new();
-        let mut g = GizmoSystem::new();
-        g.drag_axis = Some(GizmoAxis::Z);
-        let t = Transform::default();
-        draw_gizmo(&mut buf, &g, &t);
-        assert!(!buf.shapes.is_empty());
     }
 
     // ── apply_gizmo_drag ────────────────────────────────────────────
@@ -1645,7 +1466,7 @@ mod tests {
         assert!(!editor.is_transform_gizmo_drag_active());
         assert_eq!(editor.history.done.len(), 1);
         assert_eq!(
-            editor.history.done.last().map(|command| command.name()),
+            editor.history.done.last().map(|entry| entry.command.name()),
             Some("Transform Gizmo Drag")
         );
         assert!(editor.is_dirty());
@@ -2237,12 +2058,5 @@ mod tests {
             Vec2::new(1.0, 0.0),
         );
         assert!((d - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn draw_circle_no_crash() {
-        let mut buf = DebugDrawBuffer::new();
-        draw_circle(&mut buf, Vec3::ZERO, Vec3::Y, 1.0, [1.0, 0.0, 0.0, 1.0], 8);
-        assert!(!buf.lines.is_empty());
     }
 }

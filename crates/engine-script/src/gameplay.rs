@@ -6,7 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA;
 use serde::{Deserialize, Serialize};
+
+fn default_gameplay_script_api_schema() -> String {
+    GAMEPLAY_SCRIPT_API_SCHEMA.to_owned()
+}
 
 /// Transform data exposed to a script for its owning entity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -74,22 +79,195 @@ pub struct GameplayPhysicsEvent {
     pub other_entity_id: String,
 }
 
+/// Resulting value carried by a stateful runtime-UI event.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value")]
+pub enum GameplayUiValue {
+    Bool(bool),
+    Float(f32),
+}
+
 /// One gameplay-facing click emitted by the runtime UI for the current frame.
 ///
 /// The event identifies both the source canvas and element even when no
-/// callback id was authored. Runtime UI currently reports click events only;
-/// Toggle, Checkbox, and Slider values are not changed automatically through
-/// this bridge.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// callback id was authored. Stateful controls also report their retained
+/// value after the interaction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GameplayUiEvent {
     pub canvas_id: String,
     pub element_id: u32,
     pub callback_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<GameplayUiValue>,
+}
+
+/// RGBA colour used by managed runtime-UI commands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameplayUiColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+/// Anchor-and-offset layout sent by a managed gameplay script.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameplayUiLayout {
+    pub anchor_min: [f32; 2],
+    pub anchor_max: [f32; 2],
+    pub offset_min: [f32; 2],
+    pub offset_max: [f32; 2],
+}
+
+/// Viewport scaling policy selected by managed Canvas code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameplayUiScaleMode {
+    #[default]
+    Fixed,
+    FitWidth,
+    FitHeight,
+}
+
+/// One retained UI element authored through the managed class API.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GameplayUiElement {
+    Panel {
+        layout: GameplayUiLayout,
+        color: GameplayUiColor,
+        z_order: i32,
+    },
+    Image {
+        layout: GameplayUiLayout,
+        texture_id: String,
+        color: GameplayUiColor,
+        z_order: i32,
+    },
+    Text {
+        layout: GameplayUiLayout,
+        text: String,
+        font_size: f32,
+        color: GameplayUiColor,
+        z_order: i32,
+    },
+    Button {
+        layout: GameplayUiLayout,
+        label: String,
+        normal_color: GameplayUiColor,
+        hover_color: GameplayUiColor,
+        pressed_color: GameplayUiColor,
+        callback_id: Option<String>,
+        z_order: i32,
+    },
+    Toggle {
+        layout: GameplayUiLayout,
+        label: String,
+        is_on: bool,
+        color_on: GameplayUiColor,
+        color_off: GameplayUiColor,
+        callback_id: Option<String>,
+        z_order: i32,
+    },
+    Checkbox {
+        layout: GameplayUiLayout,
+        label: String,
+        checked: bool,
+        color: GameplayUiColor,
+        callback_id: Option<String>,
+        z_order: i32,
+    },
+    Slider {
+        layout: GameplayUiLayout,
+        label: String,
+        value: f32,
+        min: f32,
+        max: f32,
+        callback_id: Option<String>,
+        z_order: i32,
+    },
+    ScrollView {
+        layout: GameplayUiLayout,
+        content_width: f32,
+        content_height: f32,
+        color: GameplayUiColor,
+        z_order: i32,
+    },
+}
+
+/// Deferred UI mutations emitted by the managed `UICanvas`/`UIElement`
+/// classes. The engine validates and applies these commands at the same frame
+/// boundary as scene mutations, so process-host scripts never receive native
+/// pointers or ECS handles.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GameplayUiCommand {
+    CreateCanvas {
+        canvas_id: String,
+        width: f32,
+        height: f32,
+    },
+    RemoveCanvas {
+        canvas_id: String,
+    },
+    ResizeCanvas {
+        canvas_id: String,
+        width: f32,
+        height: f32,
+    },
+    SetCanvasScaleMode {
+        canvas_id: String,
+        scale_mode: GameplayUiScaleMode,
+    },
+    ClearCanvas {
+        canvas_id: String,
+    },
+    AddElement {
+        canvas_id: String,
+        element_id: u32,
+        element: GameplayUiElement,
+    },
+    RemoveElement {
+        canvas_id: String,
+        element_id: u32,
+    },
+    SetElementEnabled {
+        canvas_id: String,
+        element_id: u32,
+        enabled: bool,
+    },
+    SetText {
+        canvas_id: String,
+        element_id: u32,
+        text: String,
+    },
+    SetToggleValue {
+        canvas_id: String,
+        element_id: u32,
+        is_on: bool,
+    },
+    SetCheckboxValue {
+        canvas_id: String,
+        element_id: u32,
+        checked: bool,
+    },
+    SetSliderValue {
+        canvas_id: String,
+        element_id: u32,
+        value: f32,
+    },
 }
 
 /// Frame-local data made available to one script instance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GameplayContext {
+    /// Versioned boundary implemented by the engine-owned generated C# API.
+    ///
+    /// The default preserves compatibility with contexts recorded before the
+    /// explicit handshake was added. New runtimes always serialize this field,
+    /// and managed hosts reject a different schema before invoking game code.
+    #[serde(default = "default_gameplay_script_api_schema")]
+    pub script_api: String,
     pub entity_id: String,
     pub transform: Option<ScriptTransform>,
     pub input_actions: BTreeMap<String, GameplayInputValue>,
@@ -148,6 +326,10 @@ pub enum GameplayCommand {
     LoadScene {
         scene_id: String,
     },
+    /// Mutate retained runtime UI through the managed class API.
+    Ui {
+        command: GameplayUiCommand,
+    },
 }
 
 impl GameplayCommand {
@@ -169,7 +351,242 @@ impl GameplayCommand {
             Self::DestroySelf => Ok(()),
             Self::DestroyEntity { entity_id } => validate_entity_id(entity_id),
             Self::LoadScene { scene_id } => validate_scene_id(scene_id),
+            Self::Ui { command } => command.validate(),
         }
+    }
+}
+
+impl GameplayUiCommand {
+    /// Validate UI data received from an untrusted process-host script.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::CreateCanvas {
+                canvas_id,
+                width,
+                height,
+            }
+            | Self::ResizeCanvas {
+                canvas_id,
+                width,
+                height,
+            } => {
+                validate_canvas_id(canvas_id)?;
+                validate_canvas_size(*width, *height)
+            }
+            Self::RemoveCanvas { canvas_id } | Self::ClearCanvas { canvas_id } => {
+                validate_canvas_id(canvas_id)
+            }
+            Self::SetCanvasScaleMode { canvas_id, .. } => validate_canvas_id(canvas_id),
+            Self::AddElement {
+                canvas_id,
+                element_id,
+                element,
+            } => {
+                validate_canvas_id(canvas_id)?;
+                validate_ui_element_id(*element_id)?;
+                element.validate()
+            }
+            Self::RemoveElement {
+                canvas_id,
+                element_id,
+            }
+            | Self::SetElementEnabled {
+                canvas_id,
+                element_id,
+                ..
+            }
+            | Self::SetToggleValue {
+                canvas_id,
+                element_id,
+                ..
+            }
+            | Self::SetCheckboxValue {
+                canvas_id,
+                element_id,
+                ..
+            } => {
+                validate_canvas_id(canvas_id)?;
+                validate_ui_element_id(*element_id)
+            }
+            Self::SetText {
+                canvas_id,
+                element_id,
+                text,
+            } => {
+                validate_canvas_id(canvas_id)?;
+                validate_ui_element_id(*element_id)?;
+                validate_ui_text(text, "text")
+            }
+            Self::SetSliderValue {
+                canvas_id,
+                element_id,
+                value,
+            } => {
+                validate_canvas_id(canvas_id)?;
+                validate_ui_element_id(*element_id)?;
+                if value.is_finite() {
+                    Ok(())
+                } else {
+                    Err("UI slider value must be finite".into())
+                }
+            }
+        }
+    }
+}
+
+impl GameplayUiElement {
+    fn validate(&self) -> Result<(), String> {
+        let layout = match self {
+            Self::Panel { layout, .. }
+            | Self::Image { layout, .. }
+            | Self::Text { layout, .. }
+            | Self::Button { layout, .. }
+            | Self::Toggle { layout, .. }
+            | Self::Checkbox { layout, .. }
+            | Self::Slider { layout, .. }
+            | Self::ScrollView { layout, .. } => layout,
+        };
+        validate_ui_layout(layout)?;
+
+        match self {
+            Self::Panel { .. } => Ok(()),
+            Self::Image { texture_id, .. } => validate_ui_asset_id(texture_id),
+            Self::Text {
+                text, font_size, ..
+            } => {
+                validate_ui_text(text, "text")?;
+                if font_size.is_finite() && *font_size > 0.0 && *font_size <= 512.0 {
+                    Ok(())
+                } else {
+                    Err("UI font_size must be finite and in the range (0, 512]".into())
+                }
+            }
+            Self::Button {
+                label, callback_id, ..
+            }
+            | Self::Toggle {
+                label, callback_id, ..
+            }
+            | Self::Checkbox {
+                label, callback_id, ..
+            } => {
+                validate_ui_text(label, "label")?;
+                validate_ui_callback_id(callback_id.as_deref())
+            }
+            Self::Slider {
+                label,
+                value,
+                min,
+                max,
+                callback_id,
+                ..
+            } => {
+                validate_ui_text(label, "label")?;
+                validate_ui_callback_id(callback_id.as_deref())?;
+                if !value.is_finite() || !min.is_finite() || !max.is_finite() || min > max {
+                    return Err(
+                        "UI slider value/min/max must be finite and min must not exceed max".into(),
+                    );
+                }
+                if *value < *min || *value > *max {
+                    return Err("UI slider value must be between min and max".into());
+                }
+                Ok(())
+            }
+            Self::ScrollView {
+                content_width,
+                content_height,
+                ..
+            } => {
+                if content_width.is_finite()
+                    && content_height.is_finite()
+                    && *content_width >= 0.0
+                    && *content_height >= 0.0
+                {
+                    Ok(())
+                } else {
+                    Err("UI scroll-view content dimensions must be finite and non-negative".into())
+                }
+            }
+        }
+    }
+}
+
+fn validate_canvas_id(canvas_id: &str) -> Result<(), String> {
+    validate_entity_id(canvas_id).map_err(|reason| format!("invalid canvas id: {reason}"))
+}
+
+fn validate_canvas_size(width: f32, height: f32) -> Result<(), String> {
+    if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+        Ok(())
+    } else {
+        Err("UI canvas width and height must be finite and greater than zero".into())
+    }
+}
+
+fn validate_ui_element_id(element_id: u32) -> Result<(), String> {
+    if element_id > 0 && element_id != u32::MAX {
+        Ok(())
+    } else {
+        Err("UI element_id must be between 1 and 4294967294".into())
+    }
+}
+
+fn validate_ui_layout(layout: &GameplayUiLayout) -> Result<(), String> {
+    if !layout
+        .anchor_min
+        .iter()
+        .chain(layout.anchor_max.iter())
+        .chain(layout.offset_min.iter())
+        .chain(layout.offset_max.iter())
+        .all(|value| value.is_finite())
+    {
+        return Err("UI layout anchors and offsets must contain only finite values".into());
+    }
+    if layout
+        .anchor_min
+        .iter()
+        .chain(layout.anchor_max.iter())
+        .any(|value| !(0.0..=1.0).contains(value))
+    {
+        return Err("UI layout anchors must be in the range [0, 1]".into());
+    }
+    Ok(())
+}
+
+fn validate_ui_text(value: &str, field: &str) -> Result<(), String> {
+    if value.len() <= 16_384
+        && !value
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t')
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "UI {field} must contain at most 16384 bytes and no control characters"
+        ))
+    }
+}
+
+fn validate_ui_asset_id(asset_id: &str) -> Result<(), String> {
+    if !asset_id.is_empty() && asset_id.len() <= 256 && !asset_id.chars().any(char::is_control) {
+        Ok(())
+    } else {
+        Err("UI texture_id must contain 1 to 256 bytes and no control characters".into())
+    }
+}
+
+fn validate_ui_callback_id(callback_id: Option<&str>) -> Result<(), String> {
+    let Some(callback_id) = callback_id else {
+        return Ok(());
+    };
+    if !callback_id.is_empty()
+        && callback_id.len() <= 128
+        && !callback_id.chars().any(char::is_control)
+    {
+        Ok(())
+    } else {
+        Err("UI callback_id must contain 1 to 128 bytes and no control characters".into())
     }
 }
 
@@ -252,6 +669,7 @@ mod tests {
     #[test]
     fn context_json_contract_roundtrips_typed_input() {
         let context = GameplayContext {
+            script_api: GAMEPLAY_SCRIPT_API_SCHEMA.to_owned(),
             entity_id: "player".into(),
             transform: Some(ScriptTransform {
                 translation: [1.0, 2.0, 3.0],
@@ -274,6 +692,7 @@ mod tests {
                 canvas_id: "main-menu".into(),
                 element_id: 17,
                 callback_id: Some("start-game".into()),
+                value: None,
             }],
             entities: BTreeMap::from([(
                 "player".into(),
@@ -288,6 +707,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&context).unwrap();
+        assert!(json.contains(r#""script_api":"ScriptAPI-v0""#));
         assert!(json.contains(r#""jump":{"type":"Bool","value":true}"#));
         assert!(json.contains(r#""pressed":["jump"]"#));
         assert!(json.contains(r#""kind":"collision_entered""#));
@@ -306,6 +726,7 @@ mod tests {
             serde_json::from_str(r#"{"entity_id":"player","transform":null,"input_actions":{}}"#)
                 .unwrap();
         assert!(context.entities.is_empty());
+        assert_eq!(context.script_api, GAMEPLAY_SCRIPT_API_SCHEMA);
         assert!(context.physics_events.is_empty());
         assert!(context.ui_events.is_empty());
         assert_eq!(
@@ -320,6 +741,7 @@ mod tests {
             canvas_id: "hud".into(),
             element_id: 42,
             callback_id: Some("pause".into()),
+            value: None,
         };
         assert_eq!(
             serde_json::to_string(&with_callback).unwrap(),
@@ -337,10 +759,22 @@ mod tests {
             canvas_id: "hud".into(),
             element_id: 43,
             callback_id: None,
+            value: None,
         };
         assert_eq!(
             serde_json::to_string(&without_callback).unwrap(),
             r#"{"canvas_id":"hud","element_id":43,"callback_id":null}"#
+        );
+
+        let stateful = GameplayUiEvent {
+            canvas_id: "hud".into(),
+            element_id: 44,
+            callback_id: Some("volume".into()),
+            value: Some(GameplayUiValue::Float(0.75)),
+        };
+        assert_eq!(
+            serde_json::to_string(&stateful).unwrap(),
+            r#"{"canvas_id":"hud","element_id":44,"callback_id":"volume","value":{"type":"Float","value":0.75}}"#
         );
     }
 
@@ -393,6 +827,18 @@ mod tests {
             create
         );
         assert!(create.validate().is_ok());
+
+        let scale = GameplayCommand::Ui {
+            command: GameplayUiCommand::SetCanvasScaleMode {
+                canvas_id: "hud".into(),
+                scale_mode: GameplayUiScaleMode::FitWidth,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&scale).unwrap(),
+            r#"{"type":"ui","command":{"type":"set_canvas_scale_mode","canvas_id":"hud","scale_mode":"fit_width"}}"#
+        );
+        assert!(scale.validate().is_ok());
         assert_eq!(
             serde_json::to_string(&GameplayCommand::DestroySelf).unwrap(),
             r#"{"type":"destroy_self"}"#
@@ -460,6 +906,89 @@ mod tests {
             command
         );
         assert!(command.validate().is_ok());
+    }
+
+    #[test]
+    fn managed_ui_commands_have_a_stable_validated_contract() {
+        let create = GameplayCommand::Ui {
+            command: GameplayUiCommand::CreateCanvas {
+                canvas_id: "hud".into(),
+                width: 1280.0,
+                height: 720.0,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&create).unwrap(),
+            r#"{"type":"ui","command":{"type":"create_canvas","canvas_id":"hud","width":1280.0,"height":720.0}}"#
+        );
+        assert!(create.validate().is_ok());
+
+        let add = GameplayCommand::Ui {
+            command: GameplayUiCommand::AddElement {
+                canvas_id: "hud".into(),
+                element_id: 1,
+                element: GameplayUiElement::Panel {
+                    layout: GameplayUiLayout {
+                        anchor_min: [0.0, 0.0],
+                        anchor_max: [0.0, 0.0],
+                        offset_min: [24.0, 24.0],
+                        offset_max: [344.0, 56.0],
+                    },
+                    color: GameplayUiColor {
+                        r: 20,
+                        g: 20,
+                        b: 20,
+                        a: 210,
+                    },
+                    z_order: 10,
+                },
+            },
+        };
+        let json = serde_json::to_string(&add).unwrap();
+        assert!(json.contains(r#""kind":"panel""#));
+        assert!(json.contains(r#""element_id":1"#));
+        assert_eq!(serde_json::from_str::<GameplayCommand>(&json).unwrap(), add);
+        assert!(add.validate().is_ok());
+
+        let set_slider = GameplayCommand::Ui {
+            command: GameplayUiCommand::SetSliderValue {
+                canvas_id: "hud".into(),
+                element_id: 3,
+                value: 0.75,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&set_slider).unwrap(),
+            r#"{"type":"ui","command":{"type":"set_slider_value","canvas_id":"hud","element_id":3,"value":0.75}}"#
+        );
+        assert!(set_slider.validate().is_ok());
+    }
+
+    #[test]
+    fn managed_ui_commands_reject_invalid_ids_and_geometry() {
+        for command in [
+            GameplayUiCommand::CreateCanvas {
+                canvas_id: "../hud".into(),
+                width: 1280.0,
+                height: 720.0,
+            },
+            GameplayUiCommand::CreateCanvas {
+                canvas_id: "hud".into(),
+                width: f32::NAN,
+                height: 720.0,
+            },
+            GameplayUiCommand::RemoveElement {
+                canvas_id: "hud".into(),
+                element_id: 0,
+            },
+            GameplayUiCommand::SetSliderValue {
+                canvas_id: "hud".into(),
+                element_id: 1,
+                value: f32::INFINITY,
+            },
+        ] {
+            assert!(command.validate().is_err());
+        }
     }
 
     #[test]

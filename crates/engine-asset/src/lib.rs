@@ -13,12 +13,11 @@
 //! - [`BincodeLoader<T>`] – bincode-based deserialization for any `T:
 //!   DeserializeOwned`.
 //! - [`AssetHandle<T>`] – [`Arc`]-backed shared handle to loaded data.
-//! - [`FileWatcher`] – directory watch via `notify`, events delivered over
-//!   a [`crossbeam_channel`] receiver.
+//! - [`ReloadCoordinator`] – the sole manifest-aware watch, recook, dependency
+//!   and reload-state pipeline.
 
 pub mod cook;
 pub mod gltf;
-pub mod hot_reload;
 mod loader;
 pub mod mesh;
 mod path;
@@ -27,14 +26,12 @@ mod registry;
 pub mod reload;
 mod watcher;
 
-pub use hot_reload::HotReload;
 pub use loader::{AssetError, AssetHandle, AssetLoader, BincodeLoader, CachedEntry, RawLoader};
 pub use path::{
     asset_path, asset_path_from_root, asset_relative_path, validate_asset_id, AssetPathError,
 };
 pub use registry::{AssetInfo, AssetRegistry, AssetState};
 pub use reload::ReloadCoordinator;
-pub use watcher::FileWatcher;
 
 /// Compute a stable SHA-256 content digest from a sequence of byte slices.
 /// Boundaries are length-prefixed so distinct part groupings cannot alias.

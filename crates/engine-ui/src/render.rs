@@ -205,10 +205,12 @@ pub fn extract_ui_quads(canvas: &Canvas) -> UiRenderBatch {
                             source_element: element.id,
                         });
                     }
-                    continue;
                 }
             }
-            // No font or empty glyphs: fall through to placeholder below.
+            // Text without a real font is intentionally omitted. A fake quad
+            // would conceal the missing-font diagnostic and misrepresent the
+            // authored content.
+            continue;
         }
 
         let quad = element_to_quad(element);
@@ -254,27 +256,8 @@ fn element_to_quad(element: &UiElement) -> Option<UiQuad> {
             source_element,
         }),
 
-        UiElementKind::Text {
-            content: _content,
-            font_size: _font_size,
-            color,
-        } => {
-            // Font rendering is handled by extract_ui_quads for
-            // multi-glyph output.  Here we only produce the fallback
-            // placeholder quad when no font is available.
-            let mut c = *color;
-            c.a /= 2;
-            Some(UiQuad {
-                x: rect.x,
-                y: rect.y,
-                w: rect.width,
-                h: rect.height,
-                color: c,
-                texture_id: None,
-                uv: None,
-                source_element,
-            })
-        }
+        // Text is emitted as real glyph quads by `extract_ui_quads`.
+        UiElementKind::Text { .. } => None,
 
         UiElementKind::Button { normal_color, .. } => Some(UiQuad {
             x: rect.x,
@@ -466,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_quads_text_semitransparent() {
+    fn extract_quads_text_uses_full_color_with_font_atlas_alpha() {
         let mut canvas = Canvas::new(800.0, 600.0);
         let layout = Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(50.0, 20.0));
         canvas.add_element(
@@ -482,7 +465,29 @@ mod tests {
         );
         canvas.layout_all();
         let batch = extract_ui_quads(&canvas);
-        assert_eq!(batch.quads[0].color.a, 127);
+        if crate::font_atlas_texture_upload().is_some() {
+            assert_eq!(batch.quads[0].color.a, 255);
+            assert_eq!(
+                batch.quads[0].texture_id.as_deref(),
+                Some(crate::FONT_ATLAS_ASSET)
+            );
+        } else {
+            assert!(batch.is_empty());
+        }
+    }
+
+    #[test]
+    fn text_never_has_a_placeholder_quad_path() {
+        let element = UiElement::new(
+            UiElementKind::Text {
+                content: "missing font must be visible as a diagnostic".into(),
+                font_size: 16.0,
+                color: Color::WHITE,
+            },
+            Layout::FILL,
+        );
+
+        assert_eq!(element_to_quad(&element), None);
     }
 
     #[test]

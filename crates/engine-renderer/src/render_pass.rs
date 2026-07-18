@@ -18,7 +18,7 @@
 //! Backends that implement pass-level execution override
 //! [`BackendRenderer::execute_pass`] and route to the registry.
 
-use crate::render_graph;
+use crate::render_graph2::PassNode;
 use crate::{Diagnostic, FrameStats, RenderFrameInput};
 use render_core::{CommandEncoder, Device};
 
@@ -31,9 +31,9 @@ pub trait RenderPass: Send {
     /// Machine-readable identifier — must match [`PassKind::name`].
     fn kind(&self) -> &'static str;
 
-    /// Build a [`PassNode`](render_graph::PassNode) declaration that will be
+    /// Build a [`PassNode`] declaration that will be
     /// inserted into the render graph for the given view.
-    fn declare(&self, view_id: u32) -> render_graph::PassNode;
+    fn declare(&self, view_id: u32) -> PassNode;
 
     /// Prepare device resources (pipelines, descriptor sets, …).
     ///

@@ -122,7 +122,7 @@ impl Drop for Instance {
     fn drop(&mut self) {
         // SAFETY: resources outlived all dependent objects (renderer drops
         // pipeline/swapchain/device/surface in the correct order before
-        // Instance is dropped because field order in VulkanRenderer puts
+        // Instance is dropped because field order in VulkanDevice puts
         // Instance last).
         unsafe {
             if let (Some(loader), Some(messenger)) =

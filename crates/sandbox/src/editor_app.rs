@@ -1,6 +1,7 @@
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use engine_asset::cook::manifest::CURRENT_MANIFEST_VERSION;
@@ -11,40 +12,87 @@ use engine_asset::cook::{
 use engine_asset::project::GameProject;
 use engine_core::game_loop::GameLoop;
 use engine_core::{create_vulkan_backend_renderer, EngineConfig, EngineRuntime};
+use engine_editor::animation_preview::AnimationPreviewPanel;
 use engine_editor::asset_browser::{
-    draw_asset_browser, refresh_asset_list, AssetBrowserPanel as ProjectAssetBrowserPanel,
+    refresh_project_asset_list, AssetBrowserPanel as ProjectAssetBrowserPanel,
 };
 use engine_editor::gizmo::{update_gizmo, GizmoMode, GizmoSpace, GizmoSystem};
 use engine_editor::gizmo_overlay::build_gizmo_ui_batch;
-use engine_editor::hierarchy::SequencedSelection;
 use engine_editor::material_editor::{
-    draw_material_editor, load_material, render_material_preview_rgba8, MaterialEditorPanel,
-    MaterialPreviewRequest, MaterialSaveAccess, MaterialSaveRequest,
+    load_material, MaterialEditorPanel, MaterialSaveAccess, MaterialSaveRequest,
 };
 use engine_editor::{
-    EditorPlayMode, EditorPlaySession, EditorScene, EditorUi, HierarchyPanel, InspectorContext,
-    InspectorPanel, SceneViewPanel, SequencedCommand, SequencedSceneViewAction, UiInteractionPhase,
-    UiKey,
+    create_prefab_asset_from_scene, prepare_prefab_instantiation_from_registry,
+    prepare_unpack_prefab, EditorPlayMode, EditorPlaySession, EditorScene,
+    PrefabAssetCreateRequest, PrefabAuthoringError, PrefabUnpackMode, SceneViewPanel,
 };
-use engine_renderer::{
-    AssetId, ColorSpace, SamplerAddressMode, SamplerDescriptor, TextureMipLevel, TextureUpload,
-    TextureUploadFormat, UiBatch,
-};
-use engine_scene::components::{Camera, Transform};
+use engine_editor_host::{EditorHostClient, EditorHostConfig, HostDirective, HostEvent, WebAsset};
+use engine_renderer::{AssetId, Rect as RendererRect, UiBatch};
+use engine_scene::components::{Camera, CameraProjection, Transform};
 use engine_scene::{
-    extract_renderer_input_from_world, ComponentRecord, Entity, EntityRecord, Scene, World,
+    extract_renderer_input_from_world_with_viewport, ComponentRecord, Entity, EntityRecord,
+    RenderViewportContext, Scene, SceneSettings, World,
 };
 use engine_serialize::{Diagnostic, DiagnosticSeverity, PersistentId, SchemaVersion, Value};
 use glam::{Mat4, Quat, Vec2, Vec3};
-use platform::winit::window::Window;
-use platform::{EventFlow, PlatformEvent, WindowApp, WindowDescriptor};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use sha2::{Digest, Sha256};
 
-const MATERIAL_PREVIEW_TEXTURE_ID: &str = "editor/material-preview";
-const MATERIAL_PREVIEW_SIZE: u32 = 256;
+mod dispatch;
+mod protocol;
+mod snapshot;
+use protocol::{InputModifiers, ScreenRect};
+
 const BUILTIN_DEFAULT_MATERIAL_ID: &str = "mat-default";
 const EDITOR_CAMERA_ID_PREFIX: &str = "__engine_editor_camera";
+const EDITOR_LIGHT_ID_PREFIX: &str = "__engine_editor_light";
+const DEFAULT_REACT_LAYOUT: &str = r#"{"zones":{"left":{"panels":["hierarchy"],"active":"hierarchy","collapsed":false},"center":{"panels":["scene","game"],"active":"scene","collapsed":false},"right":{"panels":["inspector","settings"],"active":"inspector","collapsed":false},"bottom":{"panels":["project","console","material","animation","profiler","build"],"active":"project","collapsed":false}},"leftWidth":272,"rightWidth":326,"bottomHeight":260}"#;
+
+static EDITOR_WEB_ASSETS: &[WebAsset] = &[
+    WebAsset::new(
+        "index.html",
+        include_bytes!("../editor-web/dist/index.html"),
+    ),
+    WebAsset::new(
+        "assets/editor.js",
+        include_bytes!("../editor-web/dist/assets/editor.js"),
+    ),
+    WebAsset::new(
+        "assets/editor.css",
+        include_bytes!("../editor-web/dist/assets/editor.css"),
+    ),
+];
+
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+
+    command
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not reveal {}: {error}", path.display()))
+}
+
+fn launch_editor_window(project_path: &Path) -> Result<u32, String> {
+    let project = GameProject::load(project_path)
+        .map_err(|error| format!("Could not open project {}: {error}", project_path.display()))?;
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve the editor executable: {error}"))?;
+    std::process::Command::new(executable)
+        .arg("editor")
+        .arg(&project.manifest_path)
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|error| {
+            format!(
+                "Could not launch an editor for {}: {error}",
+                project.manifest_path.display()
+            )
+        })
+}
 
 fn selected_material_asset(scene: &Scene, selected: Option<&PersistentId>) -> Option<String> {
     let selected = selected?;
@@ -60,29 +108,40 @@ fn selected_material_asset(scene: &Scene, selected: Option<&PersistentId>) -> Op
     }
 }
 
-fn material_preview_upload(request: &MaterialPreviewRequest) -> TextureUpload {
-    let pixels =
-        render_material_preview_rgba8(request, MATERIAL_PREVIEW_SIZE, MATERIAL_PREVIEW_SIZE);
-    let content_hash: [u8; 32] = Sha256::digest(&pixels).into();
-    TextureUpload {
-        texture_id: AssetId::new(MATERIAL_PREVIEW_TEXTURE_ID),
-        width: MATERIAL_PREVIEW_SIZE,
-        height: MATERIAL_PREVIEW_SIZE,
-        format: TextureUploadFormat::Rgba8,
-        color_space: ColorSpace::Srgb,
-        mip_levels: vec![TextureMipLevel {
-            width: MATERIAL_PREVIEW_SIZE,
-            height: MATERIAL_PREVIEW_SIZE,
-            bytes: pixels,
-        }],
-        sampler: SamplerDescriptor {
-            address_u: SamplerAddressMode::ClampToEdge,
-            address_v: SamplerAddressMode::ClampToEdge,
-            address_w: SamplerAddressMode::ClampToEdge,
-            ..SamplerDescriptor::default()
-        },
-        content_hash,
+fn assign_material_to_selected_command(
+    editor_scene: &EditorScene,
+    material_asset: &str,
+) -> Result<Box<dyn engine_editor::Command>, String> {
+    let material_asset = material_asset.trim();
+    if material_asset.is_empty() {
+        return Err("No material is open in the Material Editor".to_string());
     }
+    let entity_id = editor_scene
+        .selected_entity
+        .as_ref()
+        .ok_or_else(|| "Select an entity with a Mesh Renderer component".to_string())?;
+    let entity = editor_scene
+        .scene
+        .entities
+        .iter()
+        .find(|entity| &entity.persistent_id == entity_id)
+        .ok_or_else(|| format!("Selected entity '{entity_id}' is no longer in the scene"))?;
+    let renderable = entity
+        .components
+        .get("engine.renderable")
+        .ok_or_else(|| format!("Entity '{entity_id}' does not have a Mesh Renderer component"))?;
+    if !renderable.fields.contains_key("material") {
+        return Err(format!(
+            "Entity '{entity_id}' has no writable Mesh Renderer material field"
+        ));
+    }
+
+    Ok(Box::new(engine_editor::SetComponentField::new(
+        entity_id.clone(),
+        "engine.renderable".to_string(),
+        "material".to_string(),
+        Value::Asset(AssetId::new(material_asset)),
+    )))
 }
 
 #[derive(Clone, Debug)]
@@ -501,89 +560,50 @@ fn save_project_material(
     })
 }
 
-fn map_editor_key(key: platform::KeyCode) -> Option<UiKey> {
-    match key {
-        platform::KeyCode::Enter => Some(UiKey::Enter),
-        platform::KeyCode::Escape => Some(UiKey::Escape),
-        platform::KeyCode::Backspace => Some(UiKey::Backspace),
-        platform::KeyCode::Delete => Some(UiKey::Delete),
-        platform::KeyCode::Tab => Some(UiKey::Tab),
-        _ => None,
+fn editor_render_viewport(
+    viewport: ScreenRect,
+    scale_factor: f64,
+    window_size: Vec2,
+) -> Option<(Vec2, Vec2, RenderViewportContext)> {
+    if !viewport.x.is_finite()
+        || !viewport.y.is_finite()
+        || !viewport.width.is_finite()
+        || !viewport.height.is_finite()
+        || !scale_factor.is_finite()
+        || scale_factor <= 0.0
+        || viewport.width <= 0.0
+        || viewport.height <= 0.0
+        || !window_size.is_finite()
+        || window_size.x <= 0.0
+        || window_size.y <= 0.0
+    {
+        return None;
     }
-}
 
-fn should_route_event_to_gameplay(ui: &EditorUi, event: &PlatformEvent) -> bool {
-    match event {
-        PlatformEvent::MousePressed { x, y, .. } => {
-            !ui.pointer_over_widget_at(*x as f32, *y as f32)
-        }
-        // Releases must always reach gameplay so a press that began in the
-        // scene cannot remain held after the pointer crosses editor chrome.
-        PlatformEvent::MouseReleased { .. } | PlatformEvent::KeyReleased { .. } => true,
-        PlatformEvent::KeyPressed { .. } => !ui.captures_keyboard_input(),
-        PlatformEvent::CharacterTyped { .. } => false,
-        _ => true,
+    // DOMRect coordinates are CSS logical pixels. Mapping both edges independently keeps
+    // adjacent dock regions seam-free on fractional DPI scales.
+    let scale = scale_factor as f32;
+    let min = Vec2::new((viewport.x * scale).round(), (viewport.y * scale).round())
+        .clamp(Vec2::ZERO, window_size);
+    let max = Vec2::new(
+        ((viewport.x + viewport.width) * scale).round(),
+        ((viewport.y + viewport.height) * scale).round(),
+    )
+    .clamp(Vec2::ZERO, window_size);
+    if max.x <= min.x || max.y <= min.y {
+        return None;
     }
-}
 
-/// Route retained scene-Canvas input while the editor is in Play/Pause.
-///
-/// This is intentionally separate from the project's action map: gameplay
-/// button releases must reach the action map to unstick a held action, while
-/// a Canvas release over editor chrome must cancel capture instead of clicking
-/// the scene UI underneath it.
-#[cfg(feature = "runtime-subsystems")]
-fn route_editor_play_ui_event(
-    game_loop: &mut GameLoop,
-    ui: &EditorUi,
-    event: &PlatformEvent,
-) -> bool {
-    match event {
-        PlatformEvent::MouseMoved { x, y } if !ui.pointer_over_widget_at(*x as f32, *y as f32) => {
-            game_loop.ui_pointer_move(*x as f32, *y as f32);
-            true
-        }
-        PlatformEvent::MousePressed { button, x, y } if *button == platform::MouseButton::Left => {
-            if ui.pointer_over_widget_at(*x as f32, *y as f32) {
-                game_loop.cancel_ui_pointer();
-                false
-            } else {
-                game_loop.ui_pointer_move(*x as f32, *y as f32);
-                game_loop.ui_pointer_left_press();
-                true
-            }
-        }
-        PlatformEvent::MouseReleased { button, x, y } if *button == platform::MouseButton::Left => {
-            if ui.pointer_over_widget_at(*x as f32, *y as f32) {
-                game_loop.cancel_ui_pointer();
-                false
-            } else {
-                game_loop.ui_pointer_move(*x as f32, *y as f32);
-                game_loop.ui_pointer_left_release();
-                true
-            }
-        }
-        PlatformEvent::Focused(false) | PlatformEvent::Suspended => {
-            game_loop.cancel_ui_pointer();
-            true
-        }
-        _ => false,
-    }
-}
-
-fn should_apply_history_undo(
-    requested: bool,
-    had_incomplete_gizmo: bool,
-    had_uncommitted_text_change: bool,
-    history_push_serial_before_panels: u64,
-    history_push_serial_after_panels: u64,
-    can_undo: bool,
-) -> bool {
-    requested
-        && !had_incomplete_gizmo
-        && can_undo
-        && (!had_uncommitted_text_change
-            || history_push_serial_after_panels != history_push_serial_before_panels)
+    let normalized = RendererRect {
+        min: [min.x / window_size.x, min.y / window_size.y],
+        max: [max.x / window_size.x, max.y / window_size.y],
+    };
+    let render_viewport = RenderViewportContext::new(
+        window_size.x.round() as u32,
+        window_size.y.round() as u32,
+        normalized,
+    )?;
+    Some((min, max, render_viewport))
 }
 
 fn log_scene_diagnostics(context: &str, diagnostics: Vec<engine_serialize::Diagnostic>) {
@@ -634,7 +654,19 @@ fn editor_camera_entity(scene: &Scene) -> EntityRecord {
         name: Some("Editor Camera".into()),
         enabled: true,
         components: std::collections::BTreeMap::from([
-            ("engine.camera".into(), record(Default::default())),
+            (
+                "engine.camera".into(),
+                record(std::collections::BTreeMap::from([
+                    ("clear_flags".into(), Value::UInt(3)),
+                    (
+                        "clear_color".into(),
+                        Value::Color([0.055, 0.06, 0.075, 1.0]),
+                    ),
+                    ("aperture".into(), Value::Float32(1.0)),
+                    ("shutter_speed".into(), Value::Float32(1.0)),
+                    ("iso".into(), Value::Float32(100.0)),
+                ])),
+            ),
             (
                 "engine.transform".into(),
                 record(std::collections::BTreeMap::from([
@@ -647,9 +679,63 @@ fn editor_camera_entity(scene: &Scene) -> EntityRecord {
     }
 }
 
+fn editor_light_entity(scene: &Scene) -> EntityRecord {
+    let mut suffix = 0_u64;
+    let persistent_id = loop {
+        let candidate = if suffix == 0 {
+            EDITOR_LIGHT_ID_PREFIX.to_string()
+        } else {
+            format!("{EDITOR_LIGHT_ID_PREFIX}_{suffix}")
+        };
+        if scene
+            .entities
+            .iter()
+            .all(|entity| entity.persistent_id != candidate)
+        {
+            break candidate;
+        }
+        suffix += 1;
+    };
+    EntityRecord {
+        persistent_id,
+        parent: None,
+        name: Some("Editor Light".into()),
+        enabled: true,
+        components: std::collections::BTreeMap::from([(
+            "engine.light".into(),
+            ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: std::collections::BTreeMap::from([
+                    ("kind".into(), Value::Enum("Directional".into())),
+                    ("color".into(), Value::Vec3([1.0, 0.96, 0.9])),
+                    ("intensity".into(), Value::Float32(2.5)),
+                    ("direction".into(), Value::Vec3([-0.35, -0.8, -0.45])),
+                    ("shadow_mode".into(), Value::UInt(0)),
+                ]),
+            },
+        )]),
+    }
+}
+
 fn editor_preview_scene(
     runtime: &engine_core::EngineRuntime,
     authoring_scene: &Scene,
+) -> (Scene, Vec<Diagnostic>) {
+    authoring_preview_scene(runtime, authoring_scene, true)
+}
+
+fn game_preview_scene(
+    runtime: &engine_core::EngineRuntime,
+    authoring_scene: &Scene,
+) -> (Scene, Vec<Diagnostic>) {
+    authoring_preview_scene(runtime, authoring_scene, false)
+}
+
+fn authoring_preview_scene(
+    runtime: &engine_core::EngineRuntime,
+    authoring_scene: &Scene,
+    use_editor_camera: bool,
 ) -> (Scene, Vec<Diagnostic>) {
     let mut preview = authoring_scene.clone();
     let mut diagnostics = Vec::new();
@@ -660,11 +746,13 @@ fn editor_preview_scene(
         // The component remains intact in `authoring_scene` and is restored by
         // the normal Play transition.
         entity.components.remove("engine.script");
-        if let Some(camera) = entity.components.get_mut("engine.camera") {
-            // Authoring cameras remain as selectable entities (including
-            // their Transform), but only the dedicated editor camera renders
-            // while outside Play.
-            camera.enabled = false;
+        if use_editor_camera {
+            if let Some(camera) = entity.components.get_mut("engine.camera") {
+                // Authoring cameras remain as selectable entities (including
+                // their Transform), but only the dedicated editor camera renders
+                // while outside Play.
+                camera.enabled = false;
+            }
         }
 
         let Some(renderable) = entity.components.get_mut("engine.renderable") else {
@@ -699,9 +787,22 @@ fn editor_preview_scene(
             diagnostics.push(diagnostic);
         }
     }
-    let editor_camera = editor_camera_entity(&preview);
-    preview.scene_settings.active_camera = Some(editor_camera.persistent_id.clone());
-    preview.entities.push(editor_camera);
+    if use_editor_camera {
+        let editor_camera = editor_camera_entity(&preview);
+        preview.scene_settings.active_camera = Some(editor_camera.persistent_id.clone());
+        preview.entities.push(editor_camera);
+        let has_scene_light = preview.entities.iter().any(|entity| {
+            entity.enabled
+                && entity
+                    .components
+                    .get("engine.light")
+                    .is_some_and(|light| light.enabled)
+        });
+        if !has_scene_light {
+            let editor_light = editor_light_entity(&preview);
+            preview.entities.push(editor_light);
+        }
+    }
     (preview, diagnostics)
 }
 
@@ -725,6 +826,18 @@ fn synchronize_editor_preview(game_loop: &mut GameLoop, editor_scene: &mut Edito
     editor_scene.diagnostics.push_many(missing_diagnostics);
     if let Err(diagnostics) = game_loop.load_scene(preview_scene) {
         log_scene_diagnostics("editor scene synchronisation failed", diagnostics);
+    } else {
+        game_loop.init_physics();
+    }
+}
+
+fn synchronize_game_preview(game_loop: &mut GameLoop, editor_scene: &mut EditorScene) {
+    let (preview_scene, missing_diagnostics) =
+        game_preview_scene(&game_loop.runtime, &editor_scene.scene);
+    editor_scene.diagnostics.clear();
+    editor_scene.diagnostics.push_many(missing_diagnostics);
+    if let Err(diagnostics) = game_loop.load_scene(preview_scene) {
+        log_scene_diagnostics("game-view preview synchronisation failed", diagnostics);
     } else {
         game_loop.init_physics();
     }
@@ -814,31 +927,6 @@ fn execute_selected_asset_assignment(
     Ok(true)
 }
 
-fn edit_current_inspector_selection(
-    inspector: &mut InspectorPanel,
-    ui: &mut EditorUi,
-    editor_scene: &mut EditorScene,
-    context: &InspectorContext,
-) -> Vec<SequencedCommand> {
-    inspector.ui_with_context_ordered(
-        ui,
-        &editor_scene.scene,
-        editor_scene.selected_entity.as_ref(),
-        context,
-    )
-}
-
-fn project_inspector_context(project: &GameProject) -> InspectorContext {
-    project
-        .script_assembly
-        .as_deref()
-        .and_then(Path::file_stem)
-        .and_then(|stem| stem.to_str())
-        .filter(|assembly| !assembly.is_empty() && !assembly.chars().any(char::is_whitespace))
-        .map(InspectorContext::with_script_assembly)
-        .unwrap_or_default()
-}
-
 #[derive(Clone, Copy, Debug)]
 struct RuntimeGizmoView {
     world_position: Vec3,
@@ -857,70 +945,6 @@ enum GizmoPointerEvent {
     Move(Vec2),
     Release(Vec2),
     Cancel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct SequencedGizmoPointerEvent {
-    sequence: u64,
-    event: GizmoPointerEvent,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum OrderedToolbarAction {
-    Save,
-    Undo,
-    Redo,
-    StartPlay,
-    SetGizmoMode(GizmoMode),
-    ToggleGizmoSpace,
-    ToggleGizmoSnapping,
-}
-
-enum OrderedAuthoringInput {
-    Gizmo(SequencedGizmoPointerEvent),
-    Toolbar {
-        sequence: u64,
-        action: OrderedToolbarAction,
-    },
-    PanelCommand(SequencedCommand),
-    Selection(SequencedSelection),
-    SceneView(SequencedSceneViewAction),
-}
-
-impl OrderedAuthoringInput {
-    fn sequence(&self) -> u64 {
-        match self {
-            Self::Gizmo(event) => event.sequence,
-            Self::Toolbar { sequence, .. } => *sequence,
-            Self::PanelCommand(command) => command.stamp.sequence,
-            Self::Selection(selection) => selection.stamp.sequence,
-            Self::SceneView(action) => action.stamp.sequence,
-        }
-    }
-
-    fn tie_breaker(&self) -> u8 {
-        match self {
-            Self::PanelCommand(command)
-                if command.stamp.phase == UiInteractionPhase::BeforeRawPointer =>
-            {
-                0
-            }
-            Self::Gizmo(_) => 1,
-            Self::Toolbar { .. }
-            | Self::PanelCommand(_)
-            | Self::Selection(_)
-            | Self::SceneView(_) => 2,
-        }
-    }
-}
-
-fn merge_ordered_authoring_inputs(
-    mut toolbar: Vec<OrderedAuthoringInput>,
-    gizmo: Vec<SequencedGizmoPointerEvent>,
-) -> Vec<OrderedAuthoringInput> {
-    toolbar.extend(gizmo.into_iter().map(OrderedAuthoringInput::Gizmo));
-    toolbar.sort_by_key(|input| (input.sequence(), input.tie_breaker()));
-    toolbar
 }
 
 fn resolve_runtime_world_matrix(
@@ -961,11 +985,15 @@ fn runtime_gizmo_view(
     runtime: &EngineRuntime,
     entity_id: &str,
     frame: u64,
-    window_size: Vec2,
+    viewport_context: RenderViewportContext,
 ) -> Option<RuntimeGizmoView> {
+    let surface_size = viewport_context.surface_size();
+    let window_size = Vec2::new(surface_size[0] as f32, surface_size[1] as f32);
     runtime
         .with_world(|world| {
-            let input = extract_renderer_input_from_world(world, frame).ok()?;
+            let input =
+                extract_renderer_input_from_world_with_viewport(world, frame, viewport_context)
+                    .ok()?;
             let view = input.views.first()?;
             let entity = world.entity_by_persistent_id(entity_id)?;
             world.get::<Transform>(entity)?;
@@ -1000,6 +1028,113 @@ fn runtime_gizmo_view(
                 interaction_min: viewport_min,
                 interaction_max: viewport_max,
             })
+        })
+        .flatten()
+}
+
+fn project_world_point(
+    world: Vec3,
+    view: Mat4,
+    projection: Mat4,
+    viewport_size: Vec2,
+) -> Option<(Vec2, f32)> {
+    let clip = projection * view * world.extend(1.0);
+    if !clip.is_finite() || clip.w <= 1.0e-5 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if !ndc.is_finite() || !(0.0..=1.0).contains(&ndc.z) {
+        return None;
+    }
+    Some((
+        Vec2::new(
+            (ndc.x * 0.5 + 0.5) * viewport_size.x,
+            (1.0 - (ndc.y * 0.5 + 0.5)) * viewport_size.y,
+        ),
+        ndc.z,
+    ))
+}
+
+fn pick_runtime_entity(
+    runtime: &EngineRuntime,
+    frame: u64,
+    viewport_context: RenderViewportContext,
+    interaction_min: Vec2,
+    interaction_max: Vec2,
+    pointer: Vec2,
+) -> Option<PersistentId> {
+    if pointer.x < interaction_min.x
+        || pointer.y < interaction_min.y
+        || pointer.x > interaction_max.x
+        || pointer.y > interaction_max.y
+    {
+        return None;
+    }
+
+    runtime
+        .with_world(|world| {
+            let input =
+                extract_renderer_input_from_world_with_viewport(world, frame, viewport_context)
+                    .ok()?;
+            let render_view = input.views.first()?;
+            let view = Mat4::from_cols_array(&render_view.view_matrix);
+            let projection = Mat4::from_cols_array(&render_view.projection_matrix);
+            let surface_size = viewport_context.surface_size();
+            let window_size = Vec2::new(surface_size[0] as f32, surface_size[1] as f32);
+            let viewport_min =
+                Vec2::from_array(render_view.viewport_rect_normalized.min) * window_size;
+            let viewport_max =
+                Vec2::from_array(render_view.viewport_rect_normalized.max) * window_size;
+            let viewport_size = viewport_max - viewport_min;
+            let mut best: Option<(f32, PersistentId)> = None;
+
+            for drawable in &input.drawables {
+                let Some(entity) = drawable.entity.clone() else {
+                    continue;
+                };
+                let min = Vec3::from_array(drawable.bounds.min);
+                let max = Vec3::from_array(drawable.bounds.max);
+                let mut screen_min = Vec2::splat(f32::INFINITY);
+                let mut screen_max = Vec2::splat(f32::NEG_INFINITY);
+                let mut nearest_depth = f32::INFINITY;
+                let mut projected_corner = false;
+                for x in [min.x, max.x] {
+                    for y in [min.y, max.y] {
+                        for z in [min.z, max.z] {
+                            let Some((screen, depth)) = project_world_point(
+                                Vec3::new(x, y, z),
+                                view,
+                                projection,
+                                viewport_size,
+                            ) else {
+                                continue;
+                            };
+                            let screen = viewport_min + screen;
+                            projected_corner = true;
+                            screen_min = screen_min.min(screen);
+                            screen_max = screen_max.max(screen);
+                            nearest_depth = nearest_depth.min(depth);
+                        }
+                    }
+                }
+                if !projected_corner {
+                    continue;
+                }
+                // Thin or very small meshes still receive a practical click
+                // target, while overlapping objects choose the nearest depth.
+                let padding = Vec2::splat(6.0);
+                if pointer.x >= screen_min.x - padding.x
+                    && pointer.y >= screen_min.y - padding.y
+                    && pointer.x <= screen_max.x + padding.x
+                    && pointer.y <= screen_max.y + padding.y
+                    && best
+                        .as_ref()
+                        .is_none_or(|(best_depth, _)| nearest_depth < *best_depth)
+                {
+                    best = Some((nearest_depth, entity));
+                }
+            }
+            best.map(|(_, entity)| entity)
         })
         .flatten()
 }
@@ -1057,6 +1192,14 @@ fn apply_editor_camera(runtime: &EngineRuntime, panel: &SceneViewPanel) -> bool 
                     },
                 );
             }
+            if let Some(camera) = world.get_mut::<Camera>(entity) {
+                camera.projection = if panel.orthographic() {
+                    CameraProjection::Orthographic
+                } else {
+                    CameraProjection::Perspective
+                };
+                camera.ortho_half_height = distance.max(0.1);
+            }
             true
         })
         .unwrap_or(false)
@@ -1069,6 +1212,20 @@ fn synchronize_editor_preview_and_camera(
 ) {
     synchronize_editor_preview(game_loop, editor_scene);
     let _ = apply_editor_camera(&game_loop.runtime, scene_view);
+}
+
+fn synchronize_authoring_view(
+    game_loop: &mut GameLoop,
+    editor_scene: &mut EditorScene,
+    scene_view: &SceneViewPanel,
+    viewport_tab: ViewportTab,
+) {
+    match viewport_tab {
+        ViewportTab::Scene => {
+            synchronize_editor_preview_and_camera(game_loop, editor_scene, scene_view)
+        }
+        ViewportTab::Game => synchronize_game_preview(game_loop, editor_scene),
+    }
 }
 
 fn sync_runtime_transform(runtime: &EngineRuntime, entity_id: &str, authoring: &Transform) -> bool {
@@ -1117,7 +1274,6 @@ fn process_gizmo_pointer_events(
     events: Vec<GizmoPointerEvent>,
     editor_scene: &mut EditorScene,
     gizmo: &mut GizmoSystem,
-    ui: &EditorUi,
     runtime: &EngineRuntime,
     entity_id: &str,
     view: RuntimeGizmoView,
@@ -1153,7 +1309,7 @@ fn process_gizmo_pointer_events(
                     && pointer.y >= view.interaction_min.y
                     && pointer.x <= view.interaction_max.x
                     && pointer.y <= view.interaction_max.y;
-                if !pointer_inside_view || ui.pointer_over_widget_at(pointer.x, pointer.y) {
+                if !pointer_inside_view {
                     continue;
                 }
                 let _ = update_gizmo(
@@ -1236,47 +1392,136 @@ fn process_gizmo_pointer_events(
 }
 
 pub struct EditorApp {
+    session_id: String,
+    editor_revision: u64,
+    editor_event_sequence: u64,
+    pending_full_snapshot: bool,
     project: GameProject,
     current_scene_id: String,
     current_scene_path: PathBuf,
     scene_browser_selection: String,
     new_scene_id: String,
+    new_scene_folder: String,
+    scene_operation_id: String,
+    scene_replacement_id: String,
     pending_scene_switch: Option<String>,
+    pending_document_action: Option<SceneDocumentAction>,
     scene_document_status: Option<String>,
     close_confirmation_pending: bool,
+    pending_recovery: Option<PathBuf>,
     exit_after_frame: bool,
     play_runtime_scene_id: Option<String>,
     game_loop: Option<GameLoop>,
     editor_scene: Option<EditorScene>,
+    /// Ordered authoring selection. `EditorScene::selected_entity` remains the
+    /// active object used by gizmos and single-object inspectors.
+    selected_entity_ids: Vec<String>,
     play_session: EditorPlaySession,
     #[cfg(feature = "target-desktop")]
     input_state: super::project_input::ProjectInputState,
-    hierarchy: HierarchyPanel,
     scene_view: SceneViewPanel,
     gizmo: GizmoSystem,
-    gizmo_pointer_events: Vec<SequencedGizmoPointerEvent>,
-    next_platform_event_sequence: u64,
-    cancel_gizmo_requested: bool,
-    inspector: InspectorPanel,
+    gizmo_pointer_events: Vec<GizmoPointerEvent>,
     asset_browser: ProjectAssetBrowserPanel,
     material_editor: MaterialEditorPanel,
     material_editor_selection: Option<String>,
-    ui: EditorUi,
+    animation_preview: AnimationPreviewPanel,
+    viewport_tab: ViewportTab,
+    pending_ui_open_panels: Vec<protocol::UiOpenPanelParams>,
+    web_viewport_rect: ScreenRect,
+    window_scale_factor: f64,
+    surface_occluded: bool,
+    surface_zero_sized: bool,
+    render_faulted: bool,
+    web_viewport_input: WebViewportInputState,
+    build_status: Option<String>,
+    background_job: Option<EditorBackgroundJob>,
+    last_editor_operation: Option<EditorOperationStatus>,
+    recent_editor_operations: VecDeque<EditorOperationStatus>,
+    next_editor_operation_id: u64,
+    editor_build_service: Result<super::editor_build_ops::EditorBuildService, String>,
+    editor_build_task: Option<super::editor_build_ops::EditorBuildTask>,
+    run_after_build: bool,
+    build_output: String,
+    package_version: String,
+    package_output_root: String,
+    project_settings_draft: ProjectSettingsDraft,
+    scene_settings_draft: SceneSettings,
+    entity_clipboard: Option<engine_editor::EntityClipboard>,
+    component_clipboard: Option<engine_editor::ComponentClipboard>,
+    performance: engine_editor::performance::PerformancePanel,
+    workspace_preferences: EditorWorkspacePreferences,
+    saved_workspace_preferences: EditorWorkspacePreferences,
     frame: u64,
-    mouse_x: f64,
-    mouse_y: f64,
     window_w: f32,
     window_h: f32,
     last_frame_time: Instant,
+    last_recovery_snapshot: Instant,
+    step_play_once: bool,
+}
+
+struct EditorBackgroundJob {
+    id: u64,
+    label: String,
+    receiver: mpsc::Receiver<Result<EditorJobOutput, String>>,
+    reload_assets: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum EditorJobOutput {
+    #[default]
+    None,
+    SelectAsset(String),
+    SelectFolder(String),
+    ClearAssetSelection,
+}
+
+#[derive(Clone, Debug)]
+enum EditorOperationState {
+    Running,
+    Succeeded,
+    CommittedWithWarning(String),
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+struct EditorOperationStatus {
+    id: u64,
+    label: String,
+    state: EditorOperationState,
+}
+
+#[derive(Default)]
+struct WebViewportInputState {
+    pointer_id: Option<i64>,
+    pointer: Option<Vec2>,
+    buttons: u16,
+    modifiers: InputModifiers,
+    keys: BTreeSet<String>,
+    focused: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SceneDocumentAction {
     Open(String),
-    Create(String),
+    Create {
+        scene_id: String,
+        folder: PathBuf,
+    },
+    SaveAs(String),
+    Duplicate {
+        source_id: String,
+        new_id: String,
+    },
     SetStartup(String),
-    SaveAndSwitch(String),
-    DiscardAndSwitch(String),
+    Rename {
+        old_id: String,
+        new_id: String,
+    },
+    Delete {
+        scene_id: String,
+        replacement_startup: Option<String>,
+    },
     CancelSwitch,
 }
 
@@ -1287,43 +1532,230 @@ enum CloseDocumentAction {
     Cancel,
 }
 
+#[derive(Clone, Debug)]
+struct ProjectSettingsDraft {
+    title: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ViewportTab {
+    #[default]
+    Scene,
+    Game,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorFrameOutcome {
+    Completed,
+    Failed,
+}
+
+fn editor_frame_time_ms(gpu_frame_ms: f32, frame_interval_seconds: f32) -> f32 {
+    if gpu_frame_ms.is_finite() && gpu_frame_ms > 0.0 {
+        gpu_frame_ms
+    } else if frame_interval_seconds.is_finite() && frame_interval_seconds >= 0.0 {
+        frame_interval_seconds * 1_000.0
+    } else {
+        0.0
+    }
+}
+
+fn gizmo_viewport_enabled(gizmos_visible: bool, editing: bool, viewport_tab: ViewportTab) -> bool {
+    gizmos_visible && editing && viewport_tab == ViewportTab::Scene
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProjectAssetView {
+    #[default]
+    Grid,
+    List,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct EditorWorkspacePreferences {
+    scene_pitch: f32,
+    scene_yaw: f32,
+    scene_distance: f32,
+    scene_target: [f32; 3],
+    scene_orthographic: bool,
+    scene_camera_speed: f32,
+    gizmos_visible: bool,
+    snapping_enabled: bool,
+    project_asset_view: ProjectAssetView,
+    project_asset_folder: String,
+    react_layout: Option<String>,
+}
+
+impl Default for EditorWorkspacePreferences {
+    fn default() -> Self {
+        Self {
+            scene_pitch: 20.0,
+            scene_yaw: 45.0,
+            scene_distance: 10.0,
+            scene_target: [0.0, 0.0, 0.0],
+            scene_orthographic: false,
+            scene_camera_speed: 5.0,
+            gizmos_visible: true,
+            snapping_enabled: false,
+            project_asset_view: ProjectAssetView::Grid,
+            project_asset_folder: "/".to_string(),
+            react_layout: None,
+        }
+    }
+}
+
+fn workspace_preferences_path(project: &GameProject) -> PathBuf {
+    project.root.join(".engine/editor-workspace.json")
+}
+
+fn scene_recovery_path(project: &GameProject, scene_id: &str) -> PathBuf {
+    project
+        .root
+        .join(".engine/recovery")
+        .join(format!("{scene_id}.scene.ron"))
+}
+
+fn newer_recovery_snapshot(
+    project: &GameProject,
+    scene_id: &str,
+    scene_path: &Path,
+) -> Option<PathBuf> {
+    let recovery = scene_recovery_path(project, scene_id);
+    let recovery_modified = std::fs::metadata(&recovery).ok()?.modified().ok()?;
+    let scene_modified = std::fs::metadata(scene_path).ok()?.modified().ok()?;
+    (recovery_modified > scene_modified).then_some(recovery)
+}
+
+fn load_workspace_preferences(project: &GameProject) -> EditorWorkspacePreferences {
+    let path = workspace_preferences_path(project);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return EditorWorkspacePreferences::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        tracing::warn!(path = %path.display(), %error, "ignored invalid editor workspace preferences");
+        EditorWorkspacePreferences::default()
+    })
+}
+
+fn save_workspace_preferences(
+    project: &GameProject,
+    preferences: &EditorWorkspacePreferences,
+) -> Result<(), String> {
+    let path = workspace_preferences_path(project);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("invalid workspace preferences path: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    let mut json = serde_json::to_string_pretty(preferences)
+        .map_err(|error| format!("could not serialize workspace preferences: {error}"))?;
+    json.push('\n');
+    std::fs::write(&path, json)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 impl EditorApp {
     pub fn new(project: GameProject) -> Self {
         let current_scene_id = project.startup_scene_id().to_string();
         let current_scene_path = project.startup_scene_path().to_path_buf();
+        let workspace_preferences = load_workspace_preferences(&project);
+        let mut scene_view = SceneViewPanel::new("Scene View");
+        scene_view.set_camera_orbit(
+            workspace_preferences.scene_pitch,
+            workspace_preferences.scene_yaw,
+            workspace_preferences.scene_distance,
+        );
+        scene_view.set_target(workspace_preferences.scene_target);
+        scene_view.set_orthographic(workspace_preferences.scene_orthographic);
+        scene_view.set_camera_speed(workspace_preferences.scene_camera_speed);
+        let mut gizmo = GizmoSystem::new();
+        gizmo.snapping = workspace_preferences.snapping_enabled;
+        let project_settings_draft = ProjectSettingsDraft {
+            title: project.manifest.window.title.clone(),
+            width: project.manifest.window.width,
+            height: project.manifest.window.height,
+        };
+        let pending_recovery =
+            newer_recovery_snapshot(&project, &current_scene_id, &current_scene_path);
+        let editor_build_service =
+            super::editor_build_ops::EditorBuildService::for_current_editor()
+                .map_err(|error| error.to_string());
         Self {
+            session_id: format!(
+                "editor-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
+            editor_revision: 0,
+            editor_event_sequence: 0,
+            pending_full_snapshot: false,
             project,
             scene_browser_selection: current_scene_id.clone(),
             current_scene_id,
             current_scene_path,
             new_scene_id: String::new(),
+            new_scene_folder: String::new(),
+            scene_operation_id: String::new(),
+            scene_replacement_id: String::new(),
             pending_scene_switch: None,
+            pending_document_action: None,
             scene_document_status: None,
             close_confirmation_pending: false,
+            pending_recovery,
             exit_after_frame: false,
             play_runtime_scene_id: None,
             game_loop: None,
             editor_scene: None,
+            selected_entity_ids: Vec::new(),
             play_session: EditorPlaySession::default(),
             #[cfg(feature = "target-desktop")]
             input_state: super::project_input::ProjectInputState::default(),
-            hierarchy: HierarchyPanel::new("Hierarchy"),
-            scene_view: SceneViewPanel::new("Scene View"),
-            gizmo: GizmoSystem::new(),
+            scene_view,
+            gizmo,
             gizmo_pointer_events: Vec::new(),
-            next_platform_event_sequence: 0,
-            cancel_gizmo_requested: false,
-            inspector: InspectorPanel::new("Inspector"),
             asset_browser: ProjectAssetBrowserPanel::new(),
             material_editor: MaterialEditorPanel::new(),
             material_editor_selection: None,
-            ui: EditorUi::new(),
+            animation_preview: AnimationPreviewPanel::new(),
+            viewport_tab: ViewportTab::Scene,
+            pending_ui_open_panels: Vec::new(),
+            web_viewport_rect: ScreenRect::default(),
+            window_scale_factor: 1.0,
+            surface_occluded: false,
+            surface_zero_sized: false,
+            render_faulted: false,
+            web_viewport_input: WebViewportInputState::default(),
+            build_status: None,
+            background_job: None,
+            last_editor_operation: None,
+            recent_editor_operations: VecDeque::new(),
+            next_editor_operation_id: 1,
+            editor_build_service,
+            editor_build_task: None,
+            run_after_build: false,
+            build_output: String::new(),
+            package_version: "0.1.0-dev".to_string(),
+            package_output_root: "dist/releases".to_string(),
+            project_settings_draft,
+            scene_settings_draft: SceneSettings::default(),
+            entity_clipboard: None,
+            component_clipboard: None,
+            performance: engine_editor::performance::PerformancePanel::new(),
+            saved_workspace_preferences: workspace_preferences.clone(),
+            workspace_preferences,
             frame: 0,
-            mouse_x: 0.0,
-            mouse_y: 0.0,
             window_w: 1600.0,
             window_h: 900.0,
             last_frame_time: Instant::now(),
+            last_recovery_snapshot: Instant::now(),
+            step_play_once: false,
         }
     }
 
@@ -1339,6 +1771,7 @@ impl EditorApp {
                 message,
             ));
         }
+        self.request_ui_open_panel(protocol::UiPanel::Console, protocol::UiDockZone::Bottom);
     }
 
     fn reload_project_manifest(&mut self) -> Result<(), String> {
@@ -1362,6 +1795,15 @@ impl EditorApp {
             .ok_or_else(|| "No editor scene is open".to_string())?;
         save_scene_atomically(&editor_scene.scene, &self.current_scene_path)?;
         editor_scene.history.mark_clean();
+        let recovery = scene_recovery_path(&self.project, &self.current_scene_id);
+        match std::fs::remove_file(&recovery) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %recovery.display(), %error, "could not remove saved recovery snapshot")
+            }
+        }
+        self.pending_recovery = None;
         tracing::info!(
             scene_id = self.current_scene_id,
             scene = %self.current_scene_path.display(),
@@ -1369,6 +1811,97 @@ impl EditorApp {
         );
         self.scene_document_status = Some(format!("Saved '{}'.", self.current_scene_id));
         Ok(())
+    }
+
+    fn maybe_write_recovery_snapshot(&mut self) {
+        const RECOVERY_INTERVAL_SECONDS: u64 = 30;
+        if self.last_recovery_snapshot.elapsed().as_secs() < RECOVERY_INTERVAL_SECONDS {
+            return;
+        }
+        self.last_recovery_snapshot = Instant::now();
+        if !self.play_session.is_editing()
+            || !self
+                .editor_scene
+                .as_ref()
+                .is_some_and(EditorScene::is_dirty)
+        {
+            return;
+        }
+        let Some(scene) = self.editor_scene.as_ref().map(|scene| &scene.scene) else {
+            return;
+        };
+        let recovery = scene_recovery_path(&self.project, &self.current_scene_id);
+        match save_scene_atomically(scene, &recovery) {
+            Ok(()) => {
+                self.build_status = Some(format!(
+                    "Recovery snapshot updated for '{}'.",
+                    self.current_scene_id
+                ));
+            }
+            Err(error) => self.record_scene_document_error(format!(
+                "Could not write recovery snapshot {}: {error}",
+                recovery.display()
+            )),
+        }
+    }
+
+    fn restore_recovery_snapshot(&mut self) -> Result<(), String> {
+        let recovery = self
+            .pending_recovery
+            .clone()
+            .ok_or_else(|| "No recovery snapshot is pending".to_string())?;
+        let scene = Scene::load_from_file(&recovery).map_err(|error| {
+            format!(
+                "Could not load recovery snapshot {}: {error}",
+                recovery.display()
+            )
+        })?;
+        super::project_scripts::validate_runtime_script_references(&self.project, &scene)?;
+        let game_loop = self
+            .game_loop
+            .as_mut()
+            .ok_or_else(|| "Editor runtime is not initialized".to_string())?;
+        let (preview_scene, diagnostics) = editor_preview_scene(&game_loop.runtime, &scene);
+        game_loop.load_scene(preview_scene).map_err(|diagnostics| {
+            format!(
+                "Recovery snapshot could not be restored into the editor runtime: {}",
+                summarize_scene_diagnostics(&diagnostics)
+            )
+        })?;
+        game_loop.init_physics();
+        let mut editor_scene = EditorScene::new_with_component_registry(
+            scene,
+            std::sync::Arc::clone(game_loop.runtime.component_registry()),
+        )
+        .map_err(|error| format!("Recovery snapshot is not authorable: {error}"))?;
+        editor_scene.history.mark_dirty();
+        editor_scene.diagnostics.push_many(diagnostics);
+        self.scene_settings_draft = editor_scene.scene.scene_settings.clone();
+        self.editor_scene = Some(editor_scene);
+        self.selected_entity_ids.clear();
+        self.pending_recovery = None;
+        self.scene_document_status = Some(format!(
+            "Recovered unsaved changes for '{}'; save to keep them.",
+            self.current_scene_id
+        ));
+        Ok(())
+    }
+
+    fn discard_recovery_snapshot(&mut self) -> Result<(), String> {
+        let Some(recovery) = self.pending_recovery.take() else {
+            return Ok(());
+        };
+        match std::fs::remove_file(&recovery) {
+            Ok(()) => {
+                self.scene_document_status = Some("Recovery snapshot discarded.".to_string());
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "Could not discard recovery snapshot {}: {error}",
+                recovery.display()
+            )),
+        }
     }
 
     /// Load and validate a catalog scene before replacing the active document.
@@ -1380,6 +1913,7 @@ impl EditorApp {
         }
         if scene_id == self.current_scene_id {
             self.pending_scene_switch = None;
+            self.pending_document_action = None;
             self.scene_document_status = Some(format!("Scene '{scene_id}' is already open."));
             return Ok(false);
         }
@@ -1411,23 +1945,32 @@ impl EditorApp {
         })?;
         game_loop.init_physics();
 
-        let mut editor_scene = EditorScene::new(scene);
+        let mut editor_scene = EditorScene::new_with_component_registry(
+            scene,
+            std::sync::Arc::clone(game_loop.runtime.component_registry()),
+        )
+        .map_err(|error| format!("Scene '{scene_id}' is not authorable: {error}"))?;
         editor_scene.diagnostics.push_many(preview_diagnostics);
-        self.ui.cancel_text_edit();
+        self.scene_settings_draft = editor_scene.scene.scene_settings.clone();
         self.editor_scene = Some(editor_scene);
+        self.selected_entity_ids.clear();
         self.current_scene_id = scene_id.to_string();
         self.current_scene_path = scene_path;
         self.scene_browser_selection = scene_id.to_string();
         self.pending_scene_switch = None;
-        self.hierarchy.set_selected(None);
-        self.inspector = InspectorPanel::new("Inspector");
+        self.pending_document_action = None;
         self.gizmo.cancel_drag();
         self.gizmo_pointer_events.clear();
-        self.cancel_gizmo_requested = false;
+        self.viewport_tab = ViewportTab::Scene;
         self.material_editor.reset();
         self.material_editor_selection = None;
         self.last_frame_time = Instant::now();
         self.scene_document_status = Some(format!("Opened scene '{scene_id}'."));
+        self.pending_recovery = newer_recovery_snapshot(
+            &self.project,
+            &self.current_scene_id,
+            &self.current_scene_path,
+        );
         tracing::info!(scene_id, scene = %self.current_scene_path.display(), "editor scene opened");
         Ok(true)
     }
@@ -1435,6 +1978,7 @@ impl EditorApp {
     fn request_scene_switch(&mut self, scene_id: String) -> Result<bool, String> {
         if scene_id == self.current_scene_id {
             self.pending_scene_switch = None;
+            self.pending_document_action = None;
             self.scene_document_status = Some(format!("Scene '{scene_id}' is already open."));
             return Ok(false);
         }
@@ -1443,7 +1987,8 @@ impl EditorApp {
             .as_ref()
             .is_some_and(EditorScene::is_dirty)
         {
-            self.pending_scene_switch = Some(scene_id.clone());
+            self.pending_scene_switch = Some(format!("opening scene '{scene_id}'"));
+            self.pending_document_action = Some(SceneDocumentAction::Open(scene_id.clone()));
             self.scene_document_status = Some(format!(
                 "Unsaved changes: choose Save & Switch, Discard & Switch, or Cancel for '{scene_id}'."
             ));
@@ -1452,24 +1997,224 @@ impl EditorApp {
         self.switch_scene_document(&scene_id)
     }
 
+    fn defer_document_action_if_dirty(
+        &mut self,
+        action: SceneDocumentAction,
+        target_label: String,
+    ) -> bool {
+        if !self
+            .editor_scene
+            .as_ref()
+            .is_some_and(EditorScene::is_dirty)
+        {
+            return false;
+        }
+        self.pending_scene_switch = Some(target_label.clone());
+        self.pending_document_action = Some(action);
+        self.scene_document_status = Some(format!(
+            "Unsaved changes must be saved or discarded before {target_label}."
+        ));
+        true
+    }
+
+    fn rename_scene_document(&mut self, old_id: &str, new_id: &str) -> Result<bool, String> {
+        let old_id = old_id.trim();
+        let new_id = new_id.trim();
+        if old_id.is_empty() || new_id.is_empty() {
+            return Err("Scene rename requires both the current and new scene IDs.".to_string());
+        }
+        super::project_cli::rename_project_scene(&self.project.manifest_path, old_id, new_id)?;
+        let reloaded = GameProject::load(&self.project.manifest_path)
+            .map_err(|error| format!("Could not reload renamed scene catalog: {error}"))?;
+
+        if old_id == self.current_scene_id {
+            self.project = reloaded;
+            self.switch_scene_document(new_id)?;
+        } else {
+            self.current_scene_path =
+                reloaded.scene_path(&self.current_scene_id).ok_or_else(|| {
+                    format!(
+                        "Renaming '{old_id}' removed the current scene '{}' from the catalog",
+                        self.current_scene_id
+                    )
+                })?;
+            self.project = reloaded;
+        }
+        self.scene_browser_selection = new_id.to_string();
+        self.scene_operation_id.clear();
+        self.new_scene_id.clear();
+        self.scene_document_status = Some(format!("Renamed scene '{old_id}' to '{new_id}'."));
+        Ok(true)
+    }
+
+    fn delete_scene_document(
+        &mut self,
+        scene_id: &str,
+        replacement_startup: Option<&str>,
+    ) -> Result<bool, String> {
+        let scene_id = scene_id.trim();
+        if scene_id.is_empty() {
+            return Err("No scene was selected for deletion.".to_string());
+        }
+        let deleting_current = scene_id == self.current_scene_id;
+        let deleted = super::project_cli::delete_project_scene(
+            &self.project.manifest_path,
+            scene_id,
+            replacement_startup,
+        )?;
+        let reloaded = GameProject::load(&self.project.manifest_path)
+            .map_err(|error| format!("Could not reload scene catalog after deletion: {error}"))?;
+
+        if deleting_current {
+            let next_scene = deleted
+                .replacement_startup
+                .clone()
+                .unwrap_or_else(|| reloaded.startup_scene_id().to_string());
+            self.project = reloaded;
+            self.switch_scene_document(&next_scene)?;
+            self.scene_browser_selection = next_scene;
+        } else {
+            self.current_scene_path =
+                reloaded.scene_path(&self.current_scene_id).ok_or_else(|| {
+                    format!(
+                        "Deleting '{scene_id}' removed the current scene '{}' from the catalog",
+                        self.current_scene_id
+                    )
+                })?;
+            self.project = reloaded;
+            self.scene_browser_selection = self.current_scene_id.clone();
+        }
+        self.scene_operation_id.clear();
+        self.scene_replacement_id.clear();
+        self.scene_document_status = Some(format!(
+            "Moved scene '{}' to project trash at {} (metadata: {}).",
+            deleted.scene_id,
+            deleted.trash_directory.display(),
+            deleted.metadata_path.display()
+        ));
+        Ok(true)
+    }
+
     fn apply_scene_document_action(&mut self, action: SceneDocumentAction) -> Result<bool, String> {
+        if self.pending_document_action.is_some()
+            && !matches!(&action, SceneDocumentAction::CancelSwitch)
+        {
+            return Err(
+                "Resolve or cancel the pending scene document operation before starting another"
+                    .to_string(),
+            );
+        }
+        self.apply_scene_document_action_after_confirmation(action, false)
+    }
+
+    /// Applies a scene-document action after the caller has explicitly resolved
+    /// the dirty-document prompt. A discarded document must stay dirty until a
+    /// successful switch replaces it; marking it clean up front would turn a
+    /// failed open/create/rename/delete into a false save checkpoint.
+    fn apply_scene_document_action_after_confirmation(
+        &mut self,
+        action: SceneDocumentAction,
+        dirty_prompt_resolved: bool,
+    ) -> Result<bool, String> {
         match action {
-            SceneDocumentAction::Open(scene_id) => self.request_scene_switch(scene_id),
-            SceneDocumentAction::Create(scene_id) => {
+            SceneDocumentAction::Open(scene_id) => {
+                if dirty_prompt_resolved {
+                    self.switch_scene_document(&scene_id)
+                } else {
+                    self.request_scene_switch(scene_id)
+                }
+            }
+            SceneDocumentAction::Create { scene_id, folder } => {
                 let scene_id = scene_id.trim();
                 if scene_id.is_empty() {
                     return Err("New scene ID must not be empty.".to_string());
                 }
-                super::project_cli::create_project_scene(
+                if !dirty_prompt_resolved
+                    && self.defer_document_action_if_dirty(
+                        SceneDocumentAction::Create {
+                            scene_id: scene_id.to_string(),
+                            folder: folder.clone(),
+                        },
+                        format!("creating and opening scene '{scene_id}'"),
+                    )
+                {
+                    return Ok(false);
+                }
+                super::project_cli::create_project_scene_in_folder(
                     &self.project.manifest_path,
                     scene_id,
                     None,
+                    &folder,
                 )?;
                 self.reload_project_manifest()?;
                 self.scene_browser_selection = scene_id.to_string();
                 self.new_scene_id.clear();
+                self.new_scene_folder.clear();
                 self.scene_document_status = Some(format!("Created scene '{scene_id}'."));
-                self.request_scene_switch(scene_id.to_string())
+                self.switch_scene_document(scene_id)
+            }
+            SceneDocumentAction::SaveAs(scene_id) => {
+                let scene_id = scene_id.trim();
+                if scene_id.is_empty() {
+                    return Err("Save As scene ID must not be empty.".to_string());
+                }
+                let source = self
+                    .editor_scene
+                    .as_ref()
+                    .ok_or_else(|| "No editor scene is open".to_string())?
+                    .scene
+                    .clone();
+                super::project_cli::duplicate_project_scene(
+                    &self.project.manifest_path,
+                    scene_id,
+                    &source,
+                )?;
+                self.reload_project_manifest()?;
+                self.scene_browser_selection = scene_id.to_string();
+                self.new_scene_id.clear();
+                self.scene_document_status = Some(format!("Saved scene as '{scene_id}'."));
+                self.switch_scene_document(scene_id)
+            }
+            SceneDocumentAction::Duplicate { source_id, new_id } => {
+                let source_id = source_id.trim();
+                let new_id = new_id.trim();
+                if source_id.is_empty() || new_id.is_empty() {
+                    return Err(
+                        "Scene duplication requires both source and destination IDs.".to_string(),
+                    );
+                }
+                if !dirty_prompt_resolved
+                    && self.defer_document_action_if_dirty(
+                        SceneDocumentAction::Duplicate {
+                            source_id: source_id.to_string(),
+                            new_id: new_id.to_string(),
+                        },
+                        format!("duplicating and opening scene '{new_id}'"),
+                    )
+                {
+                    return Ok(false);
+                }
+                let source_path = self.project.scene_path(source_id).ok_or_else(|| {
+                    format!("Unknown project scene '{source_id}' cannot be duplicated.")
+                })?;
+                let source = Scene::load_from_file(&source_path).map_err(|error| {
+                    format!(
+                        "Could not load scene '{source_id}' from {}: {error}",
+                        source_path.display()
+                    )
+                })?;
+                super::project_cli::duplicate_project_scene(
+                    &self.project.manifest_path,
+                    new_id,
+                    &source,
+                )?;
+                self.reload_project_manifest()?;
+                self.scene_browser_selection = new_id.to_string();
+                self.scene_operation_id.clear();
+                self.new_scene_id.clear();
+                self.scene_document_status =
+                    Some(format!("Duplicated scene '{source_id}' as '{new_id}'."));
+                self.switch_scene_document(new_id)
             }
             SceneDocumentAction::SetStartup(scene_id) => {
                 super::project_cli::set_project_startup_scene(
@@ -1481,15 +2226,42 @@ impl EditorApp {
                     Some(format!("Scene '{scene_id}' is now the startup scene."));
                 Ok(false)
             }
-            SceneDocumentAction::SaveAndSwitch(scene_id) => {
-                self.save_current_scene_document()?;
-                self.switch_scene_document(&scene_id)
+            SceneDocumentAction::Rename { old_id, new_id } => {
+                if !dirty_prompt_resolved
+                    && old_id == self.current_scene_id
+                    && self.defer_document_action_if_dirty(
+                        SceneDocumentAction::Rename {
+                            old_id: old_id.clone(),
+                            new_id: new_id.clone(),
+                        },
+                        format!("renaming scene '{old_id}' to '{new_id}'"),
+                    )
+                {
+                    return Ok(false);
+                }
+                self.rename_scene_document(&old_id, &new_id)
             }
-            SceneDocumentAction::DiscardAndSwitch(scene_id) => {
-                self.switch_scene_document(&scene_id)
+            SceneDocumentAction::Delete {
+                scene_id,
+                replacement_startup,
+            } => {
+                if !dirty_prompt_resolved
+                    && scene_id == self.current_scene_id
+                    && self.defer_document_action_if_dirty(
+                        SceneDocumentAction::Delete {
+                            scene_id: scene_id.clone(),
+                            replacement_startup: replacement_startup.clone(),
+                        },
+                        format!("deleting scene '{scene_id}'"),
+                    )
+                {
+                    return Ok(false);
+                }
+                self.delete_scene_document(&scene_id, replacement_startup.as_deref())
             }
             SceneDocumentAction::CancelSwitch => {
                 self.pending_scene_switch = None;
+                self.pending_document_action = None;
                 self.scene_document_status = Some("Scene switch cancelled.".to_string());
                 Ok(false)
             }
@@ -1501,12 +2273,13 @@ impl EditorApp {
             CloseDocumentAction::SaveAndClose => {
                 self.save_current_scene_document()?;
                 self.pending_scene_switch = None;
+                self.pending_document_action = None;
                 self.close_confirmation_pending = false;
                 self.exit_after_frame = true;
             }
             CloseDocumentAction::DiscardAndClose => {
-                self.ui.cancel_text_edit();
                 self.pending_scene_switch = None;
+                self.pending_document_action = None;
                 self.close_confirmation_pending = false;
                 self.exit_after_frame = true;
             }
@@ -1516,126 +2289,6 @@ impl EditorApp {
             }
         }
         Ok(())
-    }
-
-    fn draw_scene_document_panel(
-        &mut self,
-        editing: bool,
-        dirty: bool,
-    ) -> (
-        Option<SceneDocumentAction>,
-        Option<CloseDocumentAction>,
-        f32,
-    ) {
-        let scene_ids = self
-            .project
-            .scenes()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect::<Vec<_>>();
-        if !scene_ids
-            .iter()
-            .any(|id| id == &self.scene_browser_selection)
-        {
-            self.scene_browser_selection = self.current_scene_id.clone();
-        }
-        let mut selected_index = scene_ids
-            .iter()
-            .position(|id| id == &self.scene_browser_selection)
-            .unwrap_or(0);
-        let can_manage =
-            editing && self.pending_scene_switch.is_none() && !self.close_confirmation_pending;
-        let document_label = if dirty {
-            format!("{} *", self.current_scene_id)
-        } else {
-            self.current_scene_id.clone()
-        };
-
-        self.ui.set_panel_rect(4.0, 38.0, 220.0);
-        self.ui.label_value("Open Scene", &document_label);
-        self.ui
-            .label_value("Catalog Selection", &self.scene_browser_selection);
-        if self
-            .ui
-            .button_enabled("Previous Scene", can_manage && scene_ids.len() > 1)
-        {
-            selected_index = selected_index.checked_sub(1).unwrap_or(scene_ids.len() - 1);
-            self.scene_browser_selection = scene_ids[selected_index].clone();
-        }
-        if self
-            .ui
-            .button_enabled("Next Scene", can_manage && scene_ids.len() > 1)
-        {
-            selected_index = (selected_index + 1) % scene_ids.len();
-            self.scene_browser_selection = scene_ids[selected_index].clone();
-        }
-
-        let mut action = self
-            .ui
-            .button_enabled("Open Selected", can_manage)
-            .then(|| SceneDocumentAction::Open(self.scene_browser_selection.clone()));
-        self.ui
-            .label_value("Startup Scene", self.project.startup_scene_id());
-        if action.is_none() && self.ui.button_enabled("Set As Startup", can_manage) {
-            action = Some(SceneDocumentAction::SetStartup(
-                self.scene_browser_selection.clone(),
-            ));
-        }
-        if let Some(committed) = self.ui.text_field("New Scene ID", &self.new_scene_id) {
-            self.new_scene_id = committed;
-        }
-        if action.is_none() && self.ui.button_enabled("Create Scene", can_manage) {
-            action = Some(SceneDocumentAction::Create(self.new_scene_id.clone()));
-        }
-        self.ui.label_value(
-            "Scene Status",
-            self.scene_document_status.as_deref().unwrap_or("Ready"),
-        );
-
-        let mut hierarchy_top = if let Some(target) = self.pending_scene_switch.clone() {
-            self.ui.label_value("Pending Switch", &target);
-            if self
-                .ui
-                .button_enabled("Save & Switch", editing && !self.close_confirmation_pending)
-            {
-                action = Some(SceneDocumentAction::SaveAndSwitch(target.clone()));
-            }
-            if self.ui.button_enabled(
-                "Discard & Switch",
-                editing && !self.close_confirmation_pending,
-            ) {
-                action = Some(SceneDocumentAction::DiscardAndSwitch(target));
-            }
-            if self.ui.button_enabled(
-                "Cancel Scene Switch",
-                editing && !self.close_confirmation_pending,
-            ) {
-                action = Some(SceneDocumentAction::CancelSwitch);
-            }
-            438.0
-        } else {
-            326.0
-        };
-        let mut close_action = None;
-        if self.close_confirmation_pending {
-            // This is deliberately modal with respect to scene-document
-            // actions. A queued Open click must never change which document a
-            // later Save & Close writes.
-            action = None;
-            self.ui
-                .label_value("Close Editor", "This scene has unsaved changes.");
-            if self.ui.button_enabled("Save & Close", editing) {
-                close_action = Some(CloseDocumentAction::SaveAndClose);
-            }
-            if self.ui.button("Discard & Close") {
-                close_action = Some(CloseDocumentAction::DiscardAndClose);
-            }
-            if self.ui.button("Cancel Close") {
-                close_action = Some(CloseDocumentAction::Cancel);
-            }
-            hierarchy_top += 122.0;
-        }
-        (action, close_action, hierarchy_top)
     }
 
     fn init_scene(&mut self) {
@@ -1665,7 +2318,21 @@ impl EditorApp {
                 tracing::error!(%error, "editor: failed to load project cooked assets");
                 std::process::exit(1);
             }
-            refresh_asset_list(&mut self.asset_browser, game_loop.runtime.asset_registry());
+            let requested_asset_folder = self.workspace_preferences.project_asset_folder.clone();
+            if let Err(error) = refresh_project_asset_list(
+                &mut self.asset_browser,
+                game_loop.runtime.asset_registry(),
+                &self.project.asset_source,
+            ) {
+                let message = format!("Could not load the project asset catalog: {error}");
+                tracing::error!(%message);
+                self.build_status = Some(message);
+            } else {
+                self.asset_browser
+                    .set_current_folder(requested_asset_folder);
+                self.workspace_preferences.project_asset_folder =
+                    self.asset_browser.current_folder().to_string();
+            }
             if let Err(error) = super::project_scripts::prepare_project_scripts(
                 &mut game_loop.runtime,
                 &self.project,
@@ -1697,9 +2364,26 @@ impl EditorApp {
             }
             game_loop.init_physics();
         }
-        let mut editor_scene = EditorScene::new(scene);
+        let component_registry = self
+            .game_loop
+            .as_ref()
+            .map(|game_loop| std::sync::Arc::clone(game_loop.runtime.component_registry()))
+            .unwrap_or_else(|| {
+                tracing::error!("editor: runtime component registry is unavailable");
+                std::process::exit(1);
+            });
+        let mut editor_scene =
+            match EditorScene::new_with_component_registry(scene, component_registry) {
+                Ok(editor_scene) => editor_scene,
+                Err(error) => {
+                    tracing::error!(%error, "editor: startup scene is not authorable");
+                    std::process::exit(1);
+                }
+            };
         editor_scene.diagnostics.push_many(editor_diagnostics);
+        self.scene_settings_draft = editor_scene.scene.scene_settings.clone();
         self.editor_scene = Some(editor_scene);
+        self.selected_entity_ids.clear();
         self.last_frame_time = Instant::now();
         tracing::info!(
             project = self.project.manifest.name,
@@ -1792,7 +2476,7 @@ impl EditorApp {
             }
         }) {
             Ok(true) => {
-                self.ui.cancel_text_edit();
+                self.viewport_tab = ViewportTab::Game;
                 let mut runtime_scene_id = self.current_scene_id.clone();
                 game_loop.init_physics();
                 #[cfg(feature = "target-desktop")]
@@ -1850,6 +2534,11 @@ impl EditorApp {
                 }
             }
         }
+        if self.play_session.is_editing() {
+            self.request_ui_open_panel(protocol::UiPanel::Console, protocol::UiDockZone::Bottom);
+        } else {
+            self.request_ui_open_panel(protocol::UiPanel::Game, protocol::UiDockZone::Center);
+        }
     }
 
     fn pause_play(&mut self) {
@@ -1865,11 +2554,43 @@ impl EditorApp {
         }
     }
 
+    fn step_play(&mut self) {
+        if self.play_session.mode() == EditorPlayMode::Paused {
+            self.step_play_once = true;
+            tracing::info!("editor: Play mode scheduled one fixed simulation step");
+        }
+    }
+
+    fn request_editor_exit(&mut self) {
+        if !self.play_session.is_editing() {
+            self.stop_play();
+            if !self.play_session.is_editing() {
+                self.scene_document_status = Some(
+                    "Could not close while Play mode failed to restore the authoring scene. Retry Stop first."
+                        .to_string(),
+                );
+                return;
+            }
+        }
+        let has_unsaved_changes = self.gizmo.dragging
+            || self
+                .editor_scene
+                .as_ref()
+                .is_some_and(|scene| scene.is_dirty() || scene.is_transform_gizmo_drag_active());
+        if has_unsaved_changes {
+            self.pending_scene_switch = None;
+            self.pending_document_action = None;
+            self.close_confirmation_pending = true;
+            self.scene_document_status = Some(
+                "Unsaved changes: choose Save & Close, Discard & Close, or Cancel Close."
+                    .to_string(),
+            );
+        } else {
+            self.exit_after_frame = true;
+        }
+    }
+
     fn stop_play(&mut self) {
-        // Play/Pause UI state is not authoring data. Clear any focused editor
-        // field before restoring the authoring snapshot so a Stop click cannot
-        // commit a Play-time buffer into it.
-        self.ui.cancel_text_edit();
         let Some(game_loop) = self.game_loop.as_mut() else {
             return;
         };
@@ -1879,6 +2600,7 @@ impl EditorApp {
         }) {
             Ok(true) => {
                 self.play_runtime_scene_id = None;
+                self.viewport_tab = ViewportTab::Scene;
                 game_loop.init_physics();
                 #[cfg(feature = "target-desktop")]
                 self.input_state.reset(&mut game_loop.input_map);
@@ -1893,446 +2615,923 @@ impl EditorApp {
                 log_scene_diagnostics("editor Play stop failed", diagnostics);
             }
         }
+        if self.play_session.is_editing() {
+            self.request_ui_open_panel(protocol::UiPanel::Scene, protocol::UiDockZone::Center);
+        } else {
+            self.request_ui_open_panel(protocol::UiPanel::Console, protocol::UiDockZone::Bottom);
+        }
     }
 
-    fn render_editor_frame(&mut self) {
-        if self.editor_scene.is_none() || self.game_loop.is_none() {
+    fn persist_workspace_preferences_if_changed(&mut self) {
+        let (pitch, yaw, distance) = self.scene_view.camera_orbit();
+        self.workspace_preferences.scene_pitch = pitch;
+        self.workspace_preferences.scene_yaw = yaw;
+        self.workspace_preferences.scene_distance = distance;
+        self.workspace_preferences.scene_target = *self.scene_view.target();
+        self.workspace_preferences.scene_orthographic = self.scene_view.orthographic();
+        self.workspace_preferences.scene_camera_speed = self.scene_view.camera_speed();
+        self.workspace_preferences.snapping_enabled = self.gizmo.snapping;
+        if self.workspace_preferences == self.saved_workspace_preferences {
             return;
         }
+        match save_workspace_preferences(&self.project, &self.workspace_preferences) {
+            Ok(()) => self.saved_workspace_preferences = self.workspace_preferences.clone(),
+            Err(error) => tracing::warn!(%error, "editor workspace preferences were not saved"),
+        }
+    }
 
-        // ── 1. Begin UI frame ──────────────────────────────────────
-        self.ui
-            .set_pointer(self.mouse_x as f32, self.mouse_y as f32);
-        self.ui.begin_frame();
+    fn request_ui_open_panel(
+        &mut self,
+        panel: protocol::UiPanel,
+        preferred_zone: protocol::UiDockZone,
+    ) {
+        let request = protocol::UiOpenPanelParams {
+            panel,
+            preferred_zone,
+        };
+        if self.pending_ui_open_panels.last() != Some(&request) {
+            self.pending_ui_open_panels.push(request);
+        }
+    }
 
-        // ── 2. Layout and render panels ────────────────────────────
-        let gap = 4.0;
-        let content_top = 38.0;
-        let left_w = 220.0;
-        let right_w = 280.0;
-        let center_w = (self.window_w - left_w - right_w - gap * 4.0).max(100.0);
-        let center_left = left_w + gap * 2.0;
-        let scene_controls_w = center_w.min(380.0);
-        let scene_controls_h = 240.0;
-        let asset_browser_left = center_left;
-        let asset_browser_top = (self.window_h - 260.0).max(content_top + scene_controls_h + gap);
-        let asset_browser_w = center_w;
-        let inspector_left = left_w + center_w + gap * 3.0;
-        let scene_interaction_min = Vec2::new(center_left, content_top + scene_controls_h + gap);
-        let scene_interaction_max = Vec2::new(
-            center_left + center_w,
-            (asset_browser_top - gap).max(scene_interaction_min.y),
-        );
+    fn take_ui_open_panel_events_json(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_ui_open_panels)
+            .into_iter()
+            .map(|params| {
+                self.editor_event_sequence = self.editor_event_sequence.wrapping_add(1);
+                serde_json::to_string(&protocol::BridgeEvent {
+                    protocol: protocol::EDITOR_PROTOCOL,
+                    session_id: self.session_id.clone(),
+                    sequence: self.editor_event_sequence,
+                    revision: self.editor_revision,
+                    event: protocol::UI_OPEN_PANEL_EVENT,
+                    params,
+                })
+                .expect("editor UI navigation events must serialize")
+            })
+            .collect()
+    }
 
-        // The renderer currently draws the scene to the full surface, but
-        // editor chrome must still reserve its complete regions from viewport
-        // tools. The remaining center area is the interaction viewport;
-        // concrete widgets declared below take precedence over these blockers.
-        self.ui
-            .block_pointer_rect(0.0, 0.0, self.window_w, content_top);
-        self.ui.block_pointer_rect(
-            0.0,
-            content_top,
-            center_left,
-            (self.window_h - content_top).max(1.0),
-        );
-        self.ui.block_pointer_rect(
-            inspector_left,
-            content_top,
-            (self.window_w - inspector_left).max(1.0),
-            (self.window_h - content_top).max(1.0),
-        );
-        self.ui
-            .block_pointer_rect(center_left, content_top, center_w, scene_controls_h + gap);
-        self.ui.block_pointer_rect(
-            asset_browser_left,
-            asset_browser_top,
-            asset_browser_w,
-            (self.window_h - asset_browser_top).max(1.0),
-        );
-
-        // ── Hierarchy (left) ───────────────────────────────────────
-        let mode_before_toolbar = self.play_session.mode();
-        let had_uncommitted_text_change = self.ui.has_uncommitted_text_change();
-        let dirty = self
-            .editor_scene
-            .as_ref()
-            .is_some_and(EditorScene::is_dirty);
-
-        self.ui.set_panel_rect(gap, 4.0, 124.0);
-        let save_click_sequences = self
-            .ui
-            .ordered_button_clicks("Save Scene", mode_before_toolbar == EditorPlayMode::Editing);
-        self.ui.set_panel_rect(132.0, 4.0, 124.0);
-        let play_click_sequences = match mode_before_toolbar {
-            EditorPlayMode::Editing => self.ui.ordered_button_clicks("Play", true),
-            EditorPlayMode::Paused => self.ui.ordered_button_clicks("Resume", true),
-            EditorPlayMode::Playing => {
-                self.ui.label_value("State", "Playing");
-                Vec::new()
-            }
+    fn execute_editor_command(&mut self, command: Box<dyn engine_editor::Command>) -> bool {
+        let label = command.name().to_string();
+        if !self.play_session.is_editing() {
+            self.record_editor_command_error(&label, "Stop Play mode before editing the scene");
+            return false;
+        }
+        let (Some(game_loop), Some(editor_scene)) =
+            (self.game_loop.as_mut(), self.editor_scene.as_mut())
+        else {
+            self.record_editor_command_error(&label, "Editor scene runtime is not initialized");
+            return false;
         };
-        let play_clicked = !play_click_sequences.is_empty();
-        self.ui.set_panel_rect(260.0, 4.0, 124.0);
-        let pause_clicked = if mode_before_toolbar == EditorPlayMode::Playing {
-            self.ui.button("Pause")
-        } else {
-            self.ui.label_value("Pause", "Unavailable");
-            false
-        };
-        self.ui.set_panel_rect(388.0, 4.0, 124.0);
-        let stop_clicked = if mode_before_toolbar != EditorPlayMode::Editing {
-            self.ui.button("Stop")
-        } else {
-            self.ui.label_value("Stop", "Unavailable");
-            false
-        };
-        let can_undo = mode_before_toolbar == EditorPlayMode::Editing
-            && (had_uncommitted_text_change
-                || self
-                    .editor_scene
-                    .as_ref()
-                    .is_some_and(|scene| scene.history.can_undo()));
-        self.ui.set_panel_rect(516.0, 4.0, 124.0);
-        let undo_click_sequences = self.ui.ordered_button_clicks("Undo", can_undo);
-        let can_redo = mode_before_toolbar == EditorPlayMode::Editing
-            && !had_uncommitted_text_change
-            && self
-                .editor_scene
-                .as_ref()
-                .is_some_and(|scene| scene.history.can_redo());
-        self.ui.set_panel_rect(644.0, 4.0, 124.0);
-        let redo_click_sequences = self.ui.ordered_button_clicks("Redo", can_redo);
-
-        let toolbar_editing = mode_before_toolbar == EditorPlayMode::Editing;
-        self.ui.set_panel_rect(772.0, 4.0, 124.0);
-        let translate_click_sequences = if toolbar_editing {
-            self.ui.ordered_button_clicks(
-                if self.gizmo.mode == GizmoMode::Translate {
-                    "[Move]"
-                } else {
-                    "Move"
-                },
-                true,
-            )
-        } else {
-            self.ui.label_value("Move", "Unavailable");
-            Vec::new()
-        };
-        self.ui.set_panel_rect(900.0, 4.0, 124.0);
-        let rotate_click_sequences = if toolbar_editing {
-            self.ui.ordered_button_clicks(
-                if self.gizmo.mode == GizmoMode::Rotate {
-                    "[Rotate]"
-                } else {
-                    "Rotate"
-                },
-                true,
-            )
-        } else {
-            self.ui.label_value("Rotate", "Unavailable");
-            Vec::new()
-        };
-        self.ui.set_panel_rect(1028.0, 4.0, 124.0);
-        let scale_click_sequences = if toolbar_editing {
-            self.ui.ordered_button_clicks(
-                if self.gizmo.mode == GizmoMode::Scale {
-                    "[Scale]"
-                } else {
-                    "Scale"
-                },
-                true,
-            )
-        } else {
-            self.ui.label_value("Scale", "Unavailable");
-            Vec::new()
-        };
-        self.ui.set_panel_rect(1156.0, 4.0, 124.0);
-        let space_click_sequences = if toolbar_editing {
-            self.ui.ordered_button_clicks(
-                match self.gizmo.space {
-                    GizmoSpace::Local => "Space: Local",
-                    GizmoSpace::Global => "Space: Global",
-                },
-                true,
-            )
-        } else {
-            self.ui.label_value("Space", "Unavailable");
-            Vec::new()
-        };
-        self.ui.set_panel_rect(1284.0, 4.0, 124.0);
-        let snapping_click_sequences = if toolbar_editing {
-            self.ui.ordered_button_clicks(
-                if self.gizmo.snapping {
-                    "Snap: On"
-                } else {
-                    "Snap: Off"
-                },
-                true,
-            )
-        } else {
-            self.ui.label_value("Snap", "Unavailable");
-            Vec::new()
-        };
-        let gizmo_status = if !toolbar_editing {
-            "Disabled"
-        } else if let Some(editor_scene) = self.editor_scene.as_ref() {
-            match editor_scene.selected_entity.as_ref().and_then(|selected| {
-                editor_scene
+        let result = match editor_scene.execute(command) {
+            Ok(()) => {
+                let existing_ids = editor_scene
                     .scene
                     .entities
                     .iter()
-                    .find(|entity| &entity.persistent_id == selected)
-            }) {
-                None => "Select Entity",
-                Some(entity) if !entity.components.contains_key("engine.transform") => {
-                    "Add Transform"
-                }
-                Some(_) => "Drag Axis",
-            }
-        } else {
-            "No Scene"
-        };
-        self.ui.set_panel_rect(1412.0, 4.0, 184.0);
-        self.ui.label_value("Gizmo", gizmo_status);
-
-        let mut ordered_toolbar_actions = Vec::new();
-        let mut append_actions = |sequences: Vec<u64>, action: OrderedToolbarAction| {
-            ordered_toolbar_actions.extend(
-                sequences
-                    .into_iter()
-                    .map(|sequence| OrderedAuthoringInput::Toolbar { sequence, action }),
-            );
-        };
-        append_actions(save_click_sequences, OrderedToolbarAction::Save);
-        append_actions(undo_click_sequences, OrderedToolbarAction::Undo);
-        append_actions(redo_click_sequences, OrderedToolbarAction::Redo);
-        if mode_before_toolbar == EditorPlayMode::Editing {
-            append_actions(play_click_sequences, OrderedToolbarAction::StartPlay);
-        }
-        append_actions(
-            translate_click_sequences,
-            OrderedToolbarAction::SetGizmoMode(GizmoMode::Translate),
-        );
-        append_actions(
-            rotate_click_sequences,
-            OrderedToolbarAction::SetGizmoMode(GizmoMode::Rotate),
-        );
-        append_actions(
-            scale_click_sequences,
-            OrderedToolbarAction::SetGizmoMode(GizmoMode::Scale),
-        );
-        append_actions(
-            space_click_sequences,
-            OrderedToolbarAction::ToggleGizmoSpace,
-        );
-        append_actions(
-            snapping_click_sequences,
-            OrderedToolbarAction::ToggleGizmoSnapping,
-        );
-
-        if play_clicked && mode_before_toolbar == EditorPlayMode::Paused {
-            self.resume_play();
-        }
-        if pause_clicked {
-            self.pause_play();
-        }
-        if stop_clicked {
-            self.stop_play();
-        }
-
-        // Use the mode in which this frame's UI was built. In particular, the
-        // frame containing a Stop click remains read-only; authoring controls
-        // become interactive on the following redraw.
-        let editing = mode_before_toolbar == EditorPlayMode::Editing;
-        let (scene_document_action, close_document_action, hierarchy_top) =
-            self.draw_scene_document_panel(editing, dirty);
-        let inspector_context = project_inspector_context(&self.project);
-        let Some(editor_scene) = self.editor_scene.as_mut() else {
-            return;
-        };
-        let history_push_serial_before_panels = editor_scene.history.push_serial();
-        let Some(game_loop) = self.game_loop.as_mut() else {
-            return;
-        };
-
-        let mut scene_changed = false;
-        let mut gizmo_overlay_batch = None;
-
-        self.ui.set_panel_rect(gap, hierarchy_top, left_w);
-        self.ui.separator();
-        let inspector_selection = editor_scene.selected_entity.clone();
-        let hierarchy_actions =
-            self.hierarchy
-                .ui_with_authoring_ordered(&mut self.ui, &editor_scene.scene, editing);
-        // Hierarchy drawing computes the visual final selection for legacy
-        // callers. Ordered replay owns the actual editor selection here.
-        self.hierarchy.set_selected(inspector_selection.clone());
-        let mut ordered_panel_inputs = Vec::new();
-        if editing {
-            ordered_panel_inputs.extend(
-                hierarchy_actions
-                    .commands
-                    .into_iter()
-                    .map(OrderedAuthoringInput::PanelCommand),
-            );
-        }
-        ordered_panel_inputs.extend(
-            hierarchy_actions
-                .selections
-                .into_iter()
-                .map(OrderedAuthoringInput::Selection),
-        );
-        let inspector_target_exists = inspector_selection.as_ref().is_some_and(|selected| {
-            editor_scene
-                .scene
-                .entities
-                .iter()
-                .any(|entity| &entity.persistent_id == selected)
-        });
-        if inspector_selection.is_some() && !inspector_target_exists {
-            self.ui.cancel_text_edit();
-        }
-
-        // ── Scene View (center) ────────────────────────────────────
-        self.ui
-            .set_panel_rect(center_left, content_top, scene_controls_w);
-        let (_, _, scene_view_actions) = self
-            .scene_view
-            .ui_with_scene_ordered(&mut self.ui, &editor_scene.scene);
-        ordered_panel_inputs.extend(
-            scene_view_actions
-                .into_iter()
-                .map(OrderedAuthoringInput::SceneView),
-        );
-
-        // ── Inspector (right) ──────────────────────────────────────
-        self.ui
-            .set_panel_rect(inspector_left + 4.0, content_top, right_w);
-        if editing {
-            ordered_panel_inputs.extend(
-                edit_current_inspector_selection(
-                    &mut self.inspector,
-                    &mut self.ui,
-                    editor_scene,
-                    &inspector_context,
-                )
-                .into_iter()
-                .map(OrderedAuthoringInput::PanelCommand),
-            );
-        } else {
-            self.ui
-                .label_value("Inspector", "Stop Play to edit entities.");
-        }
-        // Asset browser (center). The registry is authoritative for both
-        // the displayed asset kind and the exact AssetId assigned to a scene.
-        refresh_asset_list(&mut self.asset_browser, game_loop.runtime.asset_registry());
-        self.ui
-            .set_panel_rect(asset_browser_left, asset_browser_top, asset_browser_w);
-        draw_asset_browser(&mut self.ui, &mut self.asset_browser);
-        if self.asset_browser.take_refresh_request() {
-            let refresh_result = if editing {
-                super::project_cli::cook_project(&self.project.manifest_path).and_then(|()| {
-                    super::project_app::load_project_assets(&mut game_loop.runtime, &self.project)
-                })
-            } else {
-                Err("Stop Play before reimporting project assets.".to_string())
-            };
-            match refresh_result {
-                Ok(report) => {
-                    refresh_asset_list(&mut self.asset_browser, game_loop.runtime.asset_registry());
-                    // Force the selected material to be reconstructed from the
-                    // refreshed registry snapshot below.
-                    self.material_editor_selection = None;
-                    tracing::info!(
-                        discovered = report.discovered_assets,
-                        loaded = report.loaded_assets(),
-                        loaded_extensions = report.loaded_extension_assets(),
-                        "editor project assets reimported"
-                    );
-                }
-                Err(error) => {
-                    let mut diagnostic = Diagnostic::new(
-                        "EDASSET_REIMPORT_FAILED",
-                        DiagnosticSeverity::Error,
-                        "editor.asset-browser",
-                        error.clone(),
-                    );
-                    diagnostic.asset = self.asset_browser.selected_asset().cloned();
-                    editor_scene.diagnostics.push(diagnostic);
-                    tracing::error!(%error, "editor project asset reimport failed");
-                }
-            }
-        }
-        if !editing {
-            self.ui
-                .label_value("Assignment", "Stop Play to edit scene assets.");
-        } else if editor_scene.selected_entity.is_none() {
-            self.ui
-                .label_value("Assignment", "Select a scene entity first.");
-        } else if self
-            .asset_browser
-            .selected_assignment_command(
-                editor_scene
+                    .map(|entity| entity.persistent_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                self.selected_entity_ids
+                    .retain(|entity_id| existing_ids.contains(entity_id));
+                let selection_exists = editor_scene
                     .selected_entity
-                    .clone()
-                    .expect("selection was checked above"),
-            )
-            .is_none()
-        {
-            if self.asset_browser.selected_asset().is_some() {
-                self.ui.label_value(
-                    "Assignment",
-                    "Textures are assigned through a material asset.",
+                    .as_ref()
+                    .is_some_and(|id| existing_ids.contains(id));
+                if !selection_exists {
+                    editor_scene.selected_entity = self.selected_entity_ids.first().cloned();
+                } else if let Some(active) = editor_scene.selected_entity.as_ref() {
+                    if !self.selected_entity_ids.contains(active) {
+                        self.selected_entity_ids.push(active.clone());
+                    }
+                }
+                synchronize_authoring_view(
+                    game_loop,
+                    editor_scene,
+                    &self.scene_view,
+                    self.viewport_tab,
                 );
+                Ok((label == "Set Scene Settings")
+                    .then(|| editor_scene.scene.scene_settings.clone()))
             }
-        } else if self.ui.button("Assign Selected Asset") {
-            let stamp = self.ui.take_last_interaction_stamp();
-            let command = editor_scene
-                .selected_entity
-                .clone()
-                .and_then(|entity| self.asset_browser.selected_assignment_command(entity));
-            if let (Some(stamp), Some(command)) = (stamp, command) {
-                ordered_panel_inputs.push(OrderedAuthoringInput::PanelCommand(
-                    SequencedCommand::new(stamp, Box::new(command)),
+            Err(error) => Err(error.to_string()),
+        };
+        match result {
+            Ok(scene_settings) => {
+                if let Some(scene_settings) = scene_settings {
+                    self.scene_settings_draft = scene_settings;
+                }
+                true
+            }
+            Err(error) => {
+                self.record_editor_command_error(&label, error);
+                false
+            }
+        }
+    }
+
+    fn start_editor_job(
+        &mut self,
+        label: impl Into<String>,
+        reload_assets: bool,
+        operation: impl FnOnce() -> Result<EditorJobOutput, String> + Send + 'static,
+    ) -> Result<u64, String> {
+        let label = label.into();
+        if let Some(active) = self.editor_build_task.as_ref() {
+            return Err(format!(
+                "{} is already running; wait before starting {label}.",
+                active.operation().display_name()
+            ));
+        }
+        if let Some(active) = self.background_job.as_ref() {
+            return Err(format!(
+                "{} is already running; wait for it to finish.",
+                active.label
+            ));
+        }
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(operation());
+        });
+        let id = self.next_editor_operation_id;
+        self.next_editor_operation_id = self.next_editor_operation_id.wrapping_add(1);
+        self.build_status = Some(format!("{label} in progress..."));
+        self.set_editor_operation_status(EditorOperationStatus {
+            id,
+            label: label.clone(),
+            state: EditorOperationState::Running,
+        });
+        self.background_job = Some(EditorBackgroundJob {
+            id,
+            label,
+            receiver,
+            reload_assets,
+        });
+        Ok(id)
+    }
+
+    fn poll_editor_job(&mut self) -> bool {
+        let result = self
+            .background_job
+            .as_ref()
+            .and_then(|job| match job.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(format!(
+                    "{} worker terminated without a result",
+                    job.label
+                ))),
+            });
+        let Some(result) = result else {
+            return false;
+        };
+        let job = self
+            .background_job
+            .take()
+            .expect("completed editor job must still be present");
+        match result {
+            Ok(output) => {
+                let refresh_result = (|| {
+                    if job.reload_assets {
+                        let game_loop = self
+                            .game_loop
+                            .as_mut()
+                            .ok_or_else(|| "Editor runtime is not initialized".to_string())?;
+                        super::project_app::load_project_assets(
+                            &mut game_loop.runtime,
+                            &self.project,
+                        )?;
+                        self.material_editor_selection = None;
+                    }
+                    self.refresh_asset_catalog()?;
+                    self.apply_editor_job_output(output)
+                })();
+                match refresh_result {
+                    Ok(()) => {
+                        self.set_editor_operation_status(EditorOperationStatus {
+                            id: job.id,
+                            label: job.label.clone(),
+                            state: EditorOperationState::Succeeded,
+                        });
+                        self.build_status = Some(format!("{} completed successfully.", job.label));
+                    }
+                    Err(error) => {
+                        let warning = format!(
+                            "{} committed its project files, but the editor could not refresh the result: {error}. Do not retry the mutation; use Refresh after resolving the reported error.",
+                            job.label
+                        );
+                        self.set_editor_operation_status(EditorOperationStatus {
+                            id: job.id,
+                            label: job.label.clone(),
+                            state: EditorOperationState::CommittedWithWarning(warning.clone()),
+                        });
+                        self.record_build_error(&format!("{} refresh", job.label), warning);
+                    }
+                }
+            }
+            Err(error) => {
+                self.set_editor_operation_status(EditorOperationStatus {
+                    id: job.id,
+                    label: job.label.clone(),
+                    state: EditorOperationState::Failed(error.clone()),
+                });
+                self.record_build_error(&job.label, error);
+            }
+        }
+        true
+    }
+
+    fn set_editor_operation_status(&mut self, status: EditorOperationStatus) {
+        if let Some(existing) = self
+            .recent_editor_operations
+            .iter_mut()
+            .find(|existing| existing.id == status.id)
+        {
+            *existing = status.clone();
+        } else {
+            self.recent_editor_operations.push_back(status.clone());
+            while self.recent_editor_operations.len() > 16 {
+                self.recent_editor_operations.pop_front();
+            }
+        }
+        self.last_editor_operation = Some(status);
+    }
+
+    fn apply_editor_job_output(&mut self, output: EditorJobOutput) -> Result<(), String> {
+        match output {
+            EditorJobOutput::None => {}
+            EditorJobOutput::SelectAsset(asset_id) => {
+                if !self.asset_browser.reveal_asset(&asset_id) {
+                    return Err(format!(
+                        "asset '{asset_id}' was committed but is missing from the refreshed catalog"
+                    ));
+                }
+            }
+            EditorJobOutput::SelectFolder(folder) => {
+                let normalized = folder.trim().replace('\\', "/");
+                let requested = if normalized.trim_matches('/').is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", normalized.trim_matches('/'))
+                };
+                self.asset_browser.set_current_folder(&requested);
+                if !self
+                    .asset_browser
+                    .current_folder()
+                    .eq_ignore_ascii_case(&requested)
+                {
+                    return Err(format!(
+                        "asset folder '{requested}' was committed but is missing from the refreshed catalog"
+                    ));
+                }
+                self.asset_browser.select_asset(None);
+            }
+            EditorJobOutput::ClearAssetSelection => {
+                self.asset_browser.select_asset(None);
+            }
+        }
+        self.workspace_preferences.project_asset_folder =
+            self.asset_browser.current_folder().to_string();
+        Ok(())
+    }
+
+    fn start_editor_build(&mut self, operation: super::editor_build_ops::EditorBuildOperation) {
+        let label = operation.kind().display_name();
+        if let Some(job) = self.background_job.as_ref() {
+            self.build_status = Some(format!(
+                "{} is already running; wait before starting {label}.",
+                job.label
+            ));
+            return;
+        }
+        if let Some(task) = self.editor_build_task.as_ref() {
+            self.build_status = Some(format!(
+                "{} is already running; cancel it or wait for completion.",
+                task.operation().display_name()
+            ));
+            return;
+        }
+        let task = match self.editor_build_service.as_ref() {
+            Ok(service) => service.start(&self.project.manifest_path, operation),
+            Err(error) => {
+                self.record_build_error(label, error.clone());
+                return;
+            }
+        };
+        match task {
+            Ok(task) => {
+                self.build_output.clear();
+                self.build_status = Some(format!("{label} in progress..."));
+                self.request_ui_open_panel(protocol::UiPanel::Build, protocol::UiDockZone::Bottom);
+                self.editor_build_task = Some(task);
+            }
+            Err(error) => self.record_build_error(label, error.to_string()),
+        }
+    }
+
+    fn poll_editor_build(&mut self) -> bool {
+        let Some(task) = self.editor_build_task.as_mut() else {
+            return false;
+        };
+        let output = task.output_snapshot();
+        self.build_output = match (output.stdout.trim(), output.stderr.trim()) {
+            ("", "") => String::new(),
+            (stdout, "") => stdout.to_string(),
+            ("", stderr) => stderr.to_string(),
+            (stdout, stderr) => format!("{stdout}\n\n--- stderr ---\n{stderr}"),
+        };
+        let Some(result) = task.try_complete() else {
+            return false;
+        };
+        self.editor_build_task = None;
+        match result {
+            Ok(super::editor_build_ops::EditorBuildResult::Validated(result)) => {
+                self.build_status = Some(format!(
+                    "Validated '{}': {} scenes, {} entities, {} declared / {} cooked assets in {:.2}s.",
+                    result.project,
+                    result.scenes,
+                    result.entities,
+                    result.declared_assets,
+                    result.cooked_assets,
+                    result.elapsed.as_secs_f32()
                 ));
             }
-        }
-
-        // ── Material preview (lower right) ─────────────────────────
-        let selected_material =
-            selected_material_asset(&editor_scene.scene, editor_scene.selected_entity.as_ref());
-        if selected_material != self.material_editor_selection {
-            // The material panel is replaced wholesale on selection change.
-            // Discard its focused text buffer before loading the next asset so
-            // a blurred value from material A cannot be consumed by the same
-            // widget label while material B is active.
-            self.ui.cancel_text_edit();
-            match selected_material.as_deref() {
-                Some(material) => {
-                    load_material(
-                        &mut self.material_editor,
-                        material,
-                        game_loop.runtime.asset_registry(),
-                    );
-                    self.material_editor
-                        .set_save_access(project_material_save_access(&self.project, material));
+            Ok(super::editor_build_ops::EditorBuildResult::CookedAndCompiled(result)) => {
+                self.build_status = Some(format!(
+                    "Cooked and compiled '{}' in {:.2}s{}.",
+                    result.project,
+                    result.elapsed.as_secs_f32(),
+                    if result.scripts_configured {
+                        " including project scripts"
+                    } else {
+                        ""
+                    }
+                ));
+                let reload = self
+                    .game_loop
+                    .as_mut()
+                    .ok_or_else(|| "Editor runtime is not initialized".to_string())
+                    .and_then(|game_loop| {
+                        super::project_app::load_project_assets(
+                            &mut game_loop.runtime,
+                            &self.project,
+                        )
+                        .map(|_| ())
+                    });
+                if let Err(error) = reload {
+                    self.run_after_build = false;
+                    self.record_build_error("Cook & Compile asset reload", error);
+                } else if let Err(error) = self.refresh_asset_catalog() {
+                    self.run_after_build = false;
+                    self.record_build_error("Refresh project asset catalog", error);
+                } else if self.run_after_build {
+                    self.run_after_build = false;
+                    match self.launch_project_player() {
+                        Ok(pid) => {
+                            self.build_status = Some(format!(
+                                "Cooked, validated, and started project player ({pid})."
+                            ));
+                        }
+                        Err(error) => self.record_build_error("Run project", error),
+                    }
                 }
-                None => self.material_editor.reset(),
             }
-            self.material_editor_selection = selected_material;
+            Ok(super::editor_build_ops::EditorBuildResult::PackagedWindows(result)) => {
+                self.build_status = Some(format!(
+                    "Packaged Windows player {} in {:.2}s: {} (SHA-256 {}).",
+                    result.version,
+                    result.elapsed.as_secs_f32(),
+                    result.archive_path.display(),
+                    result.archive_sha256
+                ));
+                self.build_output.push_str(&format!(
+                    "\n\nRelease root: {}\nArchive: {}\nArchive SHA-256: {}\nSymbols: {}\nSymbols SHA-256: {}\nManifest: {}\nDirty worktree: {}",
+                    result.release_root.display(),
+                    result.archive_path.display(),
+                    result.archive_sha256,
+                    result.symbols_archive_path.display(),
+                    result.symbols_sha256,
+                    result.release_manifest_path.display(),
+                    result.dirty
+                ));
+            }
+            Err(error) => {
+                self.run_after_build = false;
+                self.record_build_error(error.operation.display_name(), error.to_string())
+            }
         }
-        self.ui
-            .set_panel_rect(inspector_left + 4.0, content_top + 410.0, right_w);
-        if editing {
-            draw_material_editor(&mut self.ui, &mut self.material_editor);
-        } else {
-            self.ui
-                .label_value("Material Editor", "Stop Play to edit materials.");
-        }
+        true
+    }
 
-        let save_request = match self.material_editor.take_save_request() {
+    fn request_run_project(&mut self) {
+        if self.editor_build_task.is_some() || self.background_job.is_some() {
+            self.record_build_error(
+                "Run project",
+                "Wait for the active project operation to finish".to_string(),
+            );
+            return;
+        }
+        if !self.play_session.is_editing() {
+            self.record_build_error(
+                "Run project",
+                "Stop the in-editor Play session before launching the player".to_string(),
+            );
+            return;
+        }
+        if let Err(error) = self.save_current_scene_document() {
+            self.record_build_error("Run project", error);
+            return;
+        }
+        let input_save = self
+            .game_loop
+            .as_ref()
+            .ok_or_else(|| "Editor runtime is not initialized".to_string())
+            .and_then(|game_loop| {
+                super::project_input::save_project_input_map(&self.project, &game_loop.input_map)
+            });
+        if let Err(error) = input_save {
+            self.record_build_error("Run project input settings", error);
+            return;
+        }
+        self.run_after_build = true;
+        self.start_editor_build(super::editor_build_ops::EditorBuildOperation::CookAndCompile);
+        if self.editor_build_task.is_none() {
+            self.run_after_build = false;
+        } else {
+            self.build_status =
+                Some("Saving, validating, cooking, and compiling before Run...".to_string());
+        }
+    }
+
+    fn launch_project_player(&self) -> Result<u32, String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("could not resolve editor executable: {error}"))?;
+        std::process::Command::new(executable)
+            .arg("project")
+            .arg("run")
+            .arg(&self.project.manifest_path)
+            .spawn()
+            .map(|child| child.id())
+            .map_err(|error| format!("could not launch project player: {error}"))
+    }
+
+    fn cancel_editor_build(&mut self) {
+        let Some(task) = self.editor_build_task.as_ref() else {
+            self.build_status = Some("No cancellable build operation is running.".to_string());
+            return;
+        };
+        match task.cancel() {
+            Ok(true) => {
+                self.build_status =
+                    Some(format!("Cancelling {}...", task.operation().display_name()));
+            }
+            Ok(false) => {
+                self.build_status =
+                    Some("The build process has already finished; collecting result.".to_string());
+            }
+            Err(error) => self.record_build_error("Cancel build", error.to_string()),
+        }
+    }
+
+    fn rebuild_and_reload_scripts(&mut self) {
+        if self.background_job.is_some() || self.editor_build_task.is_some() {
+            self.build_status = Some(
+                "Wait for the active project operation before rebuilding scripts.".to_string(),
+            );
+            return;
+        }
+        let Some(game_loop) = self.game_loop.as_mut() else {
+            self.record_build_error(
+                "Rebuild & Reload Scripts",
+                "Editor runtime is not initialized".to_string(),
+            );
+            return;
+        };
+        self.build_status = Some("Rebuilding project scripts...".to_string());
+        match super::project_scripts::rebuild_and_reload_project_scripts(
+            &mut game_loop.runtime,
+            &self.project,
+        ) {
+            Ok(result) => {
+                let verified_classes = game_loop.runtime.verified_script_classes().len();
+                self.build_status = Some(format!(
+                    "Rebuilt and transactionally reloaded {} script assemblies; {} concrete EngineBehaviour classes verified.",
+                    result.assemblies, verified_classes
+                ));
+                self.request_ui_open_panel(protocol::UiPanel::Build, protocol::UiDockZone::Bottom);
+            }
+            Err(error) => self.record_build_error("Rebuild & Reload Scripts", error),
+        }
+    }
+
+    fn verified_script_add_command(
+        &self,
+        assembly_id: &str,
+        class_name: &str,
+    ) -> Result<Box<dyn engine_editor::Command>, String> {
+        if self.project.script_assembly.is_none() {
+            return Err(
+                "game.project.json does not configure a compiled script_assembly".to_string(),
+            );
+        }
+        let runtime = &self
+            .game_loop
+            .as_ref()
+            .ok_or_else(|| "Editor runtime is not initialized".to_string())?
+            .runtime;
+        if !runtime
+            .verified_script_classes()
+            .iter()
+            .any(|class| class.assembly_id == assembly_id && class.class_name == class_name)
+        {
+            return Err(format!(
+                "'{class_name}' is not in the reflection-verified class list for loaded assembly '{assembly_id}'; rebuild and reload scripts"
+            ));
+        }
+        let editor_scene = self
+            .editor_scene
+            .as_ref()
+            .ok_or_else(|| "No editor scene is open".to_string())?;
+        let selected_id = editor_scene
+            .selected_entity
+            .as_ref()
+            .ok_or_else(|| "Select an entity before adding a script".to_string())?;
+        let entity = editor_scene
+            .scene
+            .entities
+            .iter()
+            .find(|entity| &entity.persistent_id == selected_id)
+            .ok_or_else(|| format!("Selected entity '{selected_id}' no longer exists"))?;
+        if entity.components.contains_key("engine.script") {
+            return Err(format!(
+                "Entity '{}' already has an engine.script component",
+                entity.persistent_id
+            ));
+        }
+        let component = ComponentRecord {
+            schema_version: SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: std::collections::BTreeMap::from([
+                ("assembly_id".into(), Value::Str(assembly_id.to_string())),
+                ("class_name".into(), Value::Str(class_name.to_string())),
+            ]),
+        };
+        Ok(Box::new(engine_editor::AddComponent::new(
+            entity.persistent_id.clone(),
+            "engine.script".to_string(),
+            component,
+        )))
+    }
+
+    fn record_build_error(&mut self, label: &str, error: String) {
+        self.build_status = Some(format!("{label} failed: {error}"));
+        if let Some(editor_scene) = self.editor_scene.as_mut() {
+            editor_scene.diagnostics.push(Diagnostic::new(
+                "EDBUILD_FAILED",
+                DiagnosticSeverity::Error,
+                "editor.build",
+                format!("{label} failed: {error}"),
+            ));
+        }
+        self.request_ui_open_panel(protocol::UiPanel::Console, protocol::UiDockZone::Bottom);
+    }
+
+    fn record_editor_command_error(&mut self, label: &str, error: impl Into<String>) {
+        let error = error.into();
+        tracing::error!(label, %error, "editor authoring command failed");
+        self.build_status = Some(format!("{label} failed: {error}"));
+        if let Some(editor_scene) = self.editor_scene.as_mut() {
+            editor_scene.diagnostics.push(Diagnostic::new(
+                "EDCOMMAND_FAILED",
+                DiagnosticSeverity::Error,
+                "editor.command",
+                format!("{label} failed: {error}"),
+            ));
+        }
+        self.request_ui_open_panel(protocol::UiPanel::Console, protocol::UiDockZone::Bottom);
+    }
+
+    fn create_prefab_from_selection(
+        &mut self,
+        asset_id: String,
+        relative_source_path: PathBuf,
+        manifest_name: PathBuf,
+    ) -> Result<(), String> {
+        if !self.play_session.is_editing() {
+            return Err("Stop Play before authoring a prefab".to_string());
+        }
+        if self.background_job.is_some() || self.editor_build_task.is_some() {
+            return Err("Wait for the active project operation to finish".to_string());
+        }
+        let created = (|| {
+            let editor_scene = self
+                .editor_scene
+                .as_ref()
+                .ok_or_else(|| "No editor scene is open".to_string())?;
+            let selected = editor_scene
+                .selected_entity
+                .as_ref()
+                .ok_or_else(|| "Select an entity hierarchy to create a prefab".to_string())?;
+            create_prefab_asset_from_scene(
+                &editor_scene.scene,
+                selected,
+                PrefabAssetCreateRequest {
+                    source_root: &self.project.asset_source,
+                    manifest_path: &manifest_name,
+                    relative_source_path: &relative_source_path,
+                    asset_id: AssetId::new(asset_id),
+                },
+            )
+            .map_err(|error| error.to_string())
+        })()?;
+
+        self.refresh_asset_catalog()?;
+        self.asset_browser
+            .select_asset(Some(created.asset_id.clone()));
+        let source_path = created.source_path.clone();
+        let asset_id = created.asset_id.id.clone();
+        self.start_editor_build(super::editor_build_ops::EditorBuildOperation::CookAndCompile);
+        if self.editor_build_task.is_some() {
+            self.build_status = Some(format!(
+                "Created prefab '{asset_id}' at {}; cooking and compiling it through the project build pipeline...",
+                source_path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn instantiate_prefab_asset(
+        &mut self,
+        asset_id: AssetId,
+        parent_id: Option<PersistentId>,
+    ) -> Result<(), String> {
+        let prepared = (|| {
+            let editor_scene = self
+                .editor_scene
+                .as_ref()
+                .ok_or_else(|| "No editor scene is open".to_string())?;
+            let game_loop = self
+                .game_loop
+                .as_ref()
+                .ok_or_else(|| "Editor runtime is not initialized".to_string())?;
+            if game_loop
+                .runtime
+                .asset_registry()
+                .get::<engine_scene::Prefab>(&asset_id)
+                .is_none()
+            {
+                return Err(format!(
+                    "Prefab '{}' is not loaded. Run Cook & Compile Project, then instantiate it.",
+                    asset_id.id
+                ));
+            }
+            prepare_prefab_instantiation_from_registry(
+                &editor_scene.scene,
+                game_loop.runtime.asset_registry(),
+                &asset_id,
+                parent_id
+                    .clone()
+                    .map(engine_editor::EntityPasteParent::Entity)
+                    .unwrap_or(engine_editor::EntityPasteParent::SceneRoot),
+            )
+            .map_err(|error| match error {
+                PrefabAuthoringError::AssetNotLoaded(missing) => format!(
+                    "Prefab '{missing}' is not loaded. Run Cook & Compile Project, then instantiate it."
+                ),
+                error => error.to_string(),
+            })
+        })();
+        let plan = prepared?;
+        let root = plan.root_entity_id().clone();
+        let count = plan.entity_ids().len();
+        if !self.execute_editor_command(plan.into_command()) {
+            self.request_ui_open_panel(protocol::UiPanel::Console, protocol::UiDockZone::Bottom);
+            return Err("The prefab instantiation command was rejected".to_string());
+        }
+        self.selected_entity_ids = vec![root.clone()];
+        if let Some(editor_scene) = self.editor_scene.as_mut() {
+            editor_scene.selected_entity = Some(root.clone());
+        }
+        self.build_status = Some(format!(
+            "Instantiated prefab '{}' as '{}' ({} entities).",
+            asset_id.id, root, count
+        ));
+        Ok(())
+    }
+
+    fn unpack_prefab_instance(
+        &mut self,
+        entity_id: PersistentId,
+        mode: PrefabUnpackMode,
+    ) -> Result<(), String> {
+        let plan = self
+            .editor_scene
+            .as_ref()
+            .ok_or_else(|| "No editor scene is open".to_string())
+            .and_then(|editor_scene| {
+                prepare_unpack_prefab(&editor_scene.scene, &entity_id, mode)
+                    .map_err(|error| error.to_string())
+            });
+        let plan = plan?;
+        let count = plan.entity_ids().len();
+        if !self.execute_editor_command(plan.into_command()) {
+            self.request_ui_open_panel(protocol::UiPanel::Console, protocol::UiDockZone::Bottom);
+            return Err("The prefab unpack command was rejected".to_string());
+        }
+        self.selected_entity_ids = vec![entity_id.clone()];
+        if let Some(editor_scene) = self.editor_scene.as_mut() {
+            editor_scene.selected_entity = Some(entity_id.clone());
+        }
+        let scope = match mode {
+            PrefabUnpackMode::Instance => "instance",
+            PrefabUnpackMode::Completely => "instance and nested prefab links",
+        };
+        self.build_status = Some(format!(
+            "Unpacked {scope} at '{entity_id}' ({count} prefab link records removed)."
+        ));
+        Ok(())
+    }
+
+    fn refresh_asset_catalog(
+        &mut self,
+    ) -> Result<engine_editor::asset_browser::AssetRefreshSummary, String> {
+        let game_loop = self
+            .game_loop
+            .as_ref()
+            .ok_or_else(|| "Editor runtime is not initialized".to_string())?;
+        let requested_folder = self.workspace_preferences.project_asset_folder.clone();
+        let summary = refresh_project_asset_list(
+            &mut self.asset_browser,
+            game_loop.runtime.asset_registry(),
+            &self.project.asset_source,
+        )
+        .map_err(|error| error.to_string())?;
+        self.asset_browser.set_current_folder(requested_folder);
+        self.workspace_preferences.project_asset_folder =
+            self.asset_browser.current_folder().to_string();
+        Ok(summary)
+    }
+
+    fn copy_component_to_clipboard(
+        &mut self,
+        entity_id: &PersistentId,
+        component_type: &str,
+    ) -> Result<(), String> {
+        let editor_scene = self
+            .editor_scene
+            .as_ref()
+            .ok_or_else(|| "No editor scene is open".to_string())?;
+        let clipboard = engine_editor::ComponentClipboard::capture(
+            &editor_scene.scene,
+            entity_id,
+            &component_type.to_string(),
+        )
+        .map_err(|error| error.to_string())?;
+        self.component_clipboard = Some(clipboard);
+        self.build_status = Some(format!("Copied component '{component_type}'."));
+        Ok(())
+    }
+
+    fn paste_component_to_entities(
+        &mut self,
+        entity_ids: Vec<PersistentId>,
+        component_type: String,
+    ) -> Result<(), String> {
+        let commands = {
+            let editor_scene = self
+                .editor_scene
+                .as_ref()
+                .ok_or_else(|| "No editor scene is open".to_string())?;
+            let clipboard = self
+                .component_clipboard
+                .as_ref()
+                .ok_or_else(|| "The component clipboard is empty".to_string())?;
+            entity_ids
+                .into_iter()
+                .map(|entity_id| {
+                    engine_editor::ReplaceComponent::prepare(
+                        &editor_scene.scene,
+                        entity_id,
+                        component_type.clone(),
+                        clipboard,
+                    )
+                    .map(|command| Box::new(command) as Box<dyn engine_editor::Command>)
+                    .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !self.execute_editor_command(Box::new(engine_editor::CommandBatch::new(
+            "Paste Component Values",
+            commands,
+        ))) {
+            return Err("The component changed before paste could be applied".to_string());
+        }
+        Ok(())
+    }
+
+    fn paste_entity_clipboard(
+        &mut self,
+        parent: engine_editor::EntityPasteParent,
+    ) -> Result<(), String> {
+        let (command, selected) = {
+            let editor_scene = self
+                .editor_scene
+                .as_ref()
+                .ok_or_else(|| "No editor scene is open".to_string())?;
+            let clipboard = self
+                .entity_clipboard
+                .as_ref()
+                .ok_or_else(|| "The entity clipboard is empty".to_string())?;
+            let command =
+                engine_editor::PasteEntityRecords::prepare(&editor_scene.scene, clipboard, parent)
+                    .map_err(|error| error.to_string())?;
+            let selected = command.pasted_root_ids().to_vec();
+            if selected.is_empty() {
+                return Err("The prepared paste has no root entity".to_string());
+            }
+            (
+                Box::new(command) as Box<dyn engine_editor::Command>,
+                selected,
+            )
+        };
+        if !self.execute_editor_command(command) {
+            return Err("The scene changed before the paste could be applied".to_string());
+        }
+        self.selected_entity_ids = selected.clone();
+        if let Some(editor_scene) = self.editor_scene.as_mut() {
+            editor_scene.selected_entity = selected.first().cloned();
+        }
+        Ok(())
+    }
+
+    fn duplicate_entities(&mut self, source_ids: &[PersistentId]) -> Result<(), String> {
+        let (command, selected) = {
+            let editor_scene = self
+                .editor_scene
+                .as_ref()
+                .ok_or_else(|| "No editor scene is open".to_string())?;
+            let clipboard =
+                engine_editor::EntityClipboard::capture(&editor_scene.scene, source_ids)
+                    .map_err(|error| error.to_string())?;
+            let command = engine_editor::PasteEntityRecords::prepare(
+                &editor_scene.scene,
+                &clipboard,
+                engine_editor::EntityPasteParent::PreserveOriginal,
+            )
+            .map_err(|error| error.to_string())?;
+            let selected = command.pasted_root_ids().to_vec();
+            (
+                Box::new(command) as Box<dyn engine_editor::Command>,
+                selected,
+            )
+        };
+        if !self.execute_editor_command(command) {
+            return Err("The scene changed before duplication could be applied".to_string());
+        }
+        self.selected_entity_ids = selected.clone();
+        if let Some(editor_scene) = self.editor_scene.as_mut() {
+            editor_scene.selected_entity = selected.first().cloned();
+        }
+        Ok(())
+    }
+
+    fn process_material_save(&mut self) {
+        let request = match self.material_editor.take_save_request() {
             Ok(request) => request,
+            Err(error) => {
+                self.material_editor.report_save_failure(error.clone());
+                if let Some(editor_scene) = self.editor_scene.as_mut() {
+                    editor_scene.diagnostics.push(Diagnostic::new(
+                        "EDMATERIAL_SAVE_FAILED",
+                        DiagnosticSeverity::Error,
+                        "editor.material",
+                        error,
+                    ));
+                }
+                return;
+            }
+        };
+        let Some(request) = request else {
+            return;
+        };
+        let result = if !self.play_session.is_editing() {
+            Err("Stop Play before saving project materials.".to_string())
+        } else if let Some(game_loop) = self.game_loop.as_mut() {
+            save_project_material(&mut game_loop.runtime, &self.project, &request)
+        } else {
+            Err("Editor runtime is not initialized".to_string())
+        };
+        match result {
+            Ok(outcome) => {
+                self.material_editor.report_save_success(format!(
+                    "Saved {} and refreshed {}.",
+                    outcome.source_path.display(),
+                    outcome.cooked_path.display()
+                ));
+                if let Err(error) = self.refresh_asset_catalog() {
+                    self.record_editor_command_error("Refresh project asset catalog", error);
+                }
+            }
             Err(error) => {
                 self.material_editor.report_save_failure(error.clone());
                 let mut diagnostic = Diagnostic::new(
@@ -2341,707 +3540,634 @@ impl EditorApp {
                     "editor.material",
                     error.clone(),
                 );
-                diagnostic.asset = self.material_editor_selection.as_deref().map(AssetId::new);
-                editor_scene.diagnostics.push(diagnostic);
-                tracing::error!(%error, "editor material save request failed");
-                None
-            }
-        };
-        if let Some(request) = save_request {
-            let result = if editing {
-                save_project_material(&mut game_loop.runtime, &self.project, &request)
-            } else {
-                Err("Stop Play before saving project materials.".to_string())
-            };
-            match result {
-                Ok(outcome) => {
-                    self.material_editor.report_save_success(format!(
-                        "Saved {} and refreshed {}.",
-                        outcome.source_path.display(),
-                        outcome.cooked_path.display()
-                    ));
-                    refresh_asset_list(&mut self.asset_browser, game_loop.runtime.asset_registry());
-                    tracing::info!(
-                        material = %request.material_asset,
-                        source = %outcome.source_path.display(),
-                        cooked = %outcome.cooked_path.display(),
-                        "editor material saved"
-                    );
-                }
-                Err(error) => {
-                    self.material_editor.report_save_failure(error.clone());
-                    let mut diagnostic = Diagnostic::new(
-                        "EDMATERIAL_SAVE_FAILED",
-                        DiagnosticSeverity::Error,
-                        "editor.material",
-                        error.clone(),
-                    );
-                    diagnostic.asset = Some(AssetId::new(request.material_asset.clone()));
+                diagnostic.asset = Some(AssetId::new(request.material_asset));
+                if let Some(editor_scene) = self.editor_scene.as_mut() {
                     editor_scene.diagnostics.push(diagnostic);
-                    tracing::error!(
-                        material = %request.material_asset,
-                        %error,
-                        "editor material save failed"
-                    );
                 }
+                tracing::error!(%error, "editor material save failed");
             }
         }
-        if scene_changed {
-            let selection_exists = editor_scene
-                .selected_entity
-                .as_ref()
-                .is_some_and(|selected| {
-                    editor_scene
-                        .scene
-                        .entities
-                        .iter()
-                        .any(|entity| &entity.persistent_id == selected)
-                });
-            if !selection_exists {
-                editor_scene.selected_entity = None;
-                self.hierarchy.set_selected(None);
-            }
-        }
+    }
 
-        // Toolbar clicks and raw viewport input carry the same sequence
-        // allocated in `on_event`. Replaying the merged stream is what makes
-        // both Drag -> Undo and Undo -> Drag (and the corresponding Save/mode
-        // pairs) obey platform order even when no redraw occurs in between.
-        let _cancel_gizmo = std::mem::take(&mut self.cancel_gizmo_requested);
-        let selection_changed_before_replay = editor_scene
-            .active_transform_gizmo_entity()
-            .is_some_and(|active| editor_scene.selected_entity.as_ref() != Some(active));
-
-        if !editing || selection_changed_before_replay {
-            if editor_scene.cancel_transform_gizmo_drag() {
-                scene_changed = true;
-            }
+    fn process_gizmo_inputs(&mut self) {
+        if !gizmo_viewport_enabled(
+            self.workspace_preferences.gizmos_visible,
+            self.play_session.is_editing(),
+            self.viewport_tab,
+        ) {
+            self.gizmo_pointer_events.clear();
             self.gizmo.cancel_drag();
-            if !editing {
-                self.gizmo_pointer_events.clear();
+            if let Some(editor_scene) = self.editor_scene.as_mut() {
+                let _ = editor_scene.cancel_transform_gizmo_drag();
             }
+            return;
         }
-
-        ordered_panel_inputs.extend(ordered_toolbar_actions);
-        let ordered_inputs = merge_ordered_authoring_inputs(
-            ordered_panel_inputs,
-            std::mem::take(&mut self.gizmo_pointer_events),
-        );
-
-        let mut start_play_after_edit = false;
-        let mut authoring_barrier_reached = false;
-        let mut replay_gizmo_view = None;
-        if editing && scene_changed {
-            // Panel edits still precede phase-one ordered replay. Refreshing
-            // here at least guarantees the first viewport sample uses their
-            // actual transform rather than a stale runtime view.
-            synchronize_editor_preview_and_camera(game_loop, editor_scene, &self.scene_view);
-        }
-
-        for input in ordered_inputs {
-            if authoring_barrier_reached {
+        let Some((interaction_min, interaction_max, render_viewport)) = editor_render_viewport(
+            self.web_viewport_rect,
+            self.window_scale_factor,
+            Vec2::new(self.window_w, self.window_h),
+        ) else {
+            self.gizmo_pointer_events.clear();
+            self.gizmo.cancel_drag();
+            return;
+        };
+        let events = std::mem::take(&mut self.gizmo_pointer_events);
+        let mut scene_changed = false;
+        for event in events {
+            if event == GizmoPointerEvent::Cancel {
+                if let Some(editor_scene) = self.editor_scene.as_mut() {
+                    scene_changed |= editor_scene.cancel_transform_gizmo_drag();
+                }
+                self.gizmo.cancel_drag();
                 continue;
             }
-            match input {
-                OrderedAuthoringInput::Gizmo(event) => {
-                    if !editing {
-                        continue;
-                    }
-                    if event.event == GizmoPointerEvent::Cancel {
-                        scene_changed |= editor_scene.cancel_transform_gizmo_drag();
-                        self.gizmo.cancel_drag();
-                        replay_gizmo_view = None;
-                        continue;
-                    }
-                    let Some(selected) = editor_scene.selected_entity.clone() else {
-                        continue;
-                    };
-                    let view = replay_gizmo_view.or_else(|| {
-                        runtime_gizmo_view(
-                            &game_loop.runtime,
-                            &selected,
-                            self.frame,
-                            Vec2::new(self.window_w, self.window_h),
-                        )
-                        .and_then(|view| {
-                            restrict_gizmo_view_to_rect(
-                                view,
-                                scene_interaction_min,
-                                scene_interaction_max,
-                            )
-                        })
-                    });
-                    let Some(view) = view else {
-                        scene_changed |= editor_scene.cancel_transform_gizmo_drag();
-                        self.gizmo.cancel_drag();
-                        replay_gizmo_view = None;
-                        continue;
-                    };
-                    scene_changed |= process_gizmo_pointer_events(
-                        vec![event.event],
-                        editor_scene,
-                        &mut self.gizmo,
-                        &self.ui,
-                        &game_loop.runtime,
-                        &selected,
-                        view,
-                    );
-                    replay_gizmo_view = self.gizmo.dragging.then_some(view);
-                }
-                OrderedAuthoringInput::Toolbar { action, .. } => {
-                    if !editing {
-                        continue;
-                    }
-                    let had_incomplete_gizmo =
-                        self.gizmo.dragging || editor_scene.is_transform_gizmo_drag_active();
-                    if had_incomplete_gizmo {
-                        scene_changed |= editor_scene.cancel_transform_gizmo_drag();
-                        self.gizmo.cancel_drag();
-                        replay_gizmo_view = None;
-                    }
-                    match action {
-                        OrderedToolbarAction::Save => {
-                            match save_scene_atomically(
-                                &editor_scene.scene,
-                                &self.current_scene_path,
-                            ) {
-                                Ok(()) => {
-                                    editor_scene.history.mark_clean();
-                                    self.scene_document_status =
-                                        Some(format!("Saved '{}'.", self.current_scene_id));
-                                    tracing::info!(
-                                        scene_id = self.current_scene_id,
-                                        scene = %self.current_scene_path.display(),
-                                        "editor scene saved"
-                                    );
-                                }
-                                Err(error) => {
-                                    self.scene_document_status = Some(error.clone());
-                                    tracing::error!(%error, "editor scene save failed");
-                                }
-                            }
-                        }
-                        OrderedToolbarAction::Undo => {
-                            if should_apply_history_undo(
-                                true,
-                                had_incomplete_gizmo,
-                                had_uncommitted_text_change,
-                                history_push_serial_before_panels,
-                                editor_scene.history.push_serial(),
-                                editor_scene.history.can_undo(),
-                            ) {
-                                match editor_scene.undo() {
-                                    Ok(()) => {
-                                        scene_changed = true;
-                                        synchronize_editor_preview_and_camera(
-                                            game_loop,
-                                            editor_scene,
-                                            &self.scene_view,
-                                        );
-                                        replay_gizmo_view = None;
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(%error, "editor undo failed");
-                                    }
-                                }
-                            }
-                        }
-                        OrderedToolbarAction::Redo => {
-                            if !had_incomplete_gizmo && editor_scene.history.can_redo() {
-                                match editor_scene.redo() {
-                                    Ok(()) => {
-                                        scene_changed = true;
-                                        synchronize_editor_preview_and_camera(
-                                            game_loop,
-                                            editor_scene,
-                                            &self.scene_view,
-                                        );
-                                        replay_gizmo_view = None;
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(%error, "editor redo failed");
-                                    }
-                                }
-                            }
-                        }
-                        OrderedToolbarAction::StartPlay => {
-                            start_play_after_edit = true;
-                            authoring_barrier_reached = true;
-                        }
-                        OrderedToolbarAction::SetGizmoMode(mode) => self.gizmo.mode = mode,
-                        OrderedToolbarAction::ToggleGizmoSpace => {
-                            self.gizmo.space = match self.gizmo.space {
-                                GizmoSpace::Local => GizmoSpace::Global,
-                                GizmoSpace::Global => GizmoSpace::Local,
-                            };
-                        }
-                        OrderedToolbarAction::ToggleGizmoSnapping => {
-                            self.gizmo.snapping = !self.gizmo.snapping;
-                        }
-                    }
-                }
-                OrderedAuthoringInput::PanelCommand(command) => {
-                    if !editing {
-                        continue;
-                    }
-                    if self.gizmo.dragging || editor_scene.is_transform_gizmo_drag_active() {
-                        scene_changed |= editor_scene.cancel_transform_gizmo_drag();
-                        self.gizmo.cancel_drag();
-                    }
-                    replay_gizmo_view = None;
-                    match editor_scene.execute(command.command) {
-                        Ok(()) => {
-                            scene_changed = true;
-                            let selection_exists = editor_scene
-                                .selected_entity
-                                .as_ref()
-                                .is_some_and(|selected| {
-                                    editor_scene
-                                        .scene
-                                        .entities
-                                        .iter()
-                                        .any(|entity| &entity.persistent_id == selected)
-                                });
-                            if !selection_exists {
-                                editor_scene.selected_entity = None;
-                                self.hierarchy.set_selected(None);
-                            }
-                            synchronize_editor_preview_and_camera(
-                                game_loop,
-                                editor_scene,
-                                &self.scene_view,
-                            );
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "ordered editor panel command failed");
-                        }
-                    }
-                }
-                OrderedAuthoringInput::Selection(selection) => {
-                    let changes_target = editor_scene
-                        .active_transform_gizmo_entity()
-                        .is_some_and(|active| selection.selection.as_ref() != Some(active));
-                    if changes_target {
-                        scene_changed |= editor_scene.cancel_transform_gizmo_drag();
-                        self.gizmo.cancel_drag();
-                    }
-                    replay_gizmo_view = None;
-                    editor_scene.selected_entity = selection.selection.clone();
-                    self.hierarchy.set_selected(selection.selection);
-                }
-                OrderedAuthoringInput::SceneView(action) => {
-                    self.scene_view.apply_action(action.action);
-                    if editing && action.action.affects_camera() {
-                        let _ = apply_editor_camera(&game_loop.runtime, &self.scene_view);
-                        // A drag keeps the camera/view captured by its press so
-                        // changing the editor camera mid-gesture cannot bend
-                        // its axis. The next gesture observes this new camera.
-                        if !self.gizmo.dragging {
-                            replay_gizmo_view = None;
-                        }
-                    }
-                }
+            let press = match event {
+                GizmoPointerEvent::Press(pointer) => Some(pointer),
+                _ => None,
+            };
+            if press.is_some_and(|pointer| {
+                pointer.x < interaction_min.x
+                    || pointer.y < interaction_min.y
+                    || pointer.x > interaction_max.x
+                    || pointer.y > interaction_max.y
+            }) {
+                continue;
             }
-        }
-
-        if scene_changed {
-            let selection_exists = editor_scene
-                .selected_entity
+            let selected = self
+                .editor_scene
                 .as_ref()
-                .is_some_and(|selected| {
-                    editor_scene
-                        .scene
-                        .entities
-                        .iter()
-                        .any(|entity| &entity.persistent_id == selected)
-                });
-            if !selection_exists {
-                editor_scene.selected_entity = None;
-                self.hierarchy.set_selected(None);
-            }
-        }
-
-        if scene_changed {
-            synchronize_editor_preview(game_loop, editor_scene);
-        }
-
-        if editing {
-            let _ = apply_editor_camera(&game_loop.runtime, &self.scene_view);
-        }
-
-        // Build after scene synchronisation so inspector edits, undo/redo and
-        // a just-committed drag all render the current transform. The batch is
-        // inserted before normal UI batches later, keeping panels above it.
-        if editing {
-            if let Some(selected) = editor_scene.selected_entity.as_deref() {
-                if let Some(view) = runtime_gizmo_view(
+                .and_then(|scene| scene.selected_entity.clone());
+            let Some(selected) = selected else {
+                if let Some(pointer) = press {
+                    let picked = self.game_loop.as_ref().and_then(|game_loop| {
+                        pick_runtime_entity(
+                            &game_loop.runtime,
+                            self.frame,
+                            render_viewport,
+                            interaction_min,
+                            interaction_max,
+                            pointer,
+                        )
+                    });
+                    if let Some(editor_scene) = self.editor_scene.as_mut() {
+                        editor_scene.selected_entity = picked;
+                    }
+                }
+                continue;
+            };
+            let view = self.game_loop.as_ref().and_then(|game_loop| {
+                runtime_gizmo_view(&game_loop.runtime, &selected, self.frame, render_viewport)
+                    .and_then(|view| {
+                        restrict_gizmo_view_to_rect(view, interaction_min, interaction_max)
+                    })
+            });
+            let Some(view) = view else {
+                self.gizmo.cancel_drag();
+                continue;
+            };
+            if let (Some(game_loop), Some(editor_scene)) =
+                (self.game_loop.as_ref(), self.editor_scene.as_mut())
+            {
+                scene_changed |= process_gizmo_pointer_events(
+                    vec![event],
+                    editor_scene,
+                    &mut self.gizmo,
                     &game_loop.runtime,
-                    selected,
-                    self.frame,
-                    Vec2::new(self.window_w, self.window_h),
-                )
-                .and_then(|view| {
-                    restrict_gizmo_view_to_rect(view, scene_interaction_min, scene_interaction_max)
-                }) {
-                    gizmo_overlay_batch = build_gizmo_ui_batch(
-                        &self.gizmo,
-                        view.world_position,
-                        view.world_rotation,
-                        view.view,
-                        view.projection,
-                        view.viewport_size,
+                    &selected,
+                    view,
+                );
+            }
+            if let Some(pointer) = press.filter(|_| !self.gizmo.dragging) {
+                let picked = self.game_loop.as_ref().and_then(|game_loop| {
+                    pick_runtime_entity(
+                        &game_loop.runtime,
+                        self.frame,
+                        render_viewport,
+                        interaction_min,
+                        interaction_max,
+                        pointer,
                     )
-                    .map(|batch| offset_gizmo_batch(batch, view));
+                });
+                if let Some(editor_scene) = self.editor_scene.as_mut() {
+                    editor_scene.selected_entity = picked;
                 }
             }
         }
+        if scene_changed {
+            if let (Some(game_loop), Some(editor_scene)) =
+                (self.game_loop.as_mut(), self.editor_scene.as_mut())
+            {
+                synchronize_authoring_view(
+                    game_loop,
+                    editor_scene,
+                    &self.scene_view,
+                    self.viewport_tab,
+                );
+            }
+        }
+    }
 
-        let preview_request = self.material_editor.take_preview_request();
+    fn tick_editor_play_mode(&mut self, delta_seconds: f32) {
+        let stepping = std::mem::take(&mut self.step_play_once)
+            && self.play_session.mode() == EditorPlayMode::Paused;
+        if !self.play_session.should_tick() && !stepping {
+            return;
+        }
+        let (Some(game_loop), Some(editor_scene)) =
+            (self.game_loop.as_mut(), self.editor_scene.as_mut())
+        else {
+            return;
+        };
+        game_loop.update(if stepping { 1.0 / 60.0 } else { delta_seconds });
+        if let Err(error) =
+            super::project_scripts::fail_on_script_errors(&game_loop.runtime, "update")
+        {
+            let diagnostics =
+                recover_play_after_script_error(&mut self.play_session, game_loop, error);
+            editor_scene.diagnostics.push_many(diagnostics);
+            self.play_runtime_scene_id = None;
+            #[cfg(feature = "target-desktop")]
+            self.input_state.reset(&mut game_loop.input_map);
+            return;
+        }
+        let Some(runtime_scene_id) = self.play_runtime_scene_id.as_mut() else {
+            return;
+        };
+        if let Err(error) = super::project_app::process_pending_scene_transitions(
+            game_loop,
+            &self.project,
+            runtime_scene_id,
+        ) {
+            let diagnostics =
+                recover_play_after_scene_transition_error(&mut self.play_session, game_loop, error);
+            editor_scene.diagnostics.push_many(diagnostics);
+            self.play_runtime_scene_id = None;
+            #[cfg(feature = "target-desktop")]
+            self.input_state.reset(&mut game_loop.input_map);
+        }
+    }
 
-        // ── 3. End UI frame ────────────────────────────────────────
+    fn render_react_frame(&mut self) -> EditorFrameOutcome {
+        if self.editor_scene.is_none() || self.game_loop.is_none() {
+            return EditorFrameOutcome::Completed;
+        }
+        let editor_job_completed = self.poll_editor_job();
+        let editor_build_completed = self.poll_editor_build();
+        if editor_job_completed || editor_build_completed {
+            self.editor_revision = self.editor_revision.wrapping_add(1);
+            self.pending_full_snapshot = true;
+        }
+        self.maybe_write_recovery_snapshot();
+        if let Some(game_loop) = self.game_loop.as_ref() {
+            engine_editor::animation_preview::refresh_animation_assets(
+                &mut self.animation_preview,
+                game_loop.runtime.asset_registry(),
+            );
+        }
+
+        self.process_material_save();
+        self.process_gizmo_inputs();
+
         let now = Instant::now();
         let delta_seconds = now
             .duration_since(self.last_frame_time)
             .as_secs_f32()
             .min(0.1);
         self.last_frame_time = now;
-        if self.play_session.should_tick() {
-            game_loop.update(delta_seconds);
-            if let Err(error) =
-                super::project_scripts::fail_on_script_errors(&game_loop.runtime, "update")
-            {
-                tracing::error!(%error, "editor: script update failed");
-                let diagnostics =
-                    recover_play_after_script_error(&mut self.play_session, game_loop, error);
-                log_scene_diagnostics(
-                    "editor Play stopped after script update failure",
-                    diagnostics.clone(),
+        engine_editor::animation_preview::update_preview(
+            &mut self.animation_preview,
+            delta_seconds,
+        );
+        self.tick_web_viewport_camera(delta_seconds);
+        if self.play_session.is_editing() && self.viewport_tab == ViewportTab::Scene {
+            if let Some(game_loop) = self.game_loop.as_ref() {
+                let _ = apply_editor_camera(&game_loop.runtime, &self.scene_view);
+            }
+        }
+        self.tick_editor_play_mode(delta_seconds);
+
+        let Some((interaction_min, interaction_max, render_viewport)) = editor_render_viewport(
+            self.web_viewport_rect,
+            self.window_scale_factor,
+            Vec2::new(self.window_w, self.window_h),
+        ) else {
+            self.frame = self.frame.wrapping_add(1);
+            return EditorFrameOutcome::Completed;
+        };
+        let gizmo_batch = if gizmo_viewport_enabled(
+            self.workspace_preferences.gizmos_visible,
+            self.play_session.is_editing(),
+            self.viewport_tab,
+        ) {
+            self.editor_scene.as_ref().and_then(|editor_scene| {
+                let selected = editor_scene.selected_entity.as_deref()?;
+                let game_loop = self.game_loop.as_ref()?;
+                let view =
+                    runtime_gizmo_view(&game_loop.runtime, selected, self.frame, render_viewport)?;
+                let view = restrict_gizmo_view_to_rect(view, interaction_min, interaction_max)?;
+                build_gizmo_ui_batch(
+                    &self.gizmo,
+                    view.world_position,
+                    view.world_rotation,
+                    view.view,
+                    view.projection,
+                    view.viewport_size,
+                )
+                .map(|batch| offset_gizmo_batch(batch, view))
+            })
+        } else {
+            None
+        };
+
+        let mut engine_overlay_batches = Vec::new();
+        if let Some(batch) = gizmo_batch {
+            engine_overlay_batches.push(batch);
+        }
+        let overlay_batch_count = engine_overlay_batches.len();
+        let overlay_vertex_count = engine_overlay_batches
+            .iter()
+            .map(|batch: &UiBatch| batch.vertices.len())
+            .sum::<usize>();
+        let Some(game_loop) = self.game_loop.as_mut() else {
+            return EditorFrameOutcome::Completed;
+        };
+        let outcome = match game_loop.render_embedded_viewport(
+            self.frame,
+            engine_overlay_batches,
+            render_viewport,
+        ) {
+            Ok(stats) => {
+                if self.render_faulted {
+                    tracing::info!(frame = self.frame, "editor renderer recovered");
+                }
+                self.render_faulted = false;
+                let _ = game_loop.runtime.with_world(|world| {
+                    engine_editor::performance::record_frame(
+                        &mut self.performance.frame_stats,
+                        world,
+                        Some(&stats),
+                    );
+                });
+                self.performance.frame_stats.frame_time_ms =
+                    editor_frame_time_ms(self.performance.frame_stats.frame_time_ms, delta_seconds);
+                self.performance.frame_stats.asset_count = game_loop
+                    .runtime
+                    .asset_registry()
+                    .cached_ids()
+                    .len()
+                    .try_into()
+                    .unwrap_or(u32::MAX);
+                self.performance.commit_frame();
+                tracing::debug!(
+                    frame = self.frame,
+                    draw_calls = stats.draw_calls,
+                    overlay_batches = overlay_batch_count,
+                    overlay_vertices = overlay_vertex_count,
+                    "React editor viewport frame"
                 );
-                editor_scene.diagnostics.push_many(diagnostics);
-                self.play_runtime_scene_id = None;
-                #[cfg(feature = "target-desktop")]
-                self.input_state.reset(&mut game_loop.input_map);
-                self.last_frame_time = Instant::now();
-            } else if let Some(runtime_scene_id) = self.play_runtime_scene_id.as_mut() {
-                match super::project_app::process_pending_scene_transitions(
-                    game_loop,
-                    &self.project,
-                    runtime_scene_id,
-                ) {
-                    Ok(transitions) => {
-                        if transitions > 0 {
-                            tracing::info!(
-                                transitions,
-                                scene_id = runtime_scene_id,
-                                "editor Play scene transition completed"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "editor Play scene transition failed");
-                        let diagnostics = recover_play_after_scene_transition_error(
-                            &mut self.play_session,
-                            game_loop,
-                            error,
-                        );
-                        log_scene_diagnostics(
-                            "editor Play stopped after scene transition failure",
-                            diagnostics.clone(),
-                        );
-                        editor_scene.diagnostics.push_many(diagnostics);
-                        self.play_runtime_scene_id = None;
-                        #[cfg(feature = "target-desktop")]
-                        self.input_state.reset(&mut game_loop.input_map);
-                        self.last_frame_time = Instant::now();
-                    }
+                EditorFrameOutcome::Completed
+            }
+            Err(diagnostics) => {
+                if !self.render_faulted {
+                    super::log_renderer_diagnostics("editor render", &diagnostics);
                 }
+                self.render_faulted = true;
+                EditorFrameOutcome::Failed
             }
-        }
-
-        let mut ui_batches = self.ui.end_frame().build_batches();
-        if let Some(batch) = gizmo_overlay_batch {
-            ui_batches.insert(0, batch);
-        }
-
-        if let Some(request) = preview_request {
-            let revision = request.revision;
-            match game_loop
-                .runtime
-                .renderer_mut()
-                .upload_texture(material_preview_upload(&request))
-            {
-                Ok(_) => {
-                    if !self
-                        .material_editor
-                        .complete_preview(revision, MATERIAL_PREVIEW_TEXTURE_ID)
-                    {
-                        tracing::warn!(
-                            revision,
-                            "editor material preview completed after a newer edit"
-                        );
-                    }
-                }
-                Err(diagnostics) => {
-                    self.material_editor.fail_preview(revision);
-                    for diagnostic in diagnostics {
-                        tracing::error!(
-                            code = diagnostic.code,
-                            message = diagnostic.message,
-                            "editor material preview upload failed"
-                        );
-                    }
-                }
-            }
-        }
-
-        // ── 4. Render 3D scene ─────────────────────────────────────
-        match game_loop
-            .runtime
-            .render_frame_with_ui(self.frame, ui_batches)
-        {
-            Ok(stats) => tracing::debug!(
-                frame = self.frame,
-                draw_calls = stats.draw_calls,
-                "editor frame"
-            ),
-            Err(diags) => {
-                for d in &diags {
-                    tracing::error!(code = d.code, msg = d.message, "editor render failed");
-                }
-                std::process::exit(1);
-            }
-        }
-
-        self.frame += 1;
-        let had_scene_document_action = scene_document_action.is_some();
-        let had_close_document_action = close_document_action.is_some();
-        if let Some(action) = scene_document_action {
-            if let Err(error) = self.apply_scene_document_action(action) {
-                self.record_scene_document_error(error);
-            }
-        }
-        if let Some(action) = close_document_action {
-            if let Err(error) = self.apply_close_document_action(action) {
-                self.record_scene_document_error(error);
-            }
-        }
-        if start_play_after_edit
-            && !had_scene_document_action
-            && !had_close_document_action
-            && !self.close_confirmation_pending
-        {
-            self.start_play();
-        }
+        };
+        self.frame = self.frame.wrapping_add(1);
+        outcome
     }
-}
-
-impl WindowApp for EditorApp {
-    fn on_create(&mut self, window: Arc<Window>) {
-        let size = window.inner_size();
-        self.window_w = size.width as f32;
-        self.window_h = size.height as f32;
-        self.ui.resize(self.window_w, self.window_h);
-
-        let display_handle = match window.display_handle() {
-            Ok(h) => h.as_raw(),
-            Err(e) => {
-                tracing::error!("display handle: {e}");
-                std::process::exit(1);
-            }
-        };
-        let window_handle = match window.window_handle() {
-            Ok(h) => h.as_raw(),
-            Err(e) => {
-                tracing::error!("window handle: {e}");
-                std::process::exit(1);
-            }
-        };
-
-        match create_vulkan_backend_renderer(
+    fn initialize_native_surface(
+        &mut self,
+        display_handle: raw_window_handle::RawDisplayHandle,
+        window_handle: raw_window_handle::RawWindowHandle,
+        width: u32,
+        height: u32,
+        scale_factor: f64,
+    ) -> Result<(), String> {
+        self.surface_zero_sized = width == 0 || height == 0;
+        self.surface_occluded = false;
+        self.render_faulted = false;
+        self.window_w = width.max(1) as f32;
+        self.window_h = height.max(1) as f32;
+        self.window_scale_factor = scale_factor;
+        let backend = create_vulkan_backend_renderer(
             display_handle,
             window_handle,
-            size.width.max(1),
-            size.height.max(1),
+            width.max(1),
+            height.max(1),
             std::env::var("ENGINE_VK_VALIDATION").is_ok(),
             None,
-        ) {
-            Ok(backend) => {
-                let mut game_loop = GameLoop::new(EngineConfig {
-                    application_name: format!("{} Editor", self.project.manifest.name),
-                });
-                #[cfg(feature = "target-desktop")]
-                match super::project_input::load_project_input_map(&self.project) {
-                    Ok(input_map) => game_loop.input_map = input_map,
-                    Err(error) => {
-                        tracing::error!(%error, "editor: failed to load project input actions");
-                        std::process::exit(1);
-                    }
-                }
-                game_loop.runtime.renderer_mut().set_backend(backend);
-                self.game_loop = Some(game_loop);
-                tracing::info!("editor: Vulkan backend initialized");
-            }
-            Err(e) => {
-                tracing::error!("Vulkan backend creation failed: {e}");
-                std::process::exit(1);
-            }
-        }
+        )
+        .map_err(|error| format!("Vulkan backend creation failed: {error}"))?;
 
+        let mut game_loop = GameLoop::new(EngineConfig {
+            application_name: format!("{} Editor", self.project.manifest.name),
+        });
+        #[cfg(feature = "target-desktop")]
+        {
+            game_loop.input_map = super::project_input::load_project_input_map(&self.project)
+                .map_err(|error| format!("editor input actions failed to load: {error}"))?;
+        }
+        game_loop.runtime.set_renderer_backend(backend);
+        self.game_loop = Some(game_loop);
         self.init_scene();
-        tracing::info!("editor: fully initialized");
+        tracing::info!("React editor host and Vulkan viewport initialized");
+        Ok(())
     }
 
-    fn on_event(&mut self, window: &Window, event: PlatformEvent) -> EventFlow {
+    fn surface_render_suspended(&self) -> bool {
+        self.surface_occluded || self.surface_zero_sized
+    }
+
+    fn handle_native_surface_resize(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale_factor: Option<f64>,
+    ) -> HostDirective {
+        if let Some(scale_factor) = scale_factor {
+            self.window_scale_factor = scale_factor;
+            self.web_viewport_rect = ScreenRect::default();
+        }
+        self.cancel_web_viewport_input();
+        self.surface_zero_sized = width == 0 || height == 0;
+        self.window_w = width as f32;
+        self.window_h = height as f32;
+        if self.surface_zero_sized {
+            return HostDirective::Continue;
+        }
+
+        if let Some(game_loop) = self.game_loop.as_mut() {
+            if let Err(diagnostics) = game_loop.runtime.resize_renderer(width, height) {
+                if !self.render_faulted {
+                    let operation = if scale_factor.is_some() {
+                        "editor DPI resize"
+                    } else {
+                        "editor resize"
+                    };
+                    super::log_renderer_diagnostics(operation, &diagnostics);
+                }
+                self.render_faulted = true;
+                return HostDirective::Continue;
+            }
+        }
+
+        self.last_frame_time = Instant::now();
+        if self.surface_occluded {
+            HostDirective::Continue
+        } else {
+            HostDirective::RequestRedraw
+        }
+    }
+
+    fn handle_dropped_asset(&mut self, path: PathBuf) {
         if !self.play_session.is_editing() {
-            #[cfg(feature = "target-desktop")]
-            if should_route_event_to_gameplay(&self.ui, &event) {
-                if let Some(game_loop) = self.game_loop.as_mut() {
-                    self.input_state
-                        .apply_platform_event(&mut game_loop.input_map, &event);
-                }
-            }
-            #[cfg(feature = "runtime-subsystems")]
-            if let Some(game_loop) = self.game_loop.as_mut() {
-                route_editor_play_ui_event(game_loop, &self.ui, &event);
-            }
+            self.record_build_error(
+                "Import asset",
+                "Stop Play mode before importing dropped files".to_string(),
+            );
+            return;
         }
-        let event_sequence = self.next_platform_event_sequence;
-        self.next_platform_event_sequence = self.next_platform_event_sequence.wrapping_add(1);
-        match event {
-            PlatformEvent::MouseMoved { x, y } => {
-                self.mouse_x = x;
-                self.mouse_y = y;
-                self.ui
-                    .set_pointer_with_sequence(x as f32, y as f32, event_sequence);
-                self.gizmo_pointer_events.push(SequencedGizmoPointerEvent {
-                    sequence: event_sequence,
-                    event: GizmoPointerEvent::Move(Vec2::new(x as f32, y as f32)),
-                });
-            }
-            PlatformEvent::MousePressed { button, x, y } => {
-                if button == platform::MouseButton::Left {
-                    self.mouse_x = x;
-                    self.mouse_y = y;
-                    self.ui
-                        .set_pointer_with_sequence(x as f32, y as f32, event_sequence);
-                    self.ui.set_mouse_pressed_with_sequence(event_sequence);
-                    self.gizmo_pointer_events.push(SequencedGizmoPointerEvent {
-                        sequence: event_sequence,
-                        event: GizmoPointerEvent::Press(Vec2::new(x as f32, y as f32)),
-                    });
-                }
-            }
-            PlatformEvent::MouseReleased { button, x, y } => {
-                if button == platform::MouseButton::Left {
-                    self.mouse_x = x;
-                    self.mouse_y = y;
-                    self.ui
-                        .set_pointer_with_sequence(x as f32, y as f32, event_sequence);
-                    self.ui.set_mouse_released_with_sequence(event_sequence);
-                    self.gizmo_pointer_events.push(SequencedGizmoPointerEvent {
-                        sequence: event_sequence,
-                        event: GizmoPointerEvent::Release(Vec2::new(x as f32, y as f32)),
-                    });
-                }
-            }
-            PlatformEvent::CharacterTyped { character } => {
-                self.ui
-                    .type_character_with_sequence(character, event_sequence);
-            }
-            PlatformEvent::KeyPressed { key, .. } => {
-                if key == platform::KeyCode::Escape {
-                    self.cancel_gizmo_requested = true;
-                    self.gizmo_pointer_events.push(SequencedGizmoPointerEvent {
-                        sequence: event_sequence,
-                        event: GizmoPointerEvent::Cancel,
-                    });
-                }
-                if let Some(key) = map_editor_key(key) {
-                    self.ui.press_key_with_sequence(key, event_sequence);
-                }
-            }
-            PlatformEvent::Focused(false) => {
-                // A release outside the window is not guaranteed to arrive.
-                // Clear capture without synthesizing a click, then cancel any
-                // uncommitted scene gesture.
-                self.ui.cancel_pointer_interaction();
-                self.ui.cancel_text_edit();
-                self.cancel_gizmo_requested = true;
-                self.gizmo_pointer_events.push(SequencedGizmoPointerEvent {
-                    sequence: event_sequence,
-                    event: GizmoPointerEvent::Cancel,
-                });
-            }
-            PlatformEvent::Suspended => {
-                self.ui.cancel_pointer_interaction();
-                self.ui.cancel_text_edit();
-                self.cancel_gizmo_requested = true;
-                self.gizmo_pointer_events.push(SequencedGizmoPointerEvent {
-                    sequence: event_sequence,
-                    event: GizmoPointerEvent::Cancel,
-                });
-            }
-            PlatformEvent::Resized { width, height } => {
-                self.ui.cancel_pointer_interaction();
-                self.ui.cancel_text_edit();
-                self.cancel_gizmo_requested = true;
-                self.gizmo_pointer_events.push(SequencedGizmoPointerEvent {
-                    sequence: event_sequence,
-                    event: GizmoPointerEvent::Cancel,
-                });
-                self.window_w = width as f32;
-                self.window_h = height as f32;
-                self.ui.resize(self.window_w, self.window_h);
-                if let Some(ref mut game_loop) = self.game_loop {
-                    if let Err(diagnostics) = game_loop.runtime.renderer_mut().resize(width, height)
-                    {
-                        super::log_renderer_diagnostics("editor resize", &diagnostics);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            PlatformEvent::Redraw => {
-                self.render_editor_frame();
-                if self.exit_after_frame {
-                    return EventFlow::Exit;
-                }
-                window.request_redraw();
-            }
-            PlatformEvent::CloseRequested => {
-                if !self.play_session.is_editing() {
-                    self.stop_play();
-                    if !self.play_session.is_editing() {
-                        self.scene_document_status = Some(
-                            "Could not close while Play mode failed to restore the authoring scene. Retry Stop or cancel Play errors first."
-                                .to_string(),
-                        );
-                        window.request_redraw();
-                        return EventFlow::Continue;
-                    }
-                }
-                let has_unsaved_changes = self.ui.has_uncommitted_text_change()
-                    || self.gizmo.dragging
-                    || self.editor_scene.as_ref().is_some_and(|scene| {
-                        scene.is_dirty() || scene.is_transform_gizmo_drag_active()
-                    });
-                if has_unsaved_changes {
-                    self.pending_scene_switch = None;
-                    self.close_confirmation_pending = true;
-                    self.scene_document_status = Some(
-                        "Unsaved changes: choose Save & Close, Discard & Close, or Cancel Close."
-                            .to_string(),
-                    );
-                    window.request_redraw();
+        if self.background_job.is_some() {
+            self.record_build_error(
+                "Import asset",
+                "Wait for the current asset operation to finish before dropping another file"
+                    .to_string(),
+            );
+            return;
+        }
+        let mut asset_id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("asset")
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                    character
                 } else {
-                    return EventFlow::Exit;
+                    '_'
                 }
-            }
-            _ => {}
+            })
+            .collect::<String>();
+        if asset_id.is_empty()
+            || !asset_id
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+        {
+            asset_id.insert(0, 'a');
         }
-        EventFlow::Continue
+        let project_path = self.project.manifest_path.clone();
+        let source_path = path.clone();
+        let imported_id = asset_id.clone();
+        if let Err(error) = self.start_editor_job("Asset import", true, move || {
+            super::project_cli::import_project_asset_from(
+                project_path,
+                source_path,
+                asset_id,
+                None,
+                PathBuf::new(),
+            )?;
+            Ok(EditorJobOutput::SelectAsset(imported_id))
+        }) {
+            self.record_build_error("Asset import", error);
+            return;
+        }
+        self.request_ui_open_panel(protocol::UiPanel::Project, protocol::UiDockZone::Bottom);
+        self.build_status = Some(format!("Importing dropped asset '{}'.", path.display()));
+    }
+
+    fn project_changed_json(&mut self) -> String {
+        self.pending_full_snapshot = false;
+        self.editor_event_sequence = self.editor_event_sequence.wrapping_add(1);
+        serde_json::to_string(&protocol::BridgeEvent {
+            protocol: protocol::EDITOR_PROTOCOL,
+            session_id: self.session_id.clone(),
+            sequence: self.editor_event_sequence,
+            revision: self.editor_revision,
+            event: protocol::PROJECT_CHANGED_EVENT,
+            params: self.editor_snapshot(),
+        })
+        .expect("editor snapshots must serialize")
+    }
+
+    fn telemetry_json(&mut self) -> String {
+        self.editor_event_sequence = self.editor_event_sequence.wrapping_add(1);
+        serde_json::to_string(&protocol::BridgeEvent {
+            protocol: protocol::EDITOR_PROTOCOL,
+            session_id: self.session_id.clone(),
+            sequence: self.editor_event_sequence,
+            revision: self.editor_revision,
+            event: protocol::TELEMETRY_EVENT,
+            params: self.editor_telemetry(),
+        })
+        .expect("editor telemetry must serialize")
+    }
+
+    fn take_frame_bridge_messages(&mut self, periodic_telemetry: bool) -> Vec<String> {
+        let mut messages = if self.pending_full_snapshot {
+            vec![self.project_changed_json()]
+        } else if periodic_telemetry {
+            vec![self.telemetry_json()]
+        } else {
+            Vec::new()
+        };
+        messages.extend(self.take_ui_open_panel_events_json());
+        messages
+    }
+
+    fn handle_close_requested(&mut self) -> bool {
+        if !self.play_session.is_editing() {
+            self.stop_play();
+            if !self.play_session.is_editing() {
+                self.scene_document_status = Some(
+                    "Could not close while Play mode failed to restore the authoring scene. Retry Stop or cancel Play errors first."
+                        .to_string(),
+                );
+                return false;
+            }
+        }
+        let has_unsaved_changes = self.gizmo.dragging
+            || self
+                .editor_scene
+                .as_ref()
+                .is_some_and(|scene| scene.is_dirty() || scene.is_transform_gizmo_drag_active());
+        if has_unsaved_changes {
+            self.pending_scene_switch = None;
+            self.pending_document_action = None;
+            self.close_confirmation_pending = true;
+            self.scene_document_status = Some(
+                "Unsaved changes: choose Save & Close, Discard & Close, or Cancel Close."
+                    .to_string(),
+            );
+            self.editor_revision = self.editor_revision.wrapping_add(1);
+            false
+        } else {
+            true
+        }
     }
 }
 
+fn host_message_script(message: &str) -> String {
+    let argument = serde_json::to_string(message).expect("IPC JSON must be serializable as JS");
+    format!("window.__ENGINE_EDITOR_RECEIVE__?.({argument});")
+}
+
+fn host_messages(messages: impl IntoIterator<Item = String>) -> HostDirective {
+    HostDirective::Batch(
+        messages
+            .into_iter()
+            .map(|message| HostDirective::EvaluateScript(host_message_script(&message)))
+            .chain(std::iter::once(HostDirective::RequestRedraw))
+            .collect(),
+    )
+}
+
+impl EditorHostClient for EditorApp {
+    fn on_host_event(&mut self, event: HostEvent) -> HostDirective {
+        match event {
+            HostEvent::SurfaceReady {
+                window_handle,
+                display_handle,
+                size,
+                scale_factor,
+            } => match self.initialize_native_surface(
+                display_handle,
+                window_handle,
+                size.width,
+                size.height,
+                scale_factor,
+            ) {
+                Ok(()) => HostDirective::RequestRedraw,
+                Err(error) => {
+                    tracing::error!(%error, "editor native surface initialization failed");
+                    HostDirective::Exit
+                }
+            },
+            HostEvent::Ipc(raw) => {
+                let messages = self.dispatch_ipc_json(&raw).json_messages;
+                host_messages(messages)
+            }
+            HostEvent::FileDropped { paths, position: _ } => {
+                for path in paths {
+                    self.handle_dropped_asset(path);
+                }
+                self.editor_revision = self.editor_revision.wrapping_add(1);
+                let mut messages = vec![self.project_changed_json()];
+                messages.extend(self.take_ui_open_panel_events_json());
+                host_messages(messages)
+            }
+            HostEvent::Resized(size) => {
+                self.handle_native_surface_resize(size.width, size.height, None)
+            }
+            HostEvent::ScaleFactorChanged { scale_factor, size } => {
+                self.handle_native_surface_resize(size.width, size.height, Some(scale_factor))
+            }
+            HostEvent::Occluded(occluded) => {
+                self.surface_occluded = occluded;
+                if occluded {
+                    self.cancel_web_viewport_input();
+                    HostDirective::Continue
+                } else if self.surface_zero_sized {
+                    HostDirective::Continue
+                } else {
+                    self.last_frame_time = Instant::now();
+                    HostDirective::RequestRedraw
+                }
+            }
+            HostEvent::Focused(focused) => {
+                if !focused {
+                    self.persist_workspace_preferences_if_changed();
+                    self.cancel_web_viewport_input();
+                    #[cfg(feature = "runtime-subsystems")]
+                    if let Some(game_loop) = self.game_loop.as_mut() {
+                        game_loop.cancel_ui_pointer();
+                    }
+                }
+                if focused && !self.surface_render_suspended() {
+                    HostDirective::RequestRedraw
+                } else {
+                    HostDirective::Continue
+                }
+            }
+            HostEvent::Redraw => {
+                if self.surface_render_suspended() {
+                    return HostDirective::Continue;
+                }
+                let outcome = self.render_react_frame();
+                if self.exit_after_frame {
+                    return HostDirective::Exit;
+                }
+                if outcome == EditorFrameOutcome::Failed {
+                    let messages = self.take_frame_bridge_messages(false);
+                    return if messages.is_empty() {
+                        HostDirective::Continue
+                    } else {
+                        host_messages(messages)
+                    };
+                }
+                let messages = self.take_frame_bridge_messages(self.frame % 12 == 0);
+                if messages.is_empty() {
+                    HostDirective::RequestRedraw
+                } else {
+                    host_messages(messages)
+                }
+            }
+            HostEvent::CloseRequested => {
+                self.persist_workspace_preferences_if_changed();
+                if self.handle_close_requested() {
+                    HostDirective::Exit
+                } else {
+                    let mut messages = vec![self.project_changed_json()];
+                    messages.extend(self.take_ui_open_panel_events_json());
+                    host_messages(messages)
+                }
+            }
+        }
+    }
+}
 pub fn run_editor(project_path: PathBuf) {
     let project = match GameProject::load(&project_path) {
         Ok(project) => project,
@@ -3060,14 +4186,15 @@ pub fn run_editor(project_path: PathBuf) {
     }
     let title = format!("{} - Engine Editor", project.manifest.name);
     let app = EditorApp::new(project);
-    if let Err(e) = platform::run(
-        WindowDescriptor {
-            title,
-            width: 1600,
-            height: 900,
-        },
-        app,
-    ) {
+    let mut config = EditorHostConfig::new(title, EDITOR_WEB_ASSETS)
+        .with_initial_size(1600, 900)
+        .with_minimum_size(1120, 680);
+    #[cfg(debug_assertions)]
+    if let Ok(url) = std::env::var("ENGINE_EDITOR_WEB_DEV_URL") {
+        tracing::info!(%url, "loading React editor from the loopback development server");
+        config = config.with_development_url(url);
+    }
+    if let Err(e) = engine_editor_host::run_editor_host(config, app) {
         tracing::error!("editor: {e}");
         std::process::exit(1);
     }
@@ -3078,18 +4205,44 @@ mod tests {
     use super::*;
     use engine_asset::cook::{MaterialSource, MATERIAL_SOURCE_SCHEMA};
     use engine_asset::project::ProjectManifest;
-    use engine_renderer::{MaterialUpload, MeshUpload};
+    use engine_renderer::{BackendRenderer, MaterialUpload, MeshUpload};
 
     #[test]
-    fn pending_text_undo_only_targets_a_command_created_by_that_redraw() {
-        assert!(should_apply_history_undo(true, false, true, 4, 5, true));
-        assert!(
-            !should_apply_history_undo(true, false, true, 4, 4, true),
-            "rejected text must not undo an older unrelated command"
-        );
-        assert!(should_apply_history_undo(true, false, false, 4, 4, true));
-        assert!(!should_apply_history_undo(true, true, false, 4, 4, true));
-        assert!(!should_apply_history_undo(true, false, false, 4, 4, false));
+    fn editor_frame_time_uses_cpu_interval_until_gpu_timing_is_available() {
+        assert_eq!(editor_frame_time_ms(4.25, 1.0 / 60.0), 4.25);
+        assert!((editor_frame_time_ms(0.0, 1.0 / 60.0) - 16.666_668).abs() < 0.001);
+        assert_eq!(editor_frame_time_ms(f32::NAN, f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn project_browser_view_and_folder_round_trip_in_workspace_preferences() {
+        let mut preferences = EditorWorkspacePreferences {
+            project_asset_view: ProjectAssetView::List,
+            project_asset_folder: "/materials/environment".to_string(),
+            gizmos_visible: false,
+            snapping_enabled: true,
+            ..EditorWorkspacePreferences::default()
+        };
+        let json = serde_json::to_vec(&preferences).unwrap();
+        let restored: EditorWorkspacePreferences = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.project_asset_view, ProjectAssetView::List);
+        assert_eq!(restored.project_asset_folder, "/materials/environment");
+        assert!(!restored.gizmos_visible);
+        assert!(restored.snapping_enabled);
+
+        preferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(preferences.project_asset_view, ProjectAssetView::Grid);
+        assert_eq!(preferences.project_asset_folder, "/");
+        assert!(preferences.gizmos_visible);
+        assert!(!preferences.snapping_enabled);
+    }
+
+    #[test]
+    fn gizmo_rendering_requires_visible_editing_scene_viewport() {
+        assert!(gizmo_viewport_enabled(true, true, ViewportTab::Scene));
+        assert!(!gizmo_viewport_enabled(false, true, ViewportTab::Scene));
+        assert!(!gizmo_viewport_enabled(true, false, ViewportTab::Scene));
+        assert!(!gizmo_viewport_enabled(true, true, ViewportTab::Game));
     }
 
     #[test]
@@ -3190,6 +4343,428 @@ mod tests {
         app
     }
 
+    fn dispatch_test_request(
+        app: &mut EditorApp,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let request = serde_json::json!({
+            "id": format!("test-{method}"),
+            "protocol": protocol::EDITOR_PROTOCOL,
+            "sessionId": app.session_id.as_str(),
+            "baseRevision": app.editor_revision,
+            "method": method,
+            "params": params,
+        });
+        let messages = app.dispatch_ipc_json(&request.to_string());
+        serde_json::from_str(
+            messages
+                .json_messages
+                .first()
+                .expect("dispatch must return a response"),
+        )
+        .unwrap()
+    }
+
+    fn make_scene_dirty(app: &mut EditorApp, name: &str) {
+        app.editor_scene
+            .as_mut()
+            .unwrap()
+            .execute(Box::new(engine_editor::SetEntityName::new(
+                "cube-01".into(),
+                Some(name.into()),
+            )))
+            .unwrap();
+    }
+
+    fn persisted_cube_name(app: &EditorApp) -> Option<String> {
+        Scene::load_from_file(&app.current_scene_path)
+            .unwrap()
+            .entities
+            .into_iter()
+            .find(|entity| entity.persistent_id == "cube-01")
+            .and_then(|entity| entity.name)
+    }
+
+    #[derive(Default)]
+    struct ResizeBackend;
+
+    impl BackendRenderer for ResizeBackend {
+        fn resize(
+            &mut self,
+            _width: u32,
+            _height: u32,
+        ) -> Result<(), Vec<engine_renderer::Diagnostic>> {
+            Ok(())
+        }
+    }
+
+    fn send_viewport_bounds(app: &mut EditorApp, viewport: &str, visible: bool, rect: ScreenRect) {
+        let request = serde_json::json!({
+            "id": "viewport-bounds-test",
+            "protocol": protocol::EDITOR_PROTOCOL,
+            "sessionId": app.session_id.as_str(),
+            "method": "viewport.bounds",
+            "params": {
+                "viewport": viewport,
+                "visible": visible,
+                "rect": rect,
+            },
+        });
+        let _ = app.dispatch_ipc_json(&request.to_string());
+    }
+
+    fn seed_active_web_input(app: &mut EditorApp) {
+        app.web_viewport_input.pointer_id = Some(7);
+        app.web_viewport_input.pointer = Some(Vec2::new(20.0, 30.0));
+        app.web_viewport_input.buttons = 1;
+        app.web_viewport_input.keys.insert("KeyW".to_string());
+        app.web_viewport_input.focused = true;
+    }
+
+    #[test]
+    fn hidden_or_switched_web_viewports_cancel_captured_input() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        app.web_viewport_rect = ScreenRect {
+            x: 10.0,
+            y: 20.0,
+            width: 640.0,
+            height: 480.0,
+        };
+        seed_active_web_input(&mut app);
+
+        send_viewport_bounds(&mut app, "scene", false, ScreenRect::default());
+        assert!(app.web_viewport_input.pointer_id.is_none());
+        assert_eq!(app.web_viewport_input.buttons, 0);
+        assert!(app.web_viewport_input.keys.is_empty());
+        assert!(!app.web_viewport_input.focused);
+        assert_eq!(app.web_viewport_rect.width, 0.0);
+
+        seed_active_web_input(&mut app);
+        send_viewport_bounds(
+            &mut app,
+            "game",
+            true,
+            ScreenRect {
+                x: 30.0,
+                y: 40.0,
+                width: 800.0,
+                height: 450.0,
+            },
+        );
+        assert_eq!(app.viewport_tab, ViewportTab::Game);
+        assert!(app.web_viewport_input.pointer_id.is_none());
+        assert_eq!(app.web_viewport_input.buttons, 0);
+        assert!(app.web_viewport_input.keys.is_empty());
+        assert_eq!(app.web_viewport_rect.x, 30.0);
+        assert_eq!(app.web_viewport_rect.width, 800.0);
+    }
+
+    #[test]
+    fn minimized_or_occluded_surfaces_stop_redraw_and_resume_once_visible() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        app.game_loop
+            .as_mut()
+            .unwrap()
+            .runtime
+            .set_renderer_backend(Box::<ResizeBackend>::default());
+        seed_active_web_input(&mut app);
+
+        assert_eq!(
+            app.handle_native_surface_resize(0, 0, None),
+            HostDirective::Continue
+        );
+        assert!(app.surface_zero_sized);
+        assert!(app.web_viewport_input.pointer_id.is_none());
+        let frame = app.frame;
+        assert_eq!(
+            app.on_host_event(HostEvent::Redraw),
+            HostDirective::Continue
+        );
+        assert_eq!(app.frame, frame);
+
+        assert_eq!(
+            app.on_host_event(HostEvent::Occluded(true)),
+            HostDirective::Continue
+        );
+        assert_eq!(
+            app.handle_native_surface_resize(1280, 720, None),
+            HostDirective::Continue
+        );
+        assert!(!app.surface_zero_sized);
+        assert!(app.surface_occluded);
+        assert_eq!(
+            app.on_host_event(HostEvent::Occluded(false)),
+            HostDirective::RequestRedraw
+        );
+        assert!(!app.surface_render_suspended());
+    }
+
+    #[test]
+    fn renderer_failure_stops_self_redraw_and_external_retry_can_recover() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        app.web_viewport_rect = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 640.0,
+            height: 480.0,
+        };
+        app.window_w = 640.0;
+        app.window_h = 480.0;
+
+        assert_eq!(
+            app.on_host_event(HostEvent::Redraw),
+            HostDirective::Continue
+        );
+        assert!(app.render_faulted);
+        assert_eq!(
+            app.on_host_event(HostEvent::Redraw),
+            HostDirective::Continue
+        );
+
+        app.game_loop
+            .as_mut()
+            .unwrap()
+            .runtime
+            .set_renderer_backend(Box::<crate::qa::QaBackend>::default());
+        assert_eq!(
+            app.on_host_event(HostEvent::Redraw),
+            HostDirective::RequestRedraw
+        );
+        assert!(!app.render_faulted);
+    }
+
+    #[test]
+    fn periodic_frame_event_serializes_only_complete_telemetry_domains() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        let messages = app.take_frame_bridge_messages(true);
+
+        assert_eq!(messages.len(), 1);
+        let event: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(event["event"], protocol::TELEMETRY_EVENT);
+        assert_eq!(event["revision"], app.editor_revision);
+        let params = event["params"].as_object().unwrap();
+        assert!(params.contains_key("performance"));
+        assert!(params.contains_key("animation"));
+        assert!(params.contains_key("build"));
+        assert_eq!(params.len(), 3);
+        assert!(!params.contains_key("hierarchy"));
+        assert!(!params.contains_key("projectName"));
+    }
+
+    #[test]
+    fn completed_background_job_bumps_revision_and_sends_one_full_snapshot() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        let revision = app.editor_revision;
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Err("expected worker failure".to_string()))
+            .unwrap();
+        app.background_job = Some(EditorBackgroundJob {
+            id: 77,
+            label: "Async asset operation".to_string(),
+            receiver,
+            reload_assets: false,
+        });
+
+        assert_eq!(app.render_react_frame(), EditorFrameOutcome::Completed);
+        assert_eq!(app.editor_revision, revision.wrapping_add(1));
+        assert!(app.pending_full_snapshot);
+
+        let messages = app.take_frame_bridge_messages(true);
+        let project_events = messages
+            .iter()
+            .filter_map(|message| serde_json::from_str::<serde_json::Value>(message).ok())
+            .filter(|event| event["event"] == protocol::PROJECT_CHANGED_EVENT)
+            .collect::<Vec<_>>();
+        assert_eq!(project_events.len(), 1);
+        assert_eq!(project_events[0]["revision"], app.editor_revision);
+        assert!(project_events[0]["params"].get("hierarchy").is_some());
+        assert_eq!(
+            project_events[0]["params"]["backgroundOperations"][0]["id"],
+            77
+        );
+        assert_eq!(
+            project_events[0]["params"]["backgroundOperations"][0]["state"],
+            "failed"
+        );
+        assert!(!app.pending_full_snapshot);
+    }
+
+    #[test]
+    fn recent_background_operation_statuses_survive_a_newer_job() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        app.set_editor_operation_status(EditorOperationStatus {
+            id: 10,
+            label: "First".into(),
+            state: EditorOperationState::Succeeded,
+        });
+        app.set_editor_operation_status(EditorOperationStatus {
+            id: 11,
+            label: "Second".into(),
+            state: EditorOperationState::Running,
+        });
+
+        let snapshot = serde_json::to_value(app.editor_snapshot()).unwrap();
+        let operations = snapshot["backgroundOperations"].as_array().unwrap();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0]["id"], 10);
+        assert_eq!(operations[0]["state"], "succeeded");
+        assert_eq!(operations[1]["id"], 11);
+        assert_eq!(operations[1]["state"], "running");
+    }
+
+    #[test]
+    fn asset_delete_rejects_a_reference_present_only_in_the_unsaved_scene() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        let editor_scene = app.editor_scene.as_mut().unwrap();
+        let renderable = editor_scene
+            .scene
+            .entities
+            .iter_mut()
+            .find_map(|entity| entity.components.get_mut("engine.renderable"))
+            .expect("sample scene contains a renderable");
+        renderable.fields.insert(
+            "material".into(),
+            Value::Asset(AssetId::new("dirty-only-material")),
+        );
+        editor_scene.history.mark_dirty();
+
+        let response = dispatch_test_request(
+            &mut app,
+            "assets.delete",
+            serde_json::json!({ "assetId": "dirty-only-material" }),
+        );
+
+        assert_eq!(response["error"]["code"], "conflict");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("open authoring scene"));
+        assert!(app.background_job.is_none());
+    }
+
+    #[test]
+    fn active_asset_job_freezes_authoring_mutations_until_dependency_checks_finish() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        let entity_count = app.editor_scene.as_ref().unwrap().scene.entities.len();
+        let (_sender, receiver) = mpsc::channel::<Result<EditorJobOutput, String>>();
+        app.background_job = Some(EditorBackgroundJob {
+            id: 42,
+            label: "Delete asset".into(),
+            receiver,
+            reload_assets: true,
+        });
+
+        let response = dispatch_test_request(
+            &mut app,
+            "scene.createEntity",
+            serde_json::json!({ "templateId": "empty" }),
+        );
+
+        assert_eq!(response["error"]["code"], "conflict");
+        assert_eq!(
+            app.editor_scene.as_ref().unwrap().scene.entities.len(),
+            entity_count
+        );
+    }
+
+    #[test]
+    fn script_component_can_only_be_created_from_the_loaded_verified_class_list() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        app.project.script_assembly = Some(PathBuf::from("build/scripts/GameScripts.dll"));
+        let game_loop = app.game_loop.as_mut().unwrap();
+        game_loop.runtime.register_script_host(Box::new(
+            engine_script::MockHost::new()
+                .with_verified_classes("GameScripts", ["GameScripts.PlayerController"]),
+        ));
+        game_loop
+            .runtime
+            .load_script_assembly("GameScripts", "mock", b"managed")
+            .unwrap();
+        app.editor_scene.as_mut().unwrap().selected_entity = Some("cube-01".into());
+
+        assert!(app
+            .verified_script_add_command("GameScripts", "GameScripts.Guessed")
+            .err()
+            .unwrap()
+            .contains("not in the reflection-verified class list"));
+        let command = app
+            .verified_script_add_command("GameScripts", "GameScripts.PlayerController")
+            .expect("verified class must produce an undoable command");
+        assert!(app.execute_editor_command(command));
+
+        let component = &app
+            .editor_scene
+            .as_ref()
+            .unwrap()
+            .scene
+            .entities
+            .iter()
+            .find(|entity| entity.persistent_id == "cube-01")
+            .unwrap()
+            .components["engine.script"];
+        assert_eq!(
+            component.fields.get("assembly_id"),
+            Some(&Value::Str("GameScripts".into()))
+        );
+        assert_eq!(
+            component.fields.get("class_name"),
+            Some(&Value::Str("GameScripts.PlayerController".into()))
+        );
+        assert!(app
+            .verified_script_add_command("GameScripts", "GameScripts.PlayerController")
+            .err()
+            .unwrap()
+            .contains("already has an engine.script component"));
+    }
+
+    #[test]
+    fn dirty_scene_recovery_snapshot_is_detected_and_restored_as_unsaved() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project.clone());
+        app.editor_scene
+            .as_mut()
+            .unwrap()
+            .execute(Box::new(engine_editor::SetEntityName::new(
+                "cube-01".into(),
+                Some("Recovered Cube".into()),
+            )))
+            .unwrap();
+        app.last_recovery_snapshot = Instant::now() - std::time::Duration::from_secs(31);
+        app.maybe_write_recovery_snapshot();
+        let recovery = scene_recovery_path(&fixture.project, "main");
+        assert!(recovery.is_file());
+
+        let mut reopened = editor_app_with_loaded_fixture(fixture.project.clone());
+        assert_eq!(
+            reopened.pending_recovery.as_deref(),
+            Some(recovery.as_path())
+        );
+        reopened.restore_recovery_snapshot().unwrap();
+        let scene = reopened.editor_scene.as_ref().unwrap();
+        assert!(scene.is_dirty());
+        assert!(!scene.history.can_undo());
+        assert_eq!(
+            scene
+                .scene
+                .entities
+                .iter()
+                .find(|entity| entity.persistent_id == "cube-01")
+                .and_then(|entity| entity.name.as_deref()),
+            Some("Recovered Cube")
+        );
+    }
+
     #[test]
     fn dirty_scene_switch_requires_an_explicit_resolution() {
         let fixture = scene_project_fixture();
@@ -3205,13 +4780,274 @@ mod tests {
 
         assert!(!app.request_scene_switch("level_two".into()).unwrap());
         assert_eq!(app.current_scene_id, "main");
-        assert_eq!(app.pending_scene_switch.as_deref(), Some("level_two"));
+        assert_eq!(
+            app.pending_scene_switch.as_deref(),
+            Some("opening scene 'level_two'")
+        );
+        assert_eq!(
+            app.pending_document_action,
+            Some(SceneDocumentAction::Open("level_two".into()))
+        );
 
         app.apply_scene_document_action(SceneDocumentAction::CancelSwitch)
             .unwrap();
         assert_eq!(app.current_scene_id, "main");
         assert!(app.pending_scene_switch.is_none());
         assert!(app.editor_scene.as_ref().unwrap().is_dirty());
+    }
+
+    #[test]
+    fn dirty_document_mutations_do_not_touch_files_before_confirmation() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        make_scene_dirty(&mut app, "Unsaved Cube");
+
+        for (method, params, expected) in [
+            (
+                "document.create",
+                serde_json::json!({ "sceneId": "created", "folder": "levels" }),
+                SceneDocumentAction::Create {
+                    scene_id: "created".into(),
+                    folder: PathBuf::from("levels"),
+                },
+            ),
+            (
+                "document.duplicate",
+                serde_json::json!({ "sourceId": "level_two", "newId": "duplicated" }),
+                SceneDocumentAction::Duplicate {
+                    source_id: "level_two".into(),
+                    new_id: "duplicated".into(),
+                },
+            ),
+            (
+                "document.rename",
+                serde_json::json!({ "oldId": "main", "newId": "renamed" }),
+                SceneDocumentAction::Rename {
+                    old_id: "main".into(),
+                    new_id: "renamed".into(),
+                },
+            ),
+            (
+                "document.delete",
+                serde_json::json!({
+                    "sceneId": "main",
+                    "replacementStartup": "level_two"
+                }),
+                SceneDocumentAction::Delete {
+                    scene_id: "main".into(),
+                    replacement_startup: Some("level_two".into()),
+                },
+            ),
+        ] {
+            let response = dispatch_test_request(&mut app, method, params);
+            assert!(response.get("error").is_none(), "{response}");
+            assert_eq!(app.current_scene_id, "main");
+            assert_eq!(app.pending_document_action, Some(expected));
+            assert_eq!(persisted_cube_name(&app).as_deref(), Some("Cube"));
+            assert!(app.project.scene_path("main").is_some());
+            assert!(app.project.scene_path("created").is_none());
+            assert!(app.project.scene_path("duplicated").is_none());
+            assert!(app.project.scene_path("renamed").is_none());
+
+            let response = dispatch_test_request(
+                &mut app,
+                "document.resolvePendingSwitch",
+                serde_json::json!({ "decision": "cancel" }),
+            );
+            assert!(response.get("error").is_none(), "{response}");
+            assert!(app.pending_scene_switch.is_none());
+            assert!(app.pending_document_action.is_none());
+            assert!(app.editor_scene.as_ref().unwrap().is_dirty());
+        }
+    }
+
+    #[test]
+    fn failed_discarded_switch_keeps_dirty_state_and_exact_pending_target() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        make_scene_dirty(&mut app, "Unsaved Cube");
+
+        let response = dispatch_test_request(
+            &mut app,
+            "document.open",
+            serde_json::json!({ "sceneId": "invalid" }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+
+        let response = dispatch_test_request(
+            &mut app,
+            "document.resolvePendingSwitch",
+            serde_json::json!({ "decision": "discard" }),
+        );
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::Value::String("validationFailed".into())
+        );
+        assert_eq!(app.current_scene_id, "main");
+        assert!(app.editor_scene.as_ref().unwrap().is_dirty());
+        assert_eq!(persisted_cube_name(&app).as_deref(), Some("Cube"));
+        assert_eq!(
+            app.pending_document_action,
+            Some(SceneDocumentAction::Open("invalid".into()))
+        );
+        assert_eq!(
+            app.pending_scene_switch.as_deref(),
+            Some("opening scene 'invalid'")
+        );
+    }
+
+    #[test]
+    fn a_second_document_request_cannot_overwrite_the_pending_target() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        make_scene_dirty(&mut app, "Unsaved Cube");
+        dispatch_test_request(
+            &mut app,
+            "document.open",
+            serde_json::json!({ "sceneId": "level_two" }),
+        );
+
+        let response = dispatch_test_request(
+            &mut app,
+            "document.create",
+            serde_json::json!({ "sceneId": "wrong-target", "folder": "" }),
+        );
+
+        assert_eq!(response["error"]["code"], "conflict");
+        assert_eq!(
+            app.pending_document_action,
+            Some(SceneDocumentAction::Open("level_two".into()))
+        );
+        assert!(app.project.scene_path("wrong-target").is_none());
+    }
+
+    #[test]
+    fn discard_resolves_each_deferred_document_action_without_losing_its_target() {
+        for (method, params, expected_scene) in [
+            (
+                "document.open",
+                serde_json::json!({ "sceneId": "level_two" }),
+                "level_two",
+            ),
+            (
+                "document.create",
+                serde_json::json!({ "sceneId": "created", "folder": "levels" }),
+                "created",
+            ),
+            (
+                "document.duplicate",
+                serde_json::json!({ "sourceId": "level_two", "newId": "duplicated" }),
+                "duplicated",
+            ),
+            (
+                "document.rename",
+                serde_json::json!({ "oldId": "main", "newId": "renamed" }),
+                "renamed",
+            ),
+            (
+                "document.delete",
+                serde_json::json!({
+                    "sceneId": "main",
+                    "replacementStartup": "level_two"
+                }),
+                "level_two",
+            ),
+        ] {
+            let fixture = scene_project_fixture();
+            let mut app = editor_app_with_loaded_fixture(fixture.project);
+            make_scene_dirty(&mut app, "Must Be Discarded");
+
+            let response = dispatch_test_request(&mut app, method, params);
+            assert!(response.get("error").is_none(), "{method}: {response}");
+            assert_eq!(app.current_scene_id, "main");
+            assert!(app.pending_document_action.is_some());
+
+            let response = dispatch_test_request(
+                &mut app,
+                "document.resolvePendingSwitch",
+                serde_json::json!({ "decision": "discard" }),
+            );
+            assert!(response.get("error").is_none(), "{method}: {response}");
+            assert_eq!(app.current_scene_id, expected_scene, "{method}");
+            assert!(app.pending_scene_switch.is_none(), "{method}");
+            assert!(app.pending_document_action.is_none(), "{method}");
+            assert!(!app.editor_scene.as_ref().unwrap().is_dirty(), "{method}");
+            assert!(app
+                .editor_scene
+                .as_ref()
+                .unwrap()
+                .scene
+                .entities
+                .iter()
+                .all(|entity| entity.name.as_deref() != Some("Must Be Discarded")));
+        }
+    }
+
+    #[test]
+    fn resolving_dirty_switch_with_save_persists_then_opens_exact_target() {
+        let fixture = scene_project_fixture();
+        let main_path = fixture.project.scene_path("main").unwrap();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        make_scene_dirty(&mut app, "Saved Cube");
+
+        dispatch_test_request(
+            &mut app,
+            "document.open",
+            serde_json::json!({ "sceneId": "level_two" }),
+        );
+        let response = dispatch_test_request(
+            &mut app,
+            "document.resolvePendingSwitch",
+            serde_json::json!({ "decision": "save" }),
+        );
+
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(app.current_scene_id, "level_two");
+        assert!(app.pending_document_action.is_none());
+        assert!(!app.editor_scene.as_ref().unwrap().is_dirty());
+        let saved = Scene::load_from_file(&main_path).unwrap();
+        assert_eq!(
+            saved
+                .entities
+                .iter()
+                .find(|entity| entity.persistent_id == "cube-01")
+                .and_then(|entity| entity.name.as_deref()),
+            Some("Saved Cube")
+        );
+    }
+
+    #[test]
+    fn play_mode_cannot_bypass_or_resolve_a_pending_document_prompt() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        make_scene_dirty(&mut app, "Unsaved Cube");
+        dispatch_test_request(
+            &mut app,
+            "document.open",
+            serde_json::json!({ "sceneId": "level_two" }),
+        );
+
+        let response = dispatch_test_request(
+            &mut app,
+            "runtime.setMode",
+            serde_json::json!({ "mode": "play" }),
+        );
+        assert_eq!(response["error"]["code"], "conflict");
+        assert!(app.play_session.is_editing());
+        assert!(app.pending_document_action.is_some());
+
+        // Simulate an already queued native Play transition racing the web
+        // prompt. Resolution must still refuse authoring writes in Play mode.
+        app.start_play();
+        assert!(!app.play_session.is_editing());
+        let response = dispatch_test_request(
+            &mut app,
+            "document.resolvePendingSwitch",
+            serde_json::json!({ "decision": "save" }),
+        );
+        assert_eq!(response["error"]["code"], "editingRequired");
+        assert_eq!(persisted_cube_name(&app).as_deref(), Some("Cube"));
+        assert!(app.pending_document_action.is_some());
     }
 
     #[test]
@@ -3285,7 +5121,6 @@ mod tests {
         let fixture = scene_project_fixture();
         let mut app = editor_app_with_loaded_fixture(fixture.project.clone());
         app.editor_scene.as_mut().unwrap().selected_entity = Some("cube-01".into());
-        app.hierarchy.set_selected(Some("cube-01".into()));
         app.material_editor_selection = Some("mat-default".into());
         app.gizmo.dragging = true;
 
@@ -3300,7 +5135,6 @@ mod tests {
         assert_eq!(editor_scene.scene.scene_id, "level_two");
         assert!(!editor_scene.is_dirty());
         assert!(editor_scene.selected_entity.is_none());
-        assert!(app.hierarchy.selected().is_none());
         assert!(!app.gizmo.dragging);
         assert!(app.material_editor_selection.is_none());
         let preview = app.game_loop.as_ref().unwrap().runtime.scene_ref().unwrap();
@@ -3367,6 +5201,87 @@ mod tests {
             .entities
             .iter()
             .any(|entity| entity.persistent_id.starts_with(EDITOR_CAMERA_ID_PREFIX)));
+    }
+
+    #[test]
+    fn loaded_prefab_instantiation_and_unpack_use_editor_history() {
+        let fixture = scene_project_fixture();
+        let mut app = editor_app_with_loaded_fixture(fixture.project);
+        let asset_id = AssetId::new("prefab-cube-test");
+        let prefab = engine_editor::prefab_from_scene_subtree(
+            &app.editor_scene.as_ref().unwrap().scene,
+            &"cube-01".into(),
+            asset_id.clone(),
+        )
+        .unwrap();
+        app.game_loop
+            .as_mut()
+            .unwrap()
+            .runtime
+            .asset_registry_mut()
+            .insert_typed(asset_id.clone(), prefab);
+        write_json(
+            &app.project.asset_source.join("prefabs.manifest"),
+            &SourceManifest {
+                schema_version: CURRENT_MANIFEST_VERSION,
+                assets: vec![SourceAssetEntry {
+                    id: asset_id.clone(),
+                    asset_type: AssetType::Prefab,
+                    source_path: "prefabs/cube.prefab.ron".to_string(),
+                    cook_rules: engine_asset::cook::CookRules::default(),
+                }],
+            },
+        );
+        app.refresh_asset_catalog().unwrap();
+        assert!(app.asset_browser.select_asset(Some(asset_id.clone())));
+
+        app.instantiate_prefab_asset(asset_id, None).unwrap();
+
+        let root = app
+            .editor_scene
+            .as_ref()
+            .unwrap()
+            .selected_entity
+            .clone()
+            .expect("instantiated root is selected");
+        assert_ne!(root, "cube-01");
+        assert!(app
+            .editor_scene
+            .as_ref()
+            .unwrap()
+            .scene
+            .entities
+            .iter()
+            .find(|entity| entity.persistent_id == root)
+            .unwrap()
+            .components
+            .contains_key("engine.prefab_instance_ref"));
+
+        app.unpack_prefab_instance(root.clone(), PrefabUnpackMode::Instance)
+            .unwrap();
+        assert!(!app
+            .editor_scene
+            .as_ref()
+            .unwrap()
+            .scene
+            .entities
+            .iter()
+            .find(|entity| entity.persistent_id == root)
+            .unwrap()
+            .components
+            .contains_key("engine.prefab_instance_ref"));
+        app.editor_scene.as_mut().unwrap().undo().unwrap();
+        assert!(app
+            .editor_scene
+            .as_ref()
+            .unwrap()
+            .scene
+            .entities
+            .iter()
+            .find(|entity| entity.persistent_id == root)
+            .unwrap()
+            .components
+            .contains_key("engine.prefab_instance_ref"));
     }
 
     struct MaterialProjectFixture {
@@ -3563,6 +5478,45 @@ mod tests {
     }
 
     #[test]
+    fn game_preview_uses_authoring_camera_without_instantiating_scripts() {
+        let runtime = engine_core::EngineRuntime::new(EngineConfig::default());
+        let mut authoring = engine_scene::sample_scene();
+        authoring.entities[1].components.insert(
+            "engine.script".into(),
+            ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: Default::default(),
+            },
+        );
+
+        let (preview, diagnostics) = game_preview_scene(&runtime, &authoring);
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            preview.scene_settings.active_camera.as_deref(),
+            Some("camera-main")
+        );
+        assert!(
+            preview
+                .entities
+                .iter()
+                .find(|entity| entity.persistent_id == "camera-main")
+                .unwrap()
+                .components["engine.camera"]
+                .enabled
+        );
+        assert!(!preview
+            .entities
+            .iter()
+            .any(|entity| entity.persistent_id.starts_with(EDITOR_CAMERA_ID_PREFIX)));
+        assert!(preview
+            .entities
+            .iter()
+            .all(|entity| !entity.components.contains_key("engine.script")));
+    }
+
+    #[test]
     fn failed_play_load_rolls_back_to_script_free_editor_preview() {
         let mut authoring = engine_scene::sample_scene();
         authoring.entities[1].components.insert(
@@ -3626,7 +5580,9 @@ mod tests {
         runtime.register_mesh_asset(alternate_mesh);
 
         let mut browser = ProjectAssetBrowserPanel::new();
-        refresh_asset_list(&mut browser, runtime.asset_registry());
+        let source_root = tempfile::tempdir().unwrap();
+        refresh_project_asset_list(&mut browser, runtime.asset_registry(), source_root.path())
+            .unwrap();
         assert!(browser.select_asset(Some(alternate_id.clone())));
 
         let mut editor_scene = EditorScene::new(engine_scene::sample_scene());
@@ -3659,146 +5615,6 @@ mod tests {
             mesh_value(&editor_scene.scene),
             Some(Value::Asset(alternate_id))
         );
-    }
-
-    #[test]
-    fn inspector_commit_targets_old_entity_before_selection_change() {
-        let mut editor_scene = EditorScene::new(engine_scene::sample_scene());
-        editor_scene.selected_entity = Some("camera-main".into());
-        let mut inspector = InspectorPanel::new("Inspector");
-        let mut ui = EditorUi::new();
-        ui.begin_frame();
-        ui.inject_event(engine_editor::UiEvent::TextFieldCommit(
-            "Name".into(),
-            "Edited Camera".into(),
-        ));
-
-        let commands = edit_current_inspector_selection(
-            &mut inspector,
-            &mut ui,
-            &mut editor_scene,
-            &InspectorContext::default(),
-        );
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0].stamp.phase,
-            UiInteractionPhase::BeforeRawPointer
-        );
-        editor_scene
-            .execute(commands.into_iter().next().unwrap().command)
-            .unwrap();
-        // This mirrors the host order: apply the Hierarchy's new selection
-        // only after the old Inspector target consumed its blurred value.
-        editor_scene.selected_entity = Some("cube-01".into());
-        ui.end_frame();
-
-        let camera = editor_scene
-            .scene
-            .entities
-            .iter()
-            .find(|entity| entity.persistent_id == "camera-main")
-            .unwrap();
-        let cube = editor_scene
-            .scene
-            .entities
-            .iter()
-            .find(|entity| entity.persistent_id == "cube-01")
-            .unwrap();
-        assert_eq!(camera.name.as_deref(), Some("Edited Camera"));
-        assert_eq!(cube.name.as_deref(), Some("Cube"));
-
-        let mut play_session = EditorPlaySession::default();
-        let mut loaded = None;
-        play_session
-            .start(&editor_scene.scene, |scene| {
-                loaded = Some(scene);
-                Ok::<_, ()>(())
-            })
-            .unwrap();
-        let played_camera = loaded
-            .as_ref()
-            .unwrap()
-            .entities
-            .iter()
-            .find(|entity| entity.persistent_id == "camera-main")
-            .unwrap();
-        assert_eq!(played_camera.name.as_deref(), Some("Edited Camera"));
-    }
-
-    #[test]
-    fn play_input_routing_excludes_editor_ui_and_text_focus() {
-        let mut ui = EditorUi::new();
-        ui.begin_frame();
-        ui.block_pointer_rect(0.0, 0.0, 200.0, 100.0);
-        assert!(!should_route_event_to_gameplay(
-            &ui,
-            &PlatformEvent::MousePressed {
-                button: platform::MouseButton::Left,
-                x: 50.0,
-                y: 50.0,
-            },
-        ));
-        assert!(should_route_event_to_gameplay(
-            &ui,
-            &PlatformEvent::MousePressed {
-                button: platform::MouseButton::Left,
-                x: 300.0,
-                y: 200.0,
-            },
-        ));
-        assert!(should_route_event_to_gameplay(
-            &ui,
-            &PlatformEvent::MouseReleased {
-                button: platform::MouseButton::Left,
-                x: 50.0,
-                y: 50.0,
-            },
-        ));
-        ui.end_frame();
-
-        let mut text_ui = EditorUi::new();
-        text_ui.set_pointer(10.0, 10.0);
-        text_ui.begin_frame();
-        let _ = text_ui.text_field("Name", "Player");
-        text_ui.end_frame();
-        text_ui.set_mouse_pressed();
-        text_ui.begin_frame();
-        let _ = text_ui.text_field("Name", "Player");
-        text_ui.end_frame();
-        text_ui.set_mouse_released();
-        text_ui.begin_frame();
-        let _ = text_ui.text_field("Name", "Player");
-        assert!(text_ui.has_active_text_edit());
-        assert!(!should_route_event_to_gameplay(
-            &text_ui,
-            &PlatformEvent::KeyPressed {
-                key: platform::KeyCode::W,
-                modifiers: platform::Modifiers::default(),
-            },
-        ));
-        assert!(should_route_event_to_gameplay(
-            &text_ui,
-            &PlatformEvent::KeyReleased {
-                key: platform::KeyCode::W,
-                modifiers: platform::Modifiers::default(),
-            },
-        ));
-        text_ui.end_frame();
-
-        let mut pending_focus_ui = EditorUi::new();
-        pending_focus_ui.begin_frame();
-        let _ = pending_focus_ui.text_field("Name", "Player");
-        pending_focus_ui.end_frame();
-        pending_focus_ui.set_pointer(10.0, 10.0);
-        pending_focus_ui.set_mouse_pressed();
-        pending_focus_ui.set_mouse_released();
-        assert!(!should_route_event_to_gameplay(
-            &pending_focus_ui,
-            &PlatformEvent::KeyPressed {
-                key: platform::KeyCode::W,
-                modifiers: platform::Modifiers::default(),
-            },
-        ));
     }
 
     #[test]
@@ -3981,490 +5797,124 @@ mod tests {
             )
     }
 
-    #[derive(Debug)]
-    struct OrderedReplayProbe {
-        value: i32,
-        saved_values: Vec<i32>,
-        mode: GizmoMode,
-        drag_mode: Option<GizmoMode>,
-        camera_distance: f32,
-        drag_camera_distance: Option<f32>,
-        completed_drag_camera_distances: Vec<f32>,
-        show_grid: bool,
-        trace: Vec<String>,
-        stopped_at_play: bool,
+    fn project_gizmo_test_axis_interior(view: RuntimeGizmoView, axis: Vec3) -> Vec2 {
+        let center = project_gizmo_test_point(view, view.world_position);
+        let unit_tip = project_gizmo_test_point(view, view.world_position + axis);
+        // Production gizmos keep an 88 px screen-space length independent of
+        // camera depth. Pick well inside that visible segment instead of
+        // assuming one world unit is the rendered handle length.
+        center + (unit_tip - center).normalize() * 44.0
     }
 
-    fn ordered_gizmo(sequence: u64, event: GizmoPointerEvent) -> SequencedGizmoPointerEvent {
-        SequencedGizmoPointerEvent { sequence, event }
+    fn full_test_viewport(width: u32, height: u32) -> RenderViewportContext {
+        RenderViewportContext::new(width, height, RendererRect::FULL).unwrap()
     }
 
-    fn ordered_action(sequence: u64, action: OrderedToolbarAction) -> OrderedAuthoringInput {
-        OrderedAuthoringInput::Toolbar { sequence, action }
-    }
-
-    fn ordered_scene_view_action(
-        sequence: u64,
-        action: engine_editor::SceneViewAction,
-    ) -> OrderedAuthoringInput {
-        OrderedAuthoringInput::SceneView(SequencedSceneViewAction::new(
-            engine_editor::UiInteractionStamp {
-                sequence,
-                phase: UiInteractionPhase::AfterRawPointer,
-            },
-            action,
-        ))
-    }
-
-    fn ordered_selection(sequence: u64, selection: Option<&str>) -> OrderedAuthoringInput {
-        OrderedAuthoringInput::Selection(SequencedSelection {
-            stamp: engine_editor::UiInteractionStamp {
-                sequence,
-                phase: UiInteractionPhase::AfterRawPointer,
-            },
-            selection: selection.map(str::to_owned),
-        })
-    }
-
-    struct NoopPanelCommand;
-
-    impl engine_editor::Command for NoopPanelCommand {
-        fn name(&self) -> &str {
-            "Noop Panel Command"
-        }
-
-        fn execute(&mut self, _scene: &mut Scene) -> Result<(), engine_editor::EditorError> {
-            Ok(())
-        }
-
-        fn undo(&mut self, _scene: &mut Scene) -> Result<(), engine_editor::EditorError> {
-            Ok(())
-        }
-    }
-
-    fn ordered_panel_command(sequence: u64, phase: UiInteractionPhase) -> OrderedAuthoringInput {
-        OrderedAuthoringInput::PanelCommand(SequencedCommand::new(
-            engine_editor::UiInteractionStamp { sequence, phase },
-            Box::new(NoopPanelCommand),
-        ))
-    }
-
-    fn ordered_input_labels(inputs: Vec<OrderedAuthoringInput>) -> Vec<&'static str> {
-        inputs
-            .into_iter()
-            .map(|input| match input {
-                OrderedAuthoringInput::Gizmo(_) => "gizmo",
-                OrderedAuthoringInput::Toolbar { .. } => "toolbar",
-                OrderedAuthoringInput::PanelCommand(_) => "panel",
-                OrderedAuthoringInput::Selection(_) => "selection",
-                OrderedAuthoringInput::SceneView(_) => "scene-view",
+    #[test]
+    fn scene_view_picking_selects_visible_runtime_entity() {
+        let (_, runtime) = gizmo_test_scene_and_runtime();
+        let window_size = Vec2::splat(800.0);
+        let viewport = full_test_viewport(800, 800);
+        let pointer = runtime
+            .with_world(|world| {
+                let input =
+                    extract_renderer_input_from_world_with_viewport(world, 0, viewport).unwrap();
+                let view = &input.views[0];
+                let drawable = input
+                    .drawables
+                    .iter()
+                    .find(|drawable| drawable.entity.as_deref() == Some("cube-01"))
+                    .unwrap();
+                let center = (Vec3::from_array(drawable.bounds.min)
+                    + Vec3::from_array(drawable.bounds.max))
+                    * 0.5;
+                project_world_point(
+                    center,
+                    Mat4::from_cols_array(&view.view_matrix),
+                    Mat4::from_cols_array(&view.projection_matrix),
+                    window_size,
+                )
+                .unwrap()
+                .0
             })
-            .collect()
-    }
+            .unwrap();
 
-    fn complete_ordered_drag(start: u64) -> Vec<SequencedGizmoPointerEvent> {
-        vec![
-            ordered_gizmo(start, GizmoPointerEvent::Press(Vec2::ZERO)),
-            ordered_gizmo(start + 1, GizmoPointerEvent::Move(Vec2::X)),
-            ordered_gizmo(start + 2, GizmoPointerEvent::Release(Vec2::X)),
-        ]
-    }
-
-    #[test]
-    fn inspector_text_blur_precedes_same_sequence_gizmo_press() {
-        let merged = merge_ordered_authoring_inputs(
-            vec![ordered_panel_command(
-                10,
-                UiInteractionPhase::BeforeRawPointer,
-            )],
-            vec![ordered_gizmo(10, GizmoPointerEvent::Press(Vec2::ZERO))],
-        );
-        assert_eq!(ordered_input_labels(merged), ["panel", "gizmo"]);
-    }
-
-    #[test]
-    fn gizmo_release_precedes_same_sequence_panel_button_command() {
-        let merged = merge_ordered_authoring_inputs(
-            vec![ordered_panel_command(
-                20,
-                UiInteractionPhase::AfterRawPointer,
-            )],
-            vec![ordered_gizmo(20, GizmoPointerEvent::Release(Vec2::ZERO))],
-        );
-        assert_eq!(ordered_input_labels(merged), ["gizmo", "panel"]);
-    }
-
-    #[test]
-    fn panel_commands_and_save_replay_in_both_platform_orders() {
-        let panel_then_save = merge_ordered_authoring_inputs(
-            vec![
-                ordered_panel_command(1, UiInteractionPhase::AfterRawPointer),
-                ordered_action(2, OrderedToolbarAction::Save),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(ordered_input_labels(panel_then_save), ["panel", "toolbar"]);
-
-        let save_then_panel = merge_ordered_authoring_inputs(
-            vec![
-                ordered_action(1, OrderedToolbarAction::Save),
-                ordered_panel_command(2, UiInteractionPhase::AfterRawPointer),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(ordered_input_labels(save_then_panel), ["toolbar", "panel"]);
-    }
-
-    #[test]
-    fn hierarchy_selection_and_complete_drag_replay_in_both_orders() {
-        let selection = |sequence| ordered_selection(sequence, Some("cube-01"));
-        let select_then_drag =
-            merge_ordered_authoring_inputs(vec![selection(1)], complete_ordered_drag(2));
         assert_eq!(
-            ordered_input_labels(select_then_drag),
-            ["selection", "gizmo", "gizmo", "gizmo"]
+            pick_runtime_entity(&runtime, 0, viewport, Vec2::ZERO, window_size, pointer,)
+                .as_deref(),
+            Some("cube-01")
         );
-
-        let drag_then_select =
-            merge_ordered_authoring_inputs(vec![selection(4)], complete_ordered_drag(1));
         assert_eq!(
-            ordered_input_labels(drag_then_select),
-            ["gizmo", "gizmo", "gizmo", "selection"]
+            pick_runtime_entity(
+                &runtime,
+                0,
+                viewport,
+                Vec2::new(200.0, 200.0),
+                Vec2::new(600.0, 600.0),
+                Vec2::new(100.0, 100.0),
+            ),
+            None
         );
     }
 
     #[test]
-    fn scene_view_actions_share_raw_pointer_and_semantic_ordering() {
-        let same_release = merge_ordered_authoring_inputs(
-            vec![ordered_scene_view_action(
-                10,
-                engine_editor::SceneViewAction::SetDistance(25.0),
-            )],
-            vec![ordered_gizmo(10, GizmoPointerEvent::Release(Vec2::ZERO))],
-        );
-        assert_eq!(ordered_input_labels(same_release), ["gizmo", "scene-view"]);
-
-        let setting_then_toolbar = merge_ordered_authoring_inputs(
-            vec![
-                ordered_scene_view_action(1, engine_editor::SceneViewAction::SetShowGrid(false)),
-                ordered_action(2, OrderedToolbarAction::ToggleGizmoSnapping),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(
-            ordered_input_labels(setting_then_toolbar),
-            ["scene-view", "toolbar"]
-        );
-        let toolbar_then_setting = merge_ordered_authoring_inputs(
-            vec![
-                ordered_action(1, OrderedToolbarAction::ToggleGizmoSnapping),
-                ordered_scene_view_action(2, engine_editor::SceneViewAction::SetShowGrid(false)),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(
-            ordered_input_labels(toolbar_then_setting),
-            ["toolbar", "scene-view"]
-        );
-
-        let setting_then_selection = merge_ordered_authoring_inputs(
-            vec![
-                ordered_scene_view_action(1, engine_editor::SceneViewAction::SetYaw(45.0)),
-                ordered_selection(2, Some("cube-01")),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(
-            ordered_input_labels(setting_then_selection),
-            ["scene-view", "selection"]
-        );
-        let selection_then_setting = merge_ordered_authoring_inputs(
-            vec![
-                ordered_selection(1, Some("cube-01")),
-                ordered_scene_view_action(2, engine_editor::SceneViewAction::SetYaw(45.0)),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(
-            ordered_input_labels(selection_then_setting),
-            ["selection", "scene-view"]
-        );
-    }
-
-    fn probe_ordered_authoring_replay(
-        toolbar: Vec<OrderedAuthoringInput>,
-        gizmo: Vec<SequencedGizmoPointerEvent>,
-    ) -> OrderedReplayProbe {
-        let mut probe = OrderedReplayProbe {
-            value: 1,
-            saved_values: Vec::new(),
-            mode: GizmoMode::Translate,
-            drag_mode: None,
-            camera_distance: 10.0,
-            drag_camera_distance: None,
-            completed_drag_camera_distances: Vec::new(),
-            show_grid: true,
-            trace: Vec::new(),
-            stopped_at_play: false,
+    fn embedded_editor_viewport_drives_render_projection_picking_and_gizmo_geometry() {
+        let (_, runtime) = gizmo_test_scene_and_runtime();
+        let surface = Vec2::new(1000.0, 800.0);
+        let viewport_rect = ScreenRect {
+            x: 200.0,
+            y: 100.0,
+            width: 500.0,
+            height: 500.0,
         };
-        for input in merge_ordered_authoring_inputs(toolbar, gizmo) {
-            if probe.stopped_at_play {
-                continue;
+        let (_, _, viewport) = editor_render_viewport(viewport_rect, 1.0, surface).unwrap();
+        assert_eq!(
+            viewport.output_rect(),
+            RendererRect {
+                min: [0.2, 0.125],
+                max: [0.7, 0.75],
             }
-            match input {
-                OrderedAuthoringInput::Gizmo(event) => match event.event {
-                    GizmoPointerEvent::Press(_) => {
-                        probe.drag_mode = Some(probe.mode);
-                        probe.drag_camera_distance = Some(probe.camera_distance);
-                    }
-                    GizmoPointerEvent::Move(_) => {}
-                    GizmoPointerEvent::Release(_) => {
-                        if let Some(mode) = probe.drag_mode.take() {
-                            probe
-                                .completed_drag_camera_distances
-                                .push(probe.drag_camera_distance.take().unwrap());
-                            probe.value += match mode {
-                                GizmoMode::Translate => 1,
-                                GizmoMode::Rotate => 10,
-                                GizmoMode::Scale => 100,
-                            };
-                            probe.trace.push(format!("drag:{mode:?}"));
-                        }
-                    }
-                    GizmoPointerEvent::Cancel => {
-                        probe.drag_mode = None;
-                        probe.drag_camera_distance = None;
-                    }
-                },
-                OrderedAuthoringInput::Toolbar { action, .. } => match action {
-                    OrderedToolbarAction::Save => {
-                        probe.saved_values.push(probe.value);
-                        probe.trace.push("save".into());
-                    }
-                    OrderedToolbarAction::Undo => {
-                        probe.value -= 1;
-                        probe.trace.push("undo".into());
-                    }
-                    OrderedToolbarAction::Redo => {
-                        probe.value += 1;
-                        probe.trace.push("redo".into());
-                    }
-                    OrderedToolbarAction::StartPlay => {
-                        probe.trace.push("play".into());
-                        probe.stopped_at_play = true;
-                    }
-                    OrderedToolbarAction::SetGizmoMode(mode) => {
-                        probe.mode = mode;
-                        probe.trace.push(format!("mode:{mode:?}"));
-                    }
-                    OrderedToolbarAction::ToggleGizmoSpace => {
-                        probe.trace.push("space".into());
-                    }
-                    OrderedToolbarAction::ToggleGizmoSnapping => {
-                        probe.trace.push("snap".into());
-                    }
-                },
-                OrderedAuthoringInput::PanelCommand(_) => {
-                    probe.trace.push("panel".into());
-                }
-                OrderedAuthoringInput::Selection(selection) => {
-                    probe.trace.push(format!(
-                        "select:{}",
-                        selection.selection.as_deref().unwrap_or("none")
-                    ));
-                }
-                OrderedAuthoringInput::SceneView(action) => match action.action {
-                    engine_editor::SceneViewAction::SetPitch(value) => {
-                        probe.trace.push(format!("pitch:{value}"));
-                    }
-                    engine_editor::SceneViewAction::SetYaw(value) => {
-                        probe.trace.push(format!("yaw:{value}"));
-                    }
-                    engine_editor::SceneViewAction::SetDistance(value) => {
-                        probe.camera_distance = value;
-                        probe.trace.push(format!("distance:{value}"));
-                    }
-                    engine_editor::SceneViewAction::SetShowGrid(show_grid) => {
-                        probe.show_grid = show_grid;
-                        probe.trace.push(format!("grid:{show_grid}"));
-                    }
-                },
-            }
-        }
-        probe
-    }
-
-    #[test]
-    fn scene_view_camera_and_complete_drag_replay_in_both_platform_orders() {
-        let camera_then_drag = probe_ordered_authoring_replay(
-            vec![ordered_scene_view_action(
-                1,
-                engine_editor::SceneViewAction::SetDistance(25.0),
-            )],
-            complete_ordered_drag(2),
         );
-        assert_eq!(camera_then_drag.trace, ["distance:25", "drag:Translate"]);
-        assert_eq!(camera_then_drag.completed_drag_camera_distances, [25.0]);
 
-        let drag_then_camera = probe_ordered_authoring_replay(
-            vec![ordered_scene_view_action(
-                4,
-                engine_editor::SceneViewAction::SetDistance(25.0),
-            )],
-            complete_ordered_drag(1),
+        let gizmo_view = runtime_gizmo_view(&runtime, "cube-01", 0, viewport).unwrap();
+        assert_eq!(gizmo_view.viewport_origin, Vec2::new(200.0, 100.0));
+        assert_eq!(gizmo_view.viewport_size, Vec2::splat(500.0));
+        let pointer = project_gizmo_test_point(gizmo_view, gizmo_view.world_position);
+        assert_eq!(
+            pick_runtime_entity(
+                &runtime,
+                0,
+                viewport,
+                Vec2::new(200.0, 100.0),
+                Vec2::new(700.0, 600.0),
+                pointer,
+            )
+            .as_deref(),
+            Some("cube-01")
         );
-        assert_eq!(drag_then_camera.trace, ["drag:Translate", "distance:25"]);
-        assert_eq!(drag_then_camera.completed_drag_camera_distances, [10.0]);
-        assert_eq!(drag_then_camera.camera_distance, 25.0);
-    }
-
-    #[test]
-    fn active_drag_keeps_press_camera_when_scene_view_changes_mid_gesture() {
-        let probe = probe_ordered_authoring_replay(
-            vec![ordered_scene_view_action(
-                2,
-                engine_editor::SceneViewAction::SetDistance(25.0),
-            )],
-            vec![
-                ordered_gizmo(1, GizmoPointerEvent::Press(Vec2::ZERO)),
-                ordered_gizmo(3, GizmoPointerEvent::Release(Vec2::X)),
-            ],
+        assert_eq!(
+            pick_runtime_entity(
+                &runtime,
+                0,
+                viewport,
+                Vec2::new(200.0, 100.0),
+                Vec2::new(700.0, 600.0),
+                Vec2::new(100.0, 400.0),
+            ),
+            None
         );
-        assert_eq!(probe.trace, ["distance:25", "drag:Translate"]);
-        assert_eq!(probe.completed_drag_camera_distances, [10.0]);
-        assert_eq!(probe.camera_distance, 25.0);
-    }
-
-    #[test]
-    fn grid_visualization_and_toolbar_replay_in_both_platform_orders() {
-        let grid_then_toolbar = probe_ordered_authoring_replay(
-            vec![
-                ordered_scene_view_action(1, engine_editor::SceneViewAction::SetShowGrid(false)),
-                ordered_action(2, OrderedToolbarAction::ToggleGizmoSnapping),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(grid_then_toolbar.trace, ["grid:false", "snap"]);
-        assert!(!grid_then_toolbar.show_grid);
-
-        let toolbar_then_grid = probe_ordered_authoring_replay(
-            vec![
-                ordered_action(1, OrderedToolbarAction::ToggleGizmoSnapping),
-                ordered_scene_view_action(2, engine_editor::SceneViewAction::SetShowGrid(false)),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(toolbar_then_grid.trace, ["snap", "grid:false"]);
-        assert!(!toolbar_then_grid.show_grid);
-    }
-
-    #[test]
-    fn completed_drag_then_undo_replays_in_platform_order() {
-        let probe = probe_ordered_authoring_replay(
-            vec![ordered_action(4, OrderedToolbarAction::Undo)],
-            complete_ordered_drag(1),
-        );
-        assert_eq!(probe.trace, ["drag:Translate", "undo"]);
-        assert_eq!(probe.value, 1);
-    }
-
-    #[test]
-    fn undo_then_completed_drag_replays_in_platform_order() {
-        let probe = probe_ordered_authoring_replay(
-            vec![ordered_action(1, OrderedToolbarAction::Undo)],
-            complete_ordered_drag(2),
-        );
-        assert_eq!(probe.trace, ["undo", "drag:Translate"]);
-        assert_eq!(probe.value, 1);
-    }
-
-    #[test]
-    fn undo_can_enable_a_later_redo_in_the_same_redraw() {
-        let probe = probe_ordered_authoring_replay(
-            vec![
-                ordered_action(1, OrderedToolbarAction::Undo),
-                ordered_action(2, OrderedToolbarAction::Redo),
-            ],
-            Vec::new(),
-        );
-        assert_eq!(probe.trace, ["undo", "redo"]);
-        assert_eq!(probe.value, 1);
-    }
-
-    #[test]
-    fn completed_drag_then_save_captures_post_drag_scene() {
-        let probe = probe_ordered_authoring_replay(
-            vec![ordered_action(4, OrderedToolbarAction::Save)],
-            complete_ordered_drag(1),
-        );
-        assert_eq!(probe.trace, ["drag:Translate", "save"]);
-        assert_eq!(probe.saved_values, [2]);
-    }
-
-    #[test]
-    fn save_then_completed_drag_leaves_new_change_dirty() {
-        let probe = probe_ordered_authoring_replay(
-            vec![ordered_action(1, OrderedToolbarAction::Save)],
-            complete_ordered_drag(2),
-        );
-        assert_eq!(probe.trace, ["save", "drag:Translate"]);
-        assert_eq!(probe.saved_values, [1]);
-        assert_eq!(probe.value, 2);
-    }
-
-    #[test]
-    fn completed_drag_then_mode_change_uses_old_mode_for_drag() {
-        let probe = probe_ordered_authoring_replay(
-            vec![ordered_action(
-                4,
-                OrderedToolbarAction::SetGizmoMode(GizmoMode::Rotate),
-            )],
-            complete_ordered_drag(1),
-        );
-        assert_eq!(probe.trace, ["drag:Translate", "mode:Rotate"]);
-        assert_eq!(probe.value, 2);
-        assert_eq!(probe.mode, GizmoMode::Rotate);
-    }
-
-    #[test]
-    fn mode_change_then_completed_drag_uses_new_mode() {
-        let probe = probe_ordered_authoring_replay(
-            vec![ordered_action(
-                1,
-                OrderedToolbarAction::SetGizmoMode(GizmoMode::Rotate),
-            )],
-            complete_ordered_drag(2),
-        );
-        assert_eq!(probe.trace, ["mode:Rotate", "drag:Rotate"]);
-        assert_eq!(probe.value, 11);
-    }
-
-    #[test]
-    fn play_click_is_an_ordered_authoring_barrier() {
-        let before_drag = probe_ordered_authoring_replay(
-            vec![ordered_action(1, OrderedToolbarAction::StartPlay)],
-            complete_ordered_drag(2),
-        );
-        assert_eq!(before_drag.trace, ["play"]);
-
-        let after_drag = probe_ordered_authoring_replay(
-            vec![ordered_action(4, OrderedToolbarAction::StartPlay)],
-            complete_ordered_drag(1),
-        );
-        assert_eq!(after_drag.trace, ["drag:Translate", "play"]);
     }
 
     #[test]
     fn queued_gizmo_drag_undo_save_reload_roundtrip() {
         let (mut editor_scene, runtime) = gizmo_test_scene_and_runtime();
-        let view = runtime_gizmo_view(&runtime, "cube-01", 0, Vec2::splat(800.0)).unwrap();
+        let viewport = full_test_viewport(800, 800);
+        let view = runtime_gizmo_view(&runtime, "cube-01", 0, viewport).unwrap();
         let center = project_gizmo_test_point(view, view.world_position);
         let x_tip = project_gizmo_test_point(view, view.world_position + Vec3::X);
-        let press = center.lerp(x_tip, 0.55);
+        let press = project_gizmo_test_axis_interior(view, Vec3::X);
         let moved = press + (x_tip - center).normalize() * 60.0;
         let mut gizmo = GizmoSystem::new();
-        let ui = EditorUi::new();
-
         let processed = process_gizmo_pointer_events(
             vec![
                 GizmoPointerEvent::Press(press),
@@ -4473,7 +5923,6 @@ mod tests {
             ],
             &mut editor_scene,
             &mut gizmo,
-            &ui,
             &runtime,
             "cube-01",
             view,
@@ -4496,7 +5945,7 @@ mod tests {
             .unwrap();
         assert!((runtime_x - changed.translation.x).abs() < 1.0e-5);
 
-        let overlay_view = runtime_gizmo_view(&runtime, "cube-01", 1, Vec2::splat(800.0)).unwrap();
+        let overlay_view = runtime_gizmo_view(&runtime, "cube-01", 1, viewport).unwrap();
         let overlay = offset_gizmo_batch(
             build_gizmo_ui_batch(
                 &gizmo,
@@ -4544,14 +5993,13 @@ mod tests {
     #[test]
     fn gizmo_release_position_applies_final_drag_segment() {
         let (mut editor_scene, runtime) = gizmo_test_scene_and_runtime();
-        let view = runtime_gizmo_view(&runtime, "cube-01", 0, Vec2::splat(800.0)).unwrap();
+        let view =
+            runtime_gizmo_view(&runtime, "cube-01", 0, full_test_viewport(800, 800)).unwrap();
         let center = project_gizmo_test_point(view, view.world_position);
         let x_tip = project_gizmo_test_point(view, view.world_position + Vec3::X);
-        let press = center.lerp(x_tip, 0.55);
+        let press = project_gizmo_test_axis_interior(view, Vec3::X);
         let released = press + (x_tip - center).normalize() * 60.0;
         let mut gizmo = GizmoSystem::new();
-        let ui = EditorUi::new();
-
         assert!(process_gizmo_pointer_events(
             vec![
                 GizmoPointerEvent::Press(press),
@@ -4559,7 +6007,6 @@ mod tests {
             ],
             &mut editor_scene,
             &mut gizmo,
-            &ui,
             &runtime,
             "cube-01",
             view,
@@ -4579,7 +6026,8 @@ mod tests {
     #[test]
     fn gizmo_overlay_and_hit_testing_share_the_scene_interaction_rect() {
         let (mut editor_scene, runtime) = gizmo_test_scene_and_runtime();
-        let full_view = runtime_gizmo_view(&runtime, "cube-01", 0, Vec2::splat(800.0)).unwrap();
+        let full_view =
+            runtime_gizmo_view(&runtime, "cube-01", 0, full_test_viewport(800, 800)).unwrap();
         let visible_view = restrict_gizmo_view_to_rect(
             full_view,
             Vec2::new(250.0, 200.0),
@@ -4613,7 +6061,6 @@ mod tests {
             vec![GizmoPointerEvent::Press(press)],
             &mut editor_scene,
             &mut gizmo,
-            &EditorUi::new(),
             &runtime,
             "cube-01",
             excluded_view,
@@ -4625,14 +6072,13 @@ mod tests {
     #[test]
     fn queued_gizmo_cancel_restores_preview_without_history() {
         let (mut editor_scene, mut runtime) = gizmo_test_scene_and_runtime();
-        let view = runtime_gizmo_view(&runtime, "cube-01", 0, Vec2::splat(800.0)).unwrap();
+        let view =
+            runtime_gizmo_view(&runtime, "cube-01", 0, full_test_viewport(800, 800)).unwrap();
         let center = project_gizmo_test_point(view, view.world_position);
         let x_tip = project_gizmo_test_point(view, view.world_position + Vec3::X);
-        let press = center.lerp(x_tip, 0.5);
+        let press = project_gizmo_test_axis_interior(view, Vec3::X);
         let moved = press + (x_tip - center).normalize() * 50.0;
         let mut gizmo = GizmoSystem::new();
-        let ui = EditorUi::new();
-
         assert!(process_gizmo_pointer_events(
             vec![
                 GizmoPointerEvent::Press(press),
@@ -4641,7 +6087,6 @@ mod tests {
             ],
             &mut editor_scene,
             &mut gizmo,
-            &ui,
             &runtime,
             "cube-01",
             view,
@@ -4663,74 +6108,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(runtime_translation, Vec3::new(0.0, 0.0, -5.0));
-    }
-
-    #[test]
-    fn widget_press_does_not_start_gizmo_behind_editor_ui() {
-        let (mut editor_scene, runtime) = gizmo_test_scene_and_runtime();
-        let view = runtime_gizmo_view(&runtime, "cube-01", 0, Vec2::splat(800.0)).unwrap();
-        let center = project_gizmo_test_point(view, view.world_position);
-        let x_tip = project_gizmo_test_point(view, view.world_position + Vec3::X);
-        let press = center.lerp(x_tip, 0.5);
-        let moved = press + (x_tip - center).normalize() * 50.0;
-        let mut gizmo = GizmoSystem::new();
-        let mut ui = EditorUi::new();
-        ui.begin_frame();
-        ui.set_panel_rect(press.x - 8.0, press.y - 8.0, 100.0);
-        let _ = ui.button("Blocking Inspector Control");
-
-        assert!(!process_gizmo_pointer_events(
-            vec![
-                GizmoPointerEvent::Press(press),
-                GizmoPointerEvent::Move(moved),
-                GizmoPointerEvent::Release(moved),
-            ],
-            &mut editor_scene,
-            &mut gizmo,
-            &ui,
-            &runtime,
-            "cube-01",
-            view,
-        ));
-        assert_eq!(
-            editor_scene
-                .selected_transform_for_gizmo()
-                .unwrap()
-                .translation,
-            Vec3::new(0.0, 0.0, -5.0)
-        );
-        assert!(!editor_scene.history.can_undo());
-        assert!(!gizmo.dragging);
-    }
-
-    #[test]
-    fn blank_panel_region_does_not_start_gizmo_behind_editor_ui() {
-        let (mut editor_scene, runtime) = gizmo_test_scene_and_runtime();
-        let view = runtime_gizmo_view(&runtime, "cube-01", 0, Vec2::splat(800.0)).unwrap();
-        let center = project_gizmo_test_point(view, view.world_position);
-        let x_tip = project_gizmo_test_point(view, view.world_position + Vec3::X);
-        let press = center.lerp(x_tip, 0.5);
-        let moved = press + (x_tip - center).normalize() * 50.0;
-        let mut gizmo = GizmoSystem::new();
-        let mut ui = EditorUi::new();
-        ui.begin_frame();
-        ui.block_pointer_rect(press.x - 20.0, press.y - 20.0, 100.0, 100.0);
-
-        assert!(!process_gizmo_pointer_events(
-            vec![
-                GizmoPointerEvent::Press(press),
-                GizmoPointerEvent::Move(moved),
-                GizmoPointerEvent::Release(moved),
-            ],
-            &mut editor_scene,
-            &mut gizmo,
-            &ui,
-            &runtime,
-            "cube-01",
-            view,
-        ));
-        assert!(!editor_scene.history.can_undo());
-        assert!(!gizmo.dragging);
     }
 
     #[test]
@@ -4780,7 +6157,8 @@ mod tests {
             authored_camera
         );
 
-        let view = runtime_gizmo_view(&runtime, "camera-main", 0, Vec2::splat(800.0)).unwrap();
+        let view =
+            runtime_gizmo_view(&runtime, "camera-main", 0, full_test_viewport(800, 800)).unwrap();
         assert!(build_gizmo_ui_batch(
             &GizmoSystem::new(),
             view.world_position,
@@ -4809,6 +6187,13 @@ mod tests {
                 world.get::<Transform>(camera).unwrap().translation
             })
             .unwrap();
-        assert!((editor_camera_translation - Vec3::new(25.0, 0.0, 0.0)).length() < 1.0e-5);
+        let pitch = 20.0_f32.to_radians();
+        let yaw = 45.0_f32.to_radians();
+        let expected = Vec3::new(
+            25.0 * yaw.cos() * pitch.cos(),
+            25.0 * pitch.sin(),
+            25.0 * yaw.sin() * pitch.cos(),
+        );
+        assert!((editor_camera_translation - expected).length() < 1.0e-5);
     }
 }

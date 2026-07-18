@@ -363,8 +363,7 @@ fn run_headless(
     let (mut game_loop, cooked_report) = create_game_loop(&project, scene)?;
     game_loop
         .runtime
-        .renderer_mut()
-        .set_backend(Box::<crate::qa::QaBackend>::default());
+        .set_renderer_backend(Box::<crate::qa::QaBackend>::default());
     let mut total_draw_calls = 0u64;
     let mut total_triangles = 0u64;
     let mut last_visible_drawables = 0u32;
@@ -516,7 +515,9 @@ fn run_windowed(project: GameProject, scene: Scene, max_frames: Option<u64>) -> 
 
             match create_game_loop(&self.project, self.scene.clone()) {
                 Ok((mut game_loop, _)) => {
-                    game_loop.runtime.renderer_mut().set_backend(backend);
+                    game_loop.runtime.set_renderer_backend(backend);
+                    #[cfg(feature = "runtime-subsystems")]
+                    game_loop.set_ui_viewport_size(size.width, size.height);
                     if let Err(error) = process_pending_scene_transitions(
                         &mut game_loop,
                         &self.project,
@@ -586,9 +587,9 @@ fn run_windowed(project: GameProject, scene: Scene, max_frames: Option<u64>) -> 
                 }
                 PlatformEvent::Resized { width, height } => {
                     if let Some(game_loop) = self.game_loop.as_mut() {
-                        if let Err(diagnostics) =
-                            game_loop.runtime.renderer_mut().resize(width, height)
-                        {
+                        #[cfg(feature = "runtime-subsystems")]
+                        game_loop.set_ui_viewport_size(width, height);
+                        if let Err(diagnostics) = game_loop.runtime.resize_renderer(width, height) {
                             return self.fail(format_diagnostics(diagnostics));
                         }
                     }

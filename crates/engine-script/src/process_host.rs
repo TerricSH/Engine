@@ -12,6 +12,7 @@
 //! behind an [`Arc<Mutex<SharedScriptIO>>`], so only one message is in-flight
 //! at a time. This is sufficient for a single-threaded game loop.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -109,7 +110,17 @@ impl ScriptInstance for ProcessScriptInstance {
 
         match response {
             ScriptMessage::MethodResult { result, .. } => Ok(result),
-            ScriptMessage::Error { message } => Err(ScriptError::ExecutionError(message)),
+            ScriptMessage::Error {
+                code,
+                operation,
+                message,
+                assembly_id,
+            } => Err(ScriptError::ExecutionError(protocol_error_message(
+                &code,
+                &operation,
+                &message,
+                assembly_id.as_deref(),
+            ))),
             other => Err(ScriptError::ExecutionError(format!(
                 "Unexpected response to CallMethod: {other:?}"
             ))),
@@ -129,7 +140,17 @@ impl ScriptInstance for ProcessScriptInstance {
 
         match response {
             ScriptMessage::FieldValue { .. } => Ok(()),
-            ScriptMessage::Error { message } => Err(ScriptError::ExecutionError(message)),
+            ScriptMessage::Error {
+                code,
+                operation,
+                message,
+                assembly_id,
+            } => Err(ScriptError::ExecutionError(protocol_error_message(
+                &code,
+                &operation,
+                &message,
+                assembly_id.as_deref(),
+            ))),
             other => Err(ScriptError::ExecutionError(format!(
                 "Unexpected response to SetField: {other:?}"
             ))),
@@ -168,9 +189,15 @@ impl ScriptInstance for ProcessScriptInstance {
             {
                 Ok(())
             }
-            ScriptMessage::Error { message } => Err(ScriptError::ExecutionError(format!(
-                "SetGameplayContext failed for '{}': {message}",
-                self.instance_id
+            ScriptMessage::Error {
+                code,
+                operation,
+                message,
+                assembly_id,
+            } => Err(ScriptError::ExecutionError(format!(
+                "SetGameplayContext failed for '{}': {}",
+                self.instance_id,
+                protocol_error_message(&code, &operation, &message, assembly_id.as_deref())
             ))),
             other => Err(ScriptError::ExecutionError(format!(
                 "Unexpected response to SetGameplayContext for '{}': {other:?}",
@@ -195,9 +222,15 @@ impl ScriptInstance for ProcessScriptInstance {
             } if instance_id == self.instance_id => {
                 decode_gameplay_commands(&self.instance_id, &commands_json)
             }
-            ScriptMessage::Error { message } => Err(ScriptError::ExecutionError(format!(
-                "DrainGameplayCommands failed for '{}': {message}",
-                self.instance_id
+            ScriptMessage::Error {
+                code,
+                operation,
+                message,
+                assembly_id,
+            } => Err(ScriptError::ExecutionError(format!(
+                "DrainGameplayCommands failed for '{}': {}",
+                self.instance_id,
+                protocol_error_message(&code, &operation, &message, assembly_id.as_deref())
             ))),
             other => Err(ScriptError::ExecutionError(format!(
                 "Unexpected response to DrainGameplayCommands for '{}': {other:?}",
@@ -210,13 +243,6 @@ impl ScriptInstance for ProcessScriptInstance {
 // ---------------------------------------------------------------------------
 // Process host
 // ---------------------------------------------------------------------------
-
-/// State of a loaded assembly on the process host side.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-enum ScriptHostState {
-    Loaded { id: String },
-}
 
 /// A script host that drives a child process running the .NET script runtime.
 ///
@@ -238,8 +264,8 @@ pub struct ProcessHost {
     child: Option<Child>,
     /// Shared IO pipes — cloned for each [`ProcessScriptInstance`].
     io: Option<Arc<Mutex<SharedScriptIO>>>,
-    /// Loaded assemblies and their state.
-    assemblies: Vec<(ScriptHandle, ScriptHostState)>,
+    /// Loaded handles and the host-reflected concrete behaviour classes.
+    assemblies: BTreeMap<String, (ScriptHandle, Vec<String>)>,
     /// Monotonic instance id counter.
     next_instance_id: u64,
 }
@@ -254,7 +280,7 @@ impl ProcessHost {
             name: name.into(),
             child: None,
             io: None,
-            assemblies: Vec::new(),
+            assemblies: BTreeMap::new(),
             next_instance_id: 0,
         }
     }
@@ -354,15 +380,32 @@ impl ScriptHost for ProcessHost {
         })?;
 
         match response {
-            ScriptMessage::AssemblyLoaded { id: resp_id, .. } => {
+            ScriptMessage::AssemblyLoaded {
+                id: resp_id,
+                mut classes,
+            } => {
+                if resp_id != id {
+                    return Err(ScriptError::LoadFailed(format!(
+                        "LoadAssembly response id '{resp_id}' did not match request id '{id}'"
+                    )));
+                }
+                classes.sort();
+                classes.dedup();
                 let handle = ScriptHandle::new(&resp_id);
-                self.assemblies.push((
-                    handle.clone(),
-                    ScriptHostState::Loaded { id: id.to_string() },
-                ));
+                self.assemblies.insert(resp_id, (handle.clone(), classes));
                 Ok(handle)
             }
-            ScriptMessage::Error { message } => Err(ScriptError::LoadFailed(message)),
+            ScriptMessage::Error {
+                code,
+                operation,
+                message,
+                assembly_id,
+            } => Err(ScriptError::LoadFailed(protocol_error_message(
+                &code,
+                &operation,
+                &message,
+                assembly_id.as_deref(),
+            ))),
             other => Err(ScriptError::LoadFailed(format!(
                 "Unexpected response to LoadAssembly: {other:?}"
             ))),
@@ -374,6 +417,21 @@ impl ScriptHost for ProcessHost {
         handle: &ScriptHandle,
         class_name: &str,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
+        let verified = self.verified_classes(handle.id()).ok_or_else(|| {
+            ScriptError::LoadFailed(format!(
+                "Assembly '{}' is not loaded by ProcessHost",
+                handle.id()
+            ))
+        })?;
+        if verified
+            .binary_search_by(|candidate| candidate.as_str().cmp(class_name))
+            .is_err()
+        {
+            return Err(ScriptError::ExecutionError(format!(
+                "Class '{class_name}' is not a reflection-verified Engine.EngineBehaviour in assembly '{}'",
+                handle.id()
+            )));
+        }
         let instance_id = format!("inst-{:04x}", self.next_instance_id);
         self.next_instance_id += 1;
 
@@ -392,8 +450,18 @@ impl ScriptHost for ProcessHost {
                 instance_id: response_id,
                 ..
             } if response_id == instance_id => {}
-            ScriptMessage::Error { message } => {
-                return Err(ScriptError::ExecutionError(message));
+            ScriptMessage::Error {
+                code,
+                operation,
+                message,
+                assembly_id,
+            } => {
+                return Err(ScriptError::ExecutionError(protocol_error_message(
+                    &code,
+                    &operation,
+                    &message,
+                    assembly_id.as_deref(),
+                )));
             }
             other => {
                 return Err(ScriptError::ExecutionError(format!(
@@ -408,8 +476,14 @@ impl ScriptHost for ProcessHost {
     }
 
     fn unload(&mut self, handle: &ScriptHandle) -> Result<(), ScriptError> {
-        self.assemblies.retain(|(h, _)| h.id() != handle.id());
+        self.assemblies.remove(handle.id());
         Ok(())
+    }
+
+    fn verified_classes(&self, assembly_id: &str) -> Option<&[String]> {
+        self.assemblies
+            .get(assembly_id)
+            .map(|(_, classes)| classes.as_slice())
     }
 }
 
@@ -427,6 +501,16 @@ impl Drop for ProcessHost {
 fn base64_encode(data: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+fn protocol_error_message(
+    code: &str,
+    operation: &str,
+    message: &str,
+    assembly_id: Option<&str>,
+) -> String {
+    let assembly = assembly_id.map_or(String::new(), |id| format!(" assembly='{id}'"));
+    format!("[{code}] operation='{operation}'{assembly}: {message}")
 }
 
 fn decode_gameplay_commands(
@@ -572,6 +656,45 @@ mod tests {
     }
 
     #[test]
+    fn gameplay_command_decoder_accepts_managed_ui_class_commands() {
+        let commands = decode_gameplay_commands(
+            "inst-0001",
+            r#"[
+                {"type":"ui","command":{"type":"create_canvas","canvas_id":"hud","width":1280,"height":720}},
+                {"type":"ui","command":{"type":"add_element","canvas_id":"hud","element_id":1,"element":{"kind":"panel","layout":{"anchor_min":[0,0],"anchor_max":[0,0],"offset_min":[24,24],"offset_max":[344,56]},"color":{"r":20,"g":20,"b":20,"a":210},"z_order":10}}},
+                {"type":"ui","command":{"type":"set_slider_value","canvas_id":"hud","element_id":3,"value":0.75}}
+            ]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &commands[0],
+            GameplayCommand::Ui {
+                command: crate::GameplayUiCommand::CreateCanvas { canvas_id, .. }
+            } if canvas_id == "hud"
+        ));
+        assert!(matches!(
+            &commands[2],
+            GameplayCommand::Ui {
+                command: crate::GameplayUiCommand::SetSliderValue {
+                    canvas_id,
+                    element_id: 3,
+                    value,
+                }
+            } if canvas_id == "hud" && (*value - 0.75).abs() < f32::EPSILON
+        ));
+        assert!(matches!(
+            &commands[1],
+            GameplayCommand::Ui {
+                command: crate::GameplayUiCommand::AddElement {
+                    canvas_id,
+                    element_id: 1,
+                    element: crate::GameplayUiElement::Panel { z_order: 10, .. }
+                }
+            } if canvas_id == "hud"
+        ));
+    }
+
+    #[test]
     fn gameplay_command_decoder_rejects_unsafe_scene_ids_with_guidance() {
         for json in [
             r#"[{"type":"load_scene","scene_id":""}]"#,
@@ -611,6 +734,7 @@ mod tests {
             canvas_id: "main-menu".into(),
             element_id: 7,
             callback_id: Some("continue".into()),
+            value: None,
         }];
 
         let context_json = encode_gameplay_context("inst-ui", &context).unwrap();

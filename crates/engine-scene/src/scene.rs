@@ -331,6 +331,141 @@ pub fn sample_scene() -> Scene {
     }
 }
 
+/// Build the authoring scene installed into a newly-created project or scene.
+///
+/// Unlike [`sample_scene`], which is a compact validation fixture, this scene
+/// has the transforms and lighting needed to be immediately useful in the
+/// editor and game preview.
+pub fn starter_scene(scene_id: impl Into<PersistentId>, name: impl Into<String>) -> Scene {
+    let (camera_translation, camera_rotation) = crate::camera_utils::setup_orbit_transform(
+        glam::Vec3::ZERO,
+        glam::Vec3::new(0.0, 2.0, 5.0),
+    );
+    let transform = |translation: [f32; 3], rotation: [f32; 4]| {
+        component(BTreeMap::from([
+            ("translation".to_string(), Value::Vec3(translation)),
+            ("rotation".to_string(), Value::Quat(rotation)),
+            ("scale".to_string(), Value::Vec3([1.0, 1.0, 1.0])),
+        ]))
+    };
+
+    let camera_components = BTreeMap::from([
+        (
+            "engine.camera".to_string(),
+            component(BTreeMap::from([
+                (
+                    "projection".to_string(),
+                    Value::Enum("Perspective".to_string()),
+                ),
+                ("near".to_string(), Value::Float32(0.1)),
+                ("far".to_string(), Value::Float32(1000.0)),
+                (
+                    "fov_y".to_string(),
+                    Value::Float32(std::f32::consts::FRAC_PI_4),
+                ),
+                ("ortho_half_height".to_string(), Value::Float32(5.0)),
+                (
+                    "render_layer_mask".to_string(),
+                    Value::UInt(u32::MAX as u64),
+                ),
+                ("clear_flags".to_string(), Value::UInt(3)),
+                (
+                    "clear_color".to_string(),
+                    Value::Color([0.02, 0.02, 0.06, 1.0]),
+                ),
+                ("priority".to_string(), Value::Int(0)),
+                ("msaa_samples".to_string(), Value::UInt(1)),
+                ("hdr_output".to_string(), Value::Bool(false)),
+                ("aperture".to_string(), Value::Float32(16.0)),
+                ("shutter_speed".to_string(), Value::Float32(1.0 / 60.0)),
+                ("iso".to_string(), Value::Float32(100.0)),
+                ("ev_compensation".to_string(), Value::Float32(0.0)),
+            ])),
+        ),
+        (
+            "engine.transform".to_string(),
+            transform(camera_translation.to_array(), camera_rotation.to_array()),
+        ),
+    ]);
+
+    let cube_components = BTreeMap::from([
+        (
+            "engine.renderable".to_string(),
+            component(BTreeMap::from([
+                ("mesh".to_string(), Value::Asset(AssetId::new("mesh-cube"))),
+                (
+                    "material".to_string(),
+                    Value::Asset(AssetId::new("mat-default")),
+                ),
+                ("visible".to_string(), Value::Bool(true)),
+                (
+                    "render_layer".to_string(),
+                    Value::Str("Default".to_string()),
+                ),
+                ("cast_shadows".to_string(), Value::Bool(true)),
+            ])),
+        ),
+        (
+            "engine.transform".to_string(),
+            transform([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]),
+        ),
+    ]);
+
+    let light_components = BTreeMap::from([
+        (
+            "engine.light".to_string(),
+            component(BTreeMap::from([
+                ("kind".to_string(), Value::Enum("Directional".to_string())),
+                ("color".to_string(), Value::Vec3([1.0, 0.96, 0.9])),
+                ("intensity".to_string(), Value::Float32(2.5)),
+                ("range".to_string(), Value::Float32(10.0)),
+                ("shadow_mode".to_string(), Value::UInt(0)),
+                ("direction".to_string(), Value::Vec3([-0.35, -0.8, -0.45])),
+            ])),
+        ),
+        (
+            "engine.transform".to_string(),
+            transform([0.0, 3.0, 0.0], [0.0, 0.0, 0.0, 1.0]),
+        ),
+    ]);
+
+    Scene {
+        schema_version: SCENE_SCHEMA_VERSION,
+        engine_version: "0.1.0".to_string(),
+        scene_id: scene_id.into(),
+        name: name.into(),
+        entities: vec![
+            EntityRecord {
+                persistent_id: "camera-main".to_string(),
+                parent: None,
+                name: Some("Main Camera".to_string()),
+                enabled: true,
+                components: camera_components,
+            },
+            EntityRecord {
+                persistent_id: "cube-01".to_string(),
+                parent: None,
+                name: Some("Cube".to_string()),
+                enabled: true,
+                components: cube_components,
+            },
+            EntityRecord {
+                persistent_id: "light-directional".to_string(),
+                parent: None,
+                name: Some("Directional Light".to_string()),
+                enabled: true,
+                components: light_components,
+            },
+        ],
+        scene_settings: SceneSettings {
+            active_camera: Some("camera-main".to_string()),
+            ..SceneSettings::default()
+        },
+        dependencies: vec![AssetId::new("mesh-cube"), AssetId::new("mat-default")],
+        diagnostics_policy: DiagnosticsPolicy::Strict,
+    }
+}
+
 fn component(fields: BTreeMap<String, Value>) -> ComponentRecord {
     ComponentRecord {
         schema_version: SchemaVersion::new(0, 1, 0),

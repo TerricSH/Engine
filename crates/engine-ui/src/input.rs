@@ -1,7 +1,9 @@
 //! UI input handling — hit testing, hover detection, and click dispatch.
 //!
-//! The preferred entry point is [`UiInputState::process_event`]. The legacy
-//! [`update_input`] adapter remains available for callback-based callers.
+//! Platform integrations translate pointer input into [`UiPointerEvent`] and
+//! feed it to [`UiInputState::process_event`]. Completed interactions are
+//! returned as [`UiClickEvent`] values for the runtime or scripting layer to
+//! route by element ID and optional callback ID.
 
 use tracing::debug;
 
@@ -34,69 +36,30 @@ pub enum UiPointerEvent {
 /// `callback_id` mirrors the element's optional callback identifier. The
 /// event is still emitted when that identifier is absent so native gameplay
 /// code can route the click by [`ElementId`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UiValue {
+    Bool(bool),
+    Float(f32),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct UiClickEvent {
     pub element_id: ElementId,
     pub callback_id: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// CallbackRegistry
-// ---------------------------------------------------------------------------
-
-/// A simple registry mapping callback IDs (strings) to closures.
-///
-/// The C# / scripting layer registers callbacks by ID.  When a button with a
-/// matching `callback_id` is clicked, the closure is invoked.
-#[derive(Default)]
-pub struct CallbackRegistry {
-    callbacks: std::collections::HashMap<String, Box<dyn FnMut() + Send>>,
-}
-
-impl CallbackRegistry {
-    /// Create an empty registry.
-    pub fn new() -> Self {
-        Self {
-            callbacks: std::collections::HashMap::new(),
-        }
-    }
-
-    /// Register a callback under the given `id`.
-    pub fn register(&mut self, id: impl Into<String>, callback: Box<dyn FnMut() + Send>) {
-        self.callbacks.insert(id.into(), callback);
-    }
-
-    /// Unregister a callback by `id`.
-    pub fn unregister(&mut self, id: &str) {
-        self.callbacks.remove(id);
-    }
-
-    /// Invoke the callback identified by `id`, if one exists.
-    ///
-    /// Returns `true` if a callback was found and called.
-    pub fn invoke(&mut self, id: &str) -> bool {
-        if let Some(cb) = self.callbacks.get_mut(id) {
-            cb();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Returns `true` if a callback is registered for the given ID.
-    pub fn contains(&self, id: &str) -> bool {
-        self.callbacks.contains_key(id)
-    }
+    /// New retained value for stateful controls. Buttons report `None`.
+    pub value: Option<UiValue>,
 }
 
 // ---------------------------------------------------------------------------
 // UiInputState
 // ---------------------------------------------------------------------------
 
-/// Persistent input state for a canvas, updated once per frame.
+/// Persistent input state for a canvas, updated for every pointer event.
 ///
 /// This struct carries hover / press / click / focus / capture state across
-/// frames.  Call [`update_input`] once per frame to advance the state.
+/// events and frames. Call [`Self::process_event`] with the authoritative
+/// mutable canvas so layout and retained control values stay synchronized.
+#[derive(Clone, Debug)]
 pub struct UiInputState {
     /// The element currently under the pointer, if any.
     pub hovered: Option<ElementId>,
@@ -165,9 +128,9 @@ impl UiInputState {
     /// produced only when release occurs inside the captured element while it
     /// remains enabled and interactive.
     ///
-    /// Buttons, toggles, checkboxes, and sliders all produce the same click
-    /// event. This method deliberately does not mutate toggle, checkbox, or
-    /// slider values; gameplay or script code owns those state changes.
+    /// Buttons produce a click, toggles and checkboxes flip their retained
+    /// value, and sliders update continuously while captured. Stateful click
+    /// events include the resulting value.
     pub fn process_event(
         &mut self,
         canvas: &mut Canvas,
@@ -179,7 +142,7 @@ impl UiInputState {
 
     fn process_laid_out_event(
         &mut self,
-        canvas: &Canvas,
+        canvas: &mut Canvas,
         event: UiPointerEvent,
     ) -> Option<UiClickEvent> {
         // `clicked` describes only the event just processed. Clearing it here
@@ -188,13 +151,18 @@ impl UiInputState {
 
         match event {
             UiPointerEvent::Move { x, y } => {
+                let slider_change = self
+                    .capture
+                    .and_then(|captured| update_slider_value(canvas, captured, x));
                 self.hovered = match self.capture {
                     Some(captured) => {
                         interactive_element_at(canvas, captured, x, y).then_some(captured)
                     }
                     None => hit_test_interactive(canvas, x, y),
                 };
-                None
+                slider_change.and_then(|(element_id, value)| {
+                    value_event(canvas, element_id, UiValue::Float(value))
+                })
             }
             UiPointerEvent::Press { x, y } => {
                 let target = hit_test_interactive(canvas, x, y);
@@ -203,6 +171,7 @@ impl UiInputState {
                 self.capture = target;
                 self.focused = target;
                 if let Some(element_id) = target {
+                    let _ = update_slider_value(canvas, element_id, x);
                     debug!(?element_id, "UI element pressed and captured");
                 }
                 None
@@ -210,6 +179,9 @@ impl UiInputState {
             UiPointerEvent::Release { x, y } => {
                 let captured = self.capture.take();
                 let pressed = self.pressed.take();
+                if let Some(element_id) = captured {
+                    let _ = update_slider_value(canvas, element_id, x);
+                }
                 self.hovered = hit_test_interactive(canvas, x, y);
 
                 let clicked = captured.filter(|element_id| {
@@ -306,11 +278,40 @@ fn interactive_element_at(
     })
 }
 
-fn click_event(canvas: &Canvas, element_id: ElementId) -> Option<UiClickEvent> {
+fn click_event(canvas: &mut Canvas, element_id: ElementId) -> Option<UiClickEvent> {
+    let element = canvas.get_element_mut(element_id)?;
+    let (callback_id, value) = match &mut element.kind {
+        UiElementKind::Button { callback_id, .. } => (callback_id.clone(), None),
+        UiElementKind::Toggle {
+            callback_id, is_on, ..
+        } => {
+            *is_on = !*is_on;
+            (callback_id.clone(), Some(UiValue::Bool(*is_on)))
+        }
+        UiElementKind::Checkbox {
+            callback_id,
+            checked,
+            ..
+        } => {
+            *checked = !*checked;
+            (callback_id.clone(), Some(UiValue::Bool(*checked)))
+        }
+        UiElementKind::Slider {
+            callback_id, value, ..
+        } => (callback_id.clone(), Some(UiValue::Float(*value))),
+        _ => return None,
+    };
+    Some(UiClickEvent {
+        element_id,
+        callback_id,
+        value,
+    })
+}
+
+fn value_event(canvas: &Canvas, element_id: ElementId, value: UiValue) -> Option<UiClickEvent> {
     let element = canvas.get_element(element_id)?;
     let callback_id = match &element.kind {
-        UiElementKind::Button { callback_id, .. }
-        | UiElementKind::Toggle { callback_id, .. }
+        UiElementKind::Toggle { callback_id, .. }
         | UiElementKind::Checkbox { callback_id, .. }
         | UiElementKind::Slider { callback_id, .. } => callback_id.clone(),
         _ => return None,
@@ -318,74 +319,35 @@ fn click_event(canvas: &Canvas, element_id: ElementId) -> Option<UiClickEvent> {
     Some(UiClickEvent {
         element_id,
         callback_id,
+        value: Some(value),
     })
 }
 
-// ---------------------------------------------------------------------------
-// Input update
-// ---------------------------------------------------------------------------
-
-/// Update the input state for the current frame.
-///
-/// Call this once per frame with the current pointer / touch state.
-///
-/// # Parameters
-/// * `state` — mutable input state (carries hover, press, click).
-/// * `canvas` — the canvas to test against.
-/// * `pointer_x`, `pointer_y` — current pointer position in canvas pixels.
-/// * `pointer_down` — `true` when the pointer button was pressed this frame.
-/// * `pointer_up` — `true` when the pointer button was released this frame.
-/// * `callbacks` — optional callback registry for dispatching button clicks.
-///
-/// When an interactive element is clicked (pressed + released on the same
-/// element), its callback (if any) is dispatched through the
-/// [`CallbackRegistry`].
-/// Unlike [`UiInputState::process_event`], this compatibility adapter cannot
-/// recompute layout because it accepts an immutable canvas; callers must run
-/// [`Canvas::layout_all`] after changing layout data.
-pub fn update_input(
-    state: &mut UiInputState,
-    canvas: &Canvas,
+fn update_slider_value(
+    canvas: &mut Canvas,
+    element_id: ElementId,
     pointer_x: f32,
-    pointer_y: f32,
-    pointer_down: bool,
-    pointer_up: bool,
-    callbacks: Option<&mut CallbackRegistry>,
-) {
-    let press = UiPointerEvent::Press {
-        x: pointer_x,
-        y: pointer_y,
+) -> Option<(ElementId, f32)> {
+    let Some(element) = canvas.get_element_mut(element_id) else {
+        return None;
     };
-    let release = UiPointerEvent::Release {
-        x: pointer_x,
-        y: pointer_y,
+    let UiElementKind::Slider {
+        value, min, max, ..
+    } = &mut element.kind
+    else {
+        return None;
     };
-    let click = match (pointer_down, pointer_up) {
-        (true, true) => {
-            state.process_laid_out_event(canvas, press);
-            state.process_laid_out_event(canvas, release)
-        }
-        (true, false) => state.process_laid_out_event(canvas, press),
-        (false, true) => state.process_laid_out_event(canvas, release),
-        (false, false) => state.process_laid_out_event(
-            canvas,
-            UiPointerEvent::Move {
-                x: pointer_x,
-                y: pointer_y,
-            },
-        ),
+    let t = if element.rect.width > 0.0 {
+        ((pointer_x - element.rect.x) / element.rect.width).clamp(0.0, 1.0)
+    } else {
+        0.0
     };
-
-    if let (Some(click), Some(registry)) = (click, callbacks) {
-        if let Some(callback_id) = click.callback_id.filter(|id| !id.is_empty()) {
-            registry.invoke(&callback_id);
-            debug!(
-                element_id = ?click.element_id,
-                %callback_id,
-                "Interactive element callback fired"
-            );
-        }
+    let next = *min + (*max - *min) * t;
+    if (next - *value).abs() <= f32::EPSILON {
+        return None;
     }
+    *value = next;
+    Some((element_id, next))
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +509,7 @@ mod tests {
             UiClickEvent {
                 element_id: same_z_later,
                 callback_id: Some("same_z_later".into()),
+                value: None,
             }
         );
     }
@@ -626,12 +589,18 @@ mod tests {
     }
 
     #[test]
-    fn every_interactive_kind_emits_callback_and_element_id_without_mutating_value() {
-        for (index, kind) in interactive_kinds(Some("gameplay_callback"))
+    fn every_interactive_kind_emits_callback_element_id_and_resulting_value() {
+        let expected_values = [
+            None,
+            Some(UiValue::Bool(true)),
+            Some(UiValue::Bool(true)),
+            Some(UiValue::Float(0.5)),
+        ];
+        for (index, (kind, expected_value)) in interactive_kinds(Some("gameplay_callback"))
             .into_iter()
+            .zip(expected_values)
             .enumerate()
         {
-            let expected_kind = kind.clone();
             let mut canvas = Canvas::new(100.0, 100.0);
             let id = canvas.add_element(UiElement::new(kind, Layout::FILL));
             let mut state = UiInputState::new();
@@ -641,16 +610,26 @@ mod tests {
                 UiClickEvent {
                     element_id: id,
                     callback_id: Some("gameplay_callback".into()),
+                    value: expected_value,
                 },
                 "interactive kind {index} must emit a routed click"
             );
-            assert_eq!(canvas.get_element(id).unwrap().kind, expected_kind);
         }
     }
 
     #[test]
     fn every_interactive_kind_without_callback_still_emits_element_id() {
-        for (index, kind) in interactive_kinds(None).into_iter().enumerate() {
+        let expected_values = [
+            None,
+            Some(UiValue::Bool(true)),
+            Some(UiValue::Bool(true)),
+            Some(UiValue::Float(0.5)),
+        ];
+        for (index, (kind, expected_value)) in interactive_kinds(None)
+            .into_iter()
+            .zip(expected_values)
+            .enumerate()
+        {
             let mut canvas = Canvas::new(100.0, 100.0);
             let id = canvas.add_element(UiElement::new(kind, Layout::FILL));
             let mut state = UiInputState::new();
@@ -660,6 +639,7 @@ mod tests {
                 UiClickEvent {
                     element_id: id,
                     callback_id: None,
+                    value: expected_value,
                 },
                 "interactive kind {index} must retain its element ID"
             );
@@ -667,41 +647,94 @@ mod tests {
     }
 
     #[test]
-    fn press_on_non_button_ignored() {
-        let canvas = setup_canvas();
+    fn slider_drag_updates_retained_value_and_reports_it_on_release() {
+        let mut canvas = Canvas::new(100.0, 20.0);
+        let id = canvas.add_element(UiElement::new(
+            UiElementKind::Slider {
+                label: "Volume".into(),
+                value: 0.0,
+                min: -1.0,
+                max: 1.0,
+                callback_id: Some("volume".into()),
+            },
+            Layout::FILL,
+        ));
         let mut state = UiInputState::new();
 
-        // Press on panel (not a button) — should not set pressed
-        update_input(&mut state, &canvas, 50.0, 50.0, true, false, None);
+        state.process_event(&mut canvas, UiPointerEvent::Press { x: 10.0, y: 10.0 });
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Move { x: 75.0, y: 10.0 }),
+            Some(UiClickEvent {
+                element_id: id,
+                callback_id: Some("volume".into()),
+                value: Some(UiValue::Float(0.5)),
+            })
+        );
+        assert_eq!(
+            canvas.get_element(id).map(|element| &element.kind),
+            Some(&UiElementKind::Slider {
+                label: "Volume".into(),
+                value: 0.5,
+                min: -1.0,
+                max: 1.0,
+                callback_id: Some("volume".into()),
+            })
+        );
+
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 75.0, y: 10.0 }),
+            Some(UiClickEvent {
+                element_id: id,
+                callback_id: Some("volume".into()),
+                value: Some(UiValue::Float(0.5)),
+            })
+        );
+    }
+
+    #[test]
+    fn press_on_non_button_ignored() {
+        let mut canvas = setup_canvas();
+        let mut state = UiInputState::new();
+
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Press { x: 50.0, y: 50.0 }),
+            None
+        );
         assert!(state.pressed.is_none());
     }
 
     #[test]
     fn press_and_release_triggers_click() {
-        let canvas = setup_canvas();
+        let mut canvas = setup_canvas();
         let mut state = UiInputState::new();
 
-        // Press on button
-        update_input(&mut state, &canvas, 150.0, 125.0, true, false, None);
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Press { x: 150.0, y: 125.0 }),
+            None
+        );
         assert_eq!(state.pressed, hit_test(&canvas, 150.0, 125.0));
 
-        // Release on same button
-        update_input(&mut state, &canvas, 150.0, 125.0, false, true, None);
+        let event = state
+            .process_event(&mut canvas, UiPointerEvent::Release { x: 150.0, y: 125.0 })
+            .expect("release on the pressed button must emit an event");
         assert!(state.pressed.is_none());
-        assert_eq!(state.clicked, hit_test(&canvas, 150.0, 125.0));
+        assert_eq!(state.clicked, Some(event.element_id));
+        assert_eq!(event.callback_id.as_deref(), Some("btn_test"));
+        assert_eq!(event.value, None);
     }
 
     #[test]
     fn press_and_release_elsewhere_no_click() {
-        let canvas = setup_canvas();
+        let mut canvas = setup_canvas();
         let mut state = UiInputState::new();
 
-        // Press on button
-        update_input(&mut state, &canvas, 150.0, 125.0, true, false, None);
+        state.process_event(&mut canvas, UiPointerEvent::Press { x: 150.0, y: 125.0 });
         assert!(state.pressed.is_some());
 
-        // Release away from button
-        update_input(&mut state, &canvas, 400.0, 400.0, false, true, None);
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 400.0, y: 400.0 },),
+            None
+        );
         assert!(state.pressed.is_none());
         assert!(state.clicked.is_none());
     }
@@ -822,148 +855,51 @@ mod tests {
 
     #[test]
     fn consume_clicked_drains() {
-        let canvas = setup_canvas();
+        let mut canvas = setup_canvas();
         let mut state = UiInputState::new();
 
-        update_input(&mut state, &canvas, 150.0, 125.0, true, false, None);
-        update_input(&mut state, &canvas, 150.0, 125.0, false, true, None);
+        let event = click(&mut state, &mut canvas, 150.0, 125.0);
 
-        assert_eq!(state.consume_clicked(), hit_test(&canvas, 150.0, 125.0));
+        assert_eq!(state.consume_clicked(), Some(event.element_id));
         assert!(state.consume_clicked().is_none()); // already drained
     }
 
     #[test]
-    fn callback_fires_on_click() {
-        let canvas = setup_canvas();
-        let mut reg = CallbackRegistry::new();
-        let clicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let clicked_cb = std::sync::Arc::clone(&clicked);
-        reg.register(
-            "btn_test",
-            Box::new(move || {
-                clicked_cb.store(true, std::sync::atomic::Ordering::SeqCst);
-            }),
-        );
+    fn click_event_routes_callback_id_without_an_in_crate_callback_side_channel() {
+        let mut canvas = setup_canvas();
         let mut state = UiInputState::new();
 
-        update_input(
-            &mut state,
-            &canvas,
-            150.0,
-            125.0,
-            true,
-            false,
-            Some(&mut reg),
-        );
-        update_input(
-            &mut state,
-            &canvas,
-            150.0,
-            125.0,
-            false,
-            true,
-            Some(&mut reg),
-        );
+        let event = click(&mut state, &mut canvas, 150.0, 125.0);
 
-        assert!(
-            clicked.load(std::sync::atomic::Ordering::SeqCst),
-            "callback should have been invoked"
-        );
+        assert_eq!(event.callback_id.as_deref(), Some("btn_test"));
+        assert_eq!(event.value, None);
     }
 
     #[test]
-    fn callback_not_fired_on_drag_off() {
-        let canvas = setup_canvas();
-        let mut reg = CallbackRegistry::new();
-        let clicked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let clicked_cb = std::sync::Arc::clone(&clicked);
-        reg.register(
-            "btn_test",
-            Box::new(move || {
-                clicked_cb.store(true, std::sync::atomic::Ordering::SeqCst);
-            }),
-        );
+    fn drag_off_emits_no_routed_click_event() {
+        let mut canvas = setup_canvas();
         let mut state = UiInputState::new();
 
-        update_input(
-            &mut state,
-            &canvas,
-            150.0,
-            125.0,
-            true,
-            false,
-            Some(&mut reg),
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Press { x: 150.0, y: 125.0 },),
+            None
         );
-        // Release elsewhere — no click
-        update_input(
-            &mut state,
-            &canvas,
-            400.0,
-            400.0,
-            false,
-            true,
-            Some(&mut reg),
+        assert_eq!(
+            state.process_event(&mut canvas, UiPointerEvent::Release { x: 400.0, y: 400.0 },),
+            None
         );
-
-        assert!(
-            !clicked.load(std::sync::atomic::Ordering::SeqCst),
-            "callback should NOT have been invoked"
-        );
-    }
-
-    #[test]
-    fn callback_registry_basic() {
-        let mut reg = CallbackRegistry::new();
-        let val = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let val_cb = std::sync::Arc::clone(&val);
-        reg.register(
-            "inc",
-            Box::new(move || {
-                val_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }),
-        );
-        assert!(reg.contains("inc"));
-        assert!(!reg.contains("nonexistent"));
-
-        assert!(reg.invoke("inc"));
-        assert_eq!(val.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        assert!(reg.invoke("inc"));
-        assert_eq!(val.load(std::sync::atomic::Ordering::SeqCst), 2);
-
-        assert!(!reg.invoke("nonexistent"));
-    }
-
-    #[test]
-    fn callback_registry_unregister() {
-        let mut reg = CallbackRegistry::new();
-        let val = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let val_cb = std::sync::Arc::clone(&val);
-        reg.register(
-            "a",
-            Box::new(move || {
-                val_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }),
-        );
-        reg.invoke("a");
-        assert_eq!(val.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        reg.unregister("a");
-        assert!(!reg.invoke("a"));
-        assert_eq!(val.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(state.clicked, None);
     }
 
     #[test]
     fn hover_updates() {
-        let canvas = setup_canvas();
+        let mut canvas = setup_canvas();
         let mut state = UiInputState::new();
 
-        // Hover over button
-        update_input(&mut state, &canvas, 150.0, 125.0, false, false, None);
+        state.process_event(&mut canvas, UiPointerEvent::Move { x: 150.0, y: 125.0 });
         assert!(state.hovered.is_some());
 
-        // Move away
-        update_input(&mut state, &canvas, -10.0, -10.0, false, false, None);
+        state.process_event(&mut canvas, UiPointerEvent::Move { x: -10.0, y: -10.0 });
         assert!(state.hovered.is_none());
     }
 

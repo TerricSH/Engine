@@ -11,6 +11,7 @@ default = []
 [dependencies]
 base64.workspace = true
 crossbeam-channel.workspace = true
+engine-script-api = { path = "../engine-script-api" }
 engine-serialize = { path = "../engine-serialize" }
 serde.workspace = true
 serde_json.workspace = true

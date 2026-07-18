@@ -29,17 +29,6 @@ fn backend_error(code: &str, message: &str) -> Vec<Diagnostic> {
 }
 
 impl BackendRenderer for ContractBackend {
-    fn frame_mode(&self) -> engine_renderer::BackendFrameMode {
-        engine_renderer::BackendFrameMode::RenderGraph
-    }
-
-    fn render_frame(&mut self, _input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        Err(backend_error(
-            "SBX_TEST_LEGACY_RENDER",
-            "the integration backend only accepts the render-graph lifecycle",
-        ))
-    }
-
     fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
         let mut trace = self.trace.lock().unwrap();
         if trace.frame_active {
@@ -56,8 +45,8 @@ impl BackendRenderer for ContractBackend {
     fn apply_pass_barriers(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &engine_renderer::render_graph::PassNode,
-        _barriers: &[engine_renderer::render_graph::CompiledBarrier],
+        _pass: &engine_renderer::render_graph2::PassNode,
+        _barriers: &[engine_renderer::render_graph2::CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
         Ok(())
     }
@@ -65,7 +54,7 @@ impl BackendRenderer for ContractBackend {
     fn execute_pass(
         &mut self,
         input: &RenderFrameInput,
-        pass: &engine_renderer::render_graph::PassNode,
+        pass: &engine_renderer::render_graph2::PassNode,
         stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
         let mut trace = self.trace.lock().unwrap();
@@ -76,7 +65,7 @@ impl BackendRenderer for ContractBackend {
             ));
         }
         trace.executed_passes.push(pass.name.to_string());
-        if pass.kind == engine_renderer::render_graph::PassKind::OpaquePbrForward {
+        if pass.kind == engine_renderer::render_graph2::PassKind::OpaquePbrForward {
             stats.draw_calls += input.drawables.len() as u32;
             stats.visible_drawables = input.drawables.len() as u32;
         }
@@ -137,7 +126,7 @@ fn runtime_with_contract_backend() -> (EngineRuntime, Arc<Mutex<ContractTrace>>)
         trace: Arc::clone(&trace),
     };
     let mut runtime = EngineRuntime::new(EngineConfig::default());
-    runtime.renderer_mut().set_backend(Box::new(backend));
+    runtime.set_renderer_backend(Box::new(backend));
     (runtime, trace)
 }
 

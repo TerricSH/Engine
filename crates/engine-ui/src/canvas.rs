@@ -7,6 +7,7 @@ use tracing::debug;
 
 use crate::batch;
 use crate::color::Color;
+use crate::input::UiInputState;
 use crate::layout::{Layout, ScaleMode};
 use crate::types::{ElementId, UiElement, UiElementKind, UiRect};
 use crate::DEFAULT_UI_MATERIAL;
@@ -81,6 +82,35 @@ impl Canvas {
         debug!(element_id = ?id, "Element added to canvas");
         self.elements.push(element);
         id
+    }
+
+    /// Insert an element with an explicit stable ID.
+    ///
+    /// This is used by deferred script and network command streams where the
+    /// producer must receive a usable element handle before the command is
+    /// applied on the engine thread. Normal in-process callers should prefer
+    /// [`Self::add_element`].
+    pub fn insert_element(
+        &mut self,
+        id: ElementId,
+        mut element: UiElement,
+    ) -> Result<ElementId, crate::UiError> {
+        if !(FIRST_ELEMENT_ID..=LAST_ELEMENT_ID).contains(&id.0) {
+            return Err(crate::UiError::InvalidElementId(id));
+        }
+        if self.elements.iter().any(|existing| existing.id == id) {
+            return Err(crate::UiError::DuplicateElementId(id));
+        }
+        element.id = id;
+        self.elements.push(element);
+        let next_candidate = if id.0 >= self.next_id {
+            increment_element_id(id.0)
+        } else {
+            self.next_id
+        };
+        self.next_id = self.next_available_id(next_candidate);
+        debug!(element_id = ?id, "Element inserted into canvas");
+        Ok(id)
     }
 
     fn next_available_id(&self, requested: u32) -> u32 {
@@ -210,184 +240,318 @@ impl Canvas {
     ///
     /// Call [`Canvas::layout_all`] before this to ensure pixel rects are current.
     pub fn build_batches(&self) -> Vec<UiBatch> {
-        let mut visible: Vec<&UiElement> = self.elements.iter().filter(|e| e.enabled).collect();
-        if visible.is_empty() {
-            return Vec::new();
-        }
-        visible.sort_by_key(|e| e.z_order);
-
-        let clip = Rect {
-            min: [0.0, 0.0],
-            max: [self.width, self.height],
-        };
-
-        let mut batches: Vec<UiBatch> = Vec::new();
-
-        for element in &visible {
-            let texture = batch::element_kind_texture(&element.kind);
-
-            // Start a new batch when z_order or texture changes.
-            let new_batch = batches
-                .last()
-                .is_none_or(|b: &UiBatch| b.z_order != element.z_order || b.texture != texture);
-
-            if new_batch {
-                batches.push(UiBatch {
-                    canvas_id: String::new(), // no persistent id on new Canvas
-                    z_order: element.z_order,
-                    clip_rect: clip,
-                    texture,
-                    vertices: Vec::new(),
-                    indices: Vec::new(),
-                    material: AssetId::new(DEFAULT_UI_MATERIAL),
-                });
-            }
-
-            let batch = batches.last_mut().expect("batch just created");
-
-            match &element.kind {
-                UiElementKind::Panel { color } => {
-                    batch::add_quad(
-                        batch,
-                        &element.rect,
-                        &[0.0, 0.0],
-                        &[1.0, 1.0],
-                        &batch::color_to_array(*color),
-                    );
-                }
-                UiElementKind::Image { color, .. } => {
-                    batch::add_quad(
-                        batch,
-                        &element.rect,
-                        &[0.0, 0.0],
-                        &[1.0, 1.0],
-                        &batch::color_to_array(*color),
-                    );
-                }
-                UiElementKind::Text {
-                    content,
-                    font_size,
-                    color,
-                } => {
-                    // Render via font atlas — each glyph becomes a quad
-                    if let Some(verts) =
-                        crate::font::render_text(content, *font_size, *color, &element.rect)
-                    {
-                        for chunk in verts.chunks(4) {
-                            if chunk.len() < 4 {
-                                continue;
-                            }
-                            let gx = chunk[0].position[0];
-                            let gy = chunk[0].position[1];
-                            let gx2 = chunk[2].position[0];
-                            let gy2 = chunk[2].position[1];
-                            if (gx2 - gx) < 1.0 || (gy2 - gy) < 1.0 {
-                                continue;
-                            }
-                            // Place each glyph quad into the batch.
-                            // The font atlas texture is handled separately;
-                            // for now glyphs are rendered as colored quads
-                            // until the batch texture pipeline is extended.
-                            batch::add_quad(
-                                batch,
-                                &UiRect::new(gx, gy, gx2 - gx, gy2 - gy),
-                                &[0.0, 0.0],
-                                &[1.0, 1.0],
-                                &batch::color_to_array(*color),
-                            );
-                        }
-                    } else {
-                        // No font loaded — fallback placeholder.
-                        let mut c = batch::color_to_array(*color);
-                        c[3] /= 2;
-                        batch::add_quad(batch, &element.rect, &[0.0, 0.0], &[1.0, 1.0], &c);
-                    }
-                }
-                UiElementKind::Button { normal_color, .. } => {
-                    batch::add_quad(
-                        batch,
-                        &element.rect,
-                        &[0.0, 0.0],
-                        &[1.0, 1.0],
-                        &batch::color_to_array(*normal_color),
-                    );
-                }
-                UiElementKind::Toggle {
-                    color_on, is_on, ..
-                } => {
-                    let c = if *is_on {
-                        *color_on
-                    } else {
-                        Color::new(100, 100, 100, 255)
-                    };
-                    batch::add_quad(
-                        batch,
-                        &element.rect,
-                        &[0.0, 0.0],
-                        &[1.0, 1.0],
-                        &batch::color_to_array(c),
-                    );
-                }
-                UiElementKind::Checkbox { checked, color, .. } => {
-                    let c = if *checked {
-                        *color
-                    } else {
-                        Color::new(80, 80, 80, 255)
-                    };
-                    batch::add_quad(
-                        batch,
-                        &element.rect,
-                        &[0.0, 0.0],
-                        &[1.0, 1.0],
-                        &batch::color_to_array(c),
-                    );
-                }
-                UiElementKind::Slider {
-                    value, min, max, ..
-                } => {
-                    // Draw a track and a thumb indicator.
-                    let track_color = Color::new(60, 60, 60, 255);
-                    batch::add_quad(
-                        batch,
-                        &element.rect,
-                        &[0.0, 0.0],
-                        &[1.0, 1.0],
-                        &batch::color_to_array(track_color),
-                    );
-                    // Thumb fills a fraction of the width.
-                    let t = if (*max - *min).abs() > 1e-6 {
-                        ((*value - *min) / (*max - *min)).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    let thumb_rect = UiRect::new(
-                        element.rect.x,
-                        element.rect.y,
-                        (element.rect.width * t).max(4.0),
-                        element.rect.height,
-                    );
-                    batch::add_quad(
-                        batch,
-                        &thumb_rect,
-                        &[0.0, 0.0],
-                        &[1.0, 1.0],
-                        &batch::color_to_array(Color::new(200, 200, 200, 255)),
-                    );
-                }
-                UiElementKind::ScrollView { color, .. } => {
-                    batch::add_quad(
-                        batch,
-                        &element.rect,
-                        &[0.0, 0.0],
-                        &[1.0, 1.0],
-                        &batch::color_to_array(*color),
-                    );
-                }
-            }
-        }
-
-        batches
+        build_canvas_batches(self, self.width, self.height, None)
     }
+
+    /// Build batches for a viewport and include current hover/press visuals.
+    ///
+    /// Element layout stays in logical Canvas coordinates. Fit-width and
+    /// fit-height canvases scale the generated vertices and clipping region
+    /// to the supplied viewport while retaining their aspect ratio.
+    pub fn build_batches_for_viewport(
+        &self,
+        viewport_width: f32,
+        viewport_height: f32,
+        input: Option<&UiInputState>,
+    ) -> Vec<UiBatch> {
+        build_canvas_batches(self, viewport_width, viewport_height, input)
+    }
+}
+
+fn build_canvas_batches(
+    canvas: &Canvas,
+    viewport_width: f32,
+    viewport_height: f32,
+    input: Option<&UiInputState>,
+) -> Vec<UiBatch> {
+    let mut visible = canvas
+        .elements
+        .iter()
+        .filter(|element| element.enabled)
+        .collect::<Vec<_>>();
+    visible.sort_by_key(|element| element.z_order);
+
+    let scale = crate::canvas_scale(canvas, viewport_width, viewport_height);
+    let clip = Rect {
+        min: [0.0, 0.0],
+        max: [canvas.width * scale, canvas.height * scale],
+    };
+    let mut batches = Vec::new();
+
+    for element in visible {
+        match &element.kind {
+            UiElementKind::Panel { color } => {
+                push_quad(
+                    &mut batches,
+                    element.z_order,
+                    clip,
+                    None,
+                    &element.rect,
+                    *color,
+                );
+            }
+            UiElementKind::Image { color, .. } => push_quad(
+                &mut batches,
+                element.z_order,
+                clip,
+                batch::element_kind_texture(&element.kind),
+                &element.rect,
+                *color,
+            ),
+            UiElementKind::Text {
+                content,
+                font_size,
+                color,
+            } => push_text(
+                &mut batches,
+                element.z_order,
+                clip,
+                content,
+                *font_size,
+                *color,
+                &element.rect,
+            ),
+            UiElementKind::Button {
+                label,
+                normal_color,
+                hover_color,
+                pressed_color,
+                ..
+            } => {
+                let color = if input.is_some_and(|state| {
+                    state.pressed == Some(element.id) || state.capture == Some(element.id)
+                }) {
+                    *pressed_color
+                } else if input.is_some_and(|state| state.hovered == Some(element.id)) {
+                    *hover_color
+                } else {
+                    *normal_color
+                };
+                push_quad(
+                    &mut batches,
+                    element.z_order,
+                    clip,
+                    None,
+                    &element.rect,
+                    color,
+                );
+                push_control_label(&mut batches, element, clip, label);
+            }
+            UiElementKind::Toggle {
+                label,
+                is_on,
+                color_on,
+                color_off,
+                ..
+            } => {
+                let color = interaction_tint(
+                    if *is_on { *color_on } else { *color_off },
+                    input,
+                    element.id,
+                );
+                push_quad(
+                    &mut batches,
+                    element.z_order,
+                    clip,
+                    None,
+                    &element.rect,
+                    color,
+                );
+                push_control_label(&mut batches, element, clip, label);
+            }
+            UiElementKind::Checkbox {
+                label,
+                checked,
+                color,
+                ..
+            } => {
+                let base = if *checked {
+                    *color
+                } else {
+                    Color::new(80, 80, 80, 255)
+                };
+                push_quad(
+                    &mut batches,
+                    element.z_order,
+                    clip,
+                    None,
+                    &element.rect,
+                    interaction_tint(base, input, element.id),
+                );
+                push_control_label(&mut batches, element, clip, label);
+            }
+            UiElementKind::Slider {
+                label,
+                value,
+                min,
+                max,
+                ..
+            } => {
+                push_quad(
+                    &mut batches,
+                    element.z_order,
+                    clip,
+                    None,
+                    &element.rect,
+                    interaction_tint(Color::new(60, 60, 60, 255), input, element.id),
+                );
+                let t = if (*max - *min).abs() > 1e-6 {
+                    ((*value - *min) / (*max - *min)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let value_rect = UiRect::new(
+                    element.rect.x,
+                    element.rect.y,
+                    (element.rect.width * t).max(4.0),
+                    element.rect.height,
+                );
+                push_quad(
+                    &mut batches,
+                    element.z_order,
+                    clip,
+                    None,
+                    &value_rect,
+                    Color::new(200, 200, 200, 255),
+                );
+                push_control_label(&mut batches, element, clip, label);
+            }
+            UiElementKind::ScrollView { color, .. } => push_quad(
+                &mut batches,
+                element.z_order,
+                clip,
+                None,
+                &element.rect,
+                *color,
+            ),
+        }
+    }
+
+    if (scale - 1.0).abs() > f32::EPSILON {
+        for vertex in batches
+            .iter_mut()
+            .flat_map(|batch: &mut UiBatch| &mut batch.vertices)
+        {
+            vertex.position[0] *= scale;
+            vertex.position[1] *= scale;
+        }
+    }
+    batches
+}
+
+fn ensure_batch(
+    batches: &mut Vec<UiBatch>,
+    z_order: i32,
+    clip_rect: Rect,
+    texture: Option<AssetId>,
+) -> &mut UiBatch {
+    let starts_new = batches
+        .last()
+        .is_none_or(|batch| batch.z_order != z_order || batch.texture != texture);
+    if starts_new {
+        batches.push(UiBatch {
+            canvas_id: String::new(),
+            z_order,
+            clip_rect,
+            texture,
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            material: AssetId::new(DEFAULT_UI_MATERIAL),
+        });
+    }
+    batches.last_mut().expect("UI batch was just created")
+}
+
+fn push_quad(
+    batches: &mut Vec<UiBatch>,
+    z_order: i32,
+    clip_rect: Rect,
+    texture: Option<AssetId>,
+    rect: &UiRect,
+    color: Color,
+) {
+    batch::add_quad(
+        ensure_batch(batches, z_order, clip_rect, texture),
+        rect,
+        &[0.0, 0.0],
+        &[1.0, 1.0],
+        &batch::color_to_array(color),
+    );
+}
+
+fn push_text(
+    batches: &mut Vec<UiBatch>,
+    z_order: i32,
+    clip_rect: Rect,
+    content: &str,
+    font_size: f32,
+    color: Color,
+    rect: &UiRect,
+) {
+    if let Some(vertices) = crate::font::render_text(content, font_size, color, rect) {
+        if vertices.is_empty() {
+            return;
+        }
+        let batch = ensure_batch(
+            batches,
+            z_order,
+            clip_rect,
+            Some(AssetId::new(crate::font::FONT_ATLAS_ASSET)),
+        );
+        for glyph in vertices.chunks_exact(4) {
+            let base = batch.vertices.len() as u32;
+            batch.vertices.extend_from_slice(glyph);
+            batch
+                .indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+}
+
+fn push_control_label(
+    batches: &mut Vec<UiBatch>,
+    element: &UiElement,
+    clip_rect: Rect,
+    label: &str,
+) {
+    if label.is_empty() {
+        return;
+    }
+    let font_size = (element.rect.height * 0.6).clamp(11.0, 28.0);
+    let label_rect = UiRect::new(
+        element.rect.x + 8.0,
+        element.rect.y + ((element.rect.height - font_size) * 0.5).max(0.0),
+        (element.rect.width - 16.0).max(0.0),
+        font_size,
+    );
+    push_text(
+        batches,
+        element.z_order,
+        clip_rect,
+        label,
+        font_size,
+        Color::WHITE,
+        &label_rect,
+    );
+}
+
+fn interaction_tint(color: Color, input: Option<&UiInputState>, element_id: ElementId) -> Color {
+    let multiplier = if input
+        .is_some_and(|state| state.pressed == Some(element_id) || state.capture == Some(element_id))
+    {
+        0.8
+    } else if input.is_some_and(|state| state.hovered == Some(element_id)) {
+        1.15
+    } else {
+        1.0
+    };
+    let channel = |value: u8| ((value as f32 * multiplier).round().clamp(0.0, 255.0)) as u8;
+    Color::new(
+        channel(color.r),
+        channel(color.g),
+        channel(color.b),
+        color.a,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +985,7 @@ fn decode_elements(value: Option<&Value>) -> Vec<UiElement> {
 /// maps. Computed rectangles are omitted and recalculated by
 /// [`Canvas::layout_all`]. Image textures use `Value::Asset` so recursive
 /// scene dependency collection can discover them.
-fn serialize_canvas(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
+pub(crate) fn serialize_canvas(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
     let canvas = component.downcast_ref::<Canvas>().expect("Canvas expected");
     let mut fields = BTreeMap::new();
 
@@ -1255,6 +1419,30 @@ mod tests {
     }
 
     #[test]
+    fn insert_element_preserves_explicit_script_id_and_rejects_duplicates() {
+        let mut canvas = Canvas::new(800.0, 600.0);
+        let id = ElementId(42);
+        assert_eq!(
+            canvas
+                .insert_element(id, panel_element(Layout::FILL, 0, Color::WHITE))
+                .unwrap(),
+            id
+        );
+        assert_eq!(canvas.get_element(id).unwrap().id, id);
+        assert!(matches!(
+            canvas.insert_element(id, panel_element(Layout::FILL, 0, Color::WHITE)),
+            Err(crate::UiError::DuplicateElementId(duplicate)) if duplicate == id
+        ));
+        assert!(matches!(
+            canvas.insert_element(
+                ElementId::INVALID,
+                panel_element(Layout::FILL, 0, Color::WHITE)
+            ),
+            Err(crate::UiError::InvalidElementId(ElementId::INVALID))
+        ));
+    }
+
+    #[test]
     fn get_element_mut_allows_mutation() {
         let mut canvas = test_canvas();
         let id = canvas.add_element(panel_element(Layout::FILL, 0, Color::WHITE));
@@ -1391,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn build_batches_text_is_semitransparent() {
+    fn build_batches_text_uses_font_atlas_uvs_and_full_vertex_color() {
         let mut canvas = test_canvas();
         let layout = Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(50.0, 20.0));
         canvas.add_element(
@@ -1407,13 +1595,19 @@ mod tests {
         );
         canvas.layout_all();
         let batches = canvas.build_batches();
-        assert_eq!(batches[0].vertices.len(), 4);
-        // Alpha should be halved
-        for v in &batches[0].vertices {
-            assert_eq!(v.color[0], 255);
-            assert_eq!(v.color[1], 0);
-            assert_eq!(v.color[2], 0);
-            assert_eq!(v.color[3], 127); // 255/2 = 127
+        if crate::font_atlas_texture_upload().is_some() {
+            assert_eq!(batches[0].vertices.len(), 20);
+            assert_eq!(
+                batches[0].texture,
+                Some(AssetId::new(crate::FONT_ATLAS_ASSET))
+            );
+            for vertex in &batches[0].vertices {
+                assert_eq!(vertex.color, [255, 0, 0, 255]);
+                assert!(vertex.uv[0] >= 0.0 && vertex.uv[0] <= 1.0);
+                assert!(vertex.uv[1] >= 0.0 && vertex.uv[1] <= 1.0);
+            }
+        } else {
+            assert!(batches.is_empty());
         }
     }
 
@@ -1426,6 +1620,55 @@ mod tests {
         let batches = canvas.build_batches();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].texture, Some(AssetId::new("ui/button")));
+    }
+
+    #[test]
+    fn build_batches_applies_button_hover_color_and_emits_label_text() {
+        let mut canvas = test_canvas();
+        let id = canvas.add_element(UiElement::new(
+            UiElementKind::Button {
+                label: "Play".into(),
+                normal_color: Color::new(10, 20, 30, 255),
+                hover_color: Color::new(40, 50, 60, 255),
+                pressed_color: Color::new(70, 80, 90, 255),
+                callback_id: Some("play".into()),
+            },
+            Layout::new(Vec2::ZERO, Vec2::ZERO, Vec2::ZERO, Vec2::new(120.0, 40.0)),
+        ));
+        canvas.layout_all();
+        let mut input = UiInputState::new();
+        input.hovered = Some(id);
+
+        let batches = canvas.build_batches_for_viewport(800.0, 600.0, Some(&input));
+        assert_eq!(batches[0].vertices[0].color, [40, 50, 60, 255]);
+        if crate::font_atlas_texture_upload().is_some() {
+            assert!(batches.iter().any(|batch| {
+                batch.texture == Some(AssetId::new(crate::FONT_ATLAS_ASSET))
+                    && !batch.vertices.is_empty()
+            }));
+        }
+    }
+
+    #[test]
+    fn fit_width_scales_vertices_and_clip_rect_to_viewport() {
+        let mut canvas = Canvas::new(320.0, 180.0);
+        canvas.scale_mode = ScaleMode::FitWidth;
+        canvas.add_element(panel_element(
+            Layout::new(
+                Vec2::ZERO,
+                Vec2::ZERO,
+                Vec2::new(10.0, 20.0),
+                Vec2::new(30.0, 40.0),
+            ),
+            0,
+            Color::WHITE,
+        ));
+        canvas.layout_all();
+
+        let batches = canvas.build_batches_for_viewport(640.0, 480.0, None);
+        assert_eq!(batches[0].vertices[0].position, [20.0, 40.0]);
+        assert_eq!(batches[0].vertices[2].position, [60.0, 80.0]);
+        assert_eq!(batches[0].clip_rect.max, [640.0, 360.0]);
     }
 
     #[test]

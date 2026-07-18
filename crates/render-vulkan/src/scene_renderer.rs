@@ -17,26 +17,25 @@ use ash::vk;
 use glam::Mat4;
 
 use engine_renderer::{
-    render_graph, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, LightItem,
-    LightKind, MaterialBinding, MaterialPipelineContext, MaterialResolver, MaterialUpload,
-    MeshUpload, MeshVertexFormat, ParamBlock, PassRegistry, RenderFrameInput, RenderPass,
-    RenderableItem, ResourceKind, ResourceRemoval, SamplerAddressMode, SamplerFilter, ShadowMode,
-    SkinnedItem, TextureSlot, TextureUpload, Transparency, UiBatch, UploadReceipt,
+    render_graph2, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, LightItem,
+    LightKind, MaterialBinding, MaterialUpload, MeshUpload, MeshVertexFormat, ParamBlock,
+    PassRegistry, RenderFrameInput, RenderPass, ResourceKind, ResourceRemoval, SamplerAddressMode,
+    SamplerFilter, ShadowMode, TextureSlot, TextureUpload, UiBatch, UploadReceipt,
 };
 use render_core::{
-    self, BindGroupLayoutBinding, BindGroupLayoutDescriptor, BufferDescriptor, BufferHandle,
-    CommandEncoder, Device, FramebufferHandle, IndexFormat, MemoryHint, PipelineHandle,
-    PipelineLayoutDescriptor, PipelineLayoutHandle, PipelineVariantKey, PushConstantRange,
+    self, BufferDescriptor, BufferHandle, CommandEncoder, Device, FramebufferHandle, IndexFormat,
+    MemoryHint, PipelineLayoutDescriptor, PipelineLayoutHandle, PushConstantRange,
     RenderPassDescriptor, RenderPassHandle, ShaderFormat, ShaderModuleDescriptor,
     ShaderModuleHandle, ShaderStage, SwapchainDescriptor, SwapchainHandle, TextureFormat,
-    VertexAttribute, VertexLayout,
 };
 
 #[cfg(test)]
 use render_core::PipelineDescriptor;
 
 use crate::device_impl::VulkanDevice;
-use crate::shaders_embedded::{FORWARD_FRAG_SPV, FORWARD_VERT_SPV, SKINNED_VERT_SPV};
+use crate::shaders_embedded::{
+    FORWARD_FRAG_SPV, FORWARD_VERT_SPV, SKINNED_VERT_SPV, SKYBOX_FRAG_SPV, SKYBOX_VERT_SPV,
+};
 
 // ============================================================================
 // GpuMesh
@@ -68,44 +67,6 @@ struct UploadedMaterialState {
     revision: u64,
 }
 
-// ============================================================================
-// Fallback mesh data  �? a coloured quad
-// ============================================================================
-
-/// Single vertex for the fallback mesh.
-///
-/// Layout: position (float32x3) + normal (float32x3) + uv (float32x2).
-/// Total stride = 32 bytes, matching both the forward and shadow pipelines.
-#[repr(C)]
-struct FallbackVertex {
-    position: [f32; 3],
-    normal: [f32; 3],
-    uv: [f32; 2],
-}
-
-const FALLBACK_VERTICES: [FallbackVertex; 4] = [
-    FallbackVertex {
-        position: [-0.5, -0.5, 0.0],
-        normal: [0.0, 0.0, 1.0],
-        uv: [0.0, 1.0],
-    },
-    FallbackVertex {
-        position: [0.5, -0.5, 0.0],
-        normal: [0.0, 0.0, 1.0],
-        uv: [1.0, 1.0],
-    },
-    FallbackVertex {
-        position: [0.5, 0.5, 0.0],
-        normal: [0.0, 0.0, 1.0],
-        uv: [1.0, 0.0],
-    },
-    FallbackVertex {
-        position: [-0.5, 0.5, 0.0],
-        normal: [0.0, 0.0, 1.0],
-        uv: [0.0, 0.0],
-    },
-];
-
 fn extraction_stats(input: &RenderFrameInput) -> engine_renderer::ExtractionStats {
     input
         .extraction_stats
@@ -131,38 +92,12 @@ fn apply_extraction_stats(stats: &mut FrameStats, input: &RenderFrameInput) {
     stats.culled_lights = extraction.culled_lights;
 }
 
-fn fallback_vertex_bytes() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(FALLBACK_VERTICES.len() * 32);
-    for v in &FALLBACK_VERTICES {
-        for f in v
-            .position
-            .iter()
-            .copied()
-            .chain(v.normal.iter().copied())
-            .chain(v.uv.iter().copied())
-        {
-            bytes.extend_from_slice(&f.to_ne_bytes());
-        }
-    }
-    bytes
-}
-
-const FALLBACK_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
-
 #[inline]
 fn vulkan_index_type(format: IndexFormat) -> vk::IndexType {
     match format {
         IndexFormat::U16 => vk::IndexType::UINT16,
         IndexFormat::U32 => vk::IndexType::UINT32,
     }
-}
-
-fn fallback_index_bytes() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(FALLBACK_INDICES.len() * 2);
-    for i in &FALLBACK_INDICES {
-        bytes.extend_from_slice(&i.to_ne_bytes());
-    }
-    bytes
 }
 
 const SCENE_FORWARD_PIPELINE_ID: &str = "scene-forward";
@@ -253,7 +188,7 @@ fn apply_registered_custom_pass_declarations(
         let declaration = pass.declare(node.view_id);
         let declared_kind_matches = matches!(
             declaration.kind,
-            render_graph::PassKind::Custom(declared) if declared == name
+            render_graph2::PassKind::Custom(declared) if declared == name
         );
         if !declared_kind_matches
             || declaration.view_id != node.view_id
@@ -270,180 +205,9 @@ fn apply_registered_custom_pass_declarations(
             )]);
         }
 
-        node.name = declaration.name;
-        node.inputs.clear();
-        node.outputs.clear();
-        node.depth_stencil = None;
-        if declaration.reads_depth {
-            node.inputs
-                .push(engine_renderer::render_graph2::PassAttachment {
-                    name: "depth_stencil".into(),
-                    format: Some("D32".into()),
-                    clear: false,
-                    load_op: "load".into(),
-                    size_source: engine_renderer::render_graph2::SizeSource::Swapchain,
-                    access: engine_renderer::render_graph2::ResourceAccess::Read,
-                });
-        }
-        if declaration.writes_swapchain {
-            node.outputs
-                .push(engine_renderer::render_graph2::PassAttachment {
-                    name: "swapchain".into(),
-                    format: None,
-                    clear: false,
-                    load_op: "load".into(),
-                    size_source: engine_renderer::render_graph2::SizeSource::Swapchain,
-                    access: engine_renderer::render_graph2::ResourceAccess::Write,
-                });
-        }
+        *node = declaration;
     }
     Ok(())
-}
-
-fn scene_forward_vertex_layout() -> VertexLayout {
-    VertexLayout {
-        // 32-byte stride: position + normal + UV.
-        stride_bytes: 32,
-        attributes: vec![
-            VertexAttribute {
-                semantic: "position".into(),
-                format: "float32x3".into(),
-                offset_bytes: 0,
-            },
-            VertexAttribute {
-                semantic: "normal".into(),
-                format: "float32x3".into(),
-                offset_bytes: 12,
-            },
-            VertexAttribute {
-                semantic: "uv".into(),
-                format: "float32x2".into(),
-                offset_bytes: 24,
-            },
-        ],
-    }
-}
-
-fn scene_skinned_vertex_layout() -> VertexLayout {
-    VertexLayout {
-        // 64-byte stride: position(12) + normal(12) + uv(8) + joints(16) + weights(16)
-        stride_bytes: 64,
-        attributes: vec![
-            VertexAttribute {
-                semantic: "position".into(),
-                format: "float32x3".into(),
-                offset_bytes: 0,
-            },
-            VertexAttribute {
-                semantic: "normal".into(),
-                format: "float32x3".into(),
-                offset_bytes: 12,
-            },
-            VertexAttribute {
-                semantic: "uv".into(),
-                format: "float32x2".into(),
-                offset_bytes: 24,
-            },
-            VertexAttribute {
-                semantic: "joints".into(),
-                format: "uint32x4".into(),
-                offset_bytes: 32,
-            },
-            VertexAttribute {
-                semantic: "weights".into(),
-                format: "float32x4".into(),
-                offset_bytes: 48,
-            },
-        ],
-    }
-}
-
-fn scene_skinned_pipeline_context(
-    shader_modules: &[ShaderModuleHandle],
-    pll: PipelineLayoutHandle,
-    rp: RenderPassHandle,
-    sample_count: u8,
-) -> MaterialPipelineContext {
-    MaterialPipelineContext {
-        shader_modules: shader_modules.to_vec(),
-        vertex_layout: scene_skinned_vertex_layout(),
-        bind_layouts: vec![
-            // Material UBO at set=2, binding=0
-            BindGroupLayoutDescriptor {
-                set_index: 2,
-                bindings: vec![BindGroupLayoutBinding {
-                    binding: 0,
-                    resource_kind: "uniform_buffer".into(),
-                }],
-            },
-        ],
-        pipeline_layout: pll,
-        render_pass: rp,
-        render_targets: vec![TextureFormat::Bgra8Unorm],
-        depth_format: Some(TextureFormat::Depth32Float),
-        depth_write_enabled: true,
-        depth_compare: Some("less".into()),
-        front_face: None,
-        topology: Some("triangle_list".into()),
-        polygon_mode: Some("fill".into()),
-        sample_count,
-    }
-}
-
-fn scene_forward_pipeline_context(
-    shader_modules: &[ShaderModuleHandle],
-    pll: PipelineLayoutHandle,
-    rp: RenderPassHandle,
-    sample_count: u8,
-) -> MaterialPipelineContext {
-    MaterialPipelineContext {
-        shader_modules: shader_modules.to_vec(),
-        vertex_layout: scene_forward_vertex_layout(),
-        bind_layouts: vec![
-            // Material UBO at set=2
-            BindGroupLayoutDescriptor {
-                set_index: 2,
-                bindings: vec![BindGroupLayoutBinding {
-                    binding: 0,
-                    resource_kind: "uniform_buffer".into(),
-                }],
-            },
-        ],
-        pipeline_layout: pll,
-        render_pass: rp,
-        render_targets: vec![TextureFormat::Bgra8Unorm],
-        depth_format: Some(TextureFormat::Depth32Float),
-        depth_write_enabled: true,
-        depth_compare: Some("less".into()),
-        front_face: None,
-        topology: Some("triangle_list".into()),
-        polygon_mode: Some("fill".into()),
-        sample_count,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ScenePipelineResources<'a> {
-    shader_modules: &'a [ShaderModuleHandle],
-    pipeline_layout: PipelineLayoutHandle,
-    render_pass: RenderPassHandle,
-    sample_count: u8,
-}
-
-fn fallback_material_binding(material_id: &AssetId) -> MaterialBinding {
-    MaterialBinding {
-        material_id: material_id.clone(),
-        pipeline: AssetId::new(SCENE_FORWARD_PIPELINE_ID),
-        variant_key: 0,
-        textures: Vec::new(),
-        uniforms: ParamBlock {
-            bytes: Vec::new(),
-            layout_hash: [0; 32],
-        },
-        pass_mask: 1,
-        transparency: Transparency::Opaque,
-        double_sided: false,
-    }
 }
 
 fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
@@ -518,11 +282,9 @@ struct MaterialCacheEntry {
 
 const MAX_MATERIALS: usize = 256;
 
-/// Cache entry for a bone palette descriptor set + buffer.
-#[allow(dead_code)]
+/// Cache entry for a bone palette descriptor set.
 struct BonePaletteCacheEntry {
     desc_set: vk::DescriptorSet,
-    bone_buffer: vk::Buffer,
     bound_texture_id: String,
 }
 
@@ -535,44 +297,6 @@ struct CachedBoneBuffer {
 
 const MAX_BONE_PALETTES: usize = 64;
 
-fn get_or_create_scene_forward_pipeline(
-    material_resolver: &mut MaterialResolver,
-    device: &mut dyn Device,
-    material: &MaterialBinding,
-    resources: ScenePipelineResources<'_>,
-    variant_key: PipelineVariantKey,
-) -> Result<PipelineHandle, render_core::RhiError> {
-    let context = scene_forward_pipeline_context(
-        resources.shader_modules,
-        resources.pipeline_layout,
-        resources.render_pass,
-        resources.sample_count,
-    );
-    let (pipeline_key, pipeline_desc) = material_resolver.resolve(material, &context, variant_key);
-    material_resolver
-        .library_mut()
-        .get_or_create(device, pipeline_key, &pipeline_desc)
-}
-
-fn get_or_create_scene_skinned_pipeline(
-    material_resolver: &mut MaterialResolver,
-    device: &mut dyn Device,
-    material: &MaterialBinding,
-    resources: ScenePipelineResources<'_>,
-) -> Result<PipelineHandle, render_core::RhiError> {
-    let context = scene_skinned_pipeline_context(
-        resources.shader_modules,
-        resources.pipeline_layout,
-        resources.render_pass,
-        resources.sample_count,
-    );
-    let (pipeline_key, pipeline_desc) =
-        material_resolver.resolve(material, &context, PipelineVariantKey::SKINNED);
-    material_resolver
-        .library_mut()
-        .get_or_create(device, pipeline_key, &pipeline_desc)
-}
-
 // ============================================================================
 // Light GPU data packing
 // ============================================================================
@@ -580,10 +304,10 @@ fn get_or_create_scene_skinned_pipeline(
 /// Pack a single [`LightItem`] into the 64-byte GPU Light struct format.
 ///
 /// GPU layout (std430):
-///   position[4]    �?xyz = world position, w = type flag (0=dir, 1=point, 2=spot)
-///   direction[4]   �?xyz = normalized direction, w = unused
-///   color[4]       �?rgb = color, a = intensity
-///   attenuation[4] �?x = range, y = linear, z = quadratic, w = spot_cutoff_cos
+///   position[4]    锟?xyz = world position, w = type flag (0=dir, 1=point, 2=spot)
+///   direction[4]   锟?xyz = normalized direction, w = unused
+///   color[4]       锟?rgb = color, a = intensity
+///   attenuation[4] 锟?x = range, y = linear, z = quadratic, w = spot_cutoff_cos
 ///
 /// Total: 64 bytes per light.
 fn pack_light_gpu_bytes(light: &LightItem, dir: [f32; 3], kind_w: f32) -> Vec<u8> {
@@ -727,29 +451,85 @@ fn validate_vulkan_frame_contract(input: &RenderFrameInput) -> Result<(), Vec<Di
         )]);
     }
     if input.views.iter().any(|view| {
-        view.viewport != engine_renderer::Rect::FULL
-            || view.viewport_rect_normalized != engine_renderer::Rect::FULL
+        !view.viewport.is_valid_normalized()
+            || !view.viewport_rect_normalized.is_valid_normalized()
+            || view.viewport != view.viewport_rect_normalized
     }) {
         return Err(vec![Diagnostic::new(
             "RV0318",
             DiagnosticSeverity::Error,
             "scene_renderer",
-            "Vulkan SceneRenderer currently supports only a full-surface viewport",
+            "Vulkan SceneRenderer requires matching, valid normalized viewport rectangles",
         )]);
     }
-    if input
-        .views
-        .iter()
-        .any(|view| view.clear_flags != engine_renderer::ClearFlags::ColorAndDepth)
-    {
+    if input.views.iter().any(|view| {
+        !matches!(
+            view.clear_flags,
+            engine_renderer::ClearFlags::ColorAndDepth | engine_renderer::ClearFlags::Skybox
+        )
+    }) {
         return Err(vec![Diagnostic::new(
             "RV0319",
             DiagnosticSeverity::Error,
             "scene_renderer",
-            "Vulkan SceneRenderer currently supports only ColorAndDepth clear mode",
+            "Vulkan SceneRenderer currently supports only ColorAndDepth and Skybox clear modes",
         )]);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VulkanViewportRect {
+    viewport: vk::Viewport,
+    scissor: vk::Rect2D,
+}
+
+fn vulkan_viewport_rect(
+    rect: engine_renderer::Rect,
+    surface_width: u32,
+    surface_height: u32,
+) -> Result<VulkanViewportRect, &'static str> {
+    if !rect.is_valid_normalized() {
+        return Err("viewport must be finite, positive, and contained in [0, 1]");
+    }
+    if surface_width == 0 || surface_height == 0 {
+        return Err("viewport surface dimensions must be positive");
+    }
+    if surface_width > i32::MAX as u32 || surface_height > i32::MAX as u32 {
+        return Err("viewport surface dimensions exceed Vulkan's signed offset range");
+    }
+
+    let surface_width_f = surface_width as f32;
+    let surface_height_f = surface_height as f32;
+    let x = rect.min[0] * surface_width_f;
+    let y = rect.min[1] * surface_height_f;
+    let right = rect.max[0] * surface_width_f;
+    let bottom = rect.max[1] * surface_height_f;
+    let scissor_left = x.floor().clamp(0.0, surface_width_f) as u32;
+    let scissor_top = y.floor().clamp(0.0, surface_height_f) as u32;
+    let scissor_right = right.ceil().clamp(0.0, surface_width_f) as u32;
+    let scissor_bottom = bottom.ceil().clamp(0.0, surface_height_f) as u32;
+
+    Ok(VulkanViewportRect {
+        viewport: vk::Viewport {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        },
+        scissor: vk::Rect2D {
+            offset: vk::Offset2D {
+                x: scissor_left as i32,
+                y: scissor_top as i32,
+            },
+            extent: vk::Extent2D {
+                width: scissor_right.saturating_sub(scissor_left),
+                height: scissor_bottom.saturating_sub(scissor_top),
+            },
+        },
+    })
 }
 
 const TONE_MAP_MODE_ACES: u32 = 0;
@@ -940,7 +720,6 @@ pub struct SceneRenderer {
 
     /// Cache of loaded meshes indexed by their [`AssetId`](engine_serialize::AssetId) string.
     meshes: BTreeMap<String, GpuMesh>,
-    material_resolver: MaterialResolver,
     texture_uploads: HashMap<String, UploadedResourceState>,
     uploaded_materials: HashMap<String, UploadedMaterialState>,
 
@@ -1000,7 +779,6 @@ impl SceneRenderer {
         Self {
             device,
             initialized: false,
-            material_resolver: MaterialResolver::new(16),
             meshes: BTreeMap::new(),
             texture_uploads: HashMap::new(),
             uploaded_materials: HashMap::new(),
@@ -1060,12 +838,14 @@ impl SceneRenderer {
     }
 
     // ------------------------------------------------------------------
-    // Pipeline initialisation  (lazy �?called on the first frame)
+    // Pipeline initialisation  (lazy 锟?called on the first frame)
     // ------------------------------------------------------------------
 
     fn configure_scene_shaders(&mut self) {
         self.device
-            .set_mvp_shaders(FORWARD_VERT_SPV, FORWARD_FRAG_SPV);
+            .set_forward_shaders(FORWARD_VERT_SPV, FORWARD_FRAG_SPV);
+        self.device
+            .set_skybox_shaders(SKYBOX_VERT_SPV, SKYBOX_FRAG_SPV);
         if !SKINNED_VERT_SPV.is_empty() {
             self.device.set_skinned_vertex_shader(SKINNED_VERT_SPV);
         }
@@ -1199,7 +979,7 @@ impl SceneRenderer {
                 // VK_SHADER_STAGE_VERTEX_BIT = 0x01
                 stage_flags: 0x01,
                 offset: 0,
-                size: 128, // 4�? f32 matrix (64 B) + spare uniform data
+                size: 128, // 4锟? f32 matrix (64 B) + spare uniform data
             }],
             debug_label: Some("scene-pll".into()),
         };
@@ -1214,7 +994,7 @@ impl SceneRenderer {
 
         self.create_scene_shader_modules()?;
 
-        // ── Material descriptor infrastructure (set=2: UBO + texture) ─
+        // 鈹€鈹€ Material descriptor infrastructure (set=2: UBO + texture) 鈹€
         self.device
             .create_material_descriptor_infra()
             .map_err(|e| {
@@ -1226,7 +1006,7 @@ impl SceneRenderer {
                 )]
             })?;
 
-        // ── Shadow-mapping resources ──────────────────────────────────
+        // 鈹€鈹€ Shadow-mapping resources 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         // Ensure the device has created shadow resources (idempotent).
         self.device.ensure_shadow().map_err(|e| {
             vec![Diagnostic::new(
@@ -1237,7 +1017,7 @@ impl SceneRenderer {
             )]
         })?;
 
-        // ── Environment cubemap (IBL, set=1 binding=1) ────────────────
+        // 鈹€鈹€ Environment cubemap (IBL, set=1 binding=1) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         self.device.create_env_cubemap().map_err(|e| {
             vec![Diagnostic::new(
                 "RV0212",
@@ -1247,7 +1027,7 @@ impl SceneRenderer {
             )]
         })?;
 
-        // ── Light SSBO (set=1 binding=2) ───────────────────────────
+        // 鈹€鈹€ Light SSBO (set=1 binding=2) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         self.device.create_light_ssbo().map_err(|e| {
             vec![Diagnostic::new(
                 "RV0222",
@@ -1257,7 +1037,7 @@ impl SceneRenderer {
             )]
         })?;
 
-        // ── Indirect draw buffers (Phase 5.1) ─────────────────────
+        // 鈹€鈹€ Indirect draw buffers (Phase 5.1) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         self.device
             .create_indirect_buffers(MAX_INDIRECT_DRAWS)
             .map_err(|e| {
@@ -1272,7 +1052,7 @@ impl SceneRenderer {
         self.rp = Some(rp);
         self.pll = Some(pll);
 
-        // ── Framebuffers (per swapchain image, color + depth) ─────────
+        // 鈹€鈹€ Framebuffers (per swapchain image, color + depth) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         self.framebuffers = self.device.create_scene_framebuffers(rp).map_err(|e| {
             vec![Diagnostic::new(
                 "RV0213",
@@ -1282,7 +1062,7 @@ impl SceneRenderer {
             )]
         })?;
 
-        // ── UI overlay pipeline ────────────────────────────────────
+        // 鈹€鈹€ UI overlay pipeline 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         self.initialized = true;
         Ok(())
     }
@@ -1317,7 +1097,7 @@ impl SceneRenderer {
         &self,
         input: &RenderFrameInput,
         material_id: &AssetId,
-    ) -> MaterialBinding {
+    ) -> Result<MaterialBinding, Vec<Diagnostic>> {
         input
             .materials
             .iter()
@@ -1328,7 +1108,14 @@ impl SceneRenderer {
                     .get(&material_id.id)
                     .map(|state| state.binding.clone())
             })
-            .unwrap_or_else(|| fallback_material_binding(material_id))
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0232",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("material '{}' was not uploaded", material_id.id),
+                )]
+            })
     }
 
     fn prepare_frame_cache_capacity(
@@ -1498,101 +1285,10 @@ impl SceneRenderer {
             .map(|item| &item.material)
             .chain(input.skinned_items.iter().map(|item| &item.material))
         {
-            let material = self.material_binding_for_drawable(input, material_id);
+            let material = self.material_binding_for_drawable(input, material_id)?;
             self.selected_material_texture_id(&material)?;
         }
         Ok(())
-    }
-
-    fn pipeline_for_drawable(
-        &mut self,
-        input: &RenderFrameInput,
-        drawable: &RenderableItem,
-        sample_count: u8,
-    ) -> Result<PipelineHandle, Vec<Diagnostic>> {
-        let pll = self.pll.ok_or_else(|| {
-            vec![Diagnostic::new(
-                "RV0202",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                "pipeline layout missing during drawable pipeline resolution",
-            )]
-        })?;
-        let rp = self.rp.ok_or_else(|| {
-            vec![Diagnostic::new(
-                "RV0203",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                "render pass missing during drawable pipeline resolution",
-            )]
-        })?;
-        let material = self.material_binding_for_drawable(input, &drawable.material);
-
-        get_or_create_scene_forward_pipeline(
-            &mut self.material_resolver,
-            &mut self.device,
-            &material,
-            ScenePipelineResources {
-                shader_modules: &self.forward_shader_modules,
-                pipeline_layout: pll,
-                render_pass: rp,
-                sample_count,
-            },
-            PipelineVariantKey::NONE,
-        )
-        .map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0204",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("resolve pipeline: {e:?}"),
-            )]
-        })
-    }
-
-    fn pipeline_for_skinned_drawable(
-        &mut self,
-        input: &RenderFrameInput,
-        skinned: &SkinnedItem,
-        sample_count: u8,
-    ) -> Result<PipelineHandle, Vec<Diagnostic>> {
-        let pll = self.pll.ok_or_else(|| {
-            vec![Diagnostic::new(
-                "RV0202",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                "pipeline layout missing during skinned drawable pipeline resolution",
-            )]
-        })?;
-        let rp = self.rp.ok_or_else(|| {
-            vec![Diagnostic::new(
-                "RV0203",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                "render pass missing during skinned drawable pipeline resolution",
-            )]
-        })?;
-        let material = self.material_binding_for_drawable(input, &skinned.material);
-
-        get_or_create_scene_skinned_pipeline(
-            &mut self.material_resolver,
-            &mut self.device,
-            &material,
-            ScenePipelineResources {
-                shader_modules: &self.skinned_shader_modules,
-                pipeline_layout: pll,
-                render_pass: rp,
-                sample_count,
-            },
-        )
-        .map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0204",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("resolve skinned pipeline: {e:?}"),
-            )]
-        })
     }
 
     /// Look up or create a bone-palette UBO buffer for the given skeleton.
@@ -1612,7 +1308,7 @@ impl SceneRenderer {
         }
         ubo_data.resize(4096, 0u8);
 
-        // Check bone buffer cache �?if found, update data and return.
+        // Check bone buffer cache 锟?if found, update data and return.
         if let Some(cached) = self.bone_palette_buffers.get(skeleton_id) {
             let handle = cached.handle;
             let vk_buffer = cached.vk_buffer;
@@ -1774,7 +1470,6 @@ impl SceneRenderer {
             cache_key.clone(),
             BonePaletteCacheEntry {
                 desc_set,
-                bone_buffer,
                 bound_texture_id: crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID
                     .to_string(),
             },
@@ -1791,10 +1486,10 @@ impl SceneRenderer {
     /// Parse `ParamBlock` bytes into a [`MaterialUBO`].
     ///
     /// Expected byte layout (matching the shader's MaterialUBO):
-    ///   [0..16)  base_color  �?vec4 f32
-    ///   [16..20) metallic    �?f32
-    ///   [20..24) roughness   �?f32
-    ///   [24..28) ao          �?f32
+    ///   [0..16)  base_color  锟?vec4 f32
+    ///   [16..20) metallic    锟?f32
+    ///   [20..24) roughness   锟?f32
+    ///   [24..28) ao          锟?f32
     ///
     /// If `bytes` is empty or too short, sane defaults are used.
     fn parse_material_ubo(bytes: &[u8]) -> MaterialUBO {
@@ -2205,87 +1900,6 @@ impl SceneRenderer {
     // Mesh caching
     // ------------------------------------------------------------------
 
-    /// Return a cached [`GpuMesh`] for `mesh_id`, or create a fallback quad
-    /// mesh and cache it.
-    fn get_or_create_mesh(&mut self, mesh_id: &str) -> Result<GpuMesh, Vec<Diagnostic>> {
-        if let Some(m) = self.meshes.get(mesh_id) {
-            return Ok(m.clone());
-        }
-
-        // First encounter �?upload a fallback coloured quad.
-        let vertex_bytes = fallback_vertex_bytes();
-        let index_bytes = fallback_index_bytes();
-
-        // --- Vertex buffer ---
-        let vb_desc = BufferDescriptor {
-            size_bytes: vertex_bytes.len() as u64,
-            usage_flags: render_core::BufferUsage::VERTEX,
-            memory_hint: MemoryHint::CpuToGpu,
-            debug_label: Some(format!("mesh-{mesh_id}-vertices")),
-        };
-        let vb = self.device.create_buffer(&vb_desc).map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0203",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("create_buffer(vertices): {e:?}"),
-            )]
-        })?;
-        if let Err(error) = self.device.write_buffer(vb, &vertex_bytes, 0) {
-            self.device.destroy_buffer(vb);
-            return Err(vec![Diagnostic::new(
-                "RV0204",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("write_buffer(vertices): {error:?}"),
-            )]);
-        }
-
-        // --- Index buffer ---
-        let ib_desc = BufferDescriptor {
-            size_bytes: index_bytes.len() as u64,
-            usage_flags: render_core::BufferUsage::INDEX,
-            memory_hint: MemoryHint::CpuToGpu,
-            debug_label: Some(format!("mesh-{mesh_id}-indices")),
-        };
-        let ib = match self.device.create_buffer(&ib_desc) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                self.device.destroy_buffer(vb);
-                return Err(vec![Diagnostic::new(
-                    "RV0205",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!("create_buffer(indices): {error:?}"),
-                )]);
-            }
-        };
-        if let Err(error) = self.device.write_buffer(ib, &index_bytes, 0) {
-            self.device.destroy_buffer(ib);
-            self.device.destroy_buffer(vb);
-            return Err(vec![Diagnostic::new(
-                "RV0206",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("write_buffer(indices): {error:?}"),
-            )]);
-        }
-
-        let index_count = (index_bytes.len() / 2) as u32; // u16 indices
-        let mesh = GpuMesh {
-            vertex_buffer: vb,
-            index_buffer: ib,
-            index_count,
-            index_format: IndexFormat::U16,
-            vertex_format: MeshVertexFormat::Pbr32,
-            content_hash: [0; 32],
-            revision: 1,
-        };
-
-        self.meshes.insert(mesh_id.to_string(), mesh.clone());
-        Ok(mesh)
-    }
-
     // ------------------------------------------------------------------
     // Frame lifecycle helpers
     // ------------------------------------------------------------------
@@ -2347,7 +1961,7 @@ impl SceneRenderer {
         })?;
 
         // Apply the requested MSAA sample count to the device before any
-        // resource creation takes place (ensure_sc �?ensure_hdr_resources).
+        // resource creation takes place (ensure_sc 锟?ensure_hdr_resources).
         self.device.hdr_msaa_samples = msaa_samples;
         if !self.initialized {
             // Swapchain setup creates the HDR forward pipeline, so the scene
@@ -2366,7 +1980,7 @@ impl SceneRenderer {
             })?;
             self.device.destroy_scene_framebuffers(&self.framebuffers);
             self.framebuffers.clear();
-            self.device.destroy_mvp();
+            self.device.destroy_swapchain_resources();
         }
 
         let sc_desc = SwapchainDescriptor {
@@ -2518,14 +2132,31 @@ impl SceneRenderer {
             self.device.write_light_ssbo(&light_ssbo_data, 0);
         }
 
-        // Contract validation above limits this backend to one full-surface
-        // ColorAndDepth view, but its authored clear colour is still part of
-        // the frame contract and must not be replaced with a backend constant.
-        let clear_color = input
-            .views
-            .first()
-            .map(|view| view.clear_color)
-            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let render_view = input.views.first().ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0013",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "HDR forward pass requires a RenderView",
+            )]
+        })?;
+        let scene_viewport = vulkan_viewport_rect(
+            render_view.viewport_rect_normalized,
+            self.width,
+            self.height,
+        )
+        .map_err(|message| {
+            vec![Diagnostic::new(
+                "RV0318",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                message,
+            )]
+        })?;
+        // Render-pass load operations clear only the scene's render area. The
+        // rest of the HDR attachment is intentionally never sampled by the
+        // sub-viewport tone-map draw.
+        let clear_color = render_view.clear_color;
         let clear_values = [
             vk::ClearValue {
                 color: vk::ClearColorValue {
@@ -2542,38 +2173,64 @@ impl SceneRenderer {
         let rpbi = vk::RenderPassBeginInfo::default()
             .render_pass(hdr_rp)
             .framebuffer(hdr_fb)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: self.width,
-                    height: self.height,
-                },
-            })
+            .render_area(scene_viewport.scissor)
             .clear_values(&clear_values);
         // SAFETY: command buffer is in recording state; RP, FB valid.
         unsafe {
             d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
         }
 
-        // Viewport + scissor
-        let vp = vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: self.width as f32,
-            height: self.height as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
-        let sc = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D {
-                width: self.width,
-                height: self.height,
-            },
-        };
         unsafe {
-            d.cmd_set_viewport(cmd, 0, &[vp]);
-            d.cmd_set_scissor(cmd, 0, &[sc]);
+            d.cmd_set_viewport(cmd, 0, &[scene_viewport.viewport]);
+            d.cmd_set_scissor(cmd, 0, &[scene_viewport.scissor]);
+        }
+
+        // Draw the environment cubemap before opaque geometry. The skybox
+        // pipeline does not write depth, so all scene geometry naturally
+        // replaces it while untouched pixels retain the environment.
+        if input
+            .views
+            .first()
+            .is_some_and(|view| view.clear_flags == engine_renderer::ClearFlags::Skybox)
+        {
+            let skybox_pipeline = self.device.hdr_skybox_pipeline.ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0321",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    "HDR skybox pipeline is unavailable",
+                )]
+            })?;
+            unsafe {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, skybox_pipeline);
+            }
+            if let Some(desc_set) = self.device.frame_descriptor_set(fi) {
+                unsafe {
+                    d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        hdr_pll,
+                        0,
+                        &[desc_set],
+                        &[],
+                    );
+                }
+            }
+            if let Some(desc_set) = self.device.shadow_desc_set {
+                unsafe {
+                    d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        hdr_pll,
+                        1,
+                        &[desc_set],
+                        &[],
+                    );
+                    d.cmd_draw(cmd, 36, 1, 0, 0);
+                }
+                stats.draw_calls += 1;
+                stats.triangles += 12;
+            }
         }
 
         // Bind HDR forward pipeline
@@ -2672,11 +2329,11 @@ impl SceneRenderer {
                     continue;
                 }
             }
-            // (when same mesh, VB/IB are still bound — skip rebind)
+            // When the mesh is unchanged, the vertex and index buffers remain bound.
 
             // Skip material descriptor rebind when same as last drawable
             if Some(material_id.as_str()) != last_material_id {
-                let material = self.material_binding_for_drawable(input, &drawable.material);
+                let material = self.material_binding_for_drawable(input, &drawable.material)?;
                 let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
                 let ubo_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
@@ -2787,7 +2444,7 @@ impl SceneRenderer {
             }
 
             // Per-item: material descriptor, bone buffer, skinned descriptor set
-            let material = self.material_binding_for_drawable(input, &skinned.material);
+            let material = self.material_binding_for_drawable(input, &skinned.material)?;
             let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
             let ubo_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
@@ -3159,11 +2816,6 @@ impl SceneRenderer {
             .path("render_options.exposure_ev100")]
         })?;
         let tone_map_push_bytes = tone_map_push.to_bytes();
-        let enc = self
-            .cur_enc
-            .as_mut()
-            .expect("active frame encoder checked above");
-
         let d = &self.device.logical_device.device;
         let fi = self.device.current_frame;
         let cmd = self.device.frame_sync[fi].command_buffer;
@@ -3206,6 +2858,33 @@ impl SceneRenderer {
             )]);
         }
 
+        let render_view = input.views.first().ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0013",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "tone-map pass requires a RenderView",
+            )]
+        })?;
+        let scene_viewport = vulkan_viewport_rect(
+            render_view.viewport_rect_normalized,
+            self.width,
+            self.height,
+        )
+        .map_err(|message| {
+            vec![Diagnostic::new(
+                "RV0318",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                message,
+            )]
+        })?;
+        let swapchain_clear = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+
         let rpbi = vk::RenderPassBeginInfo::default()
             .render_pass(tone_rp)
             .framebuffer(tone_fb)
@@ -3215,15 +2894,30 @@ impl SceneRenderer {
                     width: self.width,
                     height: self.height,
                 },
-            });
+            })
+            .clear_values(&swapchain_clear);
         unsafe {
             d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
         }
 
-        enc.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
-        enc.set_scissor(0, 0, self.width, self.height);
-
         unsafe {
+            d.cmd_set_viewport(
+                cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: self.width as f32,
+                    height: self.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            // Keep the full-surface viewport so the full-screen triangle's UV
+            // coordinates sample the matching pixels in the HDR attachment.
+            // Scissoring only the scene region prevents it from covering the
+            // editor chrome or an authored letterbox region.
+            d.cmd_set_scissor(cmd, 0, &[scene_viewport.scissor]);
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, tone_pl);
         }
 
@@ -3251,14 +2945,17 @@ impl SceneRenderer {
             );
         }
 
-        enc.draw(3, 1, 0, 0);
-        enc.end_render_pass();
+        unsafe {
+            d.cmd_draw(cmd, 3, 1, 0, 0);
+            d.cmd_end_render_pass(cmd);
+        }
 
-        let _ = stats;
+        stats.draw_calls += 1;
+        stats.triangles += 1;
         Ok(())
     }
 
-    // ── UI overlay rendering ─────────────────────────────────────────────
+    // 鈹€鈹€ UI overlay rendering 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     /// Render UI in a dedicated load-op pass over the tone-mapped swapchain
     /// image. This is invoked by the graph's Present pass, so no later scene
@@ -3503,270 +3200,10 @@ impl SceneRenderer {
 }
 
 // ============================================================================
-// Retained single-pass implementation
-// ============================================================================
-
-impl SceneRenderer {
-    // ------------------------------------------------------------------
-    // Single-pass legacy path
-    // ------------------------------------------------------------------
-
-    #[allow(dead_code)]
-    fn render_frame_legacy(
-        &mut self,
-        input: &RenderFrameInput,
-    ) -> Result<FrameStats, Vec<Diagnostic>> {
-        let msaa = self.device.msaa_samples(input.render_options.msaa_samples);
-        let (sc_h, ii, mut encoder) = self.begin_frame_impl(input, msaa)?;
-
-        // Begin a render pass covering the full viewport.
-        if let Some(rp) = self.rp {
-            // Real framebuffer from per-swapchain-image handles.
-            let fb = self
-                .framebuffers
-                .get(self.cur_fb_index as usize)
-                .copied()
-                .unwrap_or(FramebufferHandle::new(0, 0));
-            encoder.begin_render_pass(
-                rp,
-                fb,
-                (0, 0, self.width, self.height),
-                [0.02, 0.02, 0.06, 1.0],
-                Some(1.0),
-            );
-        }
-
-        encoder.set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
-        encoder.set_scissor(0, 0, self.width, self.height);
-
-        if let Some(pll) = self.pll {
-            encoder
-                .bind_descriptor_sets(pll, 0, &[], &[])
-                .map_err(|error| {
-                    vec![Diagnostic::new(
-                        "RV0244",
-                        DiagnosticSeverity::Error,
-                        "scene_renderer",
-                        format!("failed to bind the frame descriptor set: {error}"),
-                    )]
-                })?;
-        }
-
-        let mut draw_calls: u32 = 0;
-        let mut triangles: u64 = 0;
-
-        for drawable in &input.drawables {
-            let mesh_id = &drawable.mesh.id;
-            let mesh = match self.get_or_create_mesh(mesh_id) {
-                Ok(m) => m,
-                Err(diags) => {
-                    tracing::warn!(
-                        target: "scene_renderer",
-                        mesh = mesh_id,
-                        "skipping drawable, mesh creation failed"
-                    );
-                    for d in &diags {
-                        tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
-                    }
-                    continue;
-                }
-            };
-
-            let sample_count = input.render_options.msaa_samples;
-            let pipeline = self.pipeline_for_drawable(input, drawable, sample_count)?;
-            encoder.bind_pipeline(pipeline);
-
-            // --- Material UBO (set=2) ---
-            let material_id = &drawable.material.id;
-            let material = self.material_binding_for_drawable(input, &drawable.material);
-            let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
-            let ubo_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &material_ubo as *const _ as *const u8,
-                    std::mem::size_of::<MaterialUBO>(),
-                )
-            };
-            let (mat_desc_set, _mat_buf) =
-                self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
-            if let Some(pll) = self.pll {
-                let pll_vk = self
-                    .device
-                    .pipeline_layouts
-                    .get(pll.index, pll.generation)
-                    .map(|e| e.layout)
-                    .unwrap_or(vk::PipelineLayout::null());
-                if pll_vk != vk::PipelineLayout::null() {
-                    let d = &self.device.logical_device.device;
-                    let fi = self.device.current_frame;
-                    let cmd = self.device.frame_sync[fi].command_buffer;
-                    let sets = [mat_desc_set];
-                    // SAFETY: command buffer is in recording state; descriptor
-                    // set and pipeline layout are valid.
-                    unsafe {
-                        d.cmd_bind_descriptor_sets(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            pll_vk,
-                            2,
-                            &sets,
-                            &[],
-                        );
-                    }
-                }
-            }
-
-            self.bind_material_texture_if_changed(material_id, &material, mat_desc_set)?;
-
-            // Push the world transform as push constants (placeholder MVP).
-            if let Some(pll) = self.pll {
-                let world = &drawable.world_transform; // [f32; 16]
-                let mut pc_bytes = Vec::with_capacity(128);
-                for v in world {
-                    pc_bytes.extend_from_slice(&v.to_ne_bytes());
-                }
-                pc_bytes.resize(128, 0u8);
-                encoder.push_constants(pll, 0x01, 0, &pc_bytes);
-            }
-
-            encoder.bind_vertex_buffers(&[mesh.vertex_buffer], &[0]);
-            encoder.bind_index_buffer(mesh.index_buffer, 0, mesh.index_format);
-            encoder.draw_indexed(mesh.index_count, 1, 0, 0, 0);
-
-            draw_calls += 1;
-            triangles += mesh.index_count as u64 / 3;
-        }
-
-        // ── Skinned items ──────────────────────────────────────────────
-        let sample_count = input.render_options.msaa_samples;
-        for skinned in &input.skinned_items {
-            let mesh_id = &skinned.mesh.id;
-            let mesh = match self.get_or_create_mesh(mesh_id) {
-                Ok(m) => m,
-                Err(diags) => {
-                    tracing::warn!(
-                        target: "scene_renderer",
-                        mesh = mesh_id,
-                        "skipping skinned drawable, mesh creation failed"
-                    );
-                    for d in &diags {
-                        tracing::warn!(target: "scene_renderer", code = d.code, message = d.message);
-                    }
-                    continue;
-                }
-            };
-
-            let pipeline = self.pipeline_for_skinned_drawable(input, skinned, sample_count)?;
-            encoder.bind_pipeline(pipeline);
-
-            // --- Material UBO (set=2, binding=0) ---
-            let material_id = &skinned.material.id;
-            let material = self.material_binding_for_drawable(input, &skinned.material);
-            let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
-            let ubo_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &material_ubo as *const _ as *const u8,
-                    std::mem::size_of::<MaterialUBO>(),
-                )
-            };
-            let (mat_desc_set, mat_buf) =
-                self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
-
-            // --- Bone palette UBO (set=2, binding=2) ---
-            let skeleton_id = &skinned.skeleton.id;
-            let bone_buf = self.get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette)?;
-
-            // --- Combined descriptor set (material + bone) ---
-            let skinned_desc_set = self.get_or_create_skinned_desc_set(
-                material_id,
-                skeleton_id,
-                mat_desc_set,
-                mat_buf,
-                bone_buf,
-            )?;
-
-            if let Some(pll) = self.pll {
-                let pll_vk = self
-                    .device
-                    .pipeline_layouts
-                    .get(pll.index, pll.generation)
-                    .map(|e| e.layout)
-                    .unwrap_or(vk::PipelineLayout::null());
-                if pll_vk != vk::PipelineLayout::null() {
-                    let d = &self.device.logical_device.device;
-                    let fi = self.device.current_frame;
-                    let cmd = self.device.frame_sync[fi].command_buffer;
-                    let sets = [skinned_desc_set];
-                    // SAFETY: command buffer is in recording state; descriptor
-                    // set and pipeline layout are valid.
-                    unsafe {
-                        d.cmd_bind_descriptor_sets(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            pll_vk,
-                            2,
-                            &sets,
-                            &[],
-                        );
-                    }
-                }
-            }
-
-            let skinned_cache_key = format!("{material_id}:{skeleton_id}");
-            self.bind_skinned_texture_if_changed(&skinned_cache_key, &material, skinned_desc_set)?;
-
-            // The skinned shader applies this drawable world matrix after the
-            // bone palette's model-space deformation.
-            if let Some(pll) = self.pll {
-                let mut pc_bytes = Vec::with_capacity(128);
-                for value in &skinned.world_transform {
-                    pc_bytes.extend_from_slice(&value.to_ne_bytes());
-                }
-                pc_bytes.resize(128, 0);
-                encoder.push_constants(pll, 0x01, 0, &pc_bytes);
-            }
-
-            encoder.bind_vertex_buffers(&[mesh.vertex_buffer], &[0]);
-            encoder.bind_index_buffer(mesh.index_buffer, 0, mesh.index_format);
-            encoder.draw_indexed(mesh.index_count, 1, 0, 0, 0);
-
-            draw_calls += 1;
-            triangles += mesh.index_count as u64 / 3;
-        }
-
-        // ── UI overlay ────────────────────────────────────────────────
-        encoder.end_render_pass();
-
-        let stats = self.device.end_frame(sc_h, encoder, ii).map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0209",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("end_frame: {e:?}"),
-            )]
-        })?;
-
-        let extraction = extraction_stats(input);
-        Ok(FrameStats {
-            visible_drawables: extraction.visible_drawables,
-            visible_lights: extraction.visible_lights,
-            culled_drawables: extraction.culled_drawables,
-            culled_lights: extraction.culled_lights,
-            draw_calls,
-            triangles,
-            gpu_frame_ms: stats.gpu_frame_ms,
-        })
-    }
-}
-
-// ============================================================================
 // BackendRenderer implementation
 // ============================================================================
 
 impl BackendRenderer for SceneRenderer {
-    fn frame_mode(&self) -> engine_renderer::BackendFrameMode {
-        engine_renderer::BackendFrameMode::RenderGraph
-    }
-
     fn configure_render_graph(
         &mut self,
         _input: &RenderFrameInput,
@@ -3775,79 +3212,11 @@ impl BackendRenderer for SceneRenderer {
         apply_registered_custom_pass_declarations(&self.pass_registry, graph)
     }
 
-    fn render_frame(&mut self, input: &RenderFrameInput) -> Result<FrameStats, Vec<Diagnostic>> {
-        validate_vulkan_frame_contract(input)?;
-        let diagnostics = engine_renderer::validate_frame_input(input);
-        if diagnostics.iter().any(|diagnostic| {
-            matches!(
-                diagnostic.severity,
-                DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
-            )
-        }) {
-            return Err(diagnostics);
-        }
-
-        let mut graph = engine_renderer::render_graph2::RenderGraph::build_with_config(
-            input,
-            &input.render_options.pass_graph_config,
-        );
-        self.configure_render_graph(input, &mut graph)?;
-        let compiled = graph.compile_v2().map_err(|error| {
-            vec![Diagnostic::new(
-                "RV0284",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("render graph compile failed: {error}"),
-            )]
-        })?;
-        let abort_after_error = |renderer: &mut SceneRenderer, mut diagnostics: Vec<Diagnostic>| {
-            if let Err(mut abort_diagnostics) = renderer.abort_frame() {
-                diagnostics.append(&mut abort_diagnostics);
-            }
-            diagnostics
-        };
-
-        let mut stats = FrameStats::default();
-        self.begin_frame(input)?;
-        for (compiled_index, &pass_index) in compiled.pass_order.iter().enumerate() {
-            let Some(pass) = graph.passes.get(pass_index) else {
-                let diagnostics = vec![Diagnostic::new(
-                    "RV0285",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!("compiled graph referenced missing pass index {pass_index}"),
-                )];
-                return Err(abort_after_error(self, diagnostics));
-            };
-            let barriers = compiled
-                .barriers_per_pass
-                .get(compiled_index)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            if let Some(legacy_pass) = pass.to_legacy() {
-                if let Err(diagnostics) = self.apply_pass_barriers(input, &legacy_pass, barriers) {
-                    return Err(abort_after_error(self, diagnostics));
-                }
-                if let Err(diagnostics) = self.execute_pass(input, &legacy_pass, &mut stats) {
-                    return Err(abort_after_error(self, diagnostics));
-                }
-            }
-        }
-        if let Err(diagnostics) = self.end_frame(&mut stats) {
-            return Err(abort_after_error(self, diagnostics));
-        }
-        Ok(stats)
-    }
-
-    // ------------------------------------------------------------------
-    // Multi-pass graph path
-    // ------------------------------------------------------------------
-
     fn apply_pass_barriers(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &render_graph::PassNode,
-        barriers: &[engine_renderer::render_graph::CompiledBarrier],
+        _pass: &render_graph2::PassNode,
+        barriers: &[engine_renderer::render_graph2::CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
         let fi = self.device.current_frame;
         self.device
@@ -3902,7 +3271,7 @@ impl BackendRenderer for SceneRenderer {
     fn execute_pass(
         &mut self,
         input: &RenderFrameInput,
-        pass: &render_graph::PassNode,
+        pass: &render_graph2::PassNode,
         stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
         if self.cur_enc.is_none() {
@@ -3920,19 +3289,19 @@ impl BackendRenderer for SceneRenderer {
         // acquired swapchain image. Custom passes continue to use the
         // pluggable registry.
         match pass.kind {
-            render_graph::PassKind::OpaquePbrForward => {
+            render_graph2::PassKind::OpaquePbrForward => {
                 self.execute_hdr_forward_pass(input, stats)?;
             }
-            render_graph::PassKind::DirectionalShadow => {
+            render_graph2::PassKind::DirectionalShadow => {
                 self.execute_shadow_pass(input, stats)?;
             }
-            render_graph::PassKind::ToneMap => {
+            render_graph2::PassKind::ToneMap => {
                 self.execute_tonemap_pass(input, stats)?;
             }
-            render_graph::PassKind::Present => {
+            render_graph2::PassKind::Present => {
                 self.execute_ui_overlay_pass(&input.ui_batches, stats)?;
             }
-            render_graph::PassKind::Custom(name) => {
+            render_graph2::PassKind::Custom(name) => {
                 let enc = self.cur_enc.as_mut().expect("encoder checked above");
                 execute_registered_custom_pass(
                     &mut self.pass_registry,
@@ -4534,7 +3903,8 @@ impl BackendRenderer for SceneRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_renderer::hash_vertex_layout;
+    use engine_renderer::{RenderableItem, SkinnedItem};
+    use render_core::PipelineHandle;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -4727,13 +4097,38 @@ mod tests {
             self.kind
         }
 
-        fn declare(&self, view_id: u32) -> render_graph::PassNode {
-            render_graph::PassNode {
-                kind: render_graph::PassKind::Custom(self.kind),
+        fn declare(&self, view_id: u32) -> render_graph2::PassNode {
+            let inputs = self
+                .reads_depth
+                .then(|| render_graph2::PassAttachment {
+                    name: "depth_stencil".into(),
+                    format: Some("D32".into()),
+                    clear: false,
+                    load_op: "load".into(),
+                    size_source: render_graph2::SizeSource::Swapchain,
+                    access: render_graph2::ResourceAccess::Read,
+                })
+                .into_iter()
+                .collect();
+            let outputs = self
+                .writes_swapchain
+                .then(|| render_graph2::PassAttachment {
+                    name: "swapchain".into(),
+                    format: None,
+                    clear: false,
+                    load_op: "load".into(),
+                    size_source: render_graph2::SizeSource::Swapchain,
+                    access: render_graph2::ResourceAccess::Write,
+                })
+                .into_iter()
+                .collect();
+            render_graph2::PassNode {
+                kind: render_graph2::PassKind::Custom(self.kind),
                 name: self.kind,
                 view_id,
-                reads_depth: self.reads_depth,
-                writes_swapchain: self.writes_swapchain,
+                inputs,
+                outputs,
+                depth_stencil: None,
             }
         }
 
@@ -4824,7 +4219,7 @@ mod tests {
         );
         apply_registered_custom_pass_declarations(&registry, &mut graph)
             .expect("custom pass declaration");
-        let compiled = graph.compile_v2().expect("custom render graph compile");
+        let compiled = graph.compile().expect("custom render graph compile");
         let mut encoder = MockEncoder;
         let mut stats = FrameStats::default();
         let mut executed_custom_node = false;
@@ -5037,109 +4432,6 @@ mod tests {
         assert_eq!(frame.culled_lights, 7);
     }
 
-    #[test]
-    fn scene_forward_pipeline_resolution_uses_explicit_render_pass() {
-        let resolver = MaterialResolver::new(4);
-        let pll = PipelineLayoutHandle::new(3, 1);
-        let rp = RenderPassHandle::new(7, 2);
-        let shaders = [ShaderModuleHandle::new(8, 1), ShaderModuleHandle::new(9, 1)];
-        let material = fallback_material_binding(&AssetId::new("mat_default"));
-
-        let (key, desc) = resolver.resolve(
-            &material,
-            &scene_forward_pipeline_context(&shaders, pll, rp, 1),
-            PipelineVariantKey::NONE,
-        );
-
-        assert_eq!(key.shader_asset_id, SCENE_FORWARD_PIPELINE_ID);
-        assert_eq!(
-            key.vertex_layout_hash,
-            hash_vertex_layout(&desc.vertex_layout)
-        );
-        assert_eq!(key.variant_key, PipelineVariantKey::NONE);
-        assert_eq!(desc.pipeline_layout, Some(pll));
-        assert_eq!(desc.render_pass, Some(rp));
-        assert_eq!(desc.shader_modules, shaders);
-    }
-
-    #[test]
-    fn scene_forward_pipeline_cache_hit_reuses_handle() {
-        let mut resolver = MaterialResolver::new(4);
-        let mut device = MockDevice::new();
-        let pll = PipelineLayoutHandle::new(1, 1);
-        let rp = RenderPassHandle::new(2, 1);
-        let shaders = [ShaderModuleHandle::new(3, 1), ShaderModuleHandle::new(4, 1)];
-        let resources = ScenePipelineResources {
-            shader_modules: &shaders,
-            pipeline_layout: pll,
-            render_pass: rp,
-            sample_count: 1,
-        };
-        let material = fallback_material_binding(&AssetId::new("mat_shared"));
-
-        let first = get_or_create_scene_forward_pipeline(
-            &mut resolver,
-            &mut device,
-            &material,
-            resources,
-            PipelineVariantKey::NONE,
-        )
-        .expect("first pipeline create should succeed");
-        let second = get_or_create_scene_forward_pipeline(
-            &mut resolver,
-            &mut device,
-            &material,
-            resources,
-            PipelineVariantKey::NONE,
-        )
-        .expect("cache hit should succeed");
-
-        assert_eq!(first, second);
-        assert_eq!(device.create_calls, 1);
-        assert!(device.destroyed.is_empty());
-        assert_eq!(device.created_descs.len(), 1);
-        assert_eq!(device.created_descs[0].render_pass, Some(rp));
-        assert_eq!(resolver.library().len(), 1);
-    }
-
-    #[test]
-    fn scene_forward_pipeline_cache_eviction_destroys_old_handle() {
-        let mut resolver = MaterialResolver::new(1);
-        let mut device = MockDevice::new();
-        let pll = PipelineLayoutHandle::new(1, 1);
-        let rp = RenderPassHandle::new(2, 1);
-        let shaders = [ShaderModuleHandle::new(3, 1), ShaderModuleHandle::new(4, 1)];
-        let resources = ScenePipelineResources {
-            shader_modules: &shaders,
-            pipeline_layout: pll,
-            render_pass: rp,
-            sample_count: 1,
-        };
-        let material = fallback_material_binding(&AssetId::new("mat_shared"));
-
-        let first = get_or_create_scene_forward_pipeline(
-            &mut resolver,
-            &mut device,
-            &material,
-            resources,
-            PipelineVariantKey::NONE,
-        )
-        .expect("first pipeline create should succeed");
-        let second = get_or_create_scene_forward_pipeline(
-            &mut resolver,
-            &mut device,
-            &material,
-            resources,
-            PipelineVariantKey::SKINNED,
-        )
-        .expect("second pipeline create should succeed");
-
-        assert_ne!(first, second);
-        assert_eq!(device.create_calls, 2);
-        assert_eq!(device.destroyed, vec![first]);
-        assert_eq!(resolver.library().len(), 1);
-    }
-
     fn ui_batch(texture: Option<&str>, clip_rect: engine_renderer::Rect) -> UiBatch {
         UiBatch {
             canvas_id: "editor".into(),
@@ -5256,6 +4548,23 @@ mod tests {
     }
 
     #[test]
+    fn ui_vertex_shader_preserves_top_left_editor_coordinates() {
+        let source = include_str!("../shaders/ui_overlay.vert");
+        assert!(source.contains("float y = (in_position.y / pc.screen_size.y) * 2.0 - 1.0;"));
+        assert!(!source.contains("float y = -(in_position.y / pc.screen_size.y) * 2.0 + 1.0;"));
+    }
+
+    #[test]
+    fn skybox_shaders_generate_a_cube_and_sample_the_environment() {
+        let vertex = include_str!("../shaders/skybox.vert");
+        let fragment = include_str!("../shaders/skybox.frag");
+        assert!(vertex.contains("CUBE_POSITIONS[gl_VertexIndex]"));
+        assert!(vertex.contains("vec4(direction, 0.0)"));
+        assert!(fragment.contains("samplerCube u_environment_map"));
+        assert!(fragment.contains("texture(u_environment_map"));
+    }
+
+    #[test]
     fn vulkan_scene_renderer_rejects_direct_to_swapchain() {
         let diagnostics =
             validate_vulkan_output_mode(engine_renderer::PassGraphOutputMode::DirectToSwapchain)
@@ -5281,18 +4590,67 @@ mod tests {
         );
         input.render_options.msaa_samples = 1;
 
+        let embedded = engine_renderer::Rect {
+            min: [0.25, 0.125],
+            max: [0.75, 0.875],
+        };
+        input.views[0].viewport = embedded;
+        input.views[0].viewport_rect_normalized = embedded;
+        assert!(validate_vulkan_frame_contract(&input).is_ok());
+
         input.views[0].viewport_rect_normalized.max = [0.5, 1.0];
         assert_eq!(
             validate_vulkan_frame_contract(&input).unwrap_err()[0].code,
             "RV0318"
         );
+        input.views[0].viewport = engine_renderer::Rect::FULL;
         input.views[0].viewport_rect_normalized = engine_renderer::Rect::FULL;
+
+        input.views[0].clear_flags = engine_renderer::ClearFlags::Skybox;
+        assert!(validate_vulkan_frame_contract(&input).is_ok());
 
         input.views[0].clear_flags = engine_renderer::ClearFlags::Nothing;
         assert_eq!(
             validate_vulkan_frame_contract(&input).unwrap_err()[0].code,
             "RV0319"
         );
+    }
+
+    #[test]
+    fn normalized_scene_viewport_maps_to_matching_vulkan_viewport_and_scissor() {
+        let mapped = vulkan_viewport_rect(
+            engine_renderer::Rect {
+                min: [0.25, 0.1],
+                max: [0.75, 0.9],
+            },
+            1600,
+            900,
+        )
+        .unwrap();
+        assert_eq!(mapped.viewport.x, 400.0);
+        assert_eq!(mapped.viewport.y, 90.0);
+        assert_eq!(mapped.viewport.width, 800.0);
+        assert_eq!(mapped.viewport.height, 720.0);
+        assert_eq!(mapped.scissor.offset.x, 400);
+        assert_eq!(mapped.scissor.offset.y, 90);
+        assert_eq!(mapped.scissor.extent.width, 800);
+        assert_eq!(mapped.scissor.extent.height, 720);
+
+        let fractional = vulkan_viewport_rect(
+            engine_renderer::Rect {
+                min: [0.1, 0.1],
+                max: [0.2, 0.2],
+            },
+            17,
+            11,
+        )
+        .unwrap();
+        assert_eq!(fractional.scissor.offset.x, 1);
+        assert_eq!(fractional.scissor.offset.y, 1);
+        assert_eq!(fractional.scissor.extent.width, 3);
+        assert_eq!(fractional.scissor.extent.height, 2);
+
+        assert!(vulkan_viewport_rect(engine_renderer::Rect::FULL, 0, 900).is_err());
     }
 
     #[test]

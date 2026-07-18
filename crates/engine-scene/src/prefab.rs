@@ -1,15 +1,17 @@
-//! Prefab seed — minimal reusable entity template (Gate 11, G11-F05).
+//! Versioned prefab asset contract.
 //!
 //! A prefab is a self-contained entity hierarchy snapshot that can be
-//! instantiated into a scene.  This seed implementation stores:
+//! instantiated into a scene. The authoring source is human-readable RON
+//! (`*.prefab.ron`); cooking validates that source and emits a bincode payload
+//! for the runtime asset registry.
 //!
 //! - A source asset identifier (logical path in the asset registry).
 //! - An entity hierarchy snapshot (list of `EntityRecord`).
 //! - Component default overrides (keyed by component type, field name, value).
 //! - A version field for forward compatibility.
 //!
-//! Full override semantics (nested prefab composition, field-level override
-//! resolution, runtime property propagation) are owned by Gate 14.
+//! Nested prefab composition is part of this contract. Field override apply or
+//! revert is deliberately not implied by the asset format.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -31,6 +33,20 @@ pub const MAX_PREFAB_NESTING_DEPTH: usize = 64;
 /// A structural error found while validating a prefab dependency graph.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PrefabValidationError {
+    #[error("prefab source asset identifier is empty")]
+    EmptySourceAsset,
+    #[error(
+        "prefab '{asset_id}' uses unsupported schema {actual_major}.{actual_minor}.{actual_patch}; expected {expected_major}.{expected_minor}.{expected_patch}"
+    )]
+    UnsupportedSchemaVersion {
+        asset_id: String,
+        actual_major: u16,
+        actual_minor: u16,
+        actual_patch: u16,
+        expected_major: u16,
+        expected_minor: u16,
+        expected_patch: u16,
+    },
     #[error("prefab '{asset_id}' has an empty hierarchy")]
     EmptyHierarchy { asset_id: String },
     #[error("prefab '{asset_id}' contains an empty persistent_id")]
@@ -47,6 +63,13 @@ pub enum PrefabValidationError {
         asset_id: String,
         entity_persistent_id: String,
         parent_persistent_id: String,
+    },
+    #[error("prefab '{asset_id}' must have exactly one root entity, found {root_count}")]
+    InvalidRootCount { asset_id: String, root_count: usize },
+    #[error("prefab '{asset_id}' entity hierarchy contains a cycle: {cycle:?}")]
+    EntityHierarchyCycle {
+        asset_id: String,
+        cycle: Vec<String>,
     },
     #[error(
         "prefab '{asset_id}' child '{child_asset_id}' references missing attachment entity '{entity_persistent_id}'"
@@ -72,6 +95,7 @@ pub enum PrefabValidationError {
 
 /// A reference to a child prefab nested inside a parent prefab.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrefabChildRef {
     /// The persistent ID of the entity in the parent prefab's hierarchy that
     /// acts as the attachment point (root of the child prefab).
@@ -80,13 +104,14 @@ pub struct PrefabChildRef {
     pub prefab_asset: AssetId,
 }
 
-/// A prefab seed: a reusable entity hierarchy with component defaults.
+/// A reusable, versioned entity hierarchy with component defaults.
 ///
 /// Fields are versioned from the start.  The `source_asset` links back to the
 /// original asset file in the registry.  `component_defaults` allow prefab
 /// authors to override specific component fields per type without replacing
 /// the entire component record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Prefab {
     /// Prefab schema version for forward-compat deserialization.
     pub schema_version: SchemaVersion,
@@ -160,11 +185,37 @@ impl Prefab {
 // Asset pipeline (cooker / loader)
 // ---------------------------------------------------------------------------
 
-/// Prefab cooker: validates by attempting full deserialise, then passes through.
+/// Parse and structurally validate the canonical human-readable prefab source.
+pub fn parse_prefab_source(source: &[u8]) -> Result<Prefab, String> {
+    let source = std::str::from_utf8(source)
+        .map_err(|error| format!("Prefab source is not UTF-8: {error}"))?;
+    let prefab: Prefab = ron::de::from_str(source)
+        .map_err(|error| format!("Prefab RON source is invalid: {error}"))?;
+    validate_prefab_structure(&prefab).map_err(format_prefab_validation_errors)?;
+    Ok(prefab)
+}
+
+/// Serialize a prefab into the canonical human-readable source form.
+pub fn serialize_prefab_source(prefab: &Prefab) -> Result<String, String> {
+    validate_prefab_structure(prefab).map_err(format_prefab_validation_errors)?;
+    ron::ser::to_string_pretty(prefab, ron::ser::PrettyConfig::default())
+        .map_err(|error| format!("Prefab RON serialization failed: {error}"))
+}
+
+fn format_prefab_validation_errors(errors: Vec<PrefabValidationError>) -> String {
+    errors
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Prefab cooker: parse RON, reject invalid structure, then emit bincode.
 pub fn prefab_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
-    let _prefab: Prefab =
-        bincode::deserialize(source).map_err(|e| format!("Prefab cook validation failed: {e}"))?;
-    output.extend_from_slice(source);
+    let prefab = parse_prefab_source(source)?;
+    let payload = bincode::serialize(&prefab)
+        .map_err(|error| format!("Prefab cook serialization failed: {error}"))?;
+    output.extend_from_slice(&payload);
     Ok(())
 }
 
@@ -172,6 +223,12 @@ pub fn prefab_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> 
 pub fn prefab_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String> {
     let prefab: Prefab =
         bincode::deserialize(cooked).map_err(|e| format!("Prefab load failed: {e}"))?;
+    validate_prefab_structure(&prefab).map_err(|errors| {
+        format!(
+            "Prefab load validation failed: {}",
+            format_prefab_validation_errors(errors)
+        )
+    })?;
     Ok(Box::new(prefab))
 }
 
@@ -186,7 +243,7 @@ pub fn register_prefab_asset_type(asset_type_registry: &mut crate::registry::Ass
     let ext = AssetTypeExtension {
         meta: AssetTypeMeta {
             type_id: "prefab",
-            source_extensions: vec!["prefab"],
+            source_extensions: vec!["prefab.ron"],
             display_name: "Prefab",
         },
         cooker: Some(prefab_cooker),
@@ -208,6 +265,129 @@ pub fn validate_prefab(
     registry: &dyn crate::prefab_instance::PrefabLoad,
 ) -> Result<(), Vec<PrefabValidationError>> {
     validate_prefab_graph(prefab, registry)
+}
+
+/// Validate one prefab document without resolving nested asset references.
+///
+/// Cooking uses this boundary because a single-asset cooker cannot prove the
+/// contents of sibling manifest entries. Full graph validation remains the
+/// responsibility of [`validate_prefab`].
+pub fn validate_prefab_structure(prefab: &Prefab) -> Result<(), Vec<PrefabValidationError>> {
+    let asset_id = prefab.source_asset.id.as_str();
+    let mut errors = Vec::new();
+    if asset_id.is_empty() {
+        errors.push(PrefabValidationError::EmptySourceAsset);
+    }
+    if prefab.schema_version != PREFAB_SCHEMA_VERSION {
+        errors.push(PrefabValidationError::UnsupportedSchemaVersion {
+            asset_id: asset_id.to_string(),
+            actual_major: prefab.schema_version.major,
+            actual_minor: prefab.schema_version.minor,
+            actual_patch: prefab.schema_version.patch,
+            expected_major: PREFAB_SCHEMA_VERSION.major,
+            expected_minor: PREFAB_SCHEMA_VERSION.minor,
+            expected_patch: PREFAB_SCHEMA_VERSION.patch,
+        });
+    }
+    if prefab.hierarchy.is_empty() {
+        errors.push(PrefabValidationError::EmptyHierarchy {
+            asset_id: asset_id.to_string(),
+        });
+    }
+
+    let mut hierarchy_ids = HashSet::new();
+    for record in &prefab.hierarchy {
+        if record.persistent_id.is_empty() {
+            errors.push(PrefabValidationError::EmptyPersistentId {
+                asset_id: asset_id.to_string(),
+            });
+        } else if !hierarchy_ids.insert(record.persistent_id.as_str()) {
+            errors.push(PrefabValidationError::DuplicatePersistentId {
+                asset_id: asset_id.to_string(),
+                persistent_id: record.persistent_id.clone(),
+            });
+        }
+    }
+
+    let root_count = prefab
+        .hierarchy
+        .iter()
+        .filter(|record| record.parent.is_none())
+        .count();
+    if !prefab.hierarchy.is_empty() && root_count != 1 {
+        errors.push(PrefabValidationError::InvalidRootCount {
+            asset_id: asset_id.to_string(),
+            root_count,
+        });
+    }
+    for record in &prefab.hierarchy {
+        if let Some(parent_id) = &record.parent {
+            if !hierarchy_ids.contains(parent_id.as_str()) {
+                errors.push(PrefabValidationError::MissingParentEntity {
+                    asset_id: asset_id.to_string(),
+                    entity_persistent_id: record.persistent_id.clone(),
+                    parent_persistent_id: parent_id.clone(),
+                });
+            }
+        }
+    }
+    let parents = prefab
+        .hierarchy
+        .iter()
+        .filter_map(|record| {
+            record
+                .parent
+                .as_ref()
+                .map(|parent| (record.persistent_id.as_str(), parent.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut reported_cycle_members = HashSet::new();
+    for record in &prefab.hierarchy {
+        let mut path = Vec::new();
+        let mut positions = BTreeMap::new();
+        let mut cursor = record.persistent_id.as_str();
+        loop {
+            if let Some(start) = positions.get(cursor).copied() {
+                let mut cycle = path[start..]
+                    .iter()
+                    .map(|id: &&str| (*id).to_string())
+                    .collect::<Vec<_>>();
+                cycle.push(cursor.to_string());
+                if !cycle
+                    .iter()
+                    .any(|member| reported_cycle_members.contains(member))
+                {
+                    reported_cycle_members.extend(cycle.iter().cloned());
+                    errors.push(PrefabValidationError::EntityHierarchyCycle {
+                        asset_id: asset_id.to_string(),
+                        cycle,
+                    });
+                }
+                break;
+            }
+            positions.insert(cursor, path.len());
+            path.push(cursor);
+            let Some(parent) = parents.get(cursor).copied() else {
+                break;
+            };
+            cursor = parent;
+        }
+    }
+    for child_ref in &prefab.child_prefab_refs {
+        if !hierarchy_ids.contains(child_ref.entity_persistent_id.as_str()) {
+            errors.push(PrefabValidationError::MissingAttachmentEntity {
+                asset_id: asset_id.to_string(),
+                child_asset_id: child_ref.prefab_asset.id.clone(),
+                entity_persistent_id: child_ref.entity_persistent_id.clone(),
+            });
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn validate_prefab_graph(
@@ -500,6 +680,48 @@ mod tests {
     fn prefab_contract_is_stable() {
         assert_eq!(PREFAB_CONTRACT, "Prefab-v0.1.0");
         assert_eq!(PREFAB_SCHEMA_VERSION, SchemaVersion::new(0, 1, 0));
+    }
+
+    #[test]
+    fn canonical_ron_source_cooks_and_loads_roundtrip() {
+        let mut prefab = Prefab::new(AssetId::new("prefab-player"));
+        let root = sample_entity("root");
+        let mut child = sample_entity("child");
+        child.parent = Some(root.persistent_id.clone());
+        prefab.add_entity(root).add_entity(child);
+
+        let source = serialize_prefab_source(&prefab).unwrap();
+        let parsed = parse_prefab_source(source.as_bytes()).unwrap();
+        assert_eq!(parsed, prefab);
+        let mut cooked = Vec::new();
+        prefab_cooker(source.as_bytes(), &mut cooked).unwrap();
+        let loaded = prefab_loader(&cooked)
+            .unwrap()
+            .downcast::<Prefab>()
+            .unwrap();
+        assert_eq!(*loaded, prefab);
+    }
+
+    #[test]
+    fn canonical_source_rejects_unknown_fields_and_invalid_structure() {
+        let mut prefab = Prefab::new(AssetId::new("prefab-empty"));
+        let source = ron::ser::to_string(&prefab).unwrap();
+        assert!(parse_prefab_source(source.as_bytes()).is_err());
+
+        prefab.add_entity(sample_entity("root"));
+        let source = serialize_prefab_source(&prefab).unwrap();
+        let with_unknown = source.replacen('(', "(unknown_field: 1,", 1);
+        assert!(parse_prefab_source(with_unknown.as_bytes()).is_err());
+
+        let mut cycle = Prefab::new(AssetId::new("prefab-cycle"));
+        let mut root = sample_entity("root");
+        let mut a = sample_entity("a");
+        let mut b = sample_entity("b");
+        a.parent = Some(b.persistent_id.clone());
+        b.parent = Some(a.persistent_id.clone());
+        root.parent = None;
+        cycle.add_entity(root).add_entity(a).add_entity(b);
+        assert!(validate_prefab_structure(&cycle).is_err());
     }
 
     // ── Nested prefab tests ────────────────────────────────────────────────

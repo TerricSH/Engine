@@ -1,6 +1,6 @@
 # Engine
 
-This repository contains a Rust game engine, project player, editor, asset cooker, and Windows release pipeline. The supported workflow starts from a `game.project.json`; launching the old `workspace` placeholder is intentionally rejected.
+This repository contains a Rust game engine, project player, editor, asset cooker, and Windows release pipeline. The supported workflow starts from a `game.project.json` and uses the `project`, `game`, or `editor` command families.
 
 ## Create and run a game
 
@@ -63,4 +63,7 @@ The ready-to-run sample is at [`examples/minimal-game`](examples/minimal-game). 
 
 The package contains the project manifest, every cataloged scene, cooked assets, runtime executable, reports, checksums, and symbols. Scene paths and hashes are recorded in release metadata. Its smoke test launches the packaged project for three headless frames and requires visible indexed geometry.
 
-See [`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md), [`docs/CI_RELEASE_GATES.md`](docs/CI_RELEASE_GATES.md), and [`docs/RELEASE_PACKAGING.md`](docs/RELEASE_PACKAGING.md) for details.
+See [`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md),
+[`docs/GAME_ENGINE_BOUNDARY.md`](docs/GAME_ENGINE_BOUNDARY.md),
+[`docs/CI_RELEASE_GATES.md`](docs/CI_RELEASE_GATES.md), and
+[`docs/RELEASE_PACKAGING.md`](docs/RELEASE_PACKAGING.md) for details.

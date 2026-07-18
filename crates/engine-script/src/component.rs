@@ -159,6 +159,19 @@ impl ScriptManager {
         Ok(())
     }
 
+    /// Visit reflection-verified behaviour classes from every loaded
+    /// assembly. Hosts are authoritative; no source parsing or naming
+    /// convention is used here.
+    pub fn verified_classes(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.assemblies.keys().flat_map(|assembly_id| {
+            self.host
+                .verified_classes(assembly_id)
+                .into_iter()
+                .flatten()
+                .map(move |class_name| (assembly_id.as_str(), class_name.as_str()))
+        })
+    }
+
     // ── Instance lifecycle ────────────────────────────────────────────────
 
     /// Attach a script component to an entity.

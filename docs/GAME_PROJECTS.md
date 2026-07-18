@@ -13,12 +13,13 @@ MyGame/
     source/game.manifest
   config/input.actions.json
   scripts/GameScripts/       # optional C# authoring source
+  build/script-sdk/          # optional engine-owned EngineGameplay.dll
   build/cooked/
-  build/scripts/             # optional compiled game assembly
+  build/scripts/             # optional game assembly plus managed dependencies
   build/script-host/         # optional .NET protocol host
 ```
 
-`project new` creates the core layout and `main.scene.ron` with a camera and a visible renderable; additional scene files appear after `project scene new`. It also creates an empty source manifest. `build/` is generated and ignored by Git.
+`project new` creates the core layout and `main.scene.ron` as an immediately usable basic scene with a positioned Main Camera, a visible Cube, and a Directional Light; additional scene files appear after `project scene new`. It also creates an empty source manifest. `build/` is generated and ignored by Git.
 
 ## Manifest
 
@@ -67,6 +68,7 @@ sandbox project scene list <project>
 sandbox project scene new <project> <scene-id> [--name NAME]
 sandbox project scene set-startup <project> <scene-id>
 sandbox project cook <project>
+sandbox project sync-script-api <project>
 sandbox project build-scripts <project>
 sandbox project build <project>
 sandbox project run <project> [--headless] [--frames N] [--report PATH]
@@ -83,7 +85,7 @@ the editor. Importing a brand-new external file still uses `project import`,
 which provides the explicit asset ID and transactional copy/manifest update.
 
 `project scene list` prints the catalog and marks its startup entry.
-`project scene new` creates a visible starter scene at
+`project scene new` creates the same basic starter scene at
 `assets/scenes/<scene-id>.scene.ron` and adds it to the catalog without
 overwriting an existing ID or file. `project scene set-startup` accepts only an
 existing catalog ID and stores that ID in `startup_scene`.
@@ -97,7 +99,21 @@ include `startup_scene_id`, the scene count, and an entity count per scene.
 `game --headless` runs the normal GameLoop update/render path and fails
 if the active scene produces no visible draw calls.
 
-`--with-csharp` creates a .NET 8 class library and an `engine.script` attachment. `build-scripts` compiles the declared DLL, runs the managed gameplay-bridge self-test, and publishes the engine-owned process host; authoring `game` and `editor` launches rebuild configured scripts automatically. Runtime reports expose loaded assemblies, attached/started instances, script-entity translations, and script errors.
+`--with-csharp` creates an empty .NET 8 class library and the engine SDK
+integration. It does not invent a script class or attach one to the scene.
+`sync-script-api` refreshes the engine-owned version/hash sidecar and MSBuild
+integration after an engine upgrade; game rules belong in behaviour sources
+created explicitly by the project author. The canonical `EngineGameplay.cs` is generated under
+`build/script-sdk-source`, not in the game source directory. `build-scripts`
+rejects a missing or modified integration, compiles `EngineGameplay.dll`
+independently, compiles the declared game DLL against that SDK, runs the managed
+gameplay-bridge self-test, and publishes the engine-owned process host. The SDK
+dependency is copied beside `GameScripts.dll` for runtime packaging. Authoring
+`game` and `editor` launches rebuild configured scripts automatically. Runtime
+reports expose loaded assemblies, attached/started instances, script-entity
+translations, and script errors. See
+[`GAME_ENGINE_BOUNDARY.md`](GAME_ENGINE_BOUNDARY.md) for the enforced ownership
+and review rules.
 
 The generated `Main` derives from `EngineBehaviour`. During `OnCreate`, `OnStart`, and `OnUpdate`, it can read and write its owning entity's local `Transform`, read the current resolved project input actions, query persistent entities, edit another entity's Transform, destroy entities, and request a cataloged scene by ID:
 
@@ -185,10 +201,82 @@ and child links. Image textures use typed asset references. The loader repairs
 invalid IDs and unsafe child graphs deterministically, and computed rectangles
 are recalculated after loading. Every render frame lays out all persistent
 canvases in stable entity-ID order and submits their UI batches together with
-the 3D scene. Routed runtime clicks are exposed to managed gameplay through
-`UI.Events` and `UI.WasClicked(callbackId)`, with the originating canvas and
-element retained. This is a click-event bridge only; Toggle, Checkbox, and
-Slider values are not mutated automatically.
+the 3D scene. Text and control labels are rasterized into a shared font atlas,
+registered as a renderer texture, and composited after the 3D pass. A project
+font under `assets/fonts` is preferred; desktop development builds fall back
+to a platform font. Button hover/pressed colors and stateful-control hover
+feedback use the retained pointer state. Routed runtime interactions are
+exposed to managed gameplay through `UI.Events` and
+`UI.WasClicked(callbackId)`, with the originating canvas, element, and optional
+Bool/Float value retained.
+
+Managed scripts author runtime UI through retained class handles. Calls enqueue
+validated gameplay commands; the Rust runtime applies them to `engine.canvas`
+components at the frame boundary. Process-host scripts never receive native
+pointers or raw ECS handles:
+
+```csharp
+private UICanvas? _hud;
+private UIText? _score;
+private UIToggle? _music;
+private UISlider? _volume;
+
+public void OnCreate()
+{
+    _hud = UI.CreateCanvas("hud", 1280.0f, 720.0f, UIScaleMode.FitWidth);
+    _hud.AddPanel(
+        UILayout.Absolute(24.0f, 24.0f, 320.0f, 32.0f),
+        new UIColor(20, 20, 20, 210),
+        zOrder: 10);
+    _score = _hud.AddText(
+        UILayout.Absolute(24.0f, 72.0f, 240.0f, 40.0f),
+        "Score: 0",
+        24.0f,
+        UIColor.White,
+        zOrder: 11);
+    _hud.AddButton(
+        UILayout.Absolute(24.0f, 128.0f, 180.0f, 48.0f),
+        "Start",
+        "start-game",
+        new UIColor(70, 90, 180),
+        new UIColor(90, 110, 210),
+        new UIColor(50, 65, 140),
+        zOrder: 12);
+    _music = _hud.AddToggle(
+        UILayout.Absolute(24.0f, 188.0f, 180.0f, 40.0f),
+        "Music", true,
+        new UIColor(30, 170, 90),
+        new UIColor(80, 80, 80),
+        "music-changed",
+        zOrder: 12);
+    _volume = _hud.AddSlider(
+        UILayout.Absolute(24.0f, 240.0f, 240.0f, 40.0f),
+        "Volume", 0.75f, 0.0f, 1.0f,
+        "volume-changed",
+        zOrder: 12);
+}
+
+public void OnUpdate(float deltaTime)
+{
+    _score!.Text = $"Score: {UpdateCount}";
+    if (UI.WasClicked("start-game"))
+        Scene.Load("level_one");
+    // Native pointer input has already synchronized these retained values.
+    bool musicEnabled = _music!.IsOn;
+    float volume = _volume!.Value;
+}
+```
+
+`UICanvas` exposes Panel, Image, Text, Button, Toggle, Checkbox, Slider, and
+ScrollView creation plus resize/clear/remove operations. `UIElement` handles
+can be enabled, disabled, or removed; `UIText.Text`, `UIToggle.IsOn`,
+`UICheckbox.IsChecked`, and `UISlider.Value` queue typed replacements. Canvas
+creation and script mutations are deferred, so a newly created canvas becomes
+visible to the native world after the current script callback finishes. Native
+pointer input updates Toggle/Checkbox values on click and Slider values while
+dragging; the C# handle is synchronized before the next `OnUpdate`. FitWidth
+and FitHeight canvases scale both rendering and hit-testing against the current
+window viewport.
 
 With `runtime-subsystems`, `engine.animation_player` and
 `engine.skeleton_component` resolve their cooked typed assets on every update.

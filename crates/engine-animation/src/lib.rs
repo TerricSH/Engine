@@ -51,6 +51,13 @@ pub use state_machine::{
     ConditionOp, StateTransition, TransitionCondition,
 };
 
+/// Return the canonical scene field map for a newly authored IK target.
+pub fn serialize_ik_target_fields(
+    target: &IkTargetComponent,
+) -> std::collections::BTreeMap<String, engine_serialize::Value> {
+    component_serde::serialize_ik_target(target)
+}
+
 /// Shared handles for animation extensions registered with the renderer.
 ///
 /// The update loop writes animation and debug data through these handles;

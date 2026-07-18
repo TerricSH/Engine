@@ -14,6 +14,7 @@
 ///   echo '{"type":"Shutdown"}' | dotnet run
 /// </summary>
 using System.Reflection;
+using System.Runtime.Loader;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -108,13 +109,15 @@ public class ScriptMessage
     public string Type { get; set; } = "";
     public string? Id { get; set; }
     public string? DataBase64 { get; set; }
-    public List<string>? Types { get; set; }
+    public List<string>? Classes { get; set; }
     public string? AssemblyId { get; set; }
     public string? ClassName { get; set; }
     public string? InstanceId { get; set; }
     public string? Method { get; set; }
     public List<ScriptValue>? Args { get; set; }
     public ScriptValue? Result { get; set; }
+    public string? Code { get; set; }
+    public string? Operation { get; set; }
     public string? Message { get; set; }
     public string? Name { get; set; }
     public ScriptValue? Value { get; set; }
@@ -146,13 +149,15 @@ public class ScriptMessageConverter : JsonConverter<ScriptMessage>
                 case "type": break;
                 case "id": msg.Id = prop.Value.GetString(); break;
                 case "data_base64": msg.DataBase64 = prop.Value.GetString(); break;
-                case "types": msg.Types = JsonSerializer.Deserialize<List<string>>(prop.Value.GetRawText()); break;
+                case "classes": msg.Classes = JsonSerializer.Deserialize<List<string>>(prop.Value.GetRawText()); break;
                 case "assembly_id": msg.AssemblyId = prop.Value.GetString(); break;
                 case "class_name": msg.ClassName = prop.Value.GetString(); break;
                 case "instance_id": msg.InstanceId = prop.Value.GetString(); break;
                 case "method": msg.Method = prop.Value.GetString(); break;
                 case "args": msg.Args = JsonSerializer.Deserialize<List<ScriptValue>>(prop.Value.GetRawText(), options); break;
                 case "result": msg.Result = JsonSerializer.Deserialize<ScriptValue>(prop.Value.GetRawText(), options); break;
+                case "code": msg.Code = prop.Value.GetString(); break;
+                case "operation": msg.Operation = prop.Value.GetString(); break;
                 case "message": msg.Message = prop.Value.GetString(); break;
                 case "name": msg.Name = prop.Value.GetString(); break;
                 case "value": msg.Value = JsonSerializer.Deserialize<ScriptValue>(prop.Value.GetRawText(), options); break;
@@ -174,15 +179,17 @@ public class ScriptMessageConverter : JsonConverter<ScriptMessage>
         WriteProp(writer, "class_name", value.ClassName);
         WriteProp(writer, "instance_id", value.InstanceId);
         WriteProp(writer, "method", value.Method);
+        WriteProp(writer, "code", value.Code);
+        WriteProp(writer, "operation", value.Operation);
         WriteProp(writer, "message", value.Message);
         WriteProp(writer, "name", value.Name);
         WriteProp(writer, "context_json", value.ContextJson);
         WriteProp(writer, "commands_json", value.CommandsJson);
 
-        if (value.Types != null)
+        if (value.Classes != null)
         {
-            writer.WritePropertyName("types");
-            JsonSerializer.Serialize(writer, value.Types, options);
+            writer.WritePropertyName("classes");
+            JsonSerializer.Serialize(writer, value.Classes, options);
         }
         if (value.Args != null)
         {
@@ -365,8 +372,14 @@ class ScriptInstance
 class ScriptProtocolHost
 {
     private readonly TextWriter _protocolOutput;
+    /// One shared context ensures separately uploaded SDK and game assemblies
+    /// participate in normal managed dependency resolution by assembly name.
+    private readonly AssemblyLoadContext _scriptLoadContext =
+        new("EngineScriptAssemblies", isCollectible: false);
     /// Loaded assemblies: assembly_id → Assembly
     private readonly Dictionary<string, Assembly> _assemblies = new();
+    /// Reflection-verified EngineBehaviour classes by assembly id.
+    private readonly Dictionary<string, HashSet<string>> _verifiedClasses = new();
     /// Runtime instances: instance_id → ScriptInstance
     private readonly Dictionary<string, ScriptInstance> _instances = new();
 
@@ -392,7 +405,10 @@ class ScriptProtocolHost
             }
             catch (Exception ex)
             {
-                RespondError(ex.Message);
+                Respond(MakeError(
+                    "PROTOCOL_EXCEPTION",
+                    "ProcessMessage",
+                    DescribeException(ex)));
             }
         }
     }
@@ -409,7 +425,10 @@ class ScriptProtocolHost
             "SetGameplayContext" => HandleSetGameplayContext(msg),
             "DrainGameplayCommands" => HandleDrainGameplayCommands(msg),
             "Shutdown" => HandleShutdown(),
-            _ => MakeError($"Unknown message type: {msg.Type}")
+            _ => MakeError(
+                "UNKNOWN_MESSAGE",
+                "ProcessMessage",
+                $"Unknown message type: {msg.Type}")
         };
     }
 
@@ -420,28 +439,82 @@ class ScriptProtocolHost
 
         try
         {
+            if (string.IsNullOrWhiteSpace(id))
+                return MakeError(
+                    "INVALID_ASSEMBLY_ID",
+                    "LoadAssembly",
+                    "Assembly id cannot be empty");
+            if (_assemblies.ContainsKey(id))
+                return MakeError(
+                    "DUPLICATE_ASSEMBLY_ID",
+                    "LoadAssembly",
+                    $"Assembly id '{id}' is already loaded",
+                    id);
             var bytes = Convert.FromBase64String(data);
-            var assembly = Assembly.Load(bytes);
+            using var stream = new MemoryStream(bytes, writable: false);
+            var assembly = _scriptLoadContext.LoadFromStream(stream);
             _assemblies[id] = assembly;
 
-            // Discover all public types in the assembly
-            var types = assembly.GetExportedTypes()
-                .Select(t => t.FullName ?? t.Name)
-                .ToList();
+            var classes = DiscoverBehaviourClasses(assembly);
+            _verifiedClasses[id] = classes.ToHashSet(StringComparer.Ordinal);
 
-            Console.Error.WriteLine($"[ScriptHost] LoadAssembly: {id} ({types.Count} types)");
+            Console.Error.WriteLine(
+                $"[ScriptHost] LoadAssembly: {id} ({classes.Count} verified behaviours)");
 
             return new ScriptMessage
             {
                 Type = "AssemblyLoaded",
                 Id = id,
-                Types = types
+                Classes = classes
             };
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            _assemblies.Remove(id);
+            _verifiedClasses.Remove(id);
+            var loaderErrors = ex.LoaderExceptions
+                .Where(error => error != null)
+                .Select(error => DescribeException(error!))
+                .Distinct(StringComparer.Ordinal);
+            return MakeError(
+                "REFLECTION_TYPE_LOAD_FAILED",
+                "LoadAssembly",
+                $"Could not reflect script classes: {string.Join(" | ", loaderErrors)}",
+                id);
         }
         catch (Exception ex)
         {
-            return MakeError($"Failed to load assembly '{id}': {ex.Message}");
+            _assemblies.Remove(id);
+            _verifiedClasses.Remove(id);
+            return MakeError(
+                "ASSEMBLY_LOAD_FAILED",
+                "LoadAssembly",
+                DescribeException(ex),
+                id);
         }
+    }
+
+    List<string> DiscoverBehaviourClasses(Assembly assembly)
+    {
+        var engineBehaviour = _assemblies.Values
+            .Select(candidate => candidate.GetType(
+                "Engine.EngineBehaviour",
+                throwOnError: false,
+                ignoreCase: false))
+            .FirstOrDefault(candidate => candidate is { IsClass: true, IsAbstract: true });
+        if (engineBehaviour == null)
+            return new List<string>();
+
+        return assembly.GetTypes()
+            .Where(type =>
+                type.IsClass &&
+                !type.IsAbstract &&
+                type.FullName != null &&
+                engineBehaviour.IsAssignableFrom(type))
+            .Select(type => type.FullName!)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
     }
 
     ScriptMessage HandleInstantiate(ScriptMessage msg)
@@ -451,23 +524,37 @@ class ScriptProtocolHost
         var className = msg.ClassName ?? "";
 
         if (!_assemblies.TryGetValue(assemblyId, out var assembly))
-            return MakeError($"Assembly not found: {assemblyId}");
+            return MakeError(
+                "ASSEMBLY_NOT_LOADED",
+                "Instantiate",
+                $"Assembly '{assemblyId}' is not loaded",
+                assemblyId);
 
-        var type = assembly.GetType(className);
+        if (!_verifiedClasses.TryGetValue(assemblyId, out var verified) ||
+            !verified.Contains(className))
+            return MakeError(
+                "SCRIPT_CLASS_NOT_VERIFIED",
+                "Instantiate",
+                $"Class '{className}' is not a concrete Engine.EngineBehaviour reported by reflection",
+                assemblyId);
+
+        var type = assembly.GetType(className, throwOnError: false, ignoreCase: false);
         if (type == null)
-        {
-            // Try searching all types in the assembly
-            type = assembly.GetExportedTypes()
-                .FirstOrDefault(t => t.FullName == className || t.Name == className);
-            if (type == null)
-                return MakeError($"Type '{className}' not found in assembly '{assemblyId}'");
-        }
+            return MakeError(
+                "SCRIPT_CLASS_DISAPPEARED",
+                "Instantiate",
+                $"Verified class '{className}' can no longer be resolved",
+                assemblyId);
 
         try
         {
             var instance = Activator.CreateInstance(type);
             if (instance == null)
-                return MakeError($"Failed to create instance of '{className}'");
+                return MakeError(
+                    "SCRIPT_INSTANTIATION_FAILED",
+                    "Instantiate",
+                    $"Activator returned null for '{className}'",
+                    assemblyId);
 
             var scriptInstance = new ScriptInstance(instanceId, type, instance);
             _instances[instanceId] = scriptInstance;
@@ -483,7 +570,11 @@ class ScriptProtocolHost
         }
         catch (Exception ex)
         {
-            return MakeError($"Failed to instantiate '{className}': {ex.Message}");
+            return MakeError(
+                "SCRIPT_INSTANTIATION_FAILED",
+                "Instantiate",
+                DescribeException(ex),
+                assemblyId);
         }
     }
 
@@ -494,7 +585,7 @@ class ScriptProtocolHost
         var args = msg.Args ?? new List<ScriptValue>();
 
         if (!_instances.TryGetValue(instanceId, out var instance))
-            return MakeError($"Instance not found: {instanceId}");
+            return MakeError("INSTANCE_NOT_FOUND", "CallMethod", $"Instance not found: {instanceId}");
 
         try
         {
@@ -508,7 +599,7 @@ class ScriptProtocolHost
         }
         catch (Exception ex)
         {
-            return MakeError($"Method '{method}' failed: {DescribeException(ex)}");
+            return MakeError("METHOD_FAILED", "CallMethod", $"Method '{method}' failed: {DescribeException(ex)}");
         }
     }
 
@@ -519,7 +610,7 @@ class ScriptProtocolHost
         var value = msg.Value ?? ScriptValue.Null();
 
         if (!_instances.TryGetValue(instanceId, out var instance))
-            return MakeError($"Instance not found: {instanceId}");
+            return MakeError("INSTANCE_NOT_FOUND", "SetField", $"Instance not found: {instanceId}");
 
         try
         {
@@ -534,7 +625,7 @@ class ScriptProtocolHost
         }
         catch (Exception ex)
         {
-            return MakeError($"SetField '{name}' failed: {DescribeException(ex)}");
+            return MakeError("SET_FIELD_FAILED", "SetField", $"SetField '{name}' failed: {DescribeException(ex)}");
         }
     }
 
@@ -544,7 +635,7 @@ class ScriptProtocolHost
         var name = msg.Name ?? "";
 
         if (!_instances.TryGetValue(instanceId, out var instance))
-            return MakeError($"Instance not found: {instanceId}");
+            return MakeError("INSTANCE_NOT_FOUND", "GetField", $"Instance not found: {instanceId}");
 
         try
         {
@@ -559,7 +650,7 @@ class ScriptProtocolHost
         }
         catch (Exception ex)
         {
-            return MakeError($"GetField '{name}' failed: {DescribeException(ex)}");
+            return MakeError("GET_FIELD_FAILED", "GetField", $"GetField '{name}' failed: {DescribeException(ex)}");
         }
     }
 
@@ -569,7 +660,7 @@ class ScriptProtocolHost
         var contextJson = msg.ContextJson
             ?? throw new InvalidOperationException("SetGameplayContext requires context_json");
         if (!_instances.TryGetValue(instanceId, out var instance))
-            return MakeError($"SetGameplayContext instance not found: {instanceId}");
+            return MakeError("INSTANCE_NOT_FOUND", "SetGameplayContext", $"Instance not found: {instanceId}");
 
         try
         {
@@ -583,7 +674,9 @@ class ScriptProtocolHost
         catch (Exception ex)
         {
             return MakeError(
-                $"SetGameplayContext failed for instance '{instanceId}': {DescribeException(ex)}");
+                "SET_GAMEPLAY_CONTEXT_FAILED",
+                "SetGameplayContext",
+                $"Instance '{instanceId}': {DescribeException(ex)}");
         }
     }
 
@@ -591,7 +684,7 @@ class ScriptProtocolHost
     {
         var instanceId = msg.InstanceId ?? "";
         if (!_instances.TryGetValue(instanceId, out var instance))
-            return MakeError($"DrainGameplayCommands instance not found: {instanceId}");
+            return MakeError("INSTANCE_NOT_FOUND", "DrainGameplayCommands", $"Instance not found: {instanceId}");
 
         try
         {
@@ -605,7 +698,9 @@ class ScriptProtocolHost
         catch (Exception ex)
         {
             return MakeError(
-                $"DrainGameplayCommands failed for instance '{instanceId}': {DescribeException(ex)}");
+                "DRAIN_GAMEPLAY_COMMANDS_FAILED",
+                "DrainGameplayCommands",
+                $"Instance '{instanceId}': {DescribeException(ex)}");
         }
     }
 
@@ -615,12 +710,19 @@ class ScriptProtocolHost
         return new ScriptMessage { Type = "Shutdown" };
     }
 
-    static ScriptMessage MakeError(string message)
+    static ScriptMessage MakeError(
+        string code,
+        string operation,
+        string message,
+        string? assemblyId = null)
     {
         return new ScriptMessage
         {
             Type = "Error",
-            Message = message
+            Code = code,
+            Operation = operation,
+            Message = message,
+            AssemblyId = assemblyId
         };
     }
 
@@ -642,10 +744,6 @@ class ScriptProtocolHost
         _protocolOutput.Flush();
     }
 
-    void RespondError(string message)
-    {
-        Respond(new ScriptMessage { Type = "Error", Message = message });
-    }
 }
 
 /// <summary>

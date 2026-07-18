@@ -1,215 +1,391 @@
-//! Incremental re-cook pipeline for hot-reload.
+//! Manifest-driven incremental asset recooking.
 //!
-//! Takes file-system [`WatchEvent`]s, resolves them to assets in the
-//! [`DependencyGraph`], and re-cooks each affected asset (including
-//! reverse dependencies) through the appropriate cooker function.
-//!
-//! This is the "subset" equivalent of [`cook_orchestrate`] — rather than
-//! scanning all manifests, it operates on the specific set of assets
-//! identified by file-change events.
+//! File-watch events and explicit reload requests are resolved through the
+//! same validated source-manifest catalog. Both paths call the authoritative
+//! single-asset cooker in [`crate::cook::cook_source_entry_atomic`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, HashDigest};
-use sha2::{Digest, Sha256};
+use engine_scene::registry::AssetTypeRegistry;
+use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity};
 
 use super::watch::WatchEvent;
 use crate::cook::dependency::DependencyGraph;
 use crate::cook::manifest::{AssetType, SourceAssetEntry, SourceManifest};
 use crate::cook::{
-    cook_material, cook_mesh, cook_scene, cook_shader, cook_texture, write_cooked_artifact,
-    CookResult,
+    cook_source_entry_atomic, resolve_source_path, validate_manifest_asset_id, CookResult,
 };
-use crate::hot_reload::path_to_asset_id;
-use crate::registry::AssetRegistry;
 
-// ---------------------------------------------------------------------------
-// Incremental recook
-// ---------------------------------------------------------------------------
+/// Complete outcome of one incremental recook batch.
+#[derive(Default)]
+pub(super) struct RecookBatch {
+    /// One result for every asset whose cooker was attempted.
+    pub results: Vec<CookResult>,
+    /// Manifest, path-resolution, and batch diagnostics not represented by a
+    /// successful cooker result.
+    pub diagnostics: Vec<Diagnostic>,
+    /// Whether at least one manifest-declared asset matched the request.
+    pub matched: bool,
+    /// Exact manifest IDs corresponding to cook results. This preserves the
+    /// logical path instead of reconstructing a lossy string-only ID.
+    pub resolved_ids: BTreeMap<String, AssetId>,
+}
 
-/// Incrementally re-cook assets affected by a batch of file-change events.
-///
-/// # Algorithm
-///
-/// 1. For each [`WatchEvent`], resolve the changed source path through the
-///    manifest, falling back to the standard `path_to_asset_id` convention.
-/// 2. Collect all directly affected assets plus their reverse dependencies
-///    (assets that depend on the changed file) from the dependency graph.
-/// 3. For each unique asset, use manifest metadata (or its id category as a
-///    fallback), dispatch to the appropriate cooker, and update the graph.
-/// 4. Return a [`CookResult`] for each asset that was re-cooked (or
-///    attempted).
-///
-/// # Parameters
-///
-/// * `events`     – debounced file-change events from the watch coordinator.
-/// * `graph`      – mutable dependency graph (updated with new cook state).
-/// * `source_dir` – directory containing source manifests and assets.
-/// * `cooked_dir` – directory where cooked artifacts are written.
-/// * `registry`   – asset registry for cache invalidation after cooking.
-///
-/// # Returns
-///
-/// A vector of [`CookResult`] values, one per attempted re-cook.  Failed
-/// cooks are reflected in the result's `success` field and in the graph.
-pub fn incremental_recook(
+#[derive(Default)]
+struct ManifestCatalog {
+    entries: BTreeMap<AssetId, SourceAssetEntry>,
+    paths: BTreeMap<String, BTreeSet<AssetId>>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Recook manifest-declared assets affected by debounced filesystem events.
+pub(super) fn incremental_recook(
     events: &[WatchEvent],
     graph: &mut DependencyGraph,
     source_dir: &Path,
     cooked_dir: &Path,
-    registry: &mut AssetRegistry,
-) -> Vec<CookResult> {
+    asset_type_registry: &AssetTypeRegistry,
+) -> RecookBatch {
     if events.is_empty() {
-        return Vec::new();
+        return RecookBatch::default();
     }
 
-    // Resolve source paths through manifests before falling back to filename
-    // conventions. Project asset IDs are not required to encode their type.
-    let manifest_entries_for_resolution = scan_manifests(source_dir);
-
-    // ── Step 1: Resolve paths to AssetIds ──────────────────────────────
-    let mut affected = BTreeSet::new();
-
+    let catalog = scan_manifests(source_dir);
+    let mut batch = RecookBatch {
+        diagnostics: catalog.diagnostics.clone(),
+        ..RecookBatch::default()
+    };
+    let mut directly_affected = BTreeSet::new();
     for event in events {
-        if let Some(asset_id) =
-            manifest_asset_id_for_path(&event.path, source_dir, &manifest_entries_for_resolution)
-                .or_else(|| path_to_asset_id(&event.path))
-        {
-            affected.insert(asset_id);
+        let comparable = comparable_path(&event.path);
+        if let Some(asset_ids) = catalog.paths.get(&comparable) {
+            directly_affected.extend(asset_ids.iter().cloned());
         } else {
-            tracing::debug!(
-                path = %event.path.display(),
-                "watch event path could not be resolved to an AssetId"
+            let mut diagnostic = reload_diagnostic(
+                "RECOOK_EVENT_PATH_NOT_DECLARED",
+                DiagnosticSeverity::Warning,
+                format!(
+                    "changed path '{}' is not declared by a valid source manifest",
+                    event.path.display()
+                ),
+                None,
             );
+            diagnostic.path = Some(event.path.display().to_string());
+            batch.diagnostics.push(diagnostic);
         }
     }
+    batch.matched = !directly_affected.is_empty();
+    recook_affected(
+        directly_affected,
+        &catalog.entries,
+        graph,
+        source_dir,
+        cooked_dir,
+        asset_type_registry,
+        &mut batch,
+    );
+    batch
+}
 
-    // ── Step 2: Expand with reverse dependencies ───────────────────────
-    // Collect all reverse deps from the graph for each directly-affected asset.
-    let mut all_affected: BTreeSet<AssetId> = affected.clone();
-
-    for id in &affected {
-        let rev_deps = graph.get_reverse_dependencies(id);
-        for rev in rev_deps {
-            all_affected.insert(rev);
-        }
+/// Recook one exact, manifest-declared [`AssetId`] and all transitive reverse
+/// dependencies. No filename, category, or string-only alias is accepted.
+pub(super) fn recook_asset(
+    asset_id: &AssetId,
+    graph: &mut DependencyGraph,
+    source_dir: &Path,
+    cooked_dir: &Path,
+    asset_type_registry: &AssetTypeRegistry,
+) -> RecookBatch {
+    let catalog = scan_manifests(source_dir);
+    let mut batch = RecookBatch {
+        diagnostics: catalog.diagnostics.clone(),
+        ..RecookBatch::default()
+    };
+    if !catalog.entries.contains_key(asset_id) {
+        batch.diagnostics.push(reload_diagnostic(
+            "RECOOK_ASSET_NOT_DECLARED",
+            DiagnosticSeverity::Error,
+            format!(
+                "asset '{}' with logical path {:?} is not declared by a valid source manifest",
+                asset_id.id, asset_id.logical_path
+            ),
+            Some(asset_id.clone()),
+        ));
+        return batch;
     }
 
-    if all_affected.is_empty() {
-        tracing::debug!("no assets resolved from watch events");
-        return Vec::new();
-    }
+    batch.matched = true;
+    recook_affected(
+        BTreeSet::from([asset_id.clone()]),
+        &catalog.entries,
+        graph,
+        source_dir,
+        cooked_dir,
+        asset_type_registry,
+        &mut batch,
+    );
+    batch
+}
 
-    // ── Step 3: Scan manifests for source_path mappings ────────────────
-    let manifest_entries = scan_manifests(source_dir);
-
-    // ── Step 4: Recook each affected asset ─────────────────────────────
-    let mut results: Vec<CookResult> = Vec::new();
-
-    for id in &all_affected {
-        // Determine asset type from category prefix.
-        let asset_type = manifest_entries
-            .get(id)
-            .map(|entry| entry.asset_type.clone())
-            .unwrap_or_else(|| category_to_asset_type(&id.id));
-
-        // Resolve source path from manifest if available, else fallback.
-        let source_path = manifest_entries
-            .get(id)
-            .map(|entry| source_dir.join(&entry.source_path))
-            .unwrap_or_else(|| resolve_source_fallback(id, source_dir));
-
-        if !source_path.exists() {
-            let err_msg = format!("source file not found: {:?}", source_path.display());
-            tracing::error!(asset_id = %id.id, "{err_msg}");
-            graph.mark_failed(id, err_msg.clone());
-            results.push(CookResult {
-                asset_id: id.id.clone(),
-                asset_type: asset_type.clone(),
-                output_path: PathBuf::new(),
-                source_path,
-                success: false,
-                diagnostics: vec![Diagnostic::new(
-                    "RECOOK_SOURCE_MISSING",
-                    DiagnosticSeverity::Error,
-                    "reload",
-                    err_msg,
-                )],
-            });
+fn recook_affected(
+    directly_affected: BTreeSet<AssetId>,
+    entries: &BTreeMap<AssetId, SourceAssetEntry>,
+    graph: &mut DependencyGraph,
+    source_dir: &Path,
+    cooked_dir: &Path,
+    asset_type_registry: &AssetTypeRegistry,
+    batch: &mut RecookBatch,
+) {
+    let all_affected = reverse_dependency_closure(graph, directly_affected);
+    for asset_id in all_affected {
+        batch
+            .resolved_ids
+            .insert(asset_id.id.clone(), asset_id.clone());
+        let Some(entry) = entries.get(&asset_id) else {
+            let message = format!(
+                "asset '{}' is a reverse dependency but has no valid source-manifest entry",
+                asset_id.id
+            );
+            graph.register(asset_id.clone());
+            graph.mark_failed(&asset_id, message.clone());
+            batch.results.push(failed_result(
+                &asset_id,
+                AssetType::Unknown,
+                PathBuf::new(),
+                PathBuf::new(),
+                "RECOOK_MANIFEST_ENTRY_MISSING",
+                message,
+            ));
             continue;
-        }
-
-        // Compute output path.
-        let output_path = resolve_cooked_path(id, cooked_dir);
-
-        // Dispatch to the appropriate cooker.
-        let result = match &asset_type {
-            AssetType::Mesh => cook_mesh(&source_path, &output_path),
-            AssetType::Texture => cook_texture(&source_path, &output_path),
-            AssetType::Material => cook_material(&source_path, &output_path),
-            AssetType::Shader => {
-                let stage = determine_shader_stage(&source_path);
-                cook_shader(&source_path, &output_path, 0, &stage)
-            }
-            AssetType::Scene => cook_scene(&source_path, &output_path, 0),
-            // For pipeline, script, audio, font, animation, skeleton, and
-            // navmesh — use a generic pass-through cooker
-            // that copies the source as-is.
-            other => generic_cook(other, &source_path, &output_path),
         };
 
-        match result {
-            Ok(mut cook_result) => {
-                // Mark the graph as cooked.
-                let hash = compute_file_hash(&source_path);
-                graph.mark_cooked(id, hash);
-
-                // Invalidate the registry cache so the next load re-reads.
-                if registry.contains(id) {
-                    let _ = registry.reload(id);
-                }
-
-                tracing::info!(
-                    asset_id = %id.id,
-                    "incremental recook succeeded"
-                );
-                cook_result.success = true;
-                results.push(cook_result);
+        graph.register(asset_id.clone());
+        graph.mark_cooking(&asset_id);
+        match cook_source_entry_atomic(source_dir, cooked_dir, entry, asset_type_registry) {
+            Ok(cooked) => {
+                graph.mark_cooked(&asset_id, cooked.source_hash);
+                batch.results.push(cooked.result);
             }
-            Err(e) => {
-                let err_msg = e.to_string();
-                graph.mark_failed(id, err_msg.clone());
-                tracing::error!(asset_id = %id.id, error = %err_msg, "incremental recook failed");
-                results.push(CookResult {
-                    asset_id: id.id.clone(),
-                    asset_type: asset_type.clone(),
-                    output_path,
-                    source_path,
+            Err(error) => {
+                graph.mark_failed(&asset_id, error.message.clone());
+                let mut diagnostic = reload_diagnostic(
+                    "RECOOK_ASSET_FAILED",
+                    DiagnosticSeverity::Error,
+                    format!("recook failed for '{}': {}", asset_id.id, error.message),
+                    Some(asset_id.clone()),
+                );
+                diagnostic.path = Some(entry.source_path.clone());
+                diagnostic
+                    .fields
+                    .insert("cook_code".into(), error.code.into());
+                batch.results.push(CookResult {
+                    asset_id: asset_id.id.clone(),
+                    asset_type: entry.asset_type.clone(),
+                    output_path: PathBuf::from(format!("{}.cooked", asset_id.id)),
+                    source_path: PathBuf::from(&entry.source_path),
                     success: false,
-                    diagnostics: vec![Diagnostic::new(
-                        "RECOOK_FAILED",
-                        DiagnosticSeverity::Error,
-                        "reload",
-                        format!("cook failed for {}: {err_msg}", id.id),
-                    )],
+                    diagnostics: vec![diagnostic],
                 });
             }
         }
     }
-
-    results
 }
 
-fn manifest_asset_id_for_path(
-    changed_path: &Path,
-    source_dir: &Path,
-    entries: &std::collections::BTreeMap<AssetId, SourceAssetEntry>,
-) -> Option<AssetId> {
-    let changed = comparable_path(changed_path);
-    entries.iter().find_map(|(id, entry)| {
-        (comparable_path(&source_dir.join(&entry.source_path)) == changed).then(|| id.clone())
-    })
+fn reverse_dependency_closure(
+    graph: &DependencyGraph,
+    roots: BTreeSet<AssetId>,
+) -> BTreeSet<AssetId> {
+    let mut affected = roots;
+    let mut queue = affected.iter().cloned().collect::<VecDeque<_>>();
+    while let Some(asset_id) = queue.pop_front() {
+        for dependent in graph.get_reverse_dependencies(&asset_id) {
+            if affected.insert(dependent.clone()) {
+                queue.push_back(dependent);
+            }
+        }
+    }
+    affected
+}
+
+fn scan_manifests(source_dir: &Path) -> ManifestCatalog {
+    let mut catalog = ManifestCatalog::default();
+    let read_dir = match std::fs::read_dir(source_dir) {
+        Ok(read_dir) => read_dir,
+        Err(error) => {
+            catalog.diagnostics.push(reload_diagnostic(
+                "RECOOK_MANIFEST_DIRECTORY_READ_FAILED",
+                DiagnosticSeverity::Error,
+                format!(
+                    "could not read source manifest directory '{}': {error}",
+                    source_dir.display()
+                ),
+                None,
+            ));
+            return catalog;
+        }
+    };
+
+    let mut manifest_paths = read_dir
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("manifest"))
+        })
+        .collect::<Vec<_>>();
+    manifest_paths.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+
+    let mut portable_ids = BTreeMap::<String, AssetId>::new();
+    let mut rejected_ids = BTreeSet::new();
+    let mut manifest_origins = BTreeMap::<AssetId, String>::new();
+    for manifest_path in manifest_paths {
+        let manifest_name = manifest_path.display().to_string();
+        let comparable_manifest_path = comparable_path(&manifest_path);
+        let bytes = match std::fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                catalog.diagnostics.push(reload_diagnostic(
+                    "RECOOK_MANIFEST_READ_FAILED",
+                    DiagnosticSeverity::Error,
+                    format!("could not read manifest '{manifest_name}': {error}"),
+                    None,
+                ));
+                continue;
+            }
+        };
+        let mut manifest: SourceManifest = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                catalog.diagnostics.push(reload_diagnostic(
+                    "RECOOK_MANIFEST_PARSE_FAILED",
+                    DiagnosticSeverity::Error,
+                    format!("could not parse manifest '{manifest_name}': {error}"),
+                    None,
+                ));
+                continue;
+            }
+        };
+        if manifest.schema_version != crate::cook::manifest::CURRENT_MANIFEST_VERSION {
+            catalog.diagnostics.push(reload_diagnostic(
+                "RECOOK_MANIFEST_VERSION_UNSUPPORTED",
+                DiagnosticSeverity::Error,
+                format!(
+                    "manifest '{manifest_name}' uses schema {}.{}.{}; expected {}.{}.{}",
+                    manifest.schema_version.major,
+                    manifest.schema_version.minor,
+                    manifest.schema_version.patch,
+                    crate::cook::manifest::CURRENT_MANIFEST_VERSION.major,
+                    crate::cook::manifest::CURRENT_MANIFEST_VERSION.minor,
+                    crate::cook::manifest::CURRENT_MANIFEST_VERSION.patch,
+                ),
+                None,
+            ));
+            continue;
+        }
+        manifest.assets.sort_by(|left, right| {
+            left.id
+                .id
+                .cmp(&right.id.id)
+                .then_with(|| left.source_path.cmp(&right.source_path))
+        });
+        for entry in manifest.assets {
+            if let Err(message) = validate_manifest_asset_id(&entry.id.id) {
+                catalog.diagnostics.push(reload_diagnostic(
+                    "RECOOK_ASSET_ID_INVALID",
+                    DiagnosticSeverity::Error,
+                    message,
+                    Some(entry.id),
+                ));
+                continue;
+            }
+            let portable_id = entry.id.id.to_ascii_lowercase();
+            if rejected_ids.contains(&portable_id) {
+                catalog.diagnostics.push(reload_diagnostic(
+                    "RECOOK_ASSET_ID_DUPLICATE",
+                    DiagnosticSeverity::Error,
+                    format!(
+                        "asset id '{}' is duplicated or differs only by case",
+                        entry.id.id
+                    ),
+                    Some(entry.id),
+                ));
+                continue;
+            }
+            if let Some(previous_id) = portable_ids.remove(&portable_id) {
+                rejected_ids.insert(portable_id);
+                if let Some(previous) = catalog.entries.remove(&previous_id) {
+                    if let Ok(previous_path) =
+                        resolve_source_path(source_dir, &previous.source_path)
+                    {
+                        remove_path_mapping(
+                            &mut catalog.paths,
+                            &comparable_path(&previous_path),
+                            &previous_id,
+                        );
+                    }
+                }
+                if let Some(previous_manifest) = manifest_origins.remove(&previous_id) {
+                    remove_path_mapping(&mut catalog.paths, &previous_manifest, &previous_id);
+                }
+                catalog.diagnostics.push(reload_diagnostic(
+                    "RECOOK_ASSET_ID_DUPLICATE",
+                    DiagnosticSeverity::Error,
+                    format!(
+                        "asset id '{}' is duplicated or differs only by case",
+                        entry.id.id
+                    ),
+                    Some(entry.id),
+                ));
+                continue;
+            }
+            let source_path = match resolve_source_path(source_dir, &entry.source_path) {
+                Ok(source_path) => source_path,
+                Err(error) => {
+                    let mut diagnostic = reload_diagnostic(
+                        "RECOOK_SOURCE_PATH_INVALID",
+                        DiagnosticSeverity::Error,
+                        error.to_string(),
+                        Some(entry.id),
+                    );
+                    diagnostic.path = Some(entry.source_path);
+                    catalog.diagnostics.push(diagnostic);
+                    continue;
+                }
+            };
+            let id = entry.id.clone();
+            portable_ids.insert(portable_id, id.clone());
+            catalog
+                .paths
+                .entry(comparable_path(&source_path))
+                .or_default()
+                .insert(id.clone());
+            catalog
+                .paths
+                .entry(comparable_manifest_path.clone())
+                .or_default()
+                .insert(id.clone());
+            manifest_origins.insert(id.clone(), comparable_manifest_path.clone());
+            catalog.entries.insert(id, entry);
+        }
+    }
+    catalog
+}
+
+fn remove_path_mapping(
+    paths: &mut BTreeMap<String, BTreeSet<AssetId>>,
+    path: &str,
+    asset_id: &AssetId,
+) {
+    let remove_path = if let Some(asset_ids) = paths.get_mut(path) {
+        asset_ids.remove(asset_id);
+        asset_ids.is_empty()
+    } else {
+        false
+    };
+    if remove_path {
+        paths.remove(path);
+    }
 }
 
 fn comparable_path(path: &Path) -> String {
@@ -224,288 +400,359 @@ fn comparable_path(path: &Path) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Map the category prefix of an AssetId string to an [`AssetType`].
-///
-/// The category is the portion of the id before the first hyphen.
-/// If the category matches a known asset type, that type is returned;
-/// otherwise [`AssetType::Unknown`] is used.
-fn category_to_asset_type(id_str: &str) -> AssetType {
-    let category = id_str.split('-').next().unwrap_or(id_str);
-    match category {
-        "mesh" => AssetType::Mesh,
-        "material" => AssetType::Material,
-        "texture" => AssetType::Texture,
-        "shader" => AssetType::Shader,
-        "scene" => AssetType::Scene,
-        "prefab" => AssetType::Mesh, // prefabs are mesh-like at the cook level
-        "animation" => AssetType::Animation,
-        "audio" => AssetType::Audio,
-        "font" => AssetType::Font,
-        "pipeline" => AssetType::Pipeline,
-        "navmesh" => AssetType::NavMesh,
-        "script" => AssetType::Script,
-        "skeleton" => AssetType::Skeleton,
-        "logic" => AssetType::Logic,
-        _ => AssetType::Unknown,
+fn failed_result(
+    asset_id: &AssetId,
+    asset_type: AssetType,
+    output_path: PathBuf,
+    source_path: PathBuf,
+    code: &str,
+    message: String,
+) -> CookResult {
+    CookResult {
+        asset_id: asset_id.id.clone(),
+        asset_type,
+        output_path,
+        source_path,
+        success: false,
+        diagnostics: vec![reload_diagnostic(
+            code,
+            DiagnosticSeverity::Error,
+            message,
+            Some(asset_id.clone()),
+        )],
     }
 }
 
-/// Scan all `.manifest` files in `source_dir` and build a map from
-/// [`AssetId`] to [`SourceAssetEntry`].
-pub(super) fn scan_manifests(
-    source_dir: &Path,
-) -> std::collections::BTreeMap<AssetId, SourceAssetEntry> {
-    let mut entries = std::collections::BTreeMap::new();
-
-    let dir = match std::fs::read_dir(source_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(
-                dir = %source_dir.display(),
-                "cannot scan manifest directory: {e}"
-            );
-            return entries;
-        }
-    };
-
-    for entry in dir.filter_map(|r| r.ok()) {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "manifest") {
-            continue;
-        }
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("failed to read manifest {:?}: {e}", path);
-                continue;
-            }
-        };
-
-        let manifest: SourceManifest = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("failed to parse manifest {:?}: {e}", path);
-                continue;
-            }
-        };
-
-        for asset_entry in &manifest.assets {
-            entries.insert(asset_entry.id.clone(), asset_entry.clone());
-        }
-    }
-
-    entries
+fn reload_diagnostic(
+    code: &str,
+    severity: DiagnosticSeverity,
+    message: String,
+    asset: Option<AssetId>,
+) -> Diagnostic {
+    let mut diagnostic = Diagnostic::new(code, severity, "reload", message);
+    diagnostic.asset = asset;
+    diagnostic
 }
-
-/// Fallback source path resolution when the asset is not found in any
-/// manifest.
-///
-/// Uses the convention: `source_dir/{id_with_underscores}.source`.
-fn resolve_source_fallback(id: &AssetId, source_dir: &Path) -> PathBuf {
-    let mut buf = source_dir.to_path_buf();
-    buf.push(format!("{}.source", id.id.replace('-', "_")));
-    buf
-}
-
-/// Resolve the cooked artifact path for an asset under `cooked_dir`.
-fn resolve_cooked_path(id: &AssetId, cooked_dir: &Path) -> PathBuf {
-    let mut buf = cooked_dir.to_path_buf();
-    buf.push(format!("{}.cooked", id.id));
-    buf
-}
-
-/// Determine the shader stage from a file extension.
-pub(super) fn determine_shader_stage(path: &Path) -> String {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("vert") => "vertex".into(),
-        Some("frag") => "fragment".into(),
-        Some("comp") => "compute".into(),
-        Some("geom") => "geometry".into(),
-        Some("tesc") => "tess_control".into(),
-        Some("tese") => "tess_eval".into(),
-        _ => "vertex".into(),
-    }
-}
-
-/// Compute a SHA-256 hash of a file's contents.
-pub(super) fn compute_file_hash(path: &Path) -> HashDigest {
-    let data = std::fs::read(path).unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    hasher.finalize().into()
-}
-
-/// Generic cooker for asset types that don't have a specialised cooker.
-///
-/// Reads the source file and writes it as a cooked artifact with the
-/// appropriate kind code.
-fn generic_cook(
-    asset_type: &AssetType,
-    source: &Path,
-    output: &Path,
-) -> Result<CookResult, crate::cook::error::CookError> {
-    let payload = std::fs::read(source)?;
-    let kind_code = asset_type.kind_code();
-    let result = write_cooked_artifact(output, kind_code, &payload, Default::default())?;
-    Ok(result)
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cook::{
-        decode_cooked_material, read_cooked_artifact, CookRules, DependencyGraph,
-        MATERIAL_SOURCE_SCHEMA,
+        decode_cooked_material, read_cooked_artifact, CookRules, MATERIAL_SOURCE_SCHEMA,
     };
     use crate::reload::watch::WatchEventKind;
+    use engine_scene::registry::{AssetTypeExtension, AssetTypeMeta};
 
-    fn id(name: &str) -> AssetId {
-        AssetId::new(name)
+    fn material_source(roughness: f32) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": MATERIAL_SOURCE_SCHEMA,
+            "base_color": [1.0, 1.0, 1.0, 1.0],
+            "metallic": 0.0,
+            "roughness": roughness,
+            "ambient_occlusion": 1.0,
+            "transparency": "Opaque",
+            "double_sided": false
+        }))
+        .unwrap()
     }
 
-    #[test]
-    fn category_to_asset_type_mesh() {
-        assert_eq!(category_to_asset_type("mesh-cube"), AssetType::Mesh);
+    fn manifest_entry(id: AssetId, source_path: &str, asset_type: AssetType) -> SourceAssetEntry {
+        SourceAssetEntry {
+            id,
+            asset_type,
+            source_path: source_path.into(),
+            cook_rules: CookRules::default(),
+        }
     }
 
-    #[test]
-    fn category_to_asset_type_texture() {
-        assert_eq!(category_to_asset_type("texture-floor"), AssetType::Texture);
-    }
-
-    #[test]
-    fn category_to_asset_type_shader() {
-        assert_eq!(category_to_asset_type("shader-std"), AssetType::Shader);
-    }
-
-    #[test]
-    fn category_to_asset_type_scene() {
-        assert_eq!(category_to_asset_type("scene-level1"), AssetType::Scene);
-    }
-
-    #[test]
-    fn category_to_asset_type_logic() {
-        assert_eq!(category_to_asset_type("logic-enemy_bt"), AssetType::Logic);
-    }
-
-    #[test]
-    fn category_to_asset_type_no_hyphen() {
-        assert_eq!(category_to_asset_type("simple"), AssetType::Unknown);
-    }
-
-    #[test]
-    fn category_to_asset_type_prefab_maps_to_mesh() {
-        assert_eq!(category_to_asset_type("prefab-enemy"), AssetType::Mesh);
-    }
-
-    #[test]
-    fn incremental_recook_empty_events() {
-        let mut graph = DependencyGraph::new();
-        let mut registry = AssetRegistry::new();
-        let source_dir = Path::new("assets/source");
-        let cooked_dir = Path::new("assets/cooked");
-
-        let results = incremental_recook(&[], &mut graph, source_dir, cooked_dir, &mut registry);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn incremental_recook_dispatches_material_cooker() {
-        let root = std::env::temp_dir().join(format!(
-            "engine_asset_material_recook_{}",
-            std::process::id()
-        ));
-        let source_dir = root.join("assets").join("source");
-        let cooked_dir = root.join("cooked");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&source_dir).unwrap();
-        let source_path = source_dir.join("sample.material.json");
-        std::fs::write(
-            &source_path,
-            serde_json::to_vec(&serde_json::json!({
-                "schema": MATERIAL_SOURCE_SCHEMA,
-                "base_color": [1.0, 1.0, 1.0, 1.0],
-                "metallic": 0.0,
-                "roughness": 0.5,
-                "ambient_occlusion": 1.0,
-                "transparency": "Opaque",
-                "double_sided": false
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+    fn write_manifest(source_dir: &Path, entries: Vec<SourceAssetEntry>) {
         let manifest = SourceManifest {
             schema_version: crate::cook::manifest::CURRENT_MANIFEST_VERSION,
-            assets: vec![SourceAssetEntry {
-                id: id("sample-material"),
-                asset_type: AssetType::Material,
-                source_path: "sample.material.json".into(),
-                cook_rules: CookRules::default(),
-            }],
+            assets: entries,
         };
         std::fs::write(
             source_dir.join("assets.manifest"),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
+    }
 
+    fn default_registry() -> AssetTypeRegistry {
+        let mut registry = AssetTypeRegistry::new();
+        engine_scene::register_prefab_asset_type(&mut registry);
+        registry
+    }
+
+    fn extension_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
+        output.extend_from_slice(b"registered:");
+        output.extend_from_slice(source);
+        Ok(())
+    }
+
+    fn extension_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String> {
+        cooked
+            .starts_with(b"registered:")
+            .then(|| Box::new(cooked.to_vec()) as Box<dyn std::any::Any + Send + Sync>)
+            .ok_or_else(|| "registered payload prefix is missing".to_string())
+    }
+
+    fn complete_extension_registry() -> AssetTypeRegistry {
+        let mut registry = default_registry();
+        for type_id in ["audio_clip", "animation_clip", "skeleton", "navmesh"] {
+            registry
+                .register(AssetTypeExtension {
+                    meta: AssetTypeMeta {
+                        type_id,
+                        source_extensions: vec!["source"],
+                        display_name: type_id,
+                    },
+                    cooker: Some(extension_cooker),
+                    loader: Some(extension_loader),
+                })
+                .unwrap();
+        }
+        registry
+    }
+
+    #[test]
+    fn incremental_recook_empty_events() {
         let mut graph = DependencyGraph::new();
-        graph.register(id("sample-material"));
-        let mut registry = AssetRegistry::new();
-        let results = incremental_recook(
+        let batch = incremental_recook(
+            &[],
+            &mut graph,
+            Path::new("unused"),
+            Path::new("unused"),
+            &default_registry(),
+        );
+        assert!(batch.results.is_empty());
+        assert!(batch.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn event_and_explicit_reload_share_the_material_cooker() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        let cooked_dir = root.path().join("cooked");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join("sample.material.json");
+        std::fs::write(&source_path, material_source(0.5)).unwrap();
+        let asset_id = AssetId::new("sample-material");
+        write_manifest(
+            &source_dir,
+            vec![manifest_entry(
+                asset_id.clone(),
+                "sample.material.json",
+                AssetType::Material,
+            )],
+        );
+        let registry = default_registry();
+        let mut graph = DependencyGraph::new();
+
+        let watched = incremental_recook(
             &[WatchEvent {
-                path: source_path,
+                path: source_path.clone(),
                 kind: WatchEventKind::Modified,
             }],
             &mut graph,
             &source_dir,
             &cooked_dir,
-            &mut registry,
+            &registry,
+        );
+        assert!(watched.matched);
+        assert_eq!(watched.results.len(), 1);
+        assert!(watched.results[0].success);
+
+        std::fs::write(&source_path, material_source(0.25)).unwrap();
+        let requested = recook_asset(&asset_id, &mut graph, &source_dir, &cooked_dir, &registry);
+        assert!(requested.matched);
+        assert!(requested.results[0].success);
+        let artifact = read_cooked_artifact(&cooked_dir.join("sample-material.cooked")).unwrap();
+        assert_eq!(decode_cooked_material(&artifact).unwrap().roughness, 0.25);
+    }
+
+    #[test]
+    fn manifest_change_recooks_every_valid_entry_in_that_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        let cooked_dir = root.path().join("cooked");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("one.material.json"), material_source(0.1)).unwrap();
+        std::fs::write(source_dir.join("two.material.json"), material_source(0.2)).unwrap();
+        write_manifest(
+            &source_dir,
+            vec![
+                manifest_entry(
+                    AssetId::new("material-one"),
+                    "one.material.json",
+                    AssetType::Material,
+                ),
+                manifest_entry(
+                    AssetId::new("material-two"),
+                    "two.material.json",
+                    AssetType::Material,
+                ),
+            ],
+        );
+        let mut graph = DependencyGraph::new();
+
+        let batch = incremental_recook(
+            &[WatchEvent {
+                path: source_dir.join("assets.manifest"),
+                kind: WatchEventKind::Modified,
+            }],
+            &mut graph,
+            &source_dir,
+            &cooked_dir,
+            &default_registry(),
         );
 
-        assert_eq!(results.len(), 1);
-        assert!(results[0].success);
-        let artifact = read_cooked_artifact(&cooked_dir.join("sample-material.cooked")).unwrap();
-        assert_eq!(decode_cooked_material(&artifact).unwrap().roughness, 0.5);
-        let _ = std::fs::remove_dir_all(root);
+        assert!(batch.matched);
+        assert_eq!(batch.results.len(), 2);
+        assert!(batch.results.iter().all(|result| result.success));
     }
 
     #[test]
-    fn resolve_source_fallback_convention() {
-        let asset_id = id("mesh-cube");
-        let path = resolve_source_fallback(&asset_id, Path::new("source"));
-        assert!(path.to_string_lossy().contains("mesh_cube.source"));
+    fn failed_recook_preserves_last_valid_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        let cooked_dir = root.path().join("cooked");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join("sample.material.json");
+        std::fs::write(&source_path, material_source(0.75)).unwrap();
+        let asset_id = AssetId::new("stable-material");
+        write_manifest(
+            &source_dir,
+            vec![manifest_entry(
+                asset_id.clone(),
+                "sample.material.json",
+                AssetType::Material,
+            )],
+        );
+        let registry = default_registry();
+        let mut graph = DependencyGraph::new();
+        assert!(
+            recook_asset(&asset_id, &mut graph, &source_dir, &cooked_dir, &registry).results[0]
+                .success
+        );
+        let prior = std::fs::read(cooked_dir.join("stable-material.cooked")).unwrap();
+
+        std::fs::write(&source_path, b"not valid material json").unwrap();
+        let failed = recook_asset(&asset_id, &mut graph, &source_dir, &cooked_dir, &registry);
+        assert!(!failed.results[0].success);
+        assert_eq!(
+            std::fs::read(cooked_dir.join("stable-material.cooked")).unwrap(),
+            prior
+        );
     }
 
     #[test]
-    fn resolve_cooked_path_convention() {
-        let asset_id = id("mesh-cube");
-        let path = resolve_cooked_path(&asset_id, Path::new("cooked"));
-        assert!(path.to_string_lossy().contains("mesh-cube.cooked"));
+    fn exact_asset_id_is_required_and_unknown_is_diagnostic() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join("sample.material.json"),
+            material_source(0.5),
+        )
+        .unwrap();
+        write_manifest(
+            &source_dir,
+            vec![manifest_entry(
+                AssetId::with_path("material", "materials/source"),
+                "sample.material.json",
+                AssetType::Material,
+            )],
+        );
+        let mut graph = DependencyGraph::new();
+        let batch = recook_asset(
+            &AssetId::new("material"),
+            &mut graph,
+            &source_dir,
+            &root.path().join("cooked"),
+            &default_registry(),
+        );
+        assert!(!batch.matched);
+        assert!(batch
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RECOOK_ASSET_NOT_DECLARED"));
     }
 
     #[test]
-    fn scan_manifests_empty_dir() {
-        let dir = std::env::temp_dir().join("recook_test_empty");
-        let _ = std::fs::create_dir_all(&dir);
-        let entries = scan_manifests(&dir);
-        assert!(entries.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn duplicate_case_insensitive_ids_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("one.material.json"), material_source(0.1)).unwrap();
+        std::fs::write(source_dir.join("two.material.json"), material_source(0.2)).unwrap();
+        write_manifest(
+            &source_dir,
+            vec![
+                manifest_entry(
+                    AssetId::new("Duplicate"),
+                    "one.material.json",
+                    AssetType::Material,
+                ),
+                manifest_entry(
+                    AssetId::new("duplicate"),
+                    "two.material.json",
+                    AssetType::Material,
+                ),
+            ],
+        );
+        let catalog = scan_manifests(&source_dir);
+        assert!(catalog.entries.is_empty());
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RECOOK_ASSET_ID_DUPLICATE"));
     }
 
     #[test]
-    fn determine_shader_stage_by_extension() {
-        assert_eq!(determine_shader_stage(Path::new("shader.vert")), "vertex");
-        assert_eq!(determine_shader_stage(Path::new("shader.frag")), "fragment");
-        assert_eq!(determine_shader_stage(Path::new("shader.comp")), "compute");
+    fn reverse_dependencies_are_transitive() {
+        let mut graph = DependencyGraph::new();
+        let texture = AssetId::new("texture");
+        let material = AssetId::new("material");
+        let scene = AssetId::new("scene");
+        graph.add_dependency(material.clone(), texture.clone());
+        graph.add_dependency(scene.clone(), material.clone());
+        assert_eq!(
+            reverse_dependency_closure(&graph, BTreeSet::from([texture])),
+            BTreeSet::from([material, scene, AssetId::new("texture")])
+        );
+    }
+
+    #[test]
+    fn incremental_recook_dispatches_every_registry_owned_asset_type() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("source");
+        let cooked_dir = root.path().join("cooked");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let entries = [
+            ("sound", AssetType::Audio),
+            ("motion", AssetType::Animation),
+            ("rig", AssetType::Skeleton),
+            ("navigation", AssetType::NavMesh),
+        ]
+        .into_iter()
+        .map(|(id, asset_type)| {
+            let source_path = format!("{id}.source");
+            std::fs::write(source_dir.join(&source_path), id.as_bytes()).unwrap();
+            manifest_entry(AssetId::new(id), &source_path, asset_type)
+        })
+        .collect::<Vec<_>>();
+        write_manifest(&source_dir, entries.clone());
+
+        let registry = complete_extension_registry();
+        let mut graph = DependencyGraph::new();
+        for entry in entries {
+            let batch = recook_asset(&entry.id, &mut graph, &source_dir, &cooked_dir, &registry);
+            assert!(batch.matched);
+            assert!(batch.results[0].success);
+            let artifact =
+                read_cooked_artifact(&cooked_dir.join(format!("{}.cooked", entry.id.id))).unwrap();
+            assert_eq!(artifact.header.asset_kind, entry.asset_type.kind_code());
+            assert!(artifact.payload.starts_with(b"registered:"));
+        }
     }
 }

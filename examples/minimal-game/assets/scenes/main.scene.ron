@@ -15,9 +15,29 @@
             enabled: true,
             components: {
                 "engine.camera": (
-                    schema_version: (major: 0, minor: 1, patch: 0),
+                    schema_version: (
+                        major: 0,
+                        minor: 1,
+                        patch: 0,
+                    ),
                     enabled: true,
-                    fields: {},
+                    fields: {
+                        "aperture": Float32(1.0),
+                        "clear_flags": UInt(4),
+                        "iso": Float32(100.0),
+                        "shutter_speed": Float32(1.0),
+                    },
+                ),
+                "engine.transform": (
+                    schema_version: (
+                        major: 0,
+                        minor: 1,
+                        patch: 0,
+                    ),
+                    enabled: true,
+                    fields: {
+                        "translation": Vec3((0.0, 0.0, 4.0)),
+                    },
                 ),
             },
         ),
@@ -28,14 +48,35 @@
             enabled: true,
             components: {
                 "engine.renderable": (
-                    schema_version: (major: 0, minor: 1, patch: 0),
+                    schema_version: (
+                        major: 0,
+                        minor: 1,
+                        patch: 0,
+                    ),
                     enabled: true,
                     fields: {
                         "cast_shadows": Bool(true),
-                        "material": Asset((id: "sample-material", logical_path: None)),
-                        "mesh": Asset((id: "sample-mesh", logical_path: None)),
+                        "material": Asset((
+                            id: "sample-material",
+                            logical_path: None,
+                        )),
+                        "mesh": Asset((
+                            id: "sample-mesh",
+                            logical_path: None,
+                        )),
                         "render_layer": Str("Default"),
                         "visible": Bool(true),
+                    },
+                ),
+                "engine.transform": (
+                    schema_version: (
+                        major: 0,
+                        minor: 1,
+                        patch: 0,
+                    ),
+                    enabled: true,
+                    fields: {
+                        "translation": Vec3((-0.5, -0.5, 0.0)),
                     },
                 ),
             },
@@ -51,17 +92,36 @@
         tone_mapping: Aces,
         pass_graph_config: (
             passes: [
-                (kind: "DirectionalShadow", enabled: true),
-                (kind: "OpaquePbrForward", enabled: true),
-                (kind: "ToneMap", enabled: true),
-                (kind: "Present", enabled: true),
+                (
+                    kind: "DirectionalShadow",
+                    enabled: true,
+                ),
+                (
+                    kind: "OpaquePbrForward",
+                    enabled: true,
+                ),
+                (
+                    kind: "ToneMap",
+                    enabled: true,
+                ),
+                (
+                    kind: "Present",
+                    enabled: true,
+                ),
             ],
             enabled: true,
+            output_mode: HdrThenToneMap,
         ),
     ),
     dependencies: [
-        (id: "sample-mesh", logical_path: None),
-        (id: "sample-material", logical_path: None),
+        (
+            id: "sample-mesh",
+            logical_path: None,
+        ),
+        (
+            id: "sample-material",
+            logical_path: None,
+        ),
     ],
     diagnostics_policy: Strict,
 )

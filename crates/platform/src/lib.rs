@@ -14,7 +14,7 @@
 //!   safe-area, low-memory, and touch events, plus [`TouchEvent`] /
 //!   [`TouchPhase`].
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use thiserror::Error;
 use winit::application::ApplicationHandler;
@@ -80,6 +80,7 @@ pub enum PlatformEvent {
 
     // ── Text input ──
     CharacterTyped { character: char },
+    FileDropped { path: PathBuf },
 }
 
 /// Keyboard modifier flags.
@@ -106,7 +107,6 @@ pub use self::input_types::KeyCode;
 mod input_types {
     /// Key codes (subset of winit's VirtualKeyCode for engine use).
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    #[allow(dead_code)]
     pub enum KeyCode {
         Escape,
         F1,
@@ -378,6 +378,9 @@ impl<A: WindowApp> Wrapper<A> {
             WinitWindowEvent::Focused(focused) => vec![PlatformEvent::Focused(*focused)],
             WinitWindowEvent::CloseRequested => vec![PlatformEvent::CloseRequested],
             WinitWindowEvent::RedrawRequested => vec![PlatformEvent::Redraw],
+            WinitWindowEvent::DroppedFile(path) => {
+                vec![PlatformEvent::FileDropped { path: path.clone() }]
+            }
             WinitWindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = Modifiers::from_winit(&modifiers.state());
                 Vec::new()
@@ -619,6 +622,13 @@ mod tests {
         };
         let cloned = ev.clone();
         assert_eq!(ev, cloned);
+    }
+
+    #[test]
+    fn platform_file_drop_preserves_the_exact_path() {
+        let path = PathBuf::from(r"C:\project assets\hero.glb");
+        let event = PlatformEvent::FileDropped { path: path.clone() };
+        assert_eq!(event, PlatformEvent::FileDropped { path });
     }
 
     // ── PlatformError tests ──────────────────────────────────────────────

@@ -92,10 +92,6 @@ pub struct GltfNode {
     pub transform: Mat4,
     /// All primitive indices referenced by this node.
     pub primitive_indices: Vec<usize>,
-    /// Compatibility alias for the first element of `primitive_indices`.
-    pub mesh_index: Option<usize>,
-    /// Compatibility alias for the first primitive's material.
-    pub material_index: Option<usize>,
     /// Child indices into the owning scene's `nodes` vector.
     pub children: Vec<usize>,
 }
@@ -106,8 +102,6 @@ pub struct GltfScene {
     /// The selected default scene index, or the first scene when no default is declared.
     pub selected_scene_index: Option<usize>,
     pub primitives: Vec<GltfPrimitive>,
-    /// Compatibility view containing one mesh per primitive in identical order.
-    pub meshes: Vec<MeshData>,
     pub materials: Vec<GltfMaterial>,
     /// One entry per glTF texture, in original document order.
     pub textures: Vec<GltfTexture>,
@@ -235,18 +229,18 @@ pub fn load_gltf_scene(path: &Path) -> Result<GltfScene, GltfImportError> {
                 });
             }
 
-            let normals = reader
-                .read_normals()
-                .map(|values| values.map(Vec3::from_array).collect())
-                .unwrap_or_else(|| vec![Vec3::Y; positions.len()]);
             let uvs = reader
                 .read_tex_coords(0)
                 .map(|values| values.into_f32().map(Vec2::from_array).collect())
                 .unwrap_or_default();
-            let indices = reader
+            let indices: Vec<u32> = reader
                 .read_indices()
                 .map(|values| values.into_u32().collect())
                 .unwrap_or_else(|| (0..positions.len() as u32).collect());
+            let normals = reader
+                .read_normals()
+                .map(|values| values.map(Vec3::from_array).collect())
+                .unwrap_or_else(|| generate_vertex_normals(&positions, &indices));
             let material_index = primitive.material().index();
             let primitive_index = primitives.len();
             let bounds = compute_bounds(&positions);
@@ -284,22 +278,15 @@ pub fn load_gltf_scene(path: &Path) -> Result<GltfScene, GltfImportError> {
                 Mat4::IDENTITY,
                 &mut nodes,
                 &mut roots,
-                &primitives,
                 &mesh_to_primitives,
                 true,
             );
         }
     }
 
-    let meshes = primitives
-        .iter()
-        .map(|primitive| primitive.mesh.clone())
-        .collect();
-
     Ok(GltfScene {
         selected_scene_index,
         primitives,
-        meshes,
         materials,
         textures,
         nodes,
@@ -398,7 +385,6 @@ fn flatten_node(
     parent_transform: Mat4,
     nodes: &mut Vec<GltfNode>,
     roots: &mut Vec<usize>,
-    primitives: &[GltfPrimitive],
     mesh_to_primitives: &[Vec<usize>],
     is_root: bool,
 ) -> usize {
@@ -409,8 +395,6 @@ fn flatten_node(
         .and_then(|mesh| mesh_to_primitives.get(mesh.index()))
         .cloned()
         .unwrap_or_default();
-    let mesh_index = primitive_indices.first().copied();
-    let material_index = mesh_index.and_then(|index| primitives[index].material_index);
     let node_index = nodes.len();
 
     nodes.push(GltfNode {
@@ -418,8 +402,6 @@ fn flatten_node(
         name: node.name().unwrap_or("node").to_string(),
         transform,
         primitive_indices,
-        mesh_index,
-        material_index,
         children: Vec::new(),
     });
     if is_root {
@@ -427,15 +409,7 @@ fn flatten_node(
     }
 
     for child in node.children() {
-        let child_index = flatten_node(
-            &child,
-            transform,
-            nodes,
-            roots,
-            primitives,
-            mesh_to_primitives,
-            false,
-        );
+        let child_index = flatten_node(&child, transform, nodes, roots, mesh_to_primitives, false);
         nodes[node_index].children.push(child_index);
     }
     node_index
@@ -449,6 +423,33 @@ fn compute_bounds(positions: &[Vec3]) -> (Vec3, Vec3) {
         max = max.max(*position);
     }
     (min, max)
+}
+
+fn generate_vertex_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
+    let mut normals = vec![Vec3::ZERO; positions.len()];
+    for triangle in indices.chunks_exact(3) {
+        let [a, b, c] = [
+            triangle[0] as usize,
+            triangle[1] as usize,
+            triangle[2] as usize,
+        ];
+        let (Some(&pa), Some(&pb), Some(&pc)) =
+            (positions.get(a), positions.get(b), positions.get(c))
+        else {
+            continue;
+        };
+        let face = (pb - pa).cross(pc - pa);
+        if !face.is_finite() || face.length_squared() <= f32::EPSILON {
+            continue;
+        }
+        normals[a] += face;
+        normals[b] += face;
+        normals[c] += face;
+    }
+    normals
+        .into_iter()
+        .map(|normal| normal.try_normalize().unwrap_or(Vec3::Y))
+        .collect()
 }
 
 fn decode_gltf_image(
@@ -588,30 +589,23 @@ mod tests {
     }
 
     #[test]
-    fn load_triangle_gltf_keeps_compatibility_view() {
+    fn load_triangle_gltf_exposes_canonical_primitive_data() {
         let scene =
             load_gltf_scene(&model_path("triangle.gltf")).expect("triangle.gltf should load");
         assert_eq!(scene.primitives.len(), 1);
-        assert_eq!(scene.meshes.len(), 1);
         assert_eq!(scene.materials.len(), 0);
         assert_eq!(scene.nodes.len(), 1);
         assert_eq!(scene.roots, vec![0]);
         assert_eq!(scene.nodes[0].primitive_indices, vec![0]);
-        assert_eq!(scene.nodes[0].mesh_index, Some(0));
-        assert_eq!(scene.meshes[0].positions.len(), 3);
-        assert!((scene.meshes[0].positions[0].x + 1.0).abs() < 0.001);
+        assert_eq!(scene.primitives[0].mesh.positions.len(), 3);
+        assert!((scene.primitives[0].mesh.positions[0].x + 1.0).abs() < 0.001);
     }
 
     #[test]
-    fn legacy_mesh_entry_points_use_the_strict_primitive_chain() {
-        let path = model_path("resource-chain.gltf");
-        let first = crate::mesh::load_mesh_from_gltf(&path).expect("load first primitive");
-        let all = crate::mesh::load_meshes_from_gltf(&path).expect("load all primitives");
-
-        assert_eq!(first.positions.len(), 3);
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].0, "SharedMesh_0");
-        assert_eq!(all[1].0, "SharedMesh_1");
+    fn missing_normals_are_generated_from_triangle_geometry() {
+        let normals = generate_vertex_normals(&[Vec3::ZERO, Vec3::X, Vec3::Y], &[0, 1, 2]);
+        assert_eq!(normals.len(), 3);
+        assert!(normals.iter().all(|normal| normal.z > 0.99));
     }
 
     #[test]
@@ -621,7 +615,6 @@ mod tests {
 
         assert_eq!(scene.selected_scene_index, Some(1));
         assert_eq!(scene.primitives.len(), 2);
-        assert_eq!(scene.meshes.len(), 2);
         assert_eq!(scene.materials.len(), 2);
         assert_eq!(scene.textures.len(), 2);
         assert_eq!(scene.nodes.len(), 2, "scene 0 decoy must not be selected");
@@ -674,8 +667,6 @@ mod tests {
         assert_eq!(scene.nodes[1].name, "ChildInstance");
         assert_eq!(scene.nodes[0].primitive_indices, vec![0, 1]);
         assert_eq!(scene.nodes[1].primitive_indices, vec![0, 1]);
-        assert_eq!(scene.nodes[0].mesh_index, Some(0));
-        assert_eq!(scene.nodes[1].mesh_index, Some(0));
         assert_eq!(scene.nodes[0].children, vec![1]);
 
         let root_transform = Mat4::from_scale_rotation_translation(

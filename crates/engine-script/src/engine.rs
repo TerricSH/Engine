@@ -8,7 +8,7 @@
 use engine_serialize::Diagnostic;
 
 use crate::component::{ScriptComponent, ScriptManager};
-use crate::host::{ScriptError, ScriptHandle, ScriptHost, ScriptInstance};
+use crate::host::{ScriptError, ScriptHandle, ScriptHost, ScriptInstance, VerifiedScriptClass};
 use crate::{GameplayContext, OwnedGameplayCommand};
 
 /// The main script system that manages hosts and dispatches script operations.
@@ -48,6 +48,29 @@ impl ScriptEngine {
     /// Return the number of registered script hosts.
     pub fn host_count(&self) -> usize {
         self.managers.len()
+    }
+
+    /// Snapshot all classes verified by the currently loaded script hosts.
+    ///
+    /// Results are sorted and de-duplicated so editor consumers do not depend
+    /// on reflection or assembly load order.
+    pub fn verified_classes(&self) -> Vec<VerifiedScriptClass> {
+        let mut classes = self
+            .managers
+            .iter()
+            .flat_map(|manager| {
+                manager
+                    .verified_classes()
+                    .map(move |(assembly_id, class_name)| VerifiedScriptClass {
+                        host_name: manager.host_name.clone(),
+                        assembly_id: assembly_id.to_string(),
+                        class_name: class_name.to_string(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        classes.sort();
+        classes.dedup();
+        classes
     }
 
     // ─── Low-level assembly / instance API (backward compat) ────────────
@@ -303,6 +326,32 @@ mod tests {
         engine.register_host(Box::new(NullScriptHost::new()));
         engine.register_host(Box::new(MockHost::new()));
         assert_eq!(engine.host_count(), 2);
+    }
+
+    #[test]
+    fn verified_classes_are_sorted_and_include_host_and_assembly_identity() {
+        let mut engine = ScriptEngine::new();
+        engine.register_host(Box::new(
+            MockHost::new()
+                .with_verified_classes("game", ["Game.Zed", "Game.Player", "Game.Player"]),
+        ));
+        engine.load_script("game", "mock", b"managed").unwrap();
+
+        assert_eq!(
+            engine.verified_classes(),
+            vec![
+                VerifiedScriptClass {
+                    host_name: "mock".into(),
+                    assembly_id: "game".into(),
+                    class_name: "Game.Player".into(),
+                },
+                VerifiedScriptClass {
+                    host_name: "mock".into(),
+                    assembly_id: "game".into(),
+                    class_name: "Game.Zed".into(),
+                },
+            ]
+        );
     }
 
     // ── Component integration tests ──────────────────────────────────────

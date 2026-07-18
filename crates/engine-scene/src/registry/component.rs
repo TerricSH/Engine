@@ -4,6 +4,7 @@ use engine_serialize::Value;
 
 use crate::component::{Component, ComponentStorageDyn, SparseSet};
 use crate::components::{Bounds, Camera, Light, Name, Renderable, Transform};
+use crate::prefab_instance::PrefabInstanceRef;
 
 // ---------------------------------------------------------------------------
 // Metadata
@@ -113,8 +114,8 @@ impl ComponentRegistry {
         storages
     }
 
-    /// Register the six core engine components: [`Name`], [`Transform`],
-    /// [`Renderable`], [`Camera`], [`Light`], [`Bounds`].
+    /// Register the core engine components, including serialized prefab
+    /// instance linkage.
     pub fn register_core(&mut self) {
         macro_rules! core_ext {
             ($ty:ty, $display:expr, $has_editor:expr, $has_script:expr) => {{
@@ -143,6 +144,7 @@ impl ComponentRegistry {
         core_ext!(Camera, "Camera", true, false);
         core_ext!(Light, "Light", true, false);
         core_ext!(Bounds, "Bounds", true, false);
+        core_ext!(PrefabInstanceRef, "Prefab Instance", false, false);
     }
 
     /// Iterate over all registered extensions in insertion order.

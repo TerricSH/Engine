@@ -62,8 +62,6 @@ impl VulkanDevice {
                     name: ["frame-ubo-0", "frame-ubo-1"][i],
                     requirements: req,
                     location: crate::allocator::MemoryLocation::CpuToGpu,
-                    linear: true,
-                    allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
                 })
                 .map_err(|e| VulkanError::Allocation(e.to_string()))?;
             unsafe { d.bind_buffer_memory(buf, allocation.memory(), allocation.offset()) }
@@ -444,8 +442,6 @@ impl VulkanDevice {
                 name: "light-ssbo",
                 requirements: req,
                 location: crate::allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         // SAFETY: `buf` was created by this device; `allocation` is compatible.

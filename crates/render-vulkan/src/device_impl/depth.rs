@@ -43,8 +43,6 @@ impl VulkanDevice {
                 name: "depth-buffer",
                 requirements: req,
                 location: crate::allocator::MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }

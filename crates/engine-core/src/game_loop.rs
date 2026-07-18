@@ -1,7 +1,7 @@
 use crate::{EngineConfig, EngineRuntime};
 use engine_character::{CharacterController, CharacterMovement};
 use engine_renderer::FrameStats;
-use engine_scene::Scene;
+use engine_scene::{RenderViewportContext, Scene};
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
 use glam::Vec3;
 
@@ -17,17 +17,226 @@ use engine_gameplay::{GameStateManager, InputActionMap};
 #[cfg(feature = "gameplay")]
 use engine_physics::{PhysicsEvents, PhysicsWorld};
 
+#[cfg(feature = "runtime-subsystems")]
+fn embed_scene_ui_batches(
+    batches: &mut [engine_renderer::UiBatch],
+    viewport: RenderViewportContext,
+) {
+    let surface_size = viewport.surface_size();
+    let output = viewport.output_rect();
+    let origin = [
+        output.min[0] * surface_size[0] as f32,
+        output.min[1] * surface_size[1] as f32,
+    ];
+    let extent = [
+        output.width() * surface_size[0] as f32,
+        output.height() * surface_size[1] as f32,
+    ];
+    for batch in batches {
+        for vertex in &mut batch.vertices {
+            vertex.position[0] += origin[0];
+            vertex.position[1] += origin[1];
+        }
+        batch.clip_rect.min[0] =
+            (batch.clip_rect.min[0] + origin[0]).clamp(origin[0], origin[0] + extent[0]);
+        batch.clip_rect.min[1] =
+            (batch.clip_rect.min[1] + origin[1]).clamp(origin[1], origin[1] + extent[1]);
+        batch.clip_rect.max[0] =
+            (batch.clip_rect.max[0] + origin[0]).clamp(origin[0], origin[0] + extent[0]);
+        batch.clip_rect.max[1] =
+            (batch.clip_rect.max[1] + origin[1]).clamp(origin[1], origin[1] + extent[1]);
+    }
+}
+
 /// Platform-independent retained UI click produced by a scene Canvas.
 ///
 /// This native event mirrors [`engine_script::GameplayUiEvent`] when the
 /// scripting feature is enabled, while remaining available to non-scripted
 /// runtime hosts through [`GameLoop::take_ui_events`].
 #[cfg(feature = "runtime-subsystems")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RuntimeUiValue {
+    Bool(bool),
+    Float(f32),
+}
+
+#[cfg(all(test, feature = "runtime-subsystems"))]
+mod runtime_ui_tests {
+    use super::*;
+
+    #[test]
+    fn retained_ui_geometry_is_embedded_and_clipped_to_the_scene_viewport() {
+        let viewport = RenderViewportContext::new(
+            1000,
+            800,
+            engine_renderer::Rect {
+                min: [0.2, 0.125],
+                max: [0.7, 0.75],
+            },
+        )
+        .unwrap();
+        let mut batches = vec![engine_renderer::UiBatch {
+            canvas_id: "hud".into(),
+            z_order: 0,
+            clip_rect: engine_renderer::Rect {
+                min: [-10.0, -20.0],
+                max: [600.0, 700.0],
+            },
+            texture: None,
+            vertices: vec![engine_renderer::UiVertex {
+                position: [25.0, 40.0],
+                uv: [0.0, 0.0],
+                color: [255; 4],
+            }],
+            indices: Vec::new(),
+            material: engine_renderer::AssetId::new("ui/default"),
+        }];
+
+        embed_scene_ui_batches(&mut batches, viewport);
+
+        assert_eq!(batches[0].vertices[0].position, [225.0, 140.0]);
+        assert_eq!(batches[0].clip_rect.min, [200.0, 100.0]);
+        assert_eq!(batches[0].clip_rect.max, [700.0, 600.0]);
+    }
+
+    fn game_loop_with_canvas(mut canvas: engine_ui::Canvas) -> GameLoop {
+        canvas.layout_all();
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let entity = world.entity_by_persistent_id("camera-main").unwrap();
+                world.add_component(entity, canvas);
+            })
+            .unwrap();
+        game_loop
+    }
+
+    #[test]
+    fn scaled_toggle_click_persists_value_and_reports_it_to_the_host() {
+        let mut canvas = engine_ui::Canvas::new(100.0, 20.0);
+        canvas.scale_mode = engine_ui::ScaleMode::FitWidth;
+        let toggle_id = canvas.add_element(engine_ui::UiElement::new(
+            engine_ui::UiElementKind::Toggle {
+                label: "Music".into(),
+                is_on: false,
+                color_on: engine_ui::Color::new(0, 200, 80, 255),
+                color_off: engine_ui::Color::new(80, 80, 80, 255),
+                callback_id: Some("music".into()),
+            },
+            engine_ui::Layout::FILL,
+        ));
+        let mut game_loop = game_loop_with_canvas(canvas);
+        game_loop.set_ui_viewport_size(200, 100);
+
+        // Screen coordinates are converted back to the 100x20 logical Canvas.
+        game_loop.ui_pointer_move(100.0, 20.0);
+        game_loop.ui_pointer_left_press();
+        game_loop.ui_pointer_left_release();
+
+        assert_eq!(
+            game_loop.take_ui_events(),
+            vec![RuntimeUiEvent {
+                canvas_id: "camera-main".into(),
+                element_id: toggle_id.0,
+                callback_id: Some("music".into()),
+                value: Some(RuntimeUiValue::Bool(true)),
+            }]
+        );
+        assert_eq!(
+            game_loop.runtime.with_world(|world| {
+                let entity = world.entity_by_persistent_id("camera-main").unwrap();
+                let canvas = world.get::<engine_ui::Canvas>(entity).unwrap();
+                match &canvas.get_element(toggle_id).unwrap().kind {
+                    engine_ui::UiElementKind::Toggle { is_on, .. } => *is_on,
+                    _ => false,
+                }
+            }),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn slider_drag_reports_continuous_float_values() {
+        let mut canvas = engine_ui::Canvas::new(100.0, 20.0);
+        let slider_id = canvas.add_element(engine_ui::UiElement::new(
+            engine_ui::UiElementKind::Slider {
+                label: "Volume".into(),
+                value: 0.0,
+                min: 0.0,
+                max: 1.0,
+                callback_id: Some("volume".into()),
+            },
+            engine_ui::Layout::FILL,
+        ));
+        let mut game_loop = game_loop_with_canvas(canvas);
+
+        game_loop.ui_pointer_move(10.0, 10.0);
+        game_loop.ui_pointer_left_press();
+        game_loop.ui_pointer_move(75.0, 10.0);
+
+        assert_eq!(
+            game_loop.take_ui_events(),
+            vec![RuntimeUiEvent {
+                canvas_id: "camera-main".into(),
+                element_id: slider_id.0,
+                callback_id: Some("volume".into()),
+                value: Some(RuntimeUiValue::Float(0.75)),
+            }]
+        );
+        assert_eq!(
+            game_loop.runtime.with_world(|world| {
+                let entity = world.entity_by_persistent_id("camera-main").unwrap();
+                let canvas = world.get::<engine_ui::Canvas>(entity).unwrap();
+                match &canvas.get_element(slider_id).unwrap().kind {
+                    engine_ui::UiElementKind::Slider { value, .. } => *value,
+                    _ => -1.0,
+                }
+            }),
+            Some(0.75)
+        );
+    }
+
+    #[test]
+    fn runtime_batches_scale_to_viewport_and_reference_the_font_atlas() {
+        if engine_ui::font_atlas_texture_upload().is_none() {
+            return;
+        }
+        let mut canvas = engine_ui::Canvas::new(320.0, 180.0);
+        canvas.scale_mode = engine_ui::ScaleMode::FitWidth;
+        canvas.add_element(engine_ui::UiElement::new(
+            engine_ui::UiElementKind::Text {
+                content: "HUD".into(),
+                font_size: 20.0,
+                color: engine_ui::Color::WHITE,
+            },
+            engine_ui::Layout::new(
+                glam::Vec2::ZERO,
+                glam::Vec2::ZERO,
+                glam::Vec2::new(10.0, 10.0),
+                glam::Vec2::new(100.0, 40.0),
+            ),
+        ));
+        let mut game_loop = game_loop_with_canvas(canvas);
+        game_loop.set_ui_viewport_size(640, 480);
+
+        let batches = game_loop.runtime_ui_batches();
+        assert_eq!(batches[0].clip_rect.max, [640.0, 360.0]);
+        assert_eq!(
+            batches[0].texture,
+            Some(engine_serialize::AssetId::new(engine_ui::FONT_ATLAS_ASSET))
+        );
+    }
+}
+
+#[cfg(feature = "runtime-subsystems")]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeUiEvent {
     pub canvas_id: String,
     pub element_id: u32,
     pub callback_id: Option<String>,
+    pub value: Option<RuntimeUiValue>,
 }
 
 #[cfg(feature = "runtime-audio-output")]
@@ -266,6 +475,8 @@ pub struct GameLoop {
     #[cfg(feature = "runtime-subsystems")]
     runtime_ui_pointer: [f32; 2],
     #[cfg(feature = "runtime-subsystems")]
+    runtime_ui_viewport: [f32; 2],
+    #[cfg(feature = "runtime-subsystems")]
     runtime_ui_captured_canvas: Option<String>,
     #[cfg(feature = "runtime-subsystems")]
     runtime_ui_events: Vec<RuntimeUiEvent>,
@@ -297,6 +508,8 @@ impl GameLoop {
             #[cfg(feature = "runtime-subsystems")]
             runtime_ui_pointer: [0.0, 0.0],
             #[cfg(feature = "runtime-subsystems")]
+            runtime_ui_viewport: [0.0, 0.0],
+            #[cfg(feature = "runtime-subsystems")]
             runtime_ui_captured_canvas: None,
             #[cfg(feature = "runtime-subsystems")]
             runtime_ui_events: Vec::new(),
@@ -321,7 +534,7 @@ impl GameLoop {
             let input_actions = self.resolved_script_input_actions();
             self.runtime.set_script_input_actions(input_actions);
         }
-        self.runtime.load_scene_to_world(scene)?;
+        self.runtime.load_scene(scene)?;
         #[cfg(feature = "runtime-subsystems")]
         self.reset_runtime_ui_input();
         #[cfg(feature = "runtime-audio-output")]
@@ -485,6 +698,14 @@ impl GameLoop {
                         canvas_id: event.canvas_id,
                         element_id: event.element_id,
                         callback_id: event.callback_id,
+                        value: event.value.map(|value| match value {
+                            RuntimeUiValue::Bool(value) => {
+                                engine_script::GameplayUiValue::Bool(value)
+                            }
+                            RuntimeUiValue::Float(value) => {
+                                engine_script::GameplayUiValue::Float(value)
+                            }
+                        }),
                     })
                     .collect::<Vec<_>>()
             }
@@ -572,6 +793,36 @@ impl GameLoop {
         }
     }
 
+    /// Render the scene, retained game UI and engine-native overlays inside an
+    /// embedded viewport. The desktop editor shell is composed by the OS and
+    /// never enters this render path.
+    pub fn render_embedded_viewport(
+        &mut self,
+        frame_index: u64,
+        engine_overlay_batches: Vec<engine_renderer::UiBatch>,
+        viewport: RenderViewportContext,
+    ) -> Result<FrameStats, Vec<Diagnostic>> {
+        #[cfg(feature = "runtime-subsystems")]
+        let ui_batches = {
+            let surface_size = viewport.surface_size();
+            let output = viewport.output_rect();
+            let extent = [
+                output.width() * surface_size[0] as f32,
+                output.height() * surface_size[1] as f32,
+            ];
+            self.runtime_ui_viewport = extent;
+            let mut scene_ui_batches = self.runtime_ui_batches();
+            embed_scene_ui_batches(&mut scene_ui_batches, viewport);
+            scene_ui_batches.extend(engine_overlay_batches);
+            scene_ui_batches
+        };
+        #[cfg(not(feature = "runtime-subsystems"))]
+        let ui_batches = engine_overlay_batches;
+
+        self.runtime
+            .render_frame_with_ui_in_viewport(frame_index, ui_batches, viewport)
+    }
+
     /// Drain retained Canvas click events for a native host.
     ///
     /// Script-enabled [`update`](Self::update) consumes the same queue once
@@ -586,6 +837,12 @@ impl GameLoop {
     #[cfg(feature = "runtime-subsystems")]
     pub fn ui_has_pointer_capture(&self) -> bool {
         self.runtime_ui_captured_canvas.is_some()
+    }
+
+    /// Update the screen viewport used by retained UI scaling and hit tests.
+    #[cfg(feature = "runtime-subsystems")]
+    pub fn set_ui_viewport_size(&mut self, width: u32, height: u32) {
+        self.runtime_ui_viewport = [width.max(1) as f32, height.max(1) as f32];
     }
 
     /// Update the retained UI primary-pointer position in Canvas coordinates.
@@ -610,17 +867,40 @@ impl GameLoop {
                 self.cancel_ui_pointer_state();
                 return;
             };
-            self.runtime_ui_input_states
-                .entry(captured_canvas)
+            let [canvas_x, canvas_y] = self.runtime_ui_canvas_point(canvas, x, y);
+            let value_change = self
+                .runtime_ui_input_states
+                .entry(captured_canvas.clone())
                 .or_default()
-                .process_event(canvas, engine_ui::UiPointerEvent::Move { x, y });
+                .process_event(
+                    canvas,
+                    engine_ui::UiPointerEvent::Move {
+                        x: canvas_x,
+                        y: canvas_y,
+                    },
+                );
+            self.commit_runtime_ui_canvas(&captured_canvas, canvas.clone());
+            if let Some(value_change) = value_change {
+                self.runtime_ui_events.push(RuntimeUiEvent {
+                    canvas_id: captured_canvas,
+                    element_id: value_change.element_id.0,
+                    callback_id: value_change.callback_id,
+                    value: value_change.value.map(|value| match value {
+                        engine_ui::UiValue::Bool(value) => RuntimeUiValue::Bool(value),
+                        engine_ui::UiValue::Float(value) => RuntimeUiValue::Float(value),
+                    }),
+                });
+            }
             return;
         }
 
         let hovered_canvas = canvases
             .iter()
             .rev()
-            .find(|(_, canvas)| engine_ui::hit_test_interactive(canvas, x, y).is_some())
+            .find(|(_, canvas)| {
+                let [canvas_x, canvas_y] = self.runtime_ui_canvas_point(canvas, x, y);
+                engine_ui::hit_test_interactive(canvas, canvas_x, canvas_y).is_some()
+            })
             .map(|(canvas_id, _)| canvas_id.clone());
         for (canvas_id, state) in &mut self.runtime_ui_input_states {
             if hovered_canvas.as_deref() != Some(canvas_id.as_str()) {
@@ -632,10 +912,17 @@ impl GameLoop {
                 .iter_mut()
                 .find_map(|(candidate, canvas)| (candidate == &canvas_id).then_some(canvas))
                 .expect("hovered Canvas came from the same snapshot");
+            let [canvas_x, canvas_y] = self.runtime_ui_canvas_point(canvas, x, y);
             self.runtime_ui_input_states
                 .entry(canvas_id)
                 .or_default()
-                .process_event(canvas, engine_ui::UiPointerEvent::Move { x, y });
+                .process_event(
+                    canvas,
+                    engine_ui::UiPointerEvent::Move {
+                        x: canvas_x,
+                        y: canvas_y,
+                    },
+                );
         }
     }
 
@@ -651,7 +938,10 @@ impl GameLoop {
         let pressed_canvas = canvases
             .iter()
             .rev()
-            .find(|(_, canvas)| engine_ui::hit_test_interactive(canvas, x, y).is_some())
+            .find(|(_, canvas)| {
+                let [canvas_x, canvas_y] = self.runtime_ui_canvas_point(canvas, x, y);
+                engine_ui::hit_test_interactive(canvas, canvas_x, canvas_y).is_some()
+            })
             .map(|(canvas_id, _)| canvas_id.clone());
         let Some(canvas_id) = pressed_canvas else {
             return;
@@ -660,12 +950,23 @@ impl GameLoop {
             .iter_mut()
             .find_map(|(candidate, canvas)| (candidate == &canvas_id).then_some(canvas))
             .expect("pressed Canvas came from the same snapshot");
-        let state = self
-            .runtime_ui_input_states
-            .entry(canvas_id.clone())
-            .or_default();
-        state.process_event(canvas, engine_ui::UiPointerEvent::Press { x, y });
-        if state.capture.is_some() {
+        let [canvas_x, canvas_y] = self.runtime_ui_canvas_point(canvas, x, y);
+        let captured = {
+            let state = self
+                .runtime_ui_input_states
+                .entry(canvas_id.clone())
+                .or_default();
+            state.process_event(
+                canvas,
+                engine_ui::UiPointerEvent::Press {
+                    x: canvas_x,
+                    y: canvas_y,
+                },
+            );
+            state.capture.is_some()
+        };
+        self.commit_runtime_ui_canvas(&canvas_id, canvas.clone());
+        if captured {
             self.runtime_ui_captured_canvas = Some(canvas_id);
         }
     }
@@ -688,16 +989,28 @@ impl GameLoop {
             self.runtime_ui_input_states.remove(&canvas_id);
             return;
         };
+        let [canvas_x, canvas_y] = self.runtime_ui_canvas_point(canvas, x, y);
         let click = self
             .runtime_ui_input_states
             .entry(canvas_id.clone())
             .or_default()
-            .process_event(canvas, engine_ui::UiPointerEvent::Release { x, y });
+            .process_event(
+                canvas,
+                engine_ui::UiPointerEvent::Release {
+                    x: canvas_x,
+                    y: canvas_y,
+                },
+            );
+        self.commit_runtime_ui_canvas(&canvas_id, canvas.clone());
         if let Some(click) = click {
             self.runtime_ui_events.push(RuntimeUiEvent {
                 canvas_id,
                 element_id: click.element_id.0,
                 callback_id: click.callback_id,
+                value: click.value.map(|value| match value {
+                    engine_ui::UiValue::Bool(value) => RuntimeUiValue::Bool(value),
+                    engine_ui::UiValue::Float(value) => RuntimeUiValue::Float(value),
+                }),
             });
         }
     }
@@ -755,12 +1068,47 @@ impl GameLoop {
             .unwrap_or_default()
     }
 
+    #[cfg(feature = "runtime-subsystems")]
+    fn runtime_ui_canvas_point(&self, canvas: &engine_ui::Canvas, x: f32, y: f32) -> [f32; 2] {
+        let viewport_width = if self.runtime_ui_viewport[0] > 0.0 {
+            self.runtime_ui_viewport[0]
+        } else {
+            canvas.width
+        };
+        let viewport_height = if self.runtime_ui_viewport[1] > 0.0 {
+            self.runtime_ui_viewport[1]
+        } else {
+            canvas.height
+        };
+        let scale = engine_ui::canvas_scale(canvas, viewport_width, viewport_height);
+        if scale.is_finite() && scale > 0.0 {
+            [x / scale, y / scale]
+        } else {
+            [x, y]
+        }
+    }
+
+    #[cfg(feature = "runtime-subsystems")]
+    fn commit_runtime_ui_canvas(&mut self, canvas_id: &str, canvas: engine_ui::Canvas) {
+        self.runtime.with_world_mut(|world| {
+            let Some(entity) = world.entity_by_persistent_id(canvas_id) else {
+                return;
+            };
+            if let Some(target) = world.get_mut::<engine_ui::Canvas>(entity) {
+                *target = canvas;
+            }
+        });
+    }
+
     /// Resolve retained-mode scene canvases into renderer batches for the
     /// current frame. Canvas order is based on persistent entity IDs so the
     /// result is stable even when ECS storage order changes.
     #[cfg(feature = "runtime-subsystems")]
     fn runtime_ui_batches(&mut self) -> Vec<engine_renderer::UiBatch> {
-        self.runtime
+        let input_states = self.runtime_ui_input_states.clone();
+        let viewport = self.runtime_ui_viewport;
+        let batches = self
+            .runtime
             .with_world_mut(|world| {
                 let mut canvases = world
                     .query::<engine_ui::Canvas>()
@@ -779,7 +1127,21 @@ impl GameLoop {
                             return Vec::new();
                         };
                         canvas.layout_all();
-                        let mut batches = canvas.build_batches();
+                        let viewport_width = if viewport[0] > 0.0 {
+                            viewport[0]
+                        } else {
+                            canvas.width
+                        };
+                        let viewport_height = if viewport[1] > 0.0 {
+                            viewport[1]
+                        } else {
+                            canvas.height
+                        };
+                        let mut batches = canvas.build_batches_for_viewport(
+                            viewport_width,
+                            viewport_height,
+                            input_states.get(&canvas_id),
+                        );
                         for batch in &mut batches {
                             batch.canvas_id.clone_from(&canvas_id);
                         }
@@ -787,7 +1149,9 @@ impl GameLoop {
                     })
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        batches
     }
 
     /// Advance scene animation players and replace their static renderer

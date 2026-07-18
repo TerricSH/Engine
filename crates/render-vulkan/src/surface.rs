@@ -33,7 +33,7 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        // SAFETY: invariant maintained by VulkanRenderer drop order.
+        // SAFETY: invariant maintained by VulkanDevice drop order.
         unsafe { self.loader.destroy_surface(self.surface, None) }
     }
 }

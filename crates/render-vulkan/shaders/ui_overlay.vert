@@ -21,7 +21,10 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     float x = (in_position.x / pc.screen_size.x) * 2.0 - 1.0;
-    float y = -(in_position.y / pc.screen_size.y) * 2.0 + 1.0;
+    // Vulkan's positive-height viewport maps NDC -1 to the top edge. Editor
+    // coordinates are already top-left based, so no additional Y flip is
+    // needed here.
+    float y = (in_position.y / pc.screen_size.y) * 2.0 - 1.0;
     gl_Position = vec4(x, y, 0.0, 1.0);
     out_uv = in_uv;
     out_color = in_color;

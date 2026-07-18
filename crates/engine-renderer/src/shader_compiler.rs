@@ -44,8 +44,8 @@ pub enum ShaderStage {
 
 /// Compiles shader source (GLSL / HLSL) into SPIR-V bytecode.
 ///
-/// Implementations **must** be [`Send`] so they can be used from a
-/// [`MaterialResolverV2`](super::MaterialResolverV2) held across threads.
+/// Implementations **must** be [`Send`] so compilation can run on a worker
+/// thread without introducing a second material-resolution path.
 pub trait ShaderCompiler: Send {
     /// Compile `source` into SPIR-V, optionally passing preprocessor
     /// `defines` (name → value).

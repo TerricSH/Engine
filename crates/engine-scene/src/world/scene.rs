@@ -11,6 +11,7 @@ use crate::scene::{
 use crate::components::{
     Bounds, Camera, CameraProjection, Light, LightKind, Name, Renderable, Transform,
 };
+use crate::prefab_instance::PrefabInstanceRef;
 use crate::{Component, Entity};
 
 use super::World;
@@ -230,6 +231,46 @@ impl World {
                 );
             }
 
+            // Prefab instance linkage. This is canonical authoring data, not
+            // an editor-only side table, so it must survive Scene -> World ->
+            // Scene roundtrips.
+            if let Some(prefab_ref) = self.get::<PrefabInstanceRef>(entity) {
+                let fields = BTreeMap::from([
+                    (
+                        "source_asset".to_string(),
+                        Value::Asset(AssetId::new(&prefab_ref.source_asset)),
+                    ),
+                    (
+                        "instance_id".to_string(),
+                        Value::Str(prefab_ref.instance_id.clone()),
+                    ),
+                    (
+                        "entity_persistent_id".to_string(),
+                        Value::Str(prefab_ref.entity_persistent_id.clone()),
+                    ),
+                    (
+                        "schema_major".to_string(),
+                        Value::UInt(u64::from(prefab_ref.schema_version.major)),
+                    ),
+                    (
+                        "schema_minor".to_string(),
+                        Value::UInt(u64::from(prefab_ref.schema_version.minor)),
+                    ),
+                    (
+                        "schema_patch".to_string(),
+                        Value::UInt(u64::from(prefab_ref.schema_version.patch)),
+                    ),
+                ]);
+                components.insert(
+                    PrefabInstanceRef::TYPE_ID.to_string(),
+                    ComponentRecord {
+                        schema_version: schema_version_for(PrefabInstanceRef::TYPE_ID),
+                        enabled: true,
+                        fields,
+                    },
+                );
+            }
+
             // ── Registered external components (e.g. physics) ──────────
             if let Some(ref registry) = self.component_registry {
                 for (&type_id, storage) in &self.storages {
@@ -241,6 +282,7 @@ impl World {
                             | Camera::TYPE_ID
                             | Light::TYPE_ID
                             | Bounds::TYPE_ID
+                            | PrefabInstanceRef::TYPE_ID
                     ) {
                         continue;
                     }
@@ -473,6 +515,7 @@ impl World {
                 | Camera::TYPE_ID
                 | Light::TYPE_ID
                 | Bounds::TYPE_ID
+                | PrefabInstanceRef::TYPE_ID
         ) {
             return Ok(());
         }
@@ -752,6 +795,46 @@ impl World {
                     },
                 );
             }
+            PrefabInstanceRef::TYPE_ID => {
+                let source_asset = match fields.get("source_asset") {
+                    Some(Value::Asset(asset)) => asset.id.clone(),
+                    _ => return Ok(()),
+                };
+                let instance_id = match fields.get("instance_id") {
+                    Some(Value::Str(value)) => value.clone(),
+                    _ => return Ok(()),
+                };
+                let entity_persistent_id = match fields.get("entity_persistent_id") {
+                    Some(Value::Str(value)) => value.clone(),
+                    _ => return Ok(()),
+                };
+                let schema_part = |name: &str| match fields.get(name) {
+                    Some(Value::UInt(value)) => u16::try_from(*value).ok(),
+                    _ => None,
+                };
+                let Some(schema_major) = schema_part("schema_major") else {
+                    return Ok(());
+                };
+                let Some(schema_minor) = schema_part("schema_minor") else {
+                    return Ok(());
+                };
+                let Some(schema_patch) = schema_part("schema_patch") else {
+                    return Ok(());
+                };
+                self.add_component(
+                    entity,
+                    PrefabInstanceRef {
+                        source_asset,
+                        instance_id,
+                        entity_persistent_id,
+                        schema_version: SchemaVersion::new(
+                            schema_major,
+                            schema_minor,
+                            schema_patch,
+                        ),
+                    },
+                );
+            }
             _ => {
                 return self.populate_external_component(entity, comp_type_id, fields);
             }
@@ -837,7 +920,7 @@ mod tests {
     use crate::components::{Camera, Name, Renderable, Transform};
     use crate::registry::{ComponentExtension, ComponentMeta, ComponentRegistry};
     use crate::scene::{sample_scene, ComponentRecord, SceneLoadDiagnostic};
-    use crate::{Component, ComponentStorageDyn, SparseSet, World};
+    use crate::{Component, ComponentStorageDyn, PrefabInstanceRef, SparseSet, World};
     use engine_serialize::{AssetId, SchemaVersion, Value};
 
     #[derive(Debug, PartialEq)]
@@ -1060,7 +1143,7 @@ mod tests {
             diagnostics
         );
 
-        let result = crate::extraction::extract_renderer_input(&scene_back, 42);
+        let result = crate::extraction::extract_renderer_input_from_world(&world, 42);
         assert!(
             result.is_ok(),
             "round-tripped scene extraction failed: {:?}",
@@ -1328,5 +1411,52 @@ mod tests {
 
         let roundtripped = world.to_scene();
         assert_eq!(roundtripped.entities[1].parent, Some(parent_id));
+    }
+
+    #[test]
+    fn prefab_instance_linkage_survives_strict_scene_world_roundtrip() {
+        let mut scene = sample_scene();
+        scene.entities[1].components.insert(
+            PrefabInstanceRef::TYPE_ID.to_string(),
+            ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: BTreeMap::from([
+                    (
+                        "source_asset".into(),
+                        Value::Asset(AssetId::new("prefab-crate")),
+                    ),
+                    (
+                        "instance_id".into(),
+                        Value::Str("prefab-instance-crate".into()),
+                    ),
+                    (
+                        "entity_persistent_id".into(),
+                        Value::Str("crate-root".into()),
+                    ),
+                    ("schema_major".into(), Value::UInt(0)),
+                    ("schema_minor".into(), Value::UInt(1)),
+                    ("schema_patch".into(), Value::UInt(0)),
+                ]),
+            },
+        );
+        let mut registry = ComponentRegistry::new();
+        registry.register_core();
+        let world = World::try_from_scene_with_registry(&scene, Arc::new(registry)).unwrap();
+        let linkage = world
+            .query::<PrefabInstanceRef>()
+            .next()
+            .map(|(_, linkage)| linkage)
+            .expect("prefab linkage materialized");
+        assert_eq!(linkage.source_asset, "prefab-crate");
+        assert_eq!(linkage.entity_persistent_id, "crate-root");
+
+        let roundtripped = world.to_scene();
+        assert_eq!(
+            roundtripped.entities[1]
+                .components
+                .get(PrefabInstanceRef::TYPE_ID),
+            scene.entities[1].components.get(PrefabInstanceRef::TYPE_ID)
+        );
     }
 }

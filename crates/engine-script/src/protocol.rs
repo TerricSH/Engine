@@ -31,8 +31,9 @@ pub enum ScriptMessage {
     AssemblyLoaded {
         /// The identifier from the corresponding `LoadAssembly` request.
         id: String,
-        /// The fully-qualified type names found in the assembly.
-        types: Vec<String>,
+        /// Sorted, de-duplicated fully-qualified names of concrete classes
+        /// that inherit `Engine.EngineBehaviour`.
+        classes: Vec<String>,
     },
 
     /// Request: create an instance of a script type.
@@ -69,8 +70,15 @@ pub enum ScriptMessage {
     /// Error response (for any request that failed).
     #[serde(rename = "Error")]
     Error {
+        /// Stable machine-readable error category.
+        code: String,
+        /// Protocol operation that failed.
+        operation: String,
         /// Human-readable error description.
         message: String,
+        /// Assembly involved in the failure, when applicable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assembly_id: Option<String>,
     },
 
     /// Request: write a field value on an instance.
@@ -174,7 +182,7 @@ mod tests {
     fn protocol_assembly_loaded_roundtrip() {
         let msg = ScriptMessage::AssemblyLoaded {
             id: "asm-001".into(),
-            types: vec!["MyApp.MyScript".into()],
+            classes: vec!["MyApp.MyScript".into()],
         };
         let json = msg.to_json().unwrap();
         let back = ScriptMessage::from_json(&json).unwrap();
@@ -210,13 +218,15 @@ mod tests {
     #[test]
     fn protocol_error_roundtrip() {
         let msg = ScriptMessage::Error {
+            code: "HOST_FAILURE".into(),
+            operation: "Test".into(),
             message: "Something went wrong".into(),
+            assembly_id: None,
         };
         let json = msg.to_json().unwrap();
         let back = ScriptMessage::from_json(&json).unwrap();
-        assert!(
-            matches!(back, ScriptMessage::Error { message } if message == "Something went wrong")
-        );
+        assert!(matches!(back, ScriptMessage::Error { code, message, .. }
+                if code == "HOST_FAILURE" && message == "Something went wrong"));
     }
 
     #[test]

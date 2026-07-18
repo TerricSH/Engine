@@ -1,4 +1,7 @@
-use super::{extract_renderer_input, sample_scene, validate_scene, EntityRecord, Scene};
+use super::{
+    extract_renderer_input_from_world, sample_scene, starter_scene, validate_scene,
+    validate_scene_for_authoring, EntityRecord, Scene, World,
+};
 use engine_serialize::{AssetId, SchemaVersion, Value};
 use std::collections::BTreeMap;
 
@@ -10,10 +13,52 @@ use std::collections::BTreeMap;
 fn sample_scene_validates_and_extracts() {
     let scene = sample_scene();
     assert!(validate_scene(&scene).is_empty());
-    let input = extract_renderer_input(&scene, 7).expect("sample scene extracts");
+    let world = World::from_scene(&scene);
+    let input = extract_renderer_input_from_world(&world, 7).expect("sample world extracts");
     assert_eq!(input.frame_index, 7);
     assert_eq!(input.views.len(), 1);
     assert_eq!(input.drawables.len(), 1);
+}
+
+#[test]
+fn starter_scene_is_a_ready_to_edit_basic_scene() {
+    let scene = starter_scene("main", "Main");
+
+    assert_eq!(scene.scene_id, "main");
+    assert_eq!(scene.name, "Main");
+    assert_eq!(
+        scene.scene_settings.active_camera.as_deref(),
+        Some("camera-main")
+    );
+    assert_eq!(scene.entities.len(), 3);
+    for (entity_id, component_types) in [
+        ("camera-main", &["engine.camera", "engine.transform"][..]),
+        ("cube-01", &["engine.renderable", "engine.transform"][..]),
+        (
+            "light-directional",
+            &["engine.light", "engine.transform"][..],
+        ),
+    ] {
+        let entity = scene
+            .entities
+            .iter()
+            .find(|entity| entity.persistent_id == entity_id)
+            .unwrap_or_else(|| panic!("starter scene is missing {entity_id}"));
+        for component_type in component_types {
+            assert!(
+                entity.components.contains_key(*component_type),
+                "{entity_id} is missing {component_type}"
+            );
+        }
+    }
+    assert!(validate_scene(&scene).is_empty());
+    validate_scene_for_authoring(&scene, None).expect("starter scene is authorable");
+
+    let world = World::from_scene(&scene);
+    let input = extract_renderer_input_from_world(&world, 0).expect("starter scene extracts");
+    assert_eq!(input.views.len(), 1);
+    assert_eq!(input.drawables.len(), 1);
+    assert_eq!(input.lights.len(), 1);
 }
 
 // ============================================================================
@@ -145,17 +190,46 @@ fn scene_without_active_camera_validates_successfully() {
     );
 }
 
+#[test]
+fn scene_settings_reject_non_finite_or_empty_runtime_values() {
+    let mut scene = sample_scene();
+    scene.scene_settings.default_render_layer.clear();
+    scene.scene_settings.fixed_timestep_seconds = f32::NAN;
+    scene.scene_settings.gravity = Some([0.0, f32::INFINITY, 0.0]);
+    scene.scene_settings.ambient = [-1.0, 0.0, 0.0, 1.0];
+    scene.scene_settings.environment_map = Some(AssetId::new(""));
+
+    let diagnostics = validate_scene(&scene);
+    for code in ["SC0018", "SC0019", "SC0020", "SC0021", "SC0022"] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "expected {code}, got {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn scene_settings_use_renderer_render_graph_validation() {
+    let mut scene = sample_scene();
+    scene.scene_settings.pass_graph_config.passes.clear();
+    let diagnostics = validate_scene(&scene);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "RV0017"),
+        "expected renderer graph diagnostic, got {diagnostics:?}"
+    );
+}
+
 // ============================================================================
 // Extraction failure for scenes with validation errors
 // ============================================================================
 
 #[test]
-fn extraction_fails_for_scene_with_validation_errors() {
+fn validation_prevents_invalid_scene_from_reaching_world_extraction() {
     let mut scene = sample_scene();
     scene.entities.push(scene.entities[0].clone()); // duplicate
-    let result = extract_renderer_input(&scene, 0);
-    assert!(result.is_err(), "extraction should fail for invalid scene");
-    let diagnostics = result.unwrap_err();
+    let diagnostics = validate_scene(&scene);
     assert!(
         diagnostics.iter().any(|d| d.code == "SC0015"),
         "expected SC0015 in extraction error, got: {:?}",
@@ -168,7 +242,8 @@ fn extraction_fails_for_scene_with_missing_camera() {
     let mut scene = sample_scene();
     scene.entities.clear(); // remove camera entity
     scene.scene_settings.active_camera = None;
-    let result = extract_renderer_input(&scene, 0);
+    let world = World::from_scene(&scene);
+    let result = extract_renderer_input_from_world(&world, 0);
     assert!(result.is_err(), "extraction should fail with no camera");
 }
 

@@ -1,7 +1,7 @@
 //! Performance inspector panel for the editor.
 //!
 //! Displays real-time frame statistics including rendering, physics,
-//! animation, navigation, memory, and asset counts.  Historical frame
+//! animation, navigation, and asset counts. Historical frame
 //! data is maintained as a rolling 60-frame buffer for graphing.
 
 use tracing;
@@ -11,8 +11,6 @@ use engine_nav::components::AiAgent;
 use engine_physics::components::RigidBody;
 use engine_renderer::FrameStats as RendererFrameStats;
 use engine_scene::World;
-
-use crate::editor_ui::EditorUi;
 
 // ---------------------------------------------------------------------------
 // FrameStats
@@ -33,8 +31,6 @@ pub struct FrameStats {
     pub animation_count: u32,
     /// Number of active navigation agents.
     pub nav_agents: u32,
-    /// Process memory usage in megabytes.
-    pub memory_mb: f32,
     /// Number of loaded assets.
     pub asset_count: u32,
 }
@@ -48,7 +44,6 @@ impl FrameStats {
         physics_bodies: 0,
         animation_count: 0,
         nav_agents: 0,
-        memory_mb: 0.0,
         asset_count: 0,
     };
 
@@ -76,61 +71,6 @@ impl Default for FrameStats {
 }
 
 // ---------------------------------------------------------------------------
-// PerformanceSections
-// ---------------------------------------------------------------------------
-
-/// Toggleable section visibility for the performance panel.
-#[derive(Clone, Debug)]
-pub struct PerformanceSections {
-    pub rendering: bool,
-    pub physics: bool,
-    pub animation: bool,
-    pub navigation: bool,
-    pub memory: bool,
-    pub assets: bool,
-}
-
-impl PerformanceSections {
-    /// All sections collapsed.
-    pub fn all_closed() -> Self {
-        Self {
-            rendering: false,
-            physics: false,
-            animation: false,
-            navigation: false,
-            memory: false,
-            assets: false,
-        }
-    }
-
-    /// All sections expanded.
-    pub fn all_open() -> Self {
-        Self {
-            rendering: true,
-            physics: true,
-            animation: true,
-            navigation: true,
-            memory: true,
-            assets: true,
-        }
-    }
-}
-
-impl Default for PerformanceSections {
-    fn default() -> Self {
-        // By default only the rendering section is expanded.
-        Self {
-            rendering: true,
-            physics: false,
-            animation: false,
-            navigation: false,
-            memory: false,
-            assets: false,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // PerformancePanel
 // ---------------------------------------------------------------------------
 
@@ -140,8 +80,6 @@ pub struct PerformancePanel {
     pub frame_stats: FrameStats,
     /// Rolling 60-frame history.
     pub history: Vec<FrameStats>,
-    /// Which sections are expanded.
-    pub visible_sections: PerformanceSections,
 }
 
 impl PerformancePanel {
@@ -150,7 +88,6 @@ impl PerformancePanel {
         Self {
             frame_stats: FrameStats::ZERO,
             history: Vec::with_capacity(60),
-            visible_sections: PerformanceSections::default(),
         }
     }
 
@@ -185,10 +122,6 @@ impl Default for PerformancePanel {
 /// Queries the ECS `World` for component counts (physics bodies, animation
 /// players, nav agents) and — when `renderer_stats` is provided — merges
 /// GPU-side statistics (draw calls, triangles, frame time) into `stats`.
-///
-/// Fields that require platform-specific measurement (`memory_mb`) are
-/// left at their default value; callers should set them externally when
-/// the platform support is available.
 pub fn record_frame(
     stats: &mut FrameStats,
     world: &World,
@@ -216,10 +149,7 @@ pub fn record_frame(
         stats.frame_time_ms = rs.gpu_frame_ms;
     }
 
-    // ── Memory & assets ──────────────────────────────────────────────
-    // `memory_mb` requires platform-specific querying (e.g.
-    // GetProcessMemoryInfo on Windows, /proc/self/status on Linux) and
-    // is left at its default value (0.0) here.
+    // ── Assets ───────────────────────────────────────────────────────
     // `asset_count` should be set externally from the AssetRegistry.
 
     tracing::trace!(
@@ -231,153 +161,6 @@ pub fn record_frame(
         "PerformancePanel: frame recorded"
     );
 }
-
-// ---------------------------------------------------------------------------
-// draw_performance
-// ---------------------------------------------------------------------------
-
-/// Draw the entire performance inspector panel.
-///
-/// Sections (collapsible):
-/// - **Rendering** — frame-time bar graph, draw call count, triangle count
-/// - **Physics**   — active rigid body count
-/// - **Animation** — active animation player count
-/// - **Navigation** — active AI agent count
-/// - **Memory**    — process memory usage
-/// - **Assets**    — loaded asset count (type breakdown placeholder)
-///
-/// Frame time values are colour-coded:
-/// - green  `< 8 ms`   — smooth
-/// - yellow `8–13 ms`  — marginal
-/// - red    `> 13 ms`  — expensive
-pub fn draw_performance(ui: &mut EditorUi, panel: &mut PerformancePanel) {
-    let _ = ui.collapsing_header("Performance Inspector", true);
-
-    let stats = &panel.frame_stats;
-    let (_tag, color) = stats.frame_time_color();
-    let color_str = format!("({:.2}, {:.2}, {:.2})", color[0], color[1], color[2]);
-
-    // ── Summary line ─────────────────────────────────────────────────
-    ui.text_field(
-        "Frame Time",
-        &format!("{:.2} ms  [{}]", stats.frame_time_ms, color_str),
-    );
-    ui.text_field("Draw Calls", &stats.draw_calls.to_string());
-    ui.text_field("Triangles", &stats.triangles.to_string());
-
-    ui.separator();
-
-    // ── Rendering section ────────────────────────────────────────────
-    panel.visible_sections.rendering =
-        ui.collapsing_header("Rendering", panel.visible_sections.rendering);
-    if panel.visible_sections.rendering {
-        draw_frame_time_graph(ui, &panel.history);
-        ui.text_field("Draw Calls", &stats.draw_calls.to_string());
-        ui.text_field("Triangles", &stats.triangles.to_string());
-        ui.text_field("GPU Frame", &format!("{:.2} ms", stats.frame_time_ms));
-    }
-
-    // ── Physics section ──────────────────────────────────────────────
-    panel.visible_sections.physics =
-        ui.collapsing_header("Physics", panel.visible_sections.physics);
-    if panel.visible_sections.physics {
-        ui.text_field("Rigid Bodies", &stats.physics_bodies.to_string());
-    }
-
-    // ── Animation section ────────────────────────────────────────────
-    panel.visible_sections.animation =
-        ui.collapsing_header("Animation", panel.visible_sections.animation);
-    if panel.visible_sections.animation {
-        ui.text_field("Anim Players", &stats.animation_count.to_string());
-    }
-
-    // ── Navigation section ───────────────────────────────────────────
-    panel.visible_sections.navigation =
-        ui.collapsing_header("Navigation", panel.visible_sections.navigation);
-    if panel.visible_sections.navigation {
-        ui.text_field("AI Agents", &stats.nav_agents.to_string());
-    }
-
-    // ── Memory section ───────────────────────────────────────────────
-    panel.visible_sections.memory = ui.collapsing_header("Memory", panel.visible_sections.memory);
-    if panel.visible_sections.memory {
-        ui.text_field(
-            "Process",
-            &format!("{:.1} MB (requires platform hook)", stats.memory_mb),
-        );
-    }
-
-    // ── Assets section ───────────────────────────────────────────────
-    panel.visible_sections.assets = ui.collapsing_header("Assets", panel.visible_sections.assets);
-    if panel.visible_sections.assets {
-        ui.text_field("Loaded Assets", &stats.asset_count.to_string());
-        // Type breakdown — wired when AssetRegistry provides per-type counts.
-        ui.text_field("Meshes", "0");
-        ui.text_field("Textures", "0");
-        ui.text_field("Materials", "0");
-        ui.text_field("Animations", "0");
-        ui.text_field("Audio", "0");
-    }
-
-    tracing::debug!(
-        frame_ms = stats.frame_time_ms,
-        sections = ?panel.visible_sections,
-        "PerformancePanel drawn"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// draw_frame_time_graph
-// ---------------------------------------------------------------------------
-
-/// Draw a simple 60-frame bar chart of recent frame times.
-///
-/// Each bar represents one frame in the history buffer.  The bar height
-/// is proportional to the frame time, and the colour follows the same
-/// green / yellow / red scheme used elsewhere.
-pub fn draw_frame_time_graph(ui: &mut EditorUi, history: &[FrameStats]) {
-    let _ = ui.collapsing_header("Frame Time Graph (last 60)", true);
-
-    if history.is_empty() {
-        ui.text_field("Graph", "(no data)");
-        return;
-    }
-
-    // Find the maximum frame time in the buffer for normalisation.
-    let max_ms = history
-        .iter()
-        .map(|s| s.frame_time_ms)
-        .fold(0.0f32, f32::max)
-        .max(0.001);
-
-    // Draw each bar as a text line.  In a full UI backend this would be
-    // a proper bar chart; here we use a simple character-based approach.
-    let bar_width = 20usize; // max bar width in characters.
-    for (i, stats) in history.iter().enumerate() {
-        let ratio = (stats.frame_time_ms / max_ms).clamp(0.0, 1.0);
-        let filled = (ratio * bar_width as f32).round() as usize;
-        let filled = filled.min(bar_width);
-        let empty = bar_width - filled;
-
-        let (_tag, _color) = stats.frame_time_color();
-        let bar = "#".repeat(filled);
-        let space = ".".repeat(empty);
-        let label = format!(
-            "[{:>3}] ▕{}{}▏ {:.1} ms",
-            i + 1,
-            bar,
-            space,
-            stats.frame_time_ms
-        );
-        ui.text_field(&format!("#{:03}", i + 1), &label);
-    }
-
-    tracing::trace!(samples = history.len(), max_ms, "Frame-time graph drawn");
-}
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -394,7 +177,6 @@ mod tests {
         assert_eq!(s.physics_bodies, 0);
         assert_eq!(s.animation_count, 0);
         assert_eq!(s.nav_agents, 0);
-        assert_eq!(s.memory_mb, 0.0);
         assert_eq!(s.asset_count, 0);
     }
 
@@ -502,41 +284,6 @@ mod tests {
         assert!((panel.history[0].frame_time_ms - 1.0).abs() < 0.001);
         assert!((panel.history[1].frame_time_ms - 2.0).abs() < 0.001);
         assert!((panel.history[2].frame_time_ms - 3.0).abs() < 0.001);
-    }
-
-    // ── PerformanceSections ─────────────────────────────────────────────
-
-    #[test]
-    fn sections_default_rendering_only() {
-        let s = PerformanceSections::default();
-        assert!(s.rendering);
-        assert!(!s.physics);
-        assert!(!s.animation);
-        assert!(!s.navigation);
-        assert!(!s.memory);
-        assert!(!s.assets);
-    }
-
-    #[test]
-    fn sections_all_open() {
-        let s = PerformanceSections::all_open();
-        assert!(s.rendering);
-        assert!(s.physics);
-        assert!(s.animation);
-        assert!(s.navigation);
-        assert!(s.memory);
-        assert!(s.assets);
-    }
-
-    #[test]
-    fn sections_all_closed() {
-        let s = PerformanceSections::all_closed();
-        assert!(!s.rendering);
-        assert!(!s.physics);
-        assert!(!s.animation);
-        assert!(!s.navigation);
-        assert!(!s.memory);
-        assert!(!s.assets);
     }
 
     // ── renderer parameter accepted (no-op) ─────────────────────────────

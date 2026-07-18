@@ -2,8 +2,8 @@
 //!
 //! Provides an extensible `PassKind`, rich `PassNode` with resource
 //! declarations, and a `RenderGraph` builder that supports topological
-//! sorting.  A `to_legacy()` adapter produces the old `render_graph::RenderGraph`
-//! so existing `BackendRenderer` consumers continue to work unchanged.
+//! sorting. This is the single render-graph contract used by the renderer and
+//! every backend.
 //!
 //! The canonical 4-pass ordering is produced by `RenderGraph::build()`:
 //!   directional_shadow_pass → opaque_pbr_forward_pass → tone_map_pass → present
@@ -16,15 +16,62 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    render_graph::{self, CompiledBarrier, CompiledRenderGraph, PipeStage, ResourceState},
-    RenderFrameInput, RenderView, ViewCompose,
-};
+use crate::{RenderFrameInput, RenderView, ViewCompose};
+
+/// Backend-agnostic state used by compiled resource barriers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceState {
+    Undefined,
+    ColorAttachmentOptimal,
+    DepthStencilAttachmentOptimal,
+    DepthStencilReadOnlyOptimal,
+    ShaderReadOnlyOptimal,
+    TransferSrcOptimal,
+    TransferDstOptimal,
+    PresentSrc,
+    General,
+}
+
+/// Backend-agnostic pipeline stage used by compiled resource barriers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeStage {
+    TopOfPipe,
+    ColorAttachmentOutput,
+    EarlyFragmentTests,
+    LateFragmentTests,
+    FragmentShader,
+    ComputeShader,
+    Transfer,
+    BottomOfPipe,
+}
+
+/// A resource transition emitted before a compiled pass.
+#[derive(Clone, Debug)]
+pub struct CompiledBarrier {
+    pub resource_name: String,
+    pub src_stage: PipeStage,
+    pub dst_stage: PipeStage,
+    pub old_state: ResourceState,
+    pub new_state: ResourceState,
+}
+
+/// The compiled pass order and barriers for a render graph.
+#[derive(Clone, Debug)]
+pub struct CompiledRenderGraph {
+    pub pass_order: Vec<usize>,
+    pub barriers_per_pass: Vec<Vec<CompiledBarrier>>,
+}
+
+impl CompiledRenderGraph {
+    pub fn pass_count(&self) -> usize {
+        self.pass_order.len()
+    }
+}
 
 // ── Pass kind (extensible) ──────────────────────────────────────────────────
 
 /// Extensible pass kind — can be one of the built-in kinds or a custom string.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PassKind {
     DirectionalShadow,
     OpaquePbrForward,
@@ -34,6 +81,23 @@ pub enum PassKind {
 }
 
 impl PassKind {
+    /// Built-in pass kinds in their canonical execution order.
+    ///
+    /// Custom kinds are deliberately absent: a custom pass is executable only
+    /// after a backend has registered a matching [`crate::RenderPass`]. UI
+    /// code must not present arbitrary strings as available render features.
+    pub const BUILTIN_KINDS: [Self; 4] = [
+        Self::DirectionalShadow,
+        Self::OpaquePbrForward,
+        Self::ToneMap,
+        Self::Present,
+    ];
+
+    /// Whether this kind is implemented without a registered custom pass.
+    pub const fn is_builtin(self) -> bool {
+        !matches!(self, Self::Custom(_))
+    }
+
     /// Machine-readable name for this pass kind.
     pub fn name(&self) -> &'static str {
         match self {
@@ -42,18 +106,6 @@ impl PassKind {
             Self::ToneMap => "tone_map_pass",
             Self::Present => "present",
             Self::Custom(name) => name,
-        }
-    }
-
-    /// Try to convert this new `PassKind` to the legacy `render_graph::PassKind`.
-    /// Custom variants are passed through.
-    pub fn to_legacy(&self) -> Option<render_graph::PassKind> {
-        match self {
-            Self::DirectionalShadow => Some(render_graph::PassKind::DirectionalShadow),
-            Self::OpaquePbrForward => Some(render_graph::PassKind::OpaquePbrForward),
-            Self::ToneMap => Some(render_graph::PassKind::ToneMap),
-            Self::Present => Some(render_graph::PassKind::Present),
-            Self::Custom(name) => Some(render_graph::PassKind::Custom(name)),
         }
     }
 
@@ -141,24 +193,6 @@ pub struct PassNode {
     pub inputs: Vec<PassAttachment>,
     pub outputs: Vec<PassAttachment>,
     pub depth_stencil: Option<PassAttachment>,
-}
-
-impl PassNode {
-    /// Convert this new-style `PassNode` to the legacy `render_graph::PassNode`
-    /// for use with the existing `BackendRenderer` trait.
-    pub fn to_legacy(&self) -> Option<render_graph::PassNode> {
-        let legacy_kind = self.kind.to_legacy()?;
-        Some(render_graph::PassNode {
-            kind: legacy_kind,
-            name: self.name,
-            view_id: self.view_id,
-            reads_depth: self
-                .inputs
-                .iter()
-                .any(|a| a.name == "depth" || a.name == "depth_stencil"),
-            writes_swapchain: self.outputs.iter().any(|a| a.name == "swapchain"),
-        })
-    }
 }
 
 // ── Graph edge ──────────────────────────────────────────────────────────────
@@ -406,93 +440,7 @@ impl RenderGraph {
         self.passes.len()
     }
 
-    /// Phase 5.4: Compile this render graph into an explicit submit order
-    /// with backend-agnostic pipeline barriers.
-    ///
-    /// 1. Topologically sorts the passes (Kahn's algorithm).
-    /// 2. Tracks resource state transitions across the sorted order.
-    /// 3. Inserts a [`CompiledBarrier`] whenever a resource changes between
-    ///    read and write (or between different write roles).
-    ///
-    /// Returns a [`CompiledRenderGraph`] that backends can turn into concrete
-    /// `VkImageMemoryBarrier` / `VkPipelineBarrier` calls.
-    pub fn compile(&self) -> Result<CompiledRenderGraph, String> {
-        let pass_order = self.topological_sort()?;
-        let n = pass_order.len();
-
-        // ── Resource state tracking ────────────────────────────────────
-        let mut resource_states: HashMap<String, ResourceState> = HashMap::new();
-        let mut barriers_per_pass: Vec<Vec<CompiledBarrier>> = vec![Vec::new(); n];
-
-        for (sorted_idx, &pass_idx) in pass_order.iter().enumerate() {
-            let pass = &self.passes[pass_idx];
-
-            // ── Inputs (read-only) ──
-            for input in &pass.inputs {
-                let old = resource_states
-                    .get(&input.name)
-                    .copied()
-                    .unwrap_or(ResourceState::Undefined);
-                let new = input_resource_state(pass, input);
-                if old != new {
-                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
-                        resource_name: input.name.clone(),
-                        src_stage: previous_stage(&old),
-                        dst_stage: input_stage(pass, input),
-                        old_state: old,
-                        new_state: new,
-                    });
-                }
-                resource_states.insert(input.name.clone(), new);
-            }
-
-            // ── Depth-stencil attachment ──
-            if let Some(ref ds) = pass.depth_stencil {
-                let old = resource_states
-                    .get(&ds.name)
-                    .copied()
-                    .unwrap_or(ResourceState::Undefined);
-                let new = ResourceState::DepthStencilAttachmentOptimal;
-                if old != new {
-                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
-                        resource_name: ds.name.clone(),
-                        src_stage: previous_stage(&old),
-                        dst_stage: PipeStage::EarlyFragmentTests,
-                        old_state: old,
-                        new_state: new,
-                    });
-                }
-                resource_states.insert(ds.name.clone(), new);
-            }
-
-            // ── Outputs (written by the pass) ──
-            for output in &pass.outputs {
-                let old = resource_states
-                    .get(&output.name)
-                    .copied()
-                    .unwrap_or(ResourceState::Undefined);
-                let new = output_resource_state(pass, &output.name);
-                if old != new {
-                    barriers_per_pass[sorted_idx].push(CompiledBarrier {
-                        resource_name: output.name.clone(),
-                        src_stage: previous_stage(&old),
-                        dst_stage: output_stage(&output.name),
-                        old_state: old,
-                        new_state: new,
-                    });
-                }
-                resource_states.insert(output.name.clone(), new);
-            }
-        }
-
-        Ok(CompiledRenderGraph {
-            pass_order,
-            barriers_per_pass,
-        })
-    }
-
-    /// Phase B: Enhanced compilation with pass culling and access-aware
-    /// barrier inference.
+    /// Compile this render graph with pass culling and access-aware barrier inference.
     ///
     /// 1. Topologically sorts the passes (Kahn's algorithm).
     /// 2. **Culls** passes whose outputs are never consumed (backward
@@ -505,7 +453,7 @@ impl RenderGraph {
     /// depth-stencil attachments used read-only get
     /// `DepthStencilReadOnlyOptimal` instead of
     /// `DepthStencilAttachmentOptimal`.
-    pub fn compile_v2(&self) -> Result<CompiledRenderGraph, String> {
+    pub fn compile(&self) -> Result<CompiledRenderGraph, String> {
         let all_sorted = self.topological_sort()?;
         let n = all_sorted.len();
         if n == 0 {
@@ -688,18 +636,6 @@ impl RenderGraph {
             pass_order: live_order,
             barriers_per_pass,
         })
-    }
-
-    /// Convert this new-style `RenderGraph` into the legacy
-    /// `render_graph::RenderGraph` so it can be consumed by the existing
-    /// `BackendRenderer::execute_pass` trait.
-    pub fn to_legacy(&self) -> render_graph::RenderGraph {
-        let legacy_passes: Vec<render_graph::PassNode> =
-            self.passes.iter().filter_map(|p| p.to_legacy()).collect();
-
-        render_graph::RenderGraph {
-            passes: legacy_passes,
-        }
     }
 }
 
@@ -1046,7 +982,7 @@ impl TransientResourcePool {
     /// Build an aliasing plan from the render graph's pass declarations.
     ///
     /// `pass_order` is the sorted execution order (e.g. from
-    /// [`compile_v2`](RenderGraph::compile_v2)).
+    /// [`compile`](RenderGraph::compile)).
     pub fn build(&self, graph: &RenderGraph, pass_order: &[usize]) -> AliasingPlan {
         // ── Step 1: collect lifetime intervals ──────────────────────────
         let mut first_use: HashMap<String, usize> = HashMap::new();
@@ -1303,7 +1239,7 @@ mod tests {
         graph
     }
 
-    // ── compile_v2 tests ─────────────────────────────────────────────────
+    // ── compile tests ────────────────────────────────────────────────────
 
     #[test]
     fn default_config_uses_canonical_builtin_resource_declarations() {
@@ -1319,10 +1255,10 @@ mod tests {
     }
 
     #[test]
-    fn default_config_compile_v2_transitions_hdr_for_tone_mapping() {
+    fn default_config_compile_transitions_hdr_for_tone_mapping() {
         let input = input_with_shadowed_view();
         let graph = RenderGraph::build_with_config(&input, &PassGraphConfig::default());
-        let compiled = graph.compile_v2().expect("default graph should compile");
+        let compiled = graph.compile().expect("default graph should compile");
         let tone_map = graph
             .passes
             .iter()
@@ -1401,7 +1337,7 @@ mod tests {
         assert_eq!(graph.edges[0].from_pass, 0);
         assert_eq!(graph.edges[0].to_pass, 1);
 
-        let compiled = graph.compile_v2().expect("direct graph should compile");
+        let compiled = graph.compile().expect("direct graph should compile");
         let present_position = compiled
             .pass_order
             .iter()
@@ -1435,9 +1371,9 @@ mod tests {
     }
 
     #[test]
-    fn compile_v2_topological_sort() {
+    fn compile_topological_sort() {
         let graph = make_graph();
-        let compiled = graph.compile_v2().expect("compile_v2 should succeed");
+        let compiled = graph.compile().expect("compile should succeed");
         assert_eq!(compiled.pass_order.len(), 4);
         let positions: Vec<usize> = compiled.pass_order.to_vec();
         for w in positions.windows(2) {
@@ -1446,16 +1382,16 @@ mod tests {
     }
 
     #[test]
-    fn compile_v2_culls_unconsumed_output() {
+    fn compile_culls_unconsumed_output() {
         // Pass B writes "unused" that nobody reads, but B also writes "temp"
         // which IS consumed → B stays live because "temp" reaches Present.
         let graph = make_graph();
-        let compiled = graph.compile_v2().expect("compile_v2 should succeed");
+        let compiled = graph.compile().expect("compile should succeed");
         assert_eq!(compiled.pass_order.len(), 4);
     }
 
     #[test]
-    fn compile_v2_culls_dead_pass() {
+    fn compile_culls_dead_pass() {
         let mut graph = make_graph();
 
         // Pass 4: E (dead) — writes "dead_buffer", nothing reads it.
@@ -1475,7 +1411,7 @@ mod tests {
             depth_stencil: None,
         });
 
-        let compiled = graph.compile_v2().expect("compile_v2 should succeed");
+        let compiled = graph.compile().expect("compile should succeed");
         assert_eq!(compiled.pass_order.len(), 4);
         assert!(
             !compiled.pass_order.contains(&4),
@@ -1484,28 +1420,19 @@ mod tests {
     }
 
     #[test]
-    fn compile_v2_barriers_between_transitions() {
+    fn compile_barriers_between_transitions() {
         let graph = make_graph();
-        let compiled = graph.compile_v2().expect("compile_v2 should succeed");
+        let compiled = graph.compile().expect("compile should succeed");
         let total_barriers: usize = compiled.barriers_per_pass.iter().map(|b| b.len()).sum();
         assert!(total_barriers >= 1, "expected at least 1 barrier");
     }
 
     #[test]
-    fn compile_v2_empty_graph() {
+    fn compile_empty_graph() {
         let graph = RenderGraph::new();
-        let compiled = graph.compile_v2().expect("empty graph should compile");
+        let compiled = graph.compile().expect("empty graph should compile");
         assert!(compiled.pass_order.is_empty());
         assert!(compiled.barriers_per_pass.is_empty());
-    }
-
-    #[test]
-    fn compile_v2_matches_compile_when_no_dead_passes() {
-        let graph = make_graph();
-        let v2 = graph.compile_v2().expect("compile_v2");
-        let v1 = graph.compile().expect("compile");
-        // Since there are no dead passes, orders match.
-        assert_eq!(v2.pass_order, v1.pass_order);
     }
 
     // ── TransientResourcePool tests ──────────────────────────────────────

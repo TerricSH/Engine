@@ -1,5 +1,5 @@
 use ash::vk;
-use engine_renderer::render_graph::{CompiledBarrier, PipeStage, ResourceState};
+use engine_renderer::render_graph2::{CompiledBarrier, PipeStage, ResourceState};
 
 use super::VulkanDevice;
 

@@ -43,6 +43,10 @@ mod protocol;
 mod value;
 
 // Re-export lifecycle constants at the crate root for convenience.
+pub use engine_script_api::{
+    GameplayScriptApiContract, GAMEPLAY_SCRIPT_API, GAMEPLAY_SCRIPT_API_SCHEMA,
+    GAMEPLAY_SCRIPT_API_VERSION, GENERATED_CONTRACT_FILE, GENERATED_CSHARP_API_FILE,
+};
 pub use lifecycle::{ON_CREATE, ON_DESTROY, ON_START, ON_UPDATE};
 
 // Core types.
@@ -51,12 +55,13 @@ pub use engine::ScriptEngine;
 pub use gameplay::{
     validate_entity_id, validate_scene_id, validate_script_transform, GameplayCommand,
     GameplayContext, GameplayEntitySnapshot, GameplayInputTransitions, GameplayInputValue,
-    GameplayPhysicsEvent, GameplayPhysicsEventKind, GameplayUiEvent, OwnedGameplayCommand,
-    ScriptTransform,
+    GameplayPhysicsEvent, GameplayPhysicsEventKind, GameplayUiColor, GameplayUiCommand,
+    GameplayUiElement, GameplayUiEvent, GameplayUiLayout, GameplayUiScaleMode, GameplayUiValue,
+    OwnedGameplayCommand, ScriptTransform,
 };
 pub use host::{
     MockHost, MockScriptInstance, NullScriptHost, ScriptError, ScriptHandle, ScriptHost,
-    ScriptInstance,
+    ScriptInstance, VerifiedScriptClass,
 };
 pub use ilruntime_host::{ILRuntimeHost, ILRuntimeInstance};
 pub use process_host::{ProcessHost, ProcessScriptInstance};

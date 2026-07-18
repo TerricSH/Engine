@@ -14,54 +14,6 @@ impl Drop for VulkanDevice {
         self.destroy_ui_overlay_resources();
         self.drain_all_retired_pipelines();
         let d = &self.logical_device.device;
-        for fb in self.mvp_framebuffers.drain(..) {
-            // SAFETY: `fb` was created by this device and is not yet destroyed.
-            unsafe {
-                d.destroy_framebuffer(fb, None);
-            }
-        }
-        for fb in self.model_framebuffers.drain(..) {
-            // SAFETY: `fb` was created by this device and is not yet destroyed.
-            unsafe {
-                d.destroy_framebuffer(fb, None);
-            }
-        }
-        if let Some(p) = self.mvp_pipeline.take() {
-            // SAFETY: `p` was created by this device and is not yet destroyed.
-            unsafe {
-                d.destroy_pipeline(p, None);
-            }
-        }
-        if let Some(l) = self.mvp_pipeline_layout.take() {
-            // SAFETY: `l` was created by this device and is not yet destroyed.
-            unsafe {
-                d.destroy_pipeline_layout(l, None);
-            }
-        }
-        if let Some(p) = self.model_pipeline.take() {
-            // SAFETY: `p` was created by this device and is not yet destroyed.
-            unsafe {
-                d.destroy_pipeline(p, None);
-            }
-        }
-        if let Some(l) = self.model_pipeline_layout.take() {
-            // SAFETY: `l` was created by this device and is not yet destroyed.
-            unsafe {
-                d.destroy_pipeline_layout(l, None);
-            }
-        }
-        if let Some(rp) = self.mvp_rp.take() {
-            // SAFETY: `rp` was created by this device and is not yet destroyed.
-            unsafe {
-                d.destroy_render_pass(rp, None);
-            }
-        }
-        if let Some(rp) = self.model_rp.take() {
-            // SAFETY: `rp` was created by this device and is not yet destroyed.
-            unsafe {
-                d.destroy_render_pass(rp, None);
-            }
-        }
         for fs in self.frame_sync.drain(..) {
             // SAFETY: all handles in `fs` were created by this device and are
             // not yet destroyed; destruction order does not matter among

@@ -2,11 +2,9 @@
 //!
 //! Tracks the lifecycle of each asset through the reload process:
 //!
-//! ```text
-//! Detected → Recooking → Cooked → Queued → Applying → Applied
-//!                ↓ (on failure)
-//!             Failed(error)
-//! ```
+//! `Detected -> Recooking -> Cooked -> Queued -> Applying -> Applied`.
+//! Cooking or application errors transition the asset to `Failed` while the
+//! previous valid runtime artifact remains available.
 //!
 //! Reload state transitions are surfaced as [`Diagnostic`] values via
 //! [`ReloadTracker::to_diagnostics`] so they can be displayed in editor

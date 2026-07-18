@@ -61,8 +61,6 @@ impl VulkanDevice {
                 name: "hdr-color",
                 requirements: req,
                 location: crate::allocator::MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: crate::allocator::AllocationScheme::GpuAllocatorManaged,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
         // SAFETY: `image` was created by this device; `allocation` was created
@@ -139,13 +137,21 @@ impl VulkanDevice {
             .hdr_color_view
             .ok_or(VulkanError::Loader("no HDR texture".into()))?;
         let vert = self
-            .mvp_vert_spv
+            .forward_vert_spv
             .clone()
             .ok_or(VulkanError::MissingShader("hdr_forward.vert"))?;
         let frag = self
-            .mvp_frag_spv
+            .forward_frag_spv
             .clone()
             .ok_or(VulkanError::MissingShader("hdr_forward.frag"))?;
+        let skybox_vert = self
+            .skybox_vert_spv
+            .clone()
+            .ok_or(VulkanError::MissingShader("skybox.vert"))?;
+        let skybox_frag = self
+            .skybox_frag_spv
+            .clone()
+            .ok_or(VulkanError::MissingShader("skybox.frag"))?;
 
         // ---- Render pass: color(RGBA16F) + depth(D32) ----
         let color_at = vk::AttachmentDescription::default()
@@ -319,6 +325,62 @@ impl VulkanDevice {
             d.destroy_shader_module(fm, None);
         }
 
+        // ---- Skybox pipeline ----
+        // It shares the forward pipeline layout and render pass. The vertex
+        // shader generates a cube from gl_VertexIndex, so no vertex input is
+        // required. Rendering happens before opaque geometry without depth
+        // writes, allowing scene geometry to replace the background normally.
+        let sky_vm = unsafe { mk_sm(d, &skybox_vert)? };
+        let sky_fm = match unsafe { mk_sm(d, &skybox_frag) } {
+            Ok(module) => module,
+            Err(error) => {
+                unsafe {
+                    d.destroy_shader_module(sky_vm, None);
+                }
+                return Err(error);
+            }
+        };
+        let sky_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(sky_vm)
+                .name(main),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(sky_fm)
+                .name(main),
+        ];
+        let sky_vi = vk::PipelineVertexInputStateCreateInfo::default();
+        let sky_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(false)
+            .depth_write_enable(false);
+        let sky_blend_attachments = [super::blend_attachment_from_mode("Opaque")];
+        let sky_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&sky_blend_attachments);
+        let sky_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&sky_stages)
+            .vertex_input_state(&sky_vi)
+            .input_assembly_state(&ia)
+            .viewport_state(&vs)
+            .rasterization_state(&rs)
+            .multisample_state(&ms)
+            .depth_stencil_state(&sky_depth)
+            .color_blend_state(&sky_blend)
+            .dynamic_state(&ds2)
+            .layout(pll)
+            .render_pass(rp)
+            .subpass(0);
+        let sky_pipeline_result = unsafe {
+            d.create_graphics_pipelines(vk::PipelineCache::null(), &[sky_pipeline_info], None)
+        };
+        unsafe {
+            d.destroy_shader_module(sky_vm, None);
+            d.destroy_shader_module(sky_fm, None);
+        }
+        let skybox_pipeline =
+            sky_pipeline_result.map_err(|(_, r)| VulkanError::vk("cgp_hdr_skybox", r))?[0];
+
         // ---- Framebuffer (HDR color view + depth view) ----
         let att_views = [hdr_view, depth_view];
         // SAFETY: `d` is a valid AshDevice; framebuffer info references valid
@@ -339,6 +401,7 @@ impl VulkanDevice {
         self.hdr_forward_rp = Some(rp);
         self.hdr_forward_pipeline_layout = Some(pll);
         self.hdr_forward_pipeline = Some(pipeline);
+        self.hdr_skybox_pipeline = Some(skybox_pipeline);
         self.hdr_forward_fb = Some(fb);
 
         Ok(())
@@ -365,7 +428,7 @@ impl VulkanDevice {
         let at = vk::AttachmentDescription::default()
             .format(swapchain_format)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -655,6 +718,11 @@ impl VulkanDevice {
         }
 
         // Forward HDR pipeline + layout
+        if let Some(p) = self.hdr_skybox_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
         if let Some(p) = self.hdr_forward_pipeline.take() {
             unsafe {
                 d.destroy_pipeline(p, None);

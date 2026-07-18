@@ -7,7 +7,6 @@
 use engine_animation::assets::{AnimationClip, Skeleton};
 use engine_animation::Pose;
 
-use crate::editor_ui::EditorUi;
 use engine_asset::AssetRegistry;
 use tracing;
 
@@ -50,6 +49,8 @@ pub struct AnimationPreviewPanel {
     pub selected_skeleton: Option<String>,
     /// Name of the currently selected clip asset.
     pub selected_clip: Option<String>,
+    /// Stable IDs of skeletons available in the asset registry.
+    pub available_skeletons: Vec<String>,
     /// All clip names available in the asset registry.
     pub available_clips: Vec<String>,
 
@@ -76,8 +77,10 @@ pub struct AnimationPreviewPanel {
     clip_info: Option<AnimClipInfo>,
     /// Cached skeleton asset handle (loaded from registry).
     cached_skeleton: Option<engine_asset::AssetHandle<Skeleton>>,
+    cached_skeleton_id: Option<String>,
     /// Cached clip asset handle (loaded from registry).
     cached_clip: Option<engine_asset::AssetHandle<AnimationClip>>,
+    cached_clip_name: Option<String>,
     /// Most recently sampled pose (updated each frame when playing).
     pub sampled_pose: Option<Pose>,
 }
@@ -88,6 +91,7 @@ impl AnimationPreviewPanel {
         Self {
             selected_skeleton: None,
             selected_clip: None,
+            available_skeletons: Vec::new(),
             available_clips: Vec::new(),
             playback_time: 0.0,
             playing: false,
@@ -97,7 +101,9 @@ impl AnimationPreviewPanel {
             events: Vec::new(),
             clip_info: None,
             cached_skeleton: None,
+            cached_skeleton_id: None,
             cached_clip: None,
+            cached_clip_name: None,
             sampled_pose: None,
         }
     }
@@ -115,61 +121,66 @@ impl Default for AnimationPreviewPanel {
 }
 
 // ---------------------------------------------------------------------------
-// load_animation_data
+// refresh_animation_assets
 // ---------------------------------------------------------------------------
 
-/// Populate the panel's clip and skeleton lists from the asset registry.
-///
-/// Scans all cached assets in `registry`, extracts assets whose ID starts
-/// with `"animation-"` as available clips, and records the skeleton at
-/// `skeleton_path` as the selected skeleton.
-pub fn load_animation_data(
-    panel: &mut AnimationPreviewPanel,
-    skeleton_path: &str,
-    asset_registry: &AssetRegistry,
-) {
-    panel.selected_skeleton = Some(skeleton_path.to_string());
-
-    // Gather all cached asset IDs that look like animation clips.
+/// Refresh the available animation assets and resolve the current selection.
+/// Existing playback state is retained unless the selected clip changes.
+pub fn refresh_animation_assets(panel: &mut AnimationPreviewPanel, asset_registry: &AssetRegistry) {
     let mut clips: Vec<String> = Vec::new();
+    let mut skeletons: Vec<String> = Vec::new();
     for id in asset_registry.cached_ids() {
-        if id.id.starts_with("animation-") || id.id.starts_with("clip-") {
-            // Try to load the AnimationClip asset to get the display name.
-            if let Some(handle) = asset_registry.get::<AnimationClip>(&id) {
-                clips.push(handle.get().name().to_string());
-            } else {
-                // Fall back to the asset ID string.
-                clips.push(id.id.clone());
-            }
+        if let Some(handle) = asset_registry.get::<AnimationClip>(&id) {
+            clips.push(handle.get().name().to_string());
+        }
+        if asset_registry.get::<Skeleton>(&id).is_some() {
+            skeletons.push(id.id.clone());
         }
     }
     clips.sort();
     clips.dedup();
+    skeletons.sort();
+    skeletons.dedup();
     panel.available_clips = clips;
+    panel.available_skeletons = skeletons;
 
-    // If there is no current selection, pick the first clip.
-    if panel.selected_clip.is_none() && !panel.available_clips.is_empty() {
-        panel.selected_clip = Some(panel.available_clips[0].clone());
+    if panel
+        .selected_clip
+        .as_ref()
+        .is_none_or(|selected| !panel.available_clips.contains(selected))
+    {
+        panel.selected_clip = panel.available_clips.first().cloned();
+    }
+    if panel
+        .selected_skeleton
+        .as_ref()
+        .is_none_or(|selected| !panel.available_skeletons.contains(selected))
+    {
+        panel.selected_skeleton = panel.available_skeletons.first().cloned();
     }
 
-    // Load skeleton handle for pose sampling.
-    panel.cached_skeleton = asset_registry.get::<Skeleton>(&id_from_path(skeleton_path));
-    if let Some(ref skel) = panel.cached_skeleton {
-        tracing::debug!(
-            skeleton = skeleton_path,
-            joints = skel.get().joint_count(),
-            "AnimationPreview: loaded skeleton"
-        );
+    if panel.cached_skeleton_id != panel.selected_skeleton {
+        panel.cached_skeleton = panel.selected_skeleton.as_ref().and_then(|selected| {
+            asset_registry.cached_ids().into_iter().find_map(|id| {
+                (id.id == *selected || id.logical_path.as_deref() == Some(selected.as_str()))
+                    .then(|| asset_registry.get::<Skeleton>(&id))
+                    .flatten()
+            })
+        });
+        panel.cached_skeleton_id = panel.selected_skeleton.clone();
     }
-
-    // Reload clip info and handle for the current selection.
-    load_current_clip_info(panel, asset_registry);
+    if panel.cached_clip_name != panel.selected_clip {
+        load_current_clip_info(panel, asset_registry);
+        panel.cached_clip_name = panel.selected_clip.clone();
+    }
+    sample_preview_pose(panel);
 }
 
 /// Internal helper: refresh the cached clip info for the selected clip.
 fn load_current_clip_info(panel: &mut AnimationPreviewPanel, registry: &AssetRegistry) {
     let Some(ref clip_name) = panel.selected_clip else {
         panel.clip_info = None;
+        panel.cached_clip = None;
         panel.events.clear();
         return;
     };
@@ -203,255 +214,48 @@ fn load_current_clip_info(panel: &mut AnimationPreviewPanel, registry: &AssetReg
 
     // Clip not found in registry – reset info.
     panel.clip_info = None;
+    panel.cached_clip = None;
     panel.events.clear();
 }
 
-/// Build an [`engine_serialize::AssetId`] from a path string (no-hyphen fallback).
-fn id_from_path(path: &str) -> engine_serialize::AssetId {
-    // Reuse the same convention as engine-asset: category-name → "category/name.asset".
-    engine_serialize::AssetId::with_path("skeleton", path)
-}
-
-// ---------------------------------------------------------------------------
-// draw_animation_preview
-// ---------------------------------------------------------------------------
-
-/// Draw the entire animation preview panel using the provided [`EditorUi`].
-///
-/// Layout (top to bottom):
-/// 1. Skeleton selector dropdown + clip selector dropdown.
-/// 2. Timeline scrubber with draggable playhead and time ruler.
-/// 3. Transport controls: play/pause, stop, speed slider, loop toggle.
-/// 4. Event markers on the timeline (diamond shapes at event times).
-/// 5. Current pose blend-state display (when using a state machine).
-pub fn draw_animation_preview(ui: &mut EditorUi, panel: &mut AnimationPreviewPanel) {
-    let _header = ui.collapsing_header("Animation Preview", true);
-
-    // ── Selector row ─────────────────────────────────────────────────
-    let _ = ui.collapsing_header("Skeleton", true);
-    let skeleton_label = panel.selected_skeleton.as_deref().unwrap_or("<none>");
-    ui.text_field("Skeleton", skeleton_label);
-
-    ui.separator();
-
-    let _ = ui.collapsing_header("Clip", true);
-    let clip_label = panel.selected_clip.as_deref().unwrap_or("<none>");
-    ui.text_field("Clip", clip_label);
-
-    // ── Clip info ────────────────────────────────────────────────────
-    if let Some(info) = &panel.clip_info {
-        ui.separator();
-        let _ = ui.collapsing_header("Clip Info", true);
-        ui.text_field("Duration", &format!("{:.3} s", info.duration));
-        ui.text_field("Events", &info.event_count.to_string());
-        if let Some(ref sm) = info.state_machine {
-            ui.text_field("State Machine", sm);
-        }
-    }
-
-    ui.separator();
-
-    // ── Timeline scrubber ────────────────────────────────────────────
-    let duration = panel.clip_info.as_ref().map(|i| i.duration).unwrap_or(1.0);
-
-    let _ = ui.collapsing_header("Timeline", true);
-    // Use a slider as a draggable playhead.
-    if let Some(t) = ui.slider_f32("Time", panel.playback_time, 0.0, duration) {
-        panel.playback_time = t.clamp(0.0, duration);
-    }
-
-    // ── Transport controls ───────────────────────────────────────────
-    ui.separator();
-    let _ = ui.collapsing_header("Transport", true);
-
-    // Play / Pause toggle
-    if ui.button(if panel.playing {
-        "⏸ Pause"
-    } else {
-        "▶ Play"
-    }) {
-        panel.playing = !panel.playing;
-        tracing::debug!(
-            playing = panel.playing,
-            "AnimationPreview: play/pause toggled"
-        );
-    }
-
-    // Stop button
-    if ui.button("⏹ Stop") {
-        panel.playing = false;
-        panel.playback_time = 0.0;
-        tracing::debug!("AnimationPreview: stopped");
-    }
-
-    // Speed slider
-    if let Some(s) = ui.slider_f32("Speed", panel.speed, 0.0, 5.0) {
-        panel.speed = s.max(0.01);
-    }
-
-    // Loop toggle
-    panel.looping = ui.checkbox("Loop", panel.looping);
-
-    // ── Event markers ────────────────────────────────────────────────
-    if !panel.events.is_empty() {
-        ui.separator();
-        let _ = ui.collapsing_header("Events", true);
-        for event in &panel.events {
-            ui.text_field(&event.name, &format!("{:.3} s", event.time));
-        }
-    }
-
-    // ── Blend state display ──────────────────────────────────────────
-    if let Some(ref state) = panel.blend_state {
-        ui.separator();
-        let _ = ui.collapsing_header("Blend State", true);
-        ui.text_field("Current State", state);
-    }
-
-    tracing::debug!(
-        playing = panel.playing,
-        time = panel.playback_time,
-        clip = ?panel.selected_clip,
-        "AnimationPreviewPanel drawn"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Keyframe interpolation helpers
-// ---------------------------------------------------------------------------
-
-/// Interpolate `[f32; 3]` keyframes at `time`. Returns first keyframe
-/// before the start, last after the end, and linear LERP between.
-fn interpolate_keyframes_f32_3(
-    kfs: &[engine_animation::assets::Keyframe<[f32; 3]>],
-    time: f32,
-) -> [f32; 3] {
-    if kfs.is_empty() {
-        return [0.0; 3];
-    }
-    if time <= kfs[0].time {
-        return kfs[0].value;
-    }
-    for pair in kfs.windows(2) {
-        if time < pair[1].time {
-            let t = (time - pair[0].time) / (pair[1].time - pair[0].time);
-            let t = t.clamp(0.0, 1.0);
-            return [
-                pair[0].value[0] + (pair[1].value[0] - pair[0].value[0]) * t,
-                pair[0].value[1] + (pair[1].value[1] - pair[0].value[1]) * t,
-                pair[0].value[2] + (pair[1].value[2] - pair[0].value[2]) * t,
-            ];
-        }
-    }
-    kfs.last().unwrap().value
-}
-
-/// Interpolate `[f32; 4]` keyframes at `time` with SLERP for quaternions.
-fn interpolate_keyframes_quat(
-    kfs: &[engine_animation::assets::Keyframe<[f32; 4]>],
-    time: f32,
-) -> [f32; 4] {
-    if kfs.is_empty() {
-        return [0.0, 0.0, 0.0, 1.0];
-    }
-    if time <= kfs[0].time {
-        return kfs[0].value;
-    }
-    for pair in kfs.windows(2) {
-        if time < pair[1].time {
-            let t = (time - pair[0].time) / (pair[1].time - pair[0].time);
-            let t = t.clamp(0.0, 1.0);
-            let a = glam::Quat::from_array(pair[0].value);
-            let b = glam::Quat::from_array(pair[1].value);
-            return a.slerp(b, t).to_array();
-        }
-    }
-    kfs.last().unwrap().value
-}
-
-// ---------------------------------------------------------------------------
-// update_preview
-// ---------------------------------------------------------------------------
-
-/// Advance the playback time by `dt` seconds.
-///
-/// When `playing` is `true`, the playback position is advanced by
-/// `dt * speed`.  At the clip end the position is either looped back to
-/// zero (when `looping` is `true`) or clamped at the end and playback is
-/// stopped.
-///
-/// When both a clip and skeleton are loaded, the clip is sampled at the
-/// current playback time and the resulting [`Pose`] is stored in
-/// [`AnimationPreviewPanel::sampled_pose`] for rendering.
-pub fn update_preview(panel: &mut AnimationPreviewPanel, dt: f32) {
-    if !panel.playing {
-        return;
-    }
-
-    let duration = panel.clip_info.as_ref().map(|i| i.duration).unwrap_or(1.0);
-
-    if duration <= 0.0 {
-        return;
-    }
-
-    panel.playback_time += dt * panel.speed;
-    // Clamp negative (defend against negative dt or speed).
-    if panel.playback_time < 0.0 {
-        panel.playback_time = 0.0;
-    }
-
-    if panel.playback_time >= duration {
-        if panel.looping {
-            panel.playback_time %= duration;
-            if panel.playback_time < 0.0001 {
-                panel.playback_time = 0.0;
-            }
-        } else {
-            panel.playback_time = duration;
-            panel.playing = false;
-        }
-    }
-
-    // Sample the clip at the current time, if both assets are loaded.
-    if let (Some(ref clip_h), Some(ref skel_h)) = (&panel.cached_clip, &panel.cached_skeleton) {
-        let runtime_skel = engine_animation::skeleton::Skeleton::from_asset(skel_h.get());
-        let clip_data = clip_h.get();
-        // Sample each channel: for every animated joint, interpolate
-        // translation/rotation/scale keyframes at the current time.
-        let mut pose = engine_animation::Pose::new(&runtime_skel);
-        {
-            let locals = pose.local_transforms_mut();
-            for channel in &clip_data.channels {
-                let idx = channel.joint_index as usize;
-                if idx >= locals.len() {
-                    continue;
+/// Advance preview playback independently from the editor UI.
+pub fn update_preview(panel: &mut AnimationPreviewPanel, delta_seconds: f32) {
+    if panel.playing && delta_seconds.is_finite() && delta_seconds > 0.0 {
+        if let Some(duration) = panel.clip_info.as_ref().map(|clip| clip.duration) {
+            if duration.is_finite() && duration > 0.0 {
+                panel.playback_time += delta_seconds * panel.speed.max(0.0);
+                if panel.playback_time >= duration {
+                    if panel.looping {
+                        panel.playback_time %= duration;
+                    } else {
+                        panel.playback_time = duration;
+                        panel.playing = false;
+                    }
                 }
-                let t = panel.playback_time.clamp(0.0, clip_data.duration);
-
-                let trans = interpolate_keyframes_f32_3(&channel.translations, t);
-                let rot = interpolate_keyframes_quat(&channel.rotations, t);
-                let scale = interpolate_keyframes_f32_3(&channel.scales, t);
-
-                locals[idx] = engine_animation::BoneTransform {
-                    translation: glam::Vec3::from(trans),
-                    rotation: glam::Quat::from_array(rot),
-                    scale: glam::Vec3::from(scale),
-                };
             }
         }
-        panel.sampled_pose = Some(pose);
     }
-
-    tracing::trace!(
-        time = panel.playback_time,
-        playing = panel.playing,
-        "AnimationPreviewPanel updated"
-    );
+    sample_preview_pose(panel);
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
+/// Evaluate the selected cooked clip against the selected cooked skeleton.
+///
+/// This is the single sampling path used by transport playback and manual
+/// timeline scrubbing. A missing or incompatible selection clears the last
+/// pose instead of leaving stale preview data visible.
+pub fn sample_preview_pose(panel: &mut AnimationPreviewPanel) -> bool {
+    let (Some(clip), Some(skeleton)) = (&panel.cached_clip, &panel.cached_skeleton) else {
+        panel.sampled_pose = None;
+        return false;
+    };
+    let runtime_skeleton = engine_animation::skeleton::Skeleton::from_asset(skeleton.get());
+    panel.sampled_pose = Some(engine_animation::AnimationEvaluator::evaluate_pose(
+        clip.get(),
+        panel.playback_time,
+        &runtime_skeleton,
+    ));
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -469,6 +273,21 @@ mod tests {
         assert!(!panel.playing);
         assert_eq!(panel.speed, 1.0);
         assert!(panel.looping);
+    }
+
+    #[test]
+    fn refresh_empty_registry_clears_stale_asset_selection() {
+        let mut panel = AnimationPreviewPanel::new();
+        panel.selected_skeleton = Some("missing-skeleton".into());
+        panel.selected_clip = Some("missing-clip".into());
+
+        refresh_animation_assets(&mut panel, &AssetRegistry::new());
+
+        assert!(panel.available_skeletons.is_empty());
+        assert!(panel.available_clips.is_empty());
+        assert!(panel.selected_skeleton.is_none());
+        assert!(panel.selected_clip.is_none());
+        assert!(panel.clip_info().is_none());
     }
 
     // ── Play / pause ─────────────────────────────────────────────────────

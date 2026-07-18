@@ -2,159 +2,108 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use engine_renderer::{
-    AxisAlignedBox, BlendMode, ClearFlags, ExtractionStats, LightItem, LightKind, Rect,
-    RenderFrameInput, RenderView, RenderableItem, ShadowMode, ViewCompose, IDENTITY_MAT4,
+    AxisAlignedBox, BlendMode, ClearFlags, ExtractionStats, LightItem, Rect, RenderFrameInput,
+    RenderView, RenderableItem, ShadowMode, ViewCompose,
 };
 use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, PersistentId};
 
 use crate::components;
-use crate::scene::{Scene, ECS_SCENE_CONTRACT};
-use crate::validation::{
-    active_camera_entity, asset_field, bool_field, enabled_component, f32_field, light_kind_field,
-    string_field, u32_field, validate_scene, vec3_field,
-};
+use crate::scene::ECS_SCENE_CONTRACT;
 use crate::World;
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Legacy Scene extraction path
-// ══════════════════════════════════════════════════════════════════════════════
-
-pub fn extract_renderer_input(
-    scene: &Scene,
-    frame_index: u64,
-) -> Result<RenderFrameInput, Vec<Diagnostic>> {
-    let diagnostics = validate_scene(scene);
-    if diagnostics.iter().any(|diagnostic| {
-        matches!(
-            diagnostic.severity,
-            DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
-        )
-    }) {
-        return Err(diagnostics);
-    }
-
-    let mut input = RenderFrameInput::empty(frame_index);
-    input.render_options.tone_mapping = scene.scene_settings.tone_mapping;
-    input.render_options.pass_graph_config = scene.scene_settings.pass_graph_config.clone();
-    input.stats_scope = Some(scene.name.clone());
-
-    let Some(camera_entity) = active_camera_entity(scene) else {
-        return Err(vec![Diagnostic::new(
-            "SC0018",
-            DiagnosticSeverity::Error,
-            "engine-scene",
-            "scene extraction requires at least one enabled active camera",
-        )
-        .contract("ECSScene-v0", ECS_SCENE_CONTRACT)]);
-    };
-
-    let camera_component = enabled_component(camera_entity, "engine.camera")
-        .expect("active_camera_entity only returns entities with an enabled camera");
-    let render_layer_mask = u32_field(camera_component, "render_layer_mask").unwrap_or(u32::MAX);
-    let camera_defaults = components::Camera::default();
-    let msaa_samples = u32_field(camera_component, "msaa_samples")
-        .and_then(|samples| u8::try_from(samples).ok())
-        .unwrap_or(camera_defaults.msaa_samples);
-    input.render_options.msaa_samples = msaa_samples;
-    input.render_options.exposure_ev100 = physical_exposure_ev100(
-        f32_field(camera_component, "aperture").unwrap_or(camera_defaults.aperture),
-        f32_field(camera_component, "shutter_speed").unwrap_or(camera_defaults.shutter_speed),
-        f32_field(camera_component, "iso").unwrap_or(camera_defaults.iso),
-        f32_field(camera_component, "ev_compensation").unwrap_or(camera_defaults.ev_compensation),
-    );
-
-    input.views.push(RenderView {
-        view_id: 0,
-        camera_entity: Some(camera_entity.persistent_id.clone()),
-        viewport: Rect::FULL,
-        viewport_rect_normalized: Rect::FULL,
-        view_matrix: IDENTITY_MAT4,
-        projection_matrix: IDENTITY_MAT4,
-        clear_flags: ClearFlags::ColorAndDepth,
-        clear_color: scene.scene_settings.ambient,
-        render_layer_mask,
-        msaa_samples,
-        compose: ViewCompose::Base {
-            clear: ClearFlags::ColorAndDepth,
-            clear_color: scene.scene_settings.ambient,
-        },
-        stack_order: 0,
-        frustum: None,
-    });
-
-    for entity in scene.entities.iter().filter(|entity| entity.enabled) {
-        if let Some(renderable) = enabled_component(entity, "engine.renderable") {
-            if bool_field(renderable, "visible").unwrap_or(true) {
-                if let (Some(mesh), Some(material)) = (
-                    asset_field(renderable, "mesh"),
-                    asset_field(renderable, "material"),
-                ) {
-                    let render_layer = string_field(renderable, "render_layer")
-                        .unwrap_or_else(|| scene.scene_settings.default_render_layer.clone());
-                    let Some(render_layer_bit) = render_layer_bit(&render_layer) else {
-                        return Err(vec![unknown_render_layer_diagnostic(
-                            &render_layer,
-                            Some(entity.persistent_id.clone()),
-                        )]);
-                    };
-                    if render_layer_mask & (1_u32 << render_layer_bit) == 0 {
-                        continue;
-                    }
-                    let sk = batch_sort_key(&material, &mesh);
-                    input.drawables.push(RenderableItem {
-                        entity: Some(entity.persistent_id.clone()),
-                        mesh,
-                        material,
-                        world_transform: IDENTITY_MAT4,
-                        bounds: AxisAlignedBox::UNIT,
-                        render_layer,
-                        cast_shadows: bool_field(renderable, "cast_shadows").unwrap_or(true),
-                        sort_key: sk,
-                    });
-                }
-            }
-        }
-
-        if let Some(light) = enabled_component(entity, "engine.light") {
-            input.lights.push(LightItem {
-                entity: Some(entity.persistent_id.clone()),
-                kind: light_kind_field(light).unwrap_or(LightKind::Directional),
-                color: vec3_field(light, "color").unwrap_or([1.0, 1.0, 1.0]),
-                intensity: f32_field(light, "intensity").unwrap_or(1.0),
-                range: f32_field(light, "range").unwrap_or(10.0),
-                position: vec3_field(light, "position").unwrap_or([0.0, 0.0, 0.0]),
-                direction: vec3_field(light, "direction").unwrap_or([0.0, -1.0, 0.0]),
-                spot_angles: None,
-                shadow_mode: ShadowMode::Off,
-            });
-        }
-    }
-
-    // Sort drawables by (material, mesh) for efficient batching.
-    input.drawables.sort_by_key(|d| d.sort_key);
-    input.extraction_stats = Some(ExtractionStats {
-        visible_drawables: input.drawables.len() as u32,
-        culled_drawables: 0,
-        visible_lights: input.lights.len() as u32,
-        culled_lights: 0,
-    });
-
-    Ok(input)
+/// Physical render-surface dimensions plus the normalized surface region
+/// available to the scene. Camera-authored viewport rectangles are composed
+/// inside `output_rect`; this keeps editor embedding on the same extraction
+/// path as a full-screen game while producing projection matrices with the
+/// actual pixel aspect ratio.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderViewportContext {
+    surface_size: [u32; 2],
+    output_rect: Rect,
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// ECS World extraction path
-// ══════════════════════════════════════════════════════════════════════════════
+impl RenderViewportContext {
+    pub fn new(surface_width: u32, surface_height: u32, output_rect: Rect) -> Option<Self> {
+        (surface_width > 0 && surface_height > 0 && output_rect.is_valid_normalized()).then_some(
+            Self {
+                surface_size: [surface_width, surface_height],
+                output_rect,
+            },
+        )
+    }
 
-/// Extract renderer input from an ECS `World` (new path).
+    pub const fn surface_size(self) -> [u32; 2] {
+        self.surface_size
+    }
+
+    pub const fn output_rect(self) -> Rect {
+        self.output_rect
+    }
+
+    fn compose(self, camera_rect: Rect) -> Rect {
+        let width = self.output_rect.width();
+        let height = self.output_rect.height();
+        let compose_x = |value: f32| {
+            (self.output_rect.min[0] + value * width)
+                .clamp(self.output_rect.min[0], self.output_rect.max[0])
+        };
+        let compose_y = |value: f32| {
+            (self.output_rect.min[1] + value * height)
+                .clamp(self.output_rect.min[1], self.output_rect.max[1])
+        };
+        Rect {
+            min: [compose_x(camera_rect.min[0]), compose_y(camera_rect.min[1])],
+            max: [compose_x(camera_rect.max[0]), compose_y(camera_rect.max[1])],
+        }
+    }
+
+    fn aspect_ratio(self, viewport: Rect) -> f32 {
+        viewport.width() * self.surface_size[0] as f32
+            / (viewport.height() * self.surface_size[1] as f32)
+    }
+}
+
+impl Default for RenderViewportContext {
+    fn default() -> Self {
+        // Surface-independent callers retain the historical 16:9 behaviour.
+        Self {
+            surface_size: [16, 9],
+            output_rect: Rect::FULL,
+        }
+    }
+}
+
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+// Canonical World extraction path
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+
+/// Extract renderer input from the canonical ECS [`World`].
 ///
-/// Iterates all entities with [`Camera`] → [`RenderView`],
-/// [`Renderable`] + [`Transform`] + [`Bounds`] → [`RenderableItem`],
-/// and [`Light`] → [`LightItem`]. Performs frustum culling against the
+/// Iterates all entities with [`Camera`] 鈫?[`RenderView`],
+/// [`Renderable`] + [`Transform`] + [`Bounds`] 鈫?[`RenderableItem`],
+/// and [`Light`] 鈫?[`LightItem`]. Performs frustum culling against the
 /// first camera's view-projection frustum.
 pub fn extract_renderer_input_from_world(
     world: &World,
     frame_index: u64,
+) -> Result<RenderFrameInput, Vec<Diagnostic>> {
+    extract_renderer_input_from_world_with_viewport(
+        world,
+        frame_index,
+        RenderViewportContext::default(),
+    )
+}
+
+/// Extract renderer input for a concrete surface viewport.
+///
+/// This is the same canonical World extractor used by
+/// [`extract_renderer_input_from_world`]. It additionally supplies the host
+/// surface geometry required to compose camera viewports and calculate their
+/// real projection aspect ratios.
+pub fn extract_renderer_input_from_world_with_viewport(
+    world: &World,
+    frame_index: u64,
+    viewport_context: RenderViewportContext,
 ) -> Result<RenderFrameInput, Vec<Diagnostic>> {
     let mut input = RenderFrameInput::empty(frame_index);
     input.render_options.tone_mapping = world.scene_settings().tone_mapping;
@@ -166,7 +115,7 @@ pub fn extract_renderer_input_from_world(
     // than rejecting the frame with a structured diagnostic.
     let world_matrices = resolve_world_transforms(world)?;
 
-    // ── Camera pass: build RenderViews ──────────────────────────────────
+    // 鈹€鈹€ Camera pass: build RenderViews 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     // Collect all cameras with their transforms, sorted by priority/stack_order.
     type CameraEntry = (
@@ -305,7 +254,8 @@ pub fn extract_renderer_input_from_world(
             );
         }
 
-        let projection = compute_projection_matrix(&camera);
+        let projection =
+            compute_projection_matrix(&camera, effective_camera_aspect(&camera, viewport_context));
         if !projection.is_finite() {
             diagnostics.push(
                 Diagnostic::new(
@@ -370,27 +320,25 @@ pub fn extract_renderer_input_from_world(
         .iter()
         .map(|(_, _, camera, world_matrix, _)| {
             extract_frustum_planes(
-                &(compute_projection_matrix(camera) * compute_view_matrix(*world_matrix)),
+                &(compute_projection_matrix(
+                    camera,
+                    effective_camera_aspect(camera, viewport_context),
+                ) * compute_view_matrix(*world_matrix)),
             )
         })
         .collect();
 
     for (view_idx, (priority, pid, camera, world_matrix, _entity)) in cameras.iter().enumerate() {
         let view = compute_view_matrix(*world_matrix);
-        let proj = compute_projection_matrix(camera);
+        let proj =
+            compute_projection_matrix(camera, effective_camera_aspect(camera, viewport_context));
 
         let clear_color = camera.clear_color;
         let clear_flags = map_clear_flags(camera.clear_flags);
 
         let frustum = Some(extract_frustum_planes(&(proj * view)));
 
-        let viewport = match camera.viewport_rect {
-            Some([x, y, w, h]) => Rect {
-                min: [x, y],
-                max: [x + w, y + h],
-            },
-            None => Rect::FULL,
-        };
+        let viewport = effective_camera_viewport(camera, viewport_context);
 
         let (view_clear_flags, compose) = if view_idx == 0 {
             (
@@ -427,7 +375,7 @@ pub fn extract_renderer_input_from_world(
         });
     }
 
-    // ── Renderable pass: build Drawables ────────────────────────────────
+    // 鈹€鈹€ Renderable pass: build Drawables 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     let mut visible_drawables: u32 = 0;
     let mut culled_drawables: u32 = 0;
@@ -495,7 +443,7 @@ pub fn extract_renderer_input_from_world(
     // Sort drawables by (material, mesh) for efficient batching.
     input.drawables.sort_by_key(|d| d.sort_key);
 
-    // ── Light pass: build LightItems ────────────────────────────────────
+    // 鈹€鈹€ Light pass: build LightItems 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     let mut visible_lights: u32 = 0;
     let mut culled_lights: u32 = 0;
@@ -601,9 +549,9 @@ pub fn extract_renderer_input_from_world(
     Ok(input)
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 // Frustum culling
-// ══════════════════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 /// Resolve a registered v0 render-layer name to its frozen bit index.
 /// Matching is ASCII case-insensitive; `Opaque` is retained as a compatibility
@@ -659,8 +607,8 @@ pub fn extract_frustum_planes(view_proj: &glam::Mat4) -> [glam::Vec4; 6] {
 
     // X/Y use [-w, w]. Z uses [0, w], matching Vulkan and glam's RH helpers.
     let mut planes = [
-        row3 + row0, // left:   -x - w >= 0  →  -(row0·p) - (row3·p) >= 0  →  (row3 + row0)·p >= 0
-        row3 - row0, // right:   x - w <= 0  →   (row0·p) - (row3·p) <= 0  →  (row3 - row0)·p >= 0
+        row3 + row0, // left:   -x - w >= 0  鈫? -(row0路p) - (row3路p) >= 0  鈫? (row3 + row0)路p >= 0
+        row3 - row0, // right:   x - w <= 0  鈫?  (row0路p) - (row3路p) <= 0  鈫? (row3 - row0)路p >= 0
         row3 + row1, // bottom: -y - w >= 0
         row3 - row1, // top:     y - w <= 0
         row2,        // near for zero-to-one clip depth: z >= 0
@@ -681,7 +629,7 @@ pub fn extract_frustum_planes(view_proj: &glam::Mat4) -> [glam::Vec4; 6] {
 /// Check whether an AABB is inside (or intersecting) the frustum.
 ///
 /// Returns `true` if the box is at least partially visible.
-/// Uses the centre–half-extents test against each frustum plane.
+/// Uses the center/half-extents test against each frustum plane.
 pub fn aabb_in_frustum(
     center: [f32; 3],
     half_extents: [f32; 3],
@@ -698,7 +646,7 @@ pub fn aabb_in_frustum(
         // Radius of the AABB projected onto the plane normal.
         let r = h.x * plane.x.abs() + h.y * plane.y.abs() + h.z * plane.z.abs();
 
-        // If the entire box is behind this plane → outside.
+        // If the entire box is behind this plane 鈫?outside.
         if d + r < 0.0 {
             return false;
         }
@@ -707,9 +655,9 @@ pub fn aabb_in_frustum(
     true
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 // Internal helpers
-// ══════════════════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 /// Resolve local TRS values into one cached world matrix per entity.
 fn resolve_world_transforms(
@@ -906,21 +854,43 @@ fn compute_view_matrix(world_matrix: glam::Mat4) -> glam::Mat4 {
     world_matrix.inverse()
 }
 
-/// Compute a 4×4 projection matrix from camera parameters.
-fn compute_projection_matrix(camera: &components::Camera) -> glam::Mat4 {
-    // Default aspect ratio (16:9) — in production this comes from the viewport.
-    const ASPECT: f32 = 16.0 / 9.0;
-
+/// Compute a 4 x 4 projection matrix from camera parameters.
+fn compute_projection_matrix(camera: &components::Camera, aspect: f32) -> glam::Mat4 {
+    // Default aspect ratio (16:9); in production this comes from the viewport.
     match camera.projection {
         components::CameraProjection::Perspective => {
-            glam::Mat4::perspective_rh(camera.fov_y, ASPECT, camera.near, camera.far)
+            glam::Mat4::perspective_rh(camera.fov_y, aspect, camera.near, camera.far)
         }
         components::CameraProjection::Orthographic => {
-            let half_w = camera.ortho_half_height * ASPECT;
+            let half_w = camera.ortho_half_height * aspect;
             let half_h = camera.ortho_half_height;
             glam::Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, camera.near, camera.far)
         }
     }
+}
+
+fn authored_camera_viewport(camera: &components::Camera) -> Rect {
+    let viewport = match camera.viewport_rect {
+        Some([x, y, width, height]) => Rect {
+            min: [x, y],
+            max: [x + width, y + height],
+        },
+        None => Rect::FULL,
+    };
+    // Invalid authored values are diagnosed before projection. Use a stable
+    // fallback here so validation errors do not also manufacture NaN matrices.
+    viewport
+        .is_valid_normalized()
+        .then_some(viewport)
+        .unwrap_or(Rect::FULL)
+}
+
+fn effective_camera_viewport(camera: &components::Camera, context: RenderViewportContext) -> Rect {
+    context.compose(authored_camera_viewport(camera))
+}
+
+fn effective_camera_aspect(camera: &components::Camera, context: RenderViewportContext) -> f32 {
+    context.aspect_ratio(effective_camera_viewport(camera, context))
 }
 
 /// Compute a sort key that groups drawables by material then mesh.
@@ -964,7 +934,9 @@ fn transform_bounds_to_world(
 
 /// Map the engine's camera `clear_flags` bitmask to the renderer's [`ClearFlags`].
 fn map_clear_flags(flags: u8) -> ClearFlags {
-    if flags & 0b11 == 0b11 {
+    if flags & 0b100 != 0 {
+        ClearFlags::Skybox
+    } else if flags & 0b11 == 0b11 {
         ClearFlags::ColorAndDepth
     } else if flags & 0b10 != 0 {
         ClearFlags::DepthOnly
@@ -1023,14 +995,13 @@ fn map_shadow_mode(mode: u8) -> ShadowMode {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 // Tests
-// ══════════════════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sample_scene;
     use crate::World;
 
     fn assert_mat4_approx(actual: &[f32; 16], expected: glam::Mat4) {
@@ -1053,7 +1024,7 @@ mod tests {
         camera
     }
 
-    // ── Frustum culling tests ───────────────────────────────────────────
+    // 鈹€鈹€ Frustum culling tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn frustum_planes_from_identity() {
@@ -1180,7 +1151,7 @@ mod tests {
         ));
     }
 
-    // ── World extraction tests ──────────────────────────────────────────
+    // 鈹€鈹€ World extraction tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn extract_from_world_with_camera_yields_view() {
@@ -1194,6 +1165,63 @@ mod tests {
         let input = result.unwrap();
         assert_eq!(input.views.len(), 1);
         assert_eq!(input.frame_index, 0);
+    }
+
+    #[test]
+    fn concrete_surface_context_composes_base_and_overlay_viewports_and_projection_aspects() {
+        let mut world = World::new();
+        let base = world.create_entity();
+        let base_camera = components::Camera::default();
+        world.add_component(base, base_camera.clone());
+        world.add_component(base, components::Transform::default());
+
+        let overlay = world.create_entity();
+        world.add_component(
+            overlay,
+            components::Camera {
+                viewport_rect: Some([0.25, 0.0, 0.5, 1.0]),
+                priority: 1,
+                ..base_camera.clone()
+            },
+        );
+        world.add_component(overlay, components::Transform::default());
+
+        let output = Rect {
+            min: [0.2, 0.25],
+            max: [0.8, 0.75],
+        };
+        let context = RenderViewportContext::new(1000, 800, output).unwrap();
+        let input = extract_renderer_input_from_world_with_viewport(&world, 4, context).unwrap();
+
+        assert_eq!(input.views[0].viewport_rect_normalized, output);
+        assert_eq!(input.views[0].viewport, output);
+        let overlay_viewport = input.views[1].viewport_rect_normalized;
+        for (actual, expected) in overlay_viewport
+            .min
+            .into_iter()
+            .chain(overlay_viewport.max)
+            .zip([0.35, 0.25, 0.65, 0.75])
+        {
+            assert!((actual - expected).abs() <= 1.0e-6);
+        }
+        assert_mat4_approx(
+            &input.views[0].projection_matrix,
+            glam::Mat4::perspective_rh(
+                base_camera.fov_y,
+                600.0 / 400.0,
+                base_camera.near,
+                base_camera.far,
+            ),
+        );
+        assert_mat4_approx(
+            &input.views[1].projection_matrix,
+            glam::Mat4::perspective_rh(
+                base_camera.fov_y,
+                300.0 / 400.0,
+                base_camera.near,
+                base_camera.far,
+            ),
+        );
     }
 
     #[test]
@@ -1362,6 +1390,13 @@ mod tests {
     }
 
     #[test]
+    fn camera_skybox_clear_flag_maps_to_renderer_contract() {
+        assert_eq!(map_clear_flags(0b100), ClearFlags::Skybox);
+        assert_eq!(map_clear_flags(0b111), ClearFlags::Skybox);
+        assert_eq!(map_clear_flags(0b011), ClearFlags::ColorAndDepth);
+    }
+
+    #[test]
     fn invalid_camera_viewport_and_msaa_are_rejected() {
         let mut world = World::new();
         let camera = world.create_entity();
@@ -1382,56 +1417,6 @@ mod tests {
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "SC0032"));
-    }
-
-    #[test]
-    fn extract_from_world_produces_parity_with_scene() {
-        let scene = sample_scene();
-        let scene_input = extract_renderer_input(&scene, 7).expect("scene extraction OK");
-
-        // Convert scene to world and extract via the new path.
-        let world = World::from_scene(&scene);
-        let world_input =
-            extract_renderer_input_from_world(&world, 7).expect("world extraction OK");
-
-        // Compare counts (the structural output should match).
-        assert_eq!(
-            world_input.views.len(),
-            scene_input.views.len(),
-            "view count mismatch"
-        );
-        assert_eq!(
-            world_input.drawables.len(),
-            scene_input.drawables.len(),
-            "drawable count mismatch"
-        );
-        assert_eq!(
-            world_input.lights.len(),
-            scene_input.lights.len(),
-            "light count mismatch"
-        );
-        assert_eq!(
-            scene_input.extraction_stats,
-            Some(ExtractionStats {
-                visible_drawables: scene_input.drawables.len() as u32,
-                culled_drawables: 0,
-                visible_lights: scene_input.lights.len() as u32,
-                culled_lights: 0,
-            }),
-            "legacy extraction must publish structured totals"
-        );
-
-        // Compare drawable mesh/material/render_layer.
-        for (wd, sd) in world_input
-            .drawables
-            .iter()
-            .zip(scene_input.drawables.iter())
-        {
-            assert_eq!(wd.mesh, sd.mesh, "mesh mismatch");
-            assert_eq!(wd.material, sd.material, "material mismatch");
-            assert_eq!(wd.render_layer, sd.render_layer, "render_layer mismatch");
-            assert_eq!(wd.cast_shadows, sd.cast_shadows, "cast_shadows mismatch");
-        }
     }
 
     #[test]

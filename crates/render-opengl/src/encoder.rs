@@ -2,7 +2,6 @@ use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::Instant;
 
 use glow::HasContext;
 use render_core::*;
@@ -16,19 +15,9 @@ pub(crate) struct FrameState {
     draw_calls: AtomicU32,
     triangles: AtomicU64,
     error: Mutex<Option<String>>,
-    started_at: Instant,
 }
 
 impl FrameState {
-    pub(crate) fn new() -> Self {
-        Self {
-            draw_calls: AtomicU32::new(0),
-            triangles: AtomicU64::new(0),
-            error: Mutex::new(None),
-            started_at: Instant::now(),
-        }
-    }
-
     fn record_error(&self, detail: impl Into<String>) {
         let detail = detail.into();
         tracing::error!(target: "opengl", %detail, "OpenGL command validation failed");
@@ -46,25 +35,6 @@ impl FrameState {
         let primitives =
             primitive_count(topology, primitive_vertices).saturating_mul(u64::from(instance_count));
         self.triangles.fetch_add(primitives, Ordering::Relaxed);
-    }
-
-    pub(crate) fn finish(&self) -> Result<RendererStatistics, RhiError> {
-        if let Some(error) = self
-            .error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            return Err(RhiError::ValidationFailed { detail: error });
-        }
-        Ok(RendererStatistics {
-            draw_calls: self.draw_calls.load(Ordering::Relaxed),
-            triangles: self.triangles.load(Ordering::Relaxed),
-            // `finish()` is issued by end_frame, so elapsed wall time includes
-            // completion of the frame's GL work. It is an approximation until
-            // timestamp-query support is added, but never a fabricated zero.
-            gpu_frame_ms: self.started_at.elapsed().as_secs_f32() * 1_000.0,
-        })
     }
 }
 
