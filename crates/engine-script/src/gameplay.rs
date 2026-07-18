@@ -215,6 +215,303 @@ pub enum GameplayUiValue {
     Float(f32),
 }
 
+// ---------------------------------------------------------------------------
+// Typed component access
+// ---------------------------------------------------------------------------
+
+/// Maximum fields a single `set_component` command may carry.
+///
+/// The curated component set has far fewer fields; the cap exists so a
+/// misbehaving script cannot push unbounded payloads through the bridge.
+pub const MAX_COMPONENT_FIELDS: usize = 64;
+
+/// Maximum nesting depth for list/map component field values.
+pub const MAX_COMPONENT_VALUE_DEPTH: usize = 16;
+
+/// Maximum items in a single list component field value.
+pub const MAX_COMPONENT_LIST_ITEMS: usize = 256;
+
+/// Maximum byte length of a string-like component field value.
+pub const MAX_COMPONENT_VALUE_STRING_BYTES: usize = 4096;
+
+/// Maximum component queries the runtime buffers from one command drain.
+/// Queries beyond the cap are rejected with a script diagnostic, mirroring
+/// [`MAX_PENDING_PHYSICS_QUERIES`].
+pub const MAX_PENDING_COMPONENT_QUERIES: usize = 256;
+
+/// JSON-friendly field value of a script-accessible ECS component.
+///
+/// Component payloads cross the gameplay bridge as string-keyed maps of these
+/// values so the data-only contract stays free of engine ECS types. The
+/// variant set deliberately mirrors the `engine-serialize` scene `Value`
+/// variants used by the registered component serde hooks; conversion helpers
+/// translate between the two without loss for every supported variant except
+/// entity references, which are not yet part of this surface.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum GameplayComponentValue {
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f32),
+    Str(String),
+    /// Enumeration case selected by name (for example a rigid-body type).
+    Enum(String),
+    /// Cooked asset identifier referenced by a component field.
+    Asset(String),
+    Vec3([f32; 3]),
+    Quat([f32; 4]),
+    Color([f32; 4]),
+    List(Vec<GameplayComponentValue>),
+    Map(BTreeMap<String, GameplayComponentValue>),
+}
+
+impl GameplayComponentValue {
+    /// Convert a scene-serialized field value into its wire form.
+    ///
+    /// Returns `None` for scene values that have no script-facing
+    /// representation (currently only entity references).
+    pub fn from_scene_value(value: &engine_serialize::Value) -> Option<Self> {
+        use engine_serialize::Value as SceneValue;
+        Some(match value {
+            SceneValue::Bool(value) => Self::Bool(*value),
+            SceneValue::Int(value) => Self::Int(*value),
+            SceneValue::UInt(value) => Self::UInt(*value),
+            SceneValue::Float32(value) => Self::Float(*value),
+            SceneValue::Float64(value) => Self::Float(*value as f32),
+            SceneValue::Str(value) => Self::Str(value.clone()),
+            SceneValue::Enum(value) => Self::Enum(value.clone()),
+            SceneValue::Asset(asset) => Self::Asset(asset.id.clone()),
+            SceneValue::Vec3(value) => Self::Vec3(*value),
+            SceneValue::Quat(value) => Self::Quat(*value),
+            SceneValue::Color(value) => Self::Color(*value),
+            SceneValue::List(items) => Self::List(
+                items
+                    .iter()
+                    .map(Self::from_scene_value)
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            SceneValue::Map(map) => Self::Map(
+                map.iter()
+                    .map(|(key, value)| Some((key.clone(), Self::from_scene_value(value)?)))
+                    .collect::<Option<BTreeMap<_, _>>>()?,
+            ),
+            SceneValue::Entity(_) => return None,
+        })
+    }
+
+    /// Convert this wire value back into the scene-serialized form consumed
+    /// by the registered component deserialize hooks.
+    pub fn to_scene_value(&self) -> engine_serialize::Value {
+        use engine_serialize::Value as SceneValue;
+        match self {
+            Self::Bool(value) => SceneValue::Bool(*value),
+            Self::Int(value) => SceneValue::Int(*value),
+            Self::UInt(value) => SceneValue::UInt(*value),
+            Self::Float(value) => SceneValue::Float32(*value),
+            Self::Str(value) => SceneValue::Str(value.clone()),
+            Self::Enum(value) => SceneValue::Enum(value.clone()),
+            Self::Asset(asset) => SceneValue::Asset(engine_serialize::AssetId::new(asset)),
+            Self::Vec3(value) => SceneValue::Vec3(*value),
+            Self::Quat(value) => SceneValue::Quat(*value),
+            Self::Color(value) => SceneValue::Color(*value),
+            Self::List(items) => SceneValue::List(items.iter().map(Self::to_scene_value).collect()),
+            Self::Map(map) => SceneValue::Map(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), value.to_scene_value()))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Validate one untrusted field value received from a script host.
+    ///
+    /// `depth` tracks list/map nesting so deeply nested payloads are rejected
+    /// before they can exhaust the deserializer stack.
+    pub fn validate(&self, depth: usize) -> Result<(), String> {
+        if depth > MAX_COMPONENT_VALUE_DEPTH {
+            return Err(format!(
+                "component field values must not nest deeper than {MAX_COMPONENT_VALUE_DEPTH} levels"
+            ));
+        }
+        match self {
+            Self::Bool(_) | Self::Int(_) | Self::UInt(_) => Ok(()),
+            Self::Float(value) => {
+                if value.is_finite() {
+                    Ok(())
+                } else {
+                    Err("component float fields must be finite".into())
+                }
+            }
+            Self::Vec3(values) => {
+                if values.iter().all(|value| value.is_finite()) {
+                    Ok(())
+                } else {
+                    Err("component vector fields must contain only finite values".into())
+                }
+            }
+            Self::Quat(values) | Self::Color(values) => {
+                if values.iter().all(|value| value.is_finite()) {
+                    Ok(())
+                } else {
+                    Err("component vector fields must contain only finite values".into())
+                }
+            }
+            Self::Str(value) | Self::Enum(value) | Self::Asset(value) => {
+                if value.len() <= MAX_COMPONENT_VALUE_STRING_BYTES
+                    && !value.chars().any(char::is_control)
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "component string fields must contain at most {MAX_COMPONENT_VALUE_STRING_BYTES} bytes and no control characters"
+                    ))
+                }
+            }
+            Self::List(items) => {
+                if items.len() > MAX_COMPONENT_LIST_ITEMS {
+                    return Err(format!(
+                        "component list fields must contain at most {MAX_COMPONENT_LIST_ITEMS} items"
+                    ));
+                }
+                for item in items {
+                    item.validate(depth + 1)?;
+                }
+                Ok(())
+            }
+            Self::Map(map) => {
+                if map.len() > MAX_COMPONENT_FIELDS {
+                    return Err(format!(
+                        "component map fields must contain at most {MAX_COMPONENT_FIELDS} entries"
+                    ));
+                }
+                for (key, value) in map {
+                    validate_component_field_name(key)?;
+                    value.validate(depth + 1)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Validate a component field name received from untrusted script code.
+pub fn validate_component_field_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid component field name {name:?}: expected 1 to 128 ASCII letters, digits, underscores, hyphens, or dots"
+        ))
+    }
+}
+
+/// Validate a component type key received from untrusted script code.
+///
+/// Type keys are stable registry identifiers such as `engine.audio_source`,
+/// never paths, so they share the wire-safe identifier alphabet of entity ids.
+pub fn validate_component_type_key(type_key: &str) -> Result<(), String> {
+    let valid = !type_key.is_empty()
+        && type_key.len() <= 128
+        && type_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid component type key {type_key:?}: expected a registered key such as 'engine.audio_source' containing 1 to 128 ASCII letters, digits, underscores, hyphens, or dots"
+        ))
+    }
+}
+
+/// Validate the complete field payload of a `set_component` command.
+pub fn validate_component_fields(
+    fields: &BTreeMap<String, GameplayComponentValue>,
+) -> Result<(), String> {
+    if fields.len() > MAX_COMPONENT_FIELDS {
+        return Err(format!(
+            "set_component accepts at most {MAX_COMPONENT_FIELDS} fields per command"
+        ));
+    }
+    for (name, value) in fields {
+        validate_component_field_name(name)?;
+        value.validate(0)?;
+    }
+    Ok(())
+}
+
+/// Active component query requested by a script through the gameplay bridge.
+///
+/// Queries travel as deferred gameplay commands exactly like physics queries:
+/// the engine validates them, snapshots the requested component through its
+/// registered scene serde hooks at the frame boundary, and delivers the
+/// matching [`GameplayComponentQueryResult`] with the next frame's snapshot.
+/// Scripts correlate requests and results through the caller-chosen
+/// `query_id`; scripts never receive raw ECS handles.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameplayComponentQuery {
+    /// Script-chosen correlator echoed back with the result.
+    pub query_id: u32,
+    /// Persistent entity id to read from — never a raw ECS handle.
+    pub entity_id: String,
+    /// Registered component type key (for example `engine.audio_source`).
+    pub component_type: String,
+}
+
+impl GameplayComponentQuery {
+    /// Validate untrusted query data received from a script host.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_entity_id(&self.entity_id)?;
+        validate_component_type_key(&self.component_type)
+    }
+}
+
+/// Outcome of a script component query, delivered with the next frame
+/// snapshot following the frame that issued the query.
+///
+/// Results are frame-local: they appear in exactly one snapshot and are not
+/// repeated. Every result echoes the issuing query's `query_id`, `entity_id`,
+/// and `component_type` so scripts can match them without extra bookkeeping.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GameplayComponentQueryResult {
+    /// The entity exists and carries the requested component; `fields` is the
+    /// component's scene-serialized snapshot converted to wire values.
+    Snapshot {
+        /// Correlator from the issuing query.
+        query_id: u32,
+        /// Persistent entity id the snapshot was read from.
+        entity_id: String,
+        /// Component type key that was read.
+        component_type: String,
+        /// Field snapshot keyed by field name.
+        fields: BTreeMap<String, GameplayComponentValue>,
+    },
+    /// The entity does not exist or does not carry the requested component.
+    Missing {
+        /// Correlator from the issuing query.
+        query_id: u32,
+        /// Persistent entity id that was probed.
+        entity_id: String,
+        /// Component type key that was probed.
+        component_type: String,
+    },
+}
+
+/// A validated component query paired with the entity that owns the script
+/// instance that issued it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnedGameplayComponentQuery {
+    pub entity_id: String,
+    pub query: GameplayComponentQuery,
+}
+
 /// One gameplay-facing click emitted by the runtime UI for the current frame.
 ///
 /// The event identifies both the source canvas and element even when no
@@ -413,6 +710,16 @@ pub struct GameplayContext {
     /// current script hosts.
     #[serde(default)]
     pub physics_query_results: Vec<GameplayPhysicsQueryResult>,
+    /// Results of component queries issued by the owning script instance in a
+    /// previous frame.
+    ///
+    /// Component queries follow the same deferred, frame-local contract as
+    /// physics queries: the engine snapshots the requested component at the
+    /// frame boundary and answers with exactly one following snapshot.
+    /// `default` keeps contexts produced before component access existed
+    /// compatible with the current script hosts.
+    #[serde(default)]
+    pub component_query_results: Vec<GameplayComponentQueryResult>,
     /// Runtime UI clicks delivered during this frame.
     ///
     /// `default` keeps contexts produced before gameplay UI events were added
@@ -488,6 +795,29 @@ pub enum GameplayCommand {
     PhysicsQuery {
         query: GameplayPhysicsQuery,
     },
+    /// Request a snapshot of one script-accessible component on a persistent
+    /// entity.
+    ///
+    /// The query is validated at the frame boundary; the snapshot (or an
+    /// explicit miss) arrives in the next frame's
+    /// [`GameplayContext::component_query_results`].
+    ComponentQuery {
+        query: GameplayComponentQuery,
+    },
+    /// Merge script-provided fields into one script-accessible component on a
+    /// persistent entity at the frame boundary.
+    ///
+    /// Fields not present in `fields` keep their current values (or the
+    /// component's authored defaults when the entity does not carry the
+    /// component yet). The engine re-validates every field through the
+    /// component's registered scene serde hooks before committing, so unknown
+    /// field names, mismatched value types, and unsupported enum cases are
+    /// rejected with a script diagnostic and never partially applied.
+    SetComponent {
+        entity_id: String,
+        component_type: String,
+        fields: BTreeMap<String, GameplayComponentValue>,
+    },
 }
 
 impl GameplayCommand {
@@ -523,6 +853,16 @@ impl GameplayCommand {
             }
             Self::Ui { command } => command.validate(),
             Self::PhysicsQuery { query } => query.validate(),
+            Self::ComponentQuery { query } => query.validate(),
+            Self::SetComponent {
+                entity_id,
+                component_type,
+                fields,
+            } => {
+                validate_entity_id(entity_id)?;
+                validate_component_type_key(component_type)?;
+                validate_component_fields(fields)
+            }
         }
     }
 }
@@ -895,6 +1235,22 @@ mod tests {
                     entity_ids: vec!["floor".into()],
                 },
             ],
+            component_query_results: vec![
+                GameplayComponentQueryResult::Snapshot {
+                    query_id: 3,
+                    entity_id: "speaker-01".into(),
+                    component_type: "engine.audio_source".into(),
+                    fields: BTreeMap::from([
+                        ("volume".into(), GameplayComponentValue::Float(0.75)),
+                        ("playing".into(), GameplayComponentValue::Bool(true)),
+                    ]),
+                },
+                GameplayComponentQueryResult::Missing {
+                    query_id: 4,
+                    entity_id: "cube-01".into(),
+                    component_type: "engine.light".into(),
+                },
+            ],
             ui_events: vec![GameplayUiEvent {
                 canvas_id: "main-menu".into(),
                 element_id: 17,
@@ -922,6 +1278,9 @@ mod tests {
             r#""physics_query_results":[{"kind":"raycast_hit","query_id":7,"entity_id":"floor","point":[1.0,0.5,0.0],"normal":[0.0,1.0,0.0],"distance":4.5},{"kind":"raycast_miss","query_id":8},{"kind":"overlap_sphere","query_id":9,"entity_ids":["floor"]}]"#
         ));
         assert!(json.contains(
+            r#""component_query_results":[{"kind":"snapshot","query_id":3,"entity_id":"speaker-01","component_type":"engine.audio_source","fields":{"playing":{"type":"bool","value":true},"volume":{"type":"float","value":0.75}}},{"kind":"missing","query_id":4,"entity_id":"cube-01","component_type":"engine.light"}]"#
+        ));
+        assert!(json.contains(
             r#""ui_events":[{"canvas_id":"main-menu","element_id":17,"callback_id":"start-game"}]"#
         ));
         assert_eq!(
@@ -939,6 +1298,7 @@ mod tests {
         assert_eq!(context.script_api, GAMEPLAY_SCRIPT_API_SCHEMA);
         assert!(context.physics_events.is_empty());
         assert!(context.physics_query_results.is_empty());
+        assert!(context.component_query_results.is_empty());
         assert!(context.ui_events.is_empty());
         assert_eq!(
             context.input_transitions,
@@ -1426,5 +1786,204 @@ mod tests {
         ] {
             assert!(invalid_command.validate().is_err());
         }
+    }
+
+    #[test]
+    fn component_value_roundtrips_every_scene_value_variant_except_entities() {
+        use engine_serialize::Value as SceneValue;
+
+        let cases = vec![
+            SceneValue::Bool(true),
+            SceneValue::Int(-7),
+            SceneValue::UInt(u32::MAX as u64),
+            SceneValue::Float32(0.75),
+            SceneValue::Float64(2.5),
+            SceneValue::Str("hello".into()),
+            SceneValue::Enum("Dynamic".into()),
+            SceneValue::Asset(engine_serialize::AssetId::new("audio.beep")),
+            SceneValue::Vec3([1.0, 2.0, 3.0]),
+            SceneValue::Quat([0.0, 0.0, 0.0, 1.0]),
+            SceneValue::Color([0.1, 0.2, 0.3, 1.0]),
+            SceneValue::List(vec![SceneValue::Float32(1.0), SceneValue::Bool(false)]),
+            SceneValue::Map(BTreeMap::from([(
+                "shape".into(),
+                SceneValue::Map(BTreeMap::from([(
+                    "radius".into(),
+                    SceneValue::Float32(0.5),
+                )])),
+            )])),
+        ];
+        for scene_value in cases {
+            let wire = GameplayComponentValue::from_scene_value(&scene_value)
+                .expect("supported scene value converts to the wire form");
+            let json = serde_json::to_string(&wire).unwrap();
+            let decoded: GameplayComponentValue = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, wire, "wire JSON round-trip failed for {json}");
+            let restored = decoded.to_scene_value();
+            if let SceneValue::Float64(value) = scene_value {
+                // The wire carries f32; Float64 sources land in Float32.
+                assert_eq!(restored, SceneValue::Float32(value as f32));
+            } else {
+                assert_eq!(restored, scene_value, "scene round-trip mismatch");
+            }
+        }
+
+        assert!(
+            GameplayComponentValue::from_scene_value(&SceneValue::Entity("cube-01".into()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn component_value_has_a_stable_tagged_json_contract() {
+        let value = GameplayComponentValue::Map(BTreeMap::from([
+            ("volume".into(), GameplayComponentValue::Float(0.5)),
+            ("playing".into(), GameplayComponentValue::Bool(true)),
+            (
+                "color".into(),
+                GameplayComponentValue::Color([1.0, 0.5, 0.25, 1.0]),
+            ),
+        ]));
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"type":"map","value":{"color":{"type":"color","value":[1.0,0.5,0.25,1.0]},"playing":{"type":"bool","value":true},"volume":{"type":"float","value":0.5}}}"#
+        );
+    }
+
+    #[test]
+    fn untrusted_component_values_reject_non_finite_oversized_and_deep_payloads() {
+        assert!(GameplayComponentValue::Float(f32::NAN).validate(0).is_err());
+        assert!(GameplayComponentValue::Vec3([0.0, f32::INFINITY, 0.0])
+            .validate(0)
+            .is_err());
+        assert!(GameplayComponentValue::Str("x".repeat(4097))
+            .validate(0)
+            .is_err());
+        assert!(GameplayComponentValue::Str("bad\u{0007}".into())
+            .validate(0)
+            .is_err());
+        assert!(GameplayComponentValue::List(vec![
+            GameplayComponentValue::Bool(true);
+            MAX_COMPONENT_LIST_ITEMS + 1
+        ])
+        .validate(0)
+        .is_err());
+
+        let mut deep = GameplayComponentValue::Bool(true);
+        for _ in 0..=MAX_COMPONENT_VALUE_DEPTH {
+            deep = GameplayComponentValue::List(vec![deep]);
+        }
+        assert!(deep.validate(0).is_err());
+
+        let shallow = GameplayComponentValue::Map(BTreeMap::from([(
+            "shape".into(),
+            GameplayComponentValue::Map(BTreeMap::from([(
+                "radius".into(),
+                GameplayComponentValue::Float(0.5),
+            )])),
+        )]));
+        assert!(shallow.validate(0).is_ok());
+    }
+
+    #[test]
+    fn component_type_keys_and_field_names_follow_the_identifier_contract() {
+        for valid in [
+            "engine.audio_source",
+            "engine.physics.rigid_body",
+            "engine.camera",
+        ] {
+            assert!(validate_component_type_key(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["", "../evil", "engine audio", "engine/audio", "组件"] {
+            assert!(validate_component_type_key(invalid).is_err(), "{invalid}");
+        }
+        assert!(validate_component_field_name("clip_asset").is_ok());
+        assert!(validate_component_field_name("").is_err());
+        assert!(validate_component_field_name("bad name").is_err());
+    }
+
+    #[test]
+    fn component_commands_have_a_stable_validated_json_contract() {
+        let query = GameplayCommand::ComponentQuery {
+            query: GameplayComponentQuery {
+                query_id: 11,
+                entity_id: "speaker-01".into(),
+                component_type: "engine.audio_source".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&query).unwrap(),
+            r#"{"type":"component_query","query":{"query_id":11,"entity_id":"speaker-01","component_type":"engine.audio_source"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(&serde_json::to_string(&query).unwrap())
+                .unwrap(),
+            query
+        );
+        assert!(query.validate().is_ok());
+
+        let set = GameplayCommand::SetComponent {
+            entity_id: "speaker-01".into(),
+            component_type: "engine.audio_source".into(),
+            fields: BTreeMap::from([
+                ("volume".into(), GameplayComponentValue::Float(0.25)),
+                ("playing".into(), GameplayComponentValue::Bool(true)),
+            ]),
+        };
+        assert_eq!(
+            serde_json::to_string(&set).unwrap(),
+            r#"{"type":"set_component","entity_id":"speaker-01","component_type":"engine.audio_source","fields":{"playing":{"type":"bool","value":true},"volume":{"type":"float","value":0.25}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(&serde_json::to_string(&set).unwrap()).unwrap(),
+            set
+        );
+        assert!(set.validate().is_ok());
+
+        for invalid in [
+            GameplayCommand::ComponentQuery {
+                query: GameplayComponentQuery {
+                    query_id: 1,
+                    entity_id: "../outside".into(),
+                    component_type: "engine.camera".into(),
+                },
+            },
+            GameplayCommand::ComponentQuery {
+                query: GameplayComponentQuery {
+                    query_id: 1,
+                    entity_id: "cube-01".into(),
+                    component_type: "engine camera".into(),
+                },
+            },
+            GameplayCommand::SetComponent {
+                entity_id: "cube-01".into(),
+                component_type: "engine.camera".into(),
+                fields: BTreeMap::from([(
+                    "near".into(),
+                    GameplayComponentValue::Float(f32::INFINITY),
+                )]),
+            },
+            GameplayCommand::SetComponent {
+                entity_id: "cube-01".into(),
+                component_type: "engine.camera".into(),
+                fields: BTreeMap::from([("bad field".into(), GameplayComponentValue::Float(1.0))]),
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+
+        let oversized = GameplayCommand::SetComponent {
+            entity_id: "cube-01".into(),
+            component_type: "engine.camera".into(),
+            fields: (0..=MAX_COMPONENT_FIELDS)
+                .map(|index| {
+                    (
+                        format!("field_{index}"),
+                        GameplayComponentValue::Bool(false),
+                    )
+                })
+                .collect(),
+        };
+        assert!(oversized.validate().is_err());
     }
 }

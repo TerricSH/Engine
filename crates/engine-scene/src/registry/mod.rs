@@ -128,6 +128,76 @@ mod tests {
     }
 
     #[test]
+    fn component_registry_core_camera_and_light_have_serde_hooks() {
+        let mut reg = ComponentRegistry::new();
+        reg.register_core();
+
+        for type_id in ["engine.camera", "engine.light"] {
+            let ext = reg.get(type_id).expect("core component registered");
+            assert!(ext.serialize.is_some(), "{type_id} needs a serialize hook");
+            assert!(
+                ext.deserialize.is_some(),
+                "{type_id} needs a deserialize hook"
+            );
+            assert!(
+                ext.meta.has_script_binding,
+                "{type_id} opts into script binding"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_and_light_field_serde_roundtrips_through_hooks() {
+        use crate::components::{
+            deserialize_camera, deserialize_light, serialize_camera, serialize_camera_fields,
+            serialize_light, serialize_light_fields, Camera, Light,
+        };
+        use std::collections::BTreeMap;
+
+        let camera = Camera {
+            viewport_rect: Some([0.1, 0.2, 0.5, 0.5]),
+            ..Camera::default()
+        };
+        let camera_fields = serialize_camera(&camera);
+        let camera_restored = deserialize_camera(&camera_fields);
+        let camera_restored = camera_restored
+            .downcast_ref::<Camera>()
+            .expect("camera hook restores a Camera");
+        assert_eq!(
+            serialize_camera_fields(camera_restored),
+            serialize_camera_fields(&camera)
+        );
+        assert_eq!(camera_restored.viewport_rect, camera.viewport_rect);
+
+        let light = Light {
+            kind: crate::components::LightKind::Spot,
+            color: [0.5, 0.25, 0.75],
+            intensity: 3.5,
+            range: 22.0,
+            spot_angles: Some([0.3, 0.6]),
+            shadow_mode: 2,
+            direction: [0.0, -1.0, 0.25],
+        };
+        let light_fields = serialize_light(&light);
+        let light_restored = deserialize_light(&light_fields);
+        let light_restored = light_restored
+            .downcast_ref::<Light>()
+            .expect("light hook restores a Light");
+        assert_eq!(
+            serialize_light_fields(light_restored),
+            serialize_light_fields(&light)
+        );
+
+        // Missing fields fall back to the authored defaults, matching the
+        // scene loader's tolerance for older scene files.
+        let defaulted = deserialize_light(&BTreeMap::new());
+        let defaulted = defaulted.downcast_ref::<Light>().expect("default light");
+        assert_eq!(defaulted.intensity, 1.0);
+        assert_eq!(defaulted.range, 10.0);
+        assert!(defaulted.spot_angles.is_none());
+    }
+
+    #[test]
     fn component_registry_is_cloneable_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ComponentRegistry>();

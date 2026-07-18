@@ -40,9 +40,9 @@ const SCRIPT_SDK_PROJECT: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
     <Nullable>enable</Nullable>
     <AssemblyName>EngineGameplay</AssemblyName>
     <RootNamespace>Engine</RootNamespace>
-    <Version>0.3.0</Version>
-    <AssemblyVersion>0.3.0.0</AssemblyVersion>
-    <FileVersion>0.3.0.0</FileVersion>
+    <Version>0.4.0</Version>
+    <AssemblyVersion>0.4.0.0</AssemblyVersion>
+    <FileVersion>0.4.0.0</FileVersion>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
@@ -86,14 +86,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.3.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.4.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.3.0";
+    public const string Version = "0.4.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
@@ -959,6 +959,449 @@ public sealed class ScriptPhysics
     }
 }
 
+// Correlates a deferred component query with its snapshot. Queries execute
+// at the next frame boundary; the handle is frame-local and only meaningful
+// to ScriptComponents.TryGet/IsMissing on the frame after it was issued.
+public readonly record struct ComponentQuery(uint Id);
+
+// One field value in a component snapshot or a SetComponent payload. Wire
+// type names mirror the engine's component value model: bool, int, uint,
+// float, str, enum, asset, vec3, quat, color, list, map.
+public readonly record struct ComponentValue
+{
+    internal const int MaxValueDepth = 16;
+    internal const int MaxListItems = 256;
+    internal const int MaxStringBytes = 4096;
+
+    private readonly string? _type;
+    private readonly object? _value;
+    private readonly int _depth;
+
+    private ComponentValue(string type, object? value, int depth)
+    {
+        _type = type;
+        _value = value;
+        _depth = depth;
+    }
+
+    public string Type => _type ?? throw new InvalidOperationException(
+        "ComponentValue is default-initialized; use one of the From* factories");
+
+    public static ComponentValue FromBool(bool value) => new("bool", value, 0);
+
+    public static ComponentValue FromInt(long value) => new("int", value, 0);
+
+    public static ComponentValue FromUInt(ulong value) => new("uint", value, 0);
+
+    public static ComponentValue FromFloat(float value)
+    {
+        UIValidation.Finite(value, nameof(value));
+        return new("float", value, 0);
+    }
+
+    public static ComponentValue FromString(string value)
+    {
+        ValidateString(value, nameof(value));
+        return new("str", value, 0);
+    }
+
+    public static ComponentValue FromEnum(string value)
+    {
+        ValidateString(value, nameof(value));
+        return new("enum", value, 0);
+    }
+
+    public static ComponentValue FromAsset(string assetId)
+    {
+        ValidateString(assetId, nameof(assetId));
+        return new("asset", assetId, 0);
+    }
+
+    public static ComponentValue FromVector3(Vector3 value)
+    {
+        UIValidation.Finite(value.X, nameof(value));
+        UIValidation.Finite(value.Y, nameof(value));
+        UIValidation.Finite(value.Z, nameof(value));
+        return new("vec3", new[] { value.X, value.Y, value.Z }, 0);
+    }
+
+    public static ComponentValue FromQuaternion(Quaternion value)
+    {
+        UIValidation.Finite(value.X, nameof(value));
+        UIValidation.Finite(value.Y, nameof(value));
+        UIValidation.Finite(value.Z, nameof(value));
+        UIValidation.Finite(value.W, nameof(value));
+        return new("quat", new[] { value.X, value.Y, value.Z, value.W }, 0);
+    }
+
+    public static ComponentValue FromColor(float r, float g, float b, float a)
+    {
+        UIValidation.Finite(r, nameof(r));
+        UIValidation.Finite(g, nameof(g));
+        UIValidation.Finite(b, nameof(b));
+        UIValidation.Finite(a, nameof(a));
+        return new("color", new[] { r, g, b, a }, 0);
+    }
+
+    public static ComponentValue FromList(IReadOnlyList<ComponentValue> items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        if (items.Count > MaxListItems)
+            throw new ArgumentException(
+                $"Component lists hold at most {MaxListItems} items", nameof(items));
+        return new("list", items.ToArray(), ChildDepth(items, nameof(items)));
+    }
+
+    public static ComponentValue FromMap(IReadOnlyDictionary<string, ComponentValue> fields)
+    {
+        ArgumentNullException.ThrowIfNull(fields);
+        if (fields.Count > MaxListItems)
+            throw new ArgumentException(
+                $"Component maps hold at most {MaxListItems} entries", nameof(fields));
+        var copy = new Dictionary<string, ComponentValue>(StringComparer.Ordinal);
+        foreach (var pair in fields)
+        {
+            ScriptComponents.ValidateFieldName(pair.Key, nameof(fields));
+            copy[pair.Key] = pair.Value;
+        }
+        return new("map", copy, ChildDepth(copy.Values, nameof(fields)));
+    }
+
+    public static implicit operator ComponentValue(bool value) => FromBool(value);
+    public static implicit operator ComponentValue(int value) => FromInt(value);
+    public static implicit operator ComponentValue(long value) => FromInt(value);
+    public static implicit operator ComponentValue(uint value) => FromUInt(value);
+    public static implicit operator ComponentValue(ulong value) => FromUInt(value);
+    public static implicit operator ComponentValue(float value) => FromFloat(value);
+    public static implicit operator ComponentValue(string value) => FromString(value);
+    public static implicit operator ComponentValue(Vector3 value) => FromVector3(value);
+    public static implicit operator ComponentValue(Quaternion value) => FromQuaternion(value);
+
+    public bool AsBool() => Expect("bool").GetBoolean();
+
+    public long AsInt() => Expect("int").GetInt64();
+
+    public ulong AsUInt() => Expect("uint").GetUInt64();
+
+    public float AsFloat() => Expect("float").GetSingle();
+
+    public string AsString() => Expect("str").GetString() ?? "";
+
+    public string AsEnum() => Expect("enum").GetString() ?? "";
+
+    public string AsAsset() => Expect("asset").GetString() ?? "";
+
+    public Vector3 AsVector3()
+    {
+        var values = ExpectFloatArray("vec3", 3);
+        return new Vector3(values[0], values[1], values[2]);
+    }
+
+    public Quaternion AsQuaternion()
+    {
+        var values = ExpectFloatArray("quat", 4);
+        return new Quaternion(values[0], values[1], values[2], values[3]);
+    }
+
+    public (float R, float G, float B, float A) AsColor()
+    {
+        var values = ExpectFloatArray("color", 4);
+        return (values[0], values[1], values[2], values[3]);
+    }
+
+    public IReadOnlyList<ComponentValue> AsList()
+    {
+        if (Type != "list")
+            throw Mismatch("list");
+        if (_value is IReadOnlyList<ComponentValue> items)
+            return items;
+        var list = new List<ComponentValue>();
+        foreach (var item in AsElement().EnumerateArray())
+            list.Add(FromElement(item));
+        return list;
+    }
+
+    public IReadOnlyDictionary<string, ComponentValue> AsMap()
+    {
+        if (Type != "map")
+            throw Mismatch("map");
+        if (_value is IReadOnlyDictionary<string, ComponentValue> map)
+            return map;
+        var fields = new Dictionary<string, ComponentValue>(StringComparer.Ordinal);
+        foreach (var property in AsElement().EnumerateObject())
+            fields[property.Name] = FromElement(property.Value);
+        return fields;
+    }
+
+    internal static ComponentValue FromState(ComponentValueState state) =>
+        new(state.Type, state.Value, 0);
+
+    internal ComponentValueState ToState()
+    {
+        object? wire = _value switch
+        {
+            IReadOnlyList<ComponentValue> items =>
+                items.Select(item => item.ToState()).ToArray(),
+            IReadOnlyDictionary<string, ComponentValue> fields =>
+                fields.ToDictionary(
+                    pair => pair.Key,
+                    pair => pair.Value.ToState(),
+                    StringComparer.Ordinal),
+            _ => _value
+        };
+        return new ComponentValueState
+        {
+            Type = Type,
+            Value = JsonSerializer.SerializeToElement(wire)
+        };
+    }
+
+    private static ComponentValue FromElement(JsonElement element)
+    {
+        var type = element.TryGetProperty("type", out var typeElement)
+            ? typeElement.GetString() ?? ""
+            : "";
+        var value = element.TryGetProperty("value", out var valueElement)
+            ? valueElement
+            : default;
+        return new ComponentValue(type, value, 0);
+    }
+
+    private JsonElement Expect(string expectedType)
+    {
+        if (Type != expectedType)
+            throw Mismatch(expectedType);
+        return AsElement();
+    }
+
+    private InvalidOperationException Mismatch(string expectedType) =>
+        new($"Component value holds '{Type}', not '{expectedType}'");
+
+    private JsonElement AsElement() =>
+        _value is JsonElement element
+            ? element
+            : JsonSerializer.SerializeToElement(_value);
+
+    private float[] ExpectFloatArray(string expectedType, int count)
+    {
+        var element = Expect(expectedType);
+        if (element.ValueKind != JsonValueKind.Array || element.GetArrayLength() != count)
+            throw new InvalidOperationException(
+                $"Component value of type '{expectedType}' must hold {count} numbers");
+        var values = new float[count];
+        var index = 0;
+        foreach (var item in element.EnumerateArray())
+            values[index++] = item.GetSingle();
+        return values;
+    }
+
+    private static int ChildDepth(IEnumerable<ComponentValue> children, string parameterName)
+    {
+        var depth = 1 + children.Aggregate(0, (max, child) => Math.Max(max, child._depth));
+        if (depth > MaxValueDepth)
+            throw new ArgumentException(
+                $"Component values nest at most {MaxValueDepth} levels deep", parameterName);
+        return depth;
+    }
+
+    private static void ValidateString(string? value, string parameterName)
+    {
+        ArgumentNullException.ThrowIfNull(value, parameterName);
+        if (System.Text.Encoding.UTF8.GetByteCount(value) > MaxStringBytes ||
+            value.Any(char.IsControl))
+            throw new ArgumentException(
+                $"Component strings contain at most {MaxStringBytes} UTF-8 bytes and no control characters",
+                parameterName);
+    }
+}
+
+// A point-in-time snapshot of one component's fields, delivered with a
+// frame's gameplay context. Snapshots are frame-local: issue another query
+// to observe later writes.
+public sealed class ComponentSnapshot
+{
+    private readonly IReadOnlyDictionary<string, ComponentValueState> _fields;
+
+    internal ComponentSnapshot(
+        string entityId,
+        string componentType,
+        IReadOnlyDictionary<string, ComponentValueState> fields)
+    {
+        EntityId = entityId;
+        ComponentType = componentType;
+        _fields = fields;
+    }
+
+    public string EntityId { get; }
+    public string ComponentType { get; }
+
+    public bool HasField(string field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        return _fields.ContainsKey(field);
+    }
+
+    public ComponentValue GetField(string field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        if (!_fields.TryGetValue(field, out var state))
+            throw new KeyNotFoundException(
+                $"Component '{ComponentType}' on '{EntityId}' has no field '{field}'");
+        return ComponentValue.FromState(state);
+    }
+
+    public bool GetBool(string field) => GetField(field).AsBool();
+    public long GetInt(string field) => GetField(field).AsInt();
+    public ulong GetUInt(string field) => GetField(field).AsUInt();
+    public float GetFloat(string field) => GetField(field).AsFloat();
+    public string GetString(string field) => GetField(field).AsString();
+    public string GetEnum(string field) => GetField(field).AsEnum();
+    public string GetAsset(string field) => GetField(field).AsAsset();
+    public Vector3 GetVector3(string field) => GetField(field).AsVector3();
+    public Quaternion GetQuaternion(string field) => GetField(field).AsQuaternion();
+    public (float R, float G, float B, float A) GetColor(string field) => GetField(field).AsColor();
+    public IReadOnlyList<ComponentValue> GetList(string field) => GetField(field).AsList();
+    public IReadOnlyDictionary<string, ComponentValue> GetMap(string field) => GetField(field).AsMap();
+}
+
+// Deferred read/write access to the engine's built-in components beyond
+// Transform. Supported component type keys: engine.camera, engine.light,
+// engine.audio_source, engine.physics.rigid_body, engine.physics.collider.
+// Reads are deferred queries executed at the frame boundary, mirroring
+// ScriptPhysics: Query returns a frame-local handle and TryGet delivers the
+// snapshot with the next frame. Writes merge the provided fields into the
+// component after this frame's script callbacks complete.
+public sealed class ScriptComponents
+{
+    internal const int MaxPendingQueriesPerFrame = 256;
+    internal const int MaxFieldsPerWrite = 64;
+
+    private readonly List<ComponentQueryState> _pendingQueries = new();
+    private readonly List<GameplayCommandState> _pendingWrites = new();
+    private readonly Dictionary<uint, ComponentQueryResultState> _queryResults = new();
+    private uint _nextQueryId = 1;
+
+    public ComponentQuery Query(string entityId, string componentType)
+    {
+        ValidateEntityId(entityId, nameof(entityId));
+        ValidateTypeKey(componentType, nameof(componentType));
+        if (_pendingQueries.Count >= MaxPendingQueriesPerFrame)
+            throw new InvalidOperationException(
+                $"Scripts may queue at most {MaxPendingQueriesPerFrame} component queries per frame");
+        var query = AllocateQuery();
+        _pendingQueries.Add(new ComponentQueryState
+        {
+            QueryId = query.Id,
+            EntityId = entityId,
+            ComponentType = componentType
+        });
+        return query;
+    }
+
+    public void Set(
+        string entityId,
+        string componentType,
+        IReadOnlyDictionary<string, ComponentValue> fields)
+    {
+        ValidateEntityId(entityId, nameof(entityId));
+        ValidateTypeKey(componentType, nameof(componentType));
+        ArgumentNullException.ThrowIfNull(fields);
+        if (fields.Count == 0)
+            throw new ArgumentException("Set requires at least one field", nameof(fields));
+        if (fields.Count > MaxFieldsPerWrite)
+            throw new ArgumentException(
+                $"Set accepts at most {MaxFieldsPerWrite} fields per call", nameof(fields));
+        foreach (var field in fields.Keys)
+            ValidateFieldName(field, nameof(fields));
+        _pendingWrites.Add(GameplayCommandState.SetComponent(entityId, componentType, fields));
+    }
+
+    public void SetField(string entityId, string componentType, string field, ComponentValue value) =>
+        Set(
+            entityId,
+            componentType,
+            new Dictionary<string, ComponentValue> { [field] = value });
+
+    public bool TryGet(ComponentQuery query, out ComponentSnapshot snapshot)
+    {
+        if (_queryResults.TryGetValue(query.Id, out var result) &&
+            result.Kind == "snapshot" &&
+            result.Fields != null)
+        {
+            snapshot = new ComponentSnapshot(result.EntityId, result.ComponentType, result.Fields);
+            return true;
+        }
+        snapshot = null!;
+        return false;
+    }
+
+    // True when the queried entity exists but does not have the component.
+    public bool IsMissing(ComponentQuery query) =>
+        _queryResults.TryGetValue(query.Id, out var result) && result.Kind == "missing";
+
+    internal void Replace(IReadOnlyList<ComponentQueryResultState> results)
+    {
+        _queryResults.Clear();
+        foreach (var result in results)
+            _queryResults[result.QueryId] = result;
+    }
+
+    internal void DrainTo(List<GameplayCommandState> commands)
+    {
+        commands.AddRange(_pendingQueries.Select(GameplayCommandState.ComponentQuery));
+        _pendingQueries.Clear();
+        commands.AddRange(_pendingWrites);
+        _pendingWrites.Clear();
+    }
+
+    private ComponentQuery AllocateQuery()
+    {
+        if (_nextQueryId == uint.MaxValue)
+            throw new InvalidOperationException("Script exhausted its component query ids");
+        return new ComponentQuery(_nextQueryId++);
+    }
+
+    internal static void ValidateFieldName(string? field, string parameterName)
+    {
+        if (!IsValidKey(field))
+            throw new ArgumentException(
+                "Component field names must contain 1 to 128 ASCII letters, digits, " +
+                "hyphens, underscores, or dots.",
+                parameterName);
+    }
+
+    private static void ValidateTypeKey(string? componentType, string parameterName)
+    {
+        if (!IsValidKey(componentType))
+            throw new ArgumentException(
+                "Component type keys must be registered keys such as 'engine.audio_source' " +
+                "containing 1 to 128 ASCII letters, digits, hyphens, underscores, or dots.",
+                parameterName);
+    }
+
+    private static void ValidateEntityId(string? entityId, string parameterName)
+    {
+        if (!IsValidKey(entityId) || entityId == "." || entityId == "..")
+            throw new ArgumentException(
+                "Entity ids must contain 1 to 128 ASCII letters, digits, hyphens, " +
+                "underscores, or dots (but not '.' or '..'); entity ids are not file paths.",
+                parameterName);
+    }
+
+    private static bool IsValidKey(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > 128)
+            return false;
+        foreach (var character in value)
+        {
+            if (!char.IsAsciiLetterOrDigit(character) &&
+                character != '_' && character != '-' && character != '.')
+                return false;
+        }
+        return true;
+    }
+}
+
 // A frame-local view of one persistent ECS entity. Entity ids are resolved by
 // the engine at the command boundary; managed code never receives raw ECS
 // handles that can become stale after a scene change.
@@ -986,6 +1429,21 @@ public sealed class Entity
     // Destruction is deferred until all script callbacks for the frame have
     // completed. OnDestroy runs before the native entity is released.
     public void Destroy() => _scene.Destroy(Id);
+
+    // Component reads are deferred queries executed at the frame boundary,
+    // exactly like physics queries: the snapshot becomes available through
+    // Scene.Components.TryGet on the next frame. Writes merge the provided
+    // fields into the component after this frame's script callbacks complete.
+    public ComponentQuery QueryComponent(string componentType) =>
+        _scene.Components.Query(Id, componentType);
+
+    public void SetComponent(
+        string componentType,
+        IReadOnlyDictionary<string, ComponentValue> fields) =>
+        _scene.Components.Set(Id, componentType, fields);
+
+    public void SetComponentField(string componentType, string field, ComponentValue value) =>
+        _scene.Components.SetField(Id, componentType, field, value);
 }
 
 public sealed class ScriptScene
@@ -995,6 +1453,8 @@ public sealed class ScriptScene
     private readonly Dictionary<string, TransformState> _pendingTransforms =
         new(StringComparer.Ordinal);
     private readonly List<GameplayCommandState> _pendingCommands = new();
+
+    internal ScriptComponents Components { get; } = new();
 
     public IEnumerable<Entity> Entities =>
         _entities.Select(pair => new Entity(pair.Key, pair.Value, this));
@@ -1180,6 +1640,7 @@ public abstract class EngineBehaviour
     public ScriptUI UI { get; } = new();
     public ScriptScene Scene { get; } = new();
     public ScriptPhysics Physics { get; }
+    public ScriptComponents Components => Scene.Components;
     public ScriptTransform Transform => _transform ?? throw new InvalidOperationException(
         $"Script entity '{EntityId}' has no Transform component");
 
@@ -1198,6 +1659,7 @@ public abstract class EngineBehaviour
         Input.Replace(context.InputActions, context.InputTransitions);
         UI.Replace(context.UiEvents);
         Physics.Replace(context.PhysicsEvents, context.PhysicsQueryResults);
+        Components.Replace(context.ComponentQueryResults);
         _transform = context.Transform == null
             ? null
             : new ScriptTransform(context.Transform, () => _transformDirty = true);
@@ -1215,6 +1677,7 @@ public abstract class EngineBehaviour
         Scene.DrainTo(commands);
         UI.DrainTo(commands);
         Physics.DrainTo(commands);
+        Components.DrainTo(commands);
         var json = JsonSerializer.Serialize(commands, JsonOptions);
         _transformDirty = false;
         return json;
@@ -1243,6 +1706,9 @@ internal sealed class GameplayContextState
 
     [JsonPropertyName("physics_query_results")]
     public List<PhysicsQueryResultState> PhysicsQueryResults { get; set; } = new();
+
+    [JsonPropertyName("component_query_results")]
+    public List<ComponentQueryResultState> ComponentQueryResults { get; set; } = new();
 
     [JsonPropertyName("ui_events")]
     public List<GameplayUiEventState> UiEvents { get; set; } = new();
@@ -1349,6 +1815,45 @@ internal sealed class PhysicsQueryState
             Center = new[] { center.X, center.Y, center.Z },
             Radius = radius
         };
+}
+
+internal sealed class ComponentValueState
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "";
+
+    [JsonPropertyName("value")]
+    public JsonElement Value { get; set; }
+}
+
+internal sealed class ComponentQueryState
+{
+    [JsonPropertyName("query_id")]
+    public required uint QueryId { get; init; }
+
+    [JsonPropertyName("entity_id")]
+    public required string EntityId { get; init; }
+
+    [JsonPropertyName("component_type")]
+    public required string ComponentType { get; init; }
+}
+
+internal sealed class ComponentQueryResultState
+{
+    [JsonPropertyName("kind")]
+    public string Kind { get; set; } = "";
+
+    [JsonPropertyName("query_id")]
+    public uint QueryId { get; set; }
+
+    [JsonPropertyName("entity_id")]
+    public string EntityId { get; set; } = "";
+
+    [JsonPropertyName("component_type")]
+    public string ComponentType { get; set; } = "";
+
+    [JsonPropertyName("fields")]
+    public Dictionary<string, ComponentValueState>? Fields { get; set; }
 }
 
 internal sealed class GameplayUiEventState
@@ -1815,7 +2320,15 @@ internal sealed class GameplayCommandState
 
     [JsonPropertyName("query")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public PhysicsQueryState? Query { get; init; }
+    public object? Query { get; init; }
+
+    [JsonPropertyName("component_type")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ComponentType { get; init; }
+
+    [JsonPropertyName("fields")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, ComponentValueState>? Fields { get; init; }
 
     public static GameplayCommandState SetTransform(TransformState transform) =>
         new() { Type = "set_transform", Transform = transform };
@@ -1862,6 +2375,24 @@ internal sealed class GameplayCommandState
 
     public static GameplayCommandState PhysicsQuery(PhysicsQueryState query) =>
         new() { Type = "physics_query", Query = query };
+
+    public static GameplayCommandState ComponentQuery(ComponentQueryState query) =>
+        new() { Type = "component_query", Query = query };
+
+    public static GameplayCommandState SetComponent(
+        string entityId,
+        string componentType,
+        IReadOnlyDictionary<string, ComponentValue> fields) =>
+        new()
+        {
+            Type = "set_component",
+            EntityId = entityId,
+            ComponentType = componentType,
+            Fields = fields.ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value.ToState(),
+                StringComparer.Ordinal)
+        };
 }
 "#;
 
@@ -3139,6 +3670,32 @@ mod tests {
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"physics_query\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"physics_query_results\")]"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Physics.DrainTo(commands)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ScriptComponents"));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public readonly record struct ComponentQuery(uint Id)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public readonly record struct ComponentValue"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ComponentSnapshot"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public ComponentQuery Query("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void Set("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void SetField("));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public bool TryGet(ComponentQuery query, out ComponentSnapshot snapshot)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool IsMissing(ComponentQuery query)"));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public ComponentQuery QueryComponent(string componentType)"));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public void SetComponentField(string componentType, string field"));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public ScriptComponents Components => Scene.Components;"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"component_query\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"set_component\""));
+        assert!(
+            STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"component_query_results\")]")
+        );
+        assert!(
+            STARTER_SCRIPT_API_SOURCE.contains("Components.Replace(context.ComponentQueryResults)")
+        );
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Components.DrainTo(commands)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool WasPressed(string actionName)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool WasReleased(string actionName)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public IReadOnlyList<GameplayUiEvent> Events"));

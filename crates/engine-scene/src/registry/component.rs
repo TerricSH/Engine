@@ -136,13 +136,45 @@ impl ComponentRegistry {
                 // Unwrap: core components are registered only once.
                 self.register(ext).ok();
             }};
+            ($ty:ty, $display:expr, $has_editor:expr, $has_script:expr, $ser:expr, $de:expr) => {{
+                let ext = ComponentExtension {
+                    meta: ComponentMeta {
+                        type_id: <$ty as Component>::TYPE_ID,
+                        display_name: $display,
+                        schema_version: (0, 1, 0),
+                        has_editor: $has_editor,
+                        has_script_binding: $has_script,
+                    },
+                    storage_factory: || -> Box<dyn ComponentStorageDyn> {
+                        Box::new(SparseSet::<$ty>::new())
+                    },
+                    serialize: Some($ser),
+                    deserialize: Some($de),
+                };
+                // Unwrap: core components are registered only once.
+                self.register(ext).ok();
+            }};
         }
 
         core_ext!(Name, "Name", true, false);
         core_ext!(Transform, "Transform", true, false);
         core_ext!(Renderable, "Renderable", true, false);
-        core_ext!(Camera, "Camera", true, false);
-        core_ext!(Light, "Light", true, false);
+        core_ext!(
+            Camera,
+            "Camera",
+            true,
+            true,
+            crate::components::serialize_camera,
+            crate::components::deserialize_camera
+        );
+        core_ext!(
+            Light,
+            "Light",
+            true,
+            true,
+            crate::components::serialize_light,
+            crate::components::deserialize_light
+        );
         core_ext!(Bounds, "Bounds", true, false);
         core_ext!(PrefabInstanceRef, "Prefab Instance", false, false);
     }

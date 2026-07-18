@@ -8,8 +8,29 @@ mod renderable;
 mod transform;
 
 pub use bounds::Bounds;
-pub use camera::{Camera, CameraProjection};
-pub use light::{Light, LightKind};
+pub use camera::{
+    deserialize_camera, deserialize_camera_fields, serialize_camera, serialize_camera_fields,
+    Camera, CameraProjection,
+};
+pub use light::{
+    deserialize_light, deserialize_light_fields, serialize_light, serialize_light_fields, Light,
+    LightKind,
+};
 pub use name::Name;
 pub use renderable::Renderable;
 pub use transform::Transform;
+
+/// Extract an f32 from a scene [`engine_serialize::Value`], defaulting to 0.0.
+///
+/// Accepts every numeric scene representation so field maps authored by hand
+/// or migrated between schema versions stay loadable.
+pub(crate) fn field_as_f32(value: &engine_serialize::Value) -> f32 {
+    use engine_serialize::Value;
+    match value {
+        Value::Float32(v) => *v,
+        Value::Float64(v) => *v as f32,
+        Value::Int(v) => *v as f32,
+        Value::UInt(v) => *v as f32,
+        _ => 0.0,
+    }
+}

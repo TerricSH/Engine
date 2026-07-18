@@ -53,12 +53,15 @@ pub use lifecycle::{ON_CREATE, ON_DESTROY, ON_START, ON_UPDATE};
 pub use component::{ScriptComponent, ScriptInstanceState, ScriptManager};
 pub use engine::ScriptEngine;
 pub use gameplay::{
-    validate_entity_id, validate_prefab_id, validate_scene_id, validate_script_transform,
-    GameplayCommand, GameplayContext, GameplayEntitySnapshot, GameplayInputTransitions,
-    GameplayInputValue, GameplayPhysicsEvent, GameplayPhysicsEventKind, GameplayPhysicsQuery,
-    GameplayPhysicsQueryResult, GameplayUiColor, GameplayUiCommand, GameplayUiElement,
-    GameplayUiEvent, GameplayUiLayout, GameplayUiScaleMode, GameplayUiValue, OwnedGameplayCommand,
-    OwnedGameplayPhysicsQuery, ScriptTransform, MAX_PENDING_PHYSICS_QUERIES,
+    validate_component_fields, validate_component_type_key, validate_entity_id, validate_prefab_id,
+    validate_scene_id, validate_script_transform, GameplayCommand, GameplayComponentQuery,
+    GameplayComponentQueryResult, GameplayComponentValue, GameplayContext, GameplayEntitySnapshot,
+    GameplayInputTransitions, GameplayInputValue, GameplayPhysicsEvent, GameplayPhysicsEventKind,
+    GameplayPhysicsQuery, GameplayPhysicsQueryResult, GameplayUiColor, GameplayUiCommand,
+    GameplayUiElement, GameplayUiEvent, GameplayUiLayout, GameplayUiScaleMode, GameplayUiValue,
+    OwnedGameplayCommand, OwnedGameplayComponentQuery, OwnedGameplayPhysicsQuery, ScriptTransform,
+    MAX_COMPONENT_FIELDS, MAX_COMPONENT_LIST_ITEMS, MAX_COMPONENT_VALUE_DEPTH,
+    MAX_COMPONENT_VALUE_STRING_BYTES, MAX_PENDING_COMPONENT_QUERIES, MAX_PENDING_PHYSICS_QUERIES,
     MAX_PHYSICS_OVERLAP_RESULTS, MAX_PHYSICS_QUERY_DISTANCE,
 };
 pub use host::{

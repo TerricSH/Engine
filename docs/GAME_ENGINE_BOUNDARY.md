@@ -125,8 +125,19 @@ remain data-only.
 
 ## Current gaps
 
-The current boundary does not yet expose arbitrary component access, full
-physics queries/movement, or every audio, animation,
+The current boundary exposes typed script access to a curated component set
+(`engine.camera`, `engine.light`, `engine.audio_source`,
+`engine.physics.rigid_body`, `engine.physics.collider`) through the deferred
+`Components.Query`/`Components.SetComponent` bridge; Transform keeps its
+dedicated snapshot path. It does not yet expose arbitrary component access
+beyond that set, full physics queries/movement, or every audio, animation,
 and navigation operation. A game needing one of these should add a generic
 engine capability and Script API binding; it should not put game-specific code
 into the Rust implementation.
+
+Adding a component to the curated set is an opt-in recipe: register scene
+serialization hooks for the component in the component registry (so scripts
+and the scene format share one field schema), then add the component's type
+key to the allow-list in `engine-core`'s `script_components` module. Reads
+snapshots through those hooks and writes merge validated fields back through
+them, so no script-specific serializer is ever hand-written twice.

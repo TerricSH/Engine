@@ -29,6 +29,8 @@ pub use game_loop::{RuntimeUiEvent, RuntimeUiValue};
 #[cfg(feature = "subsystem-scripting-csharp")]
 pub mod script;
 #[cfg(feature = "subsystem-scripting-csharp")]
+mod script_components;
+#[cfg(feature = "subsystem-scripting-csharp")]
 use engine_script::{
     GameplayCommand, GameplayContext, GameplayEntitySnapshot, GameplayInputTransitions,
     GameplayInputValue, GameplayPhysicsEvent, GameplayUiEvent, ScriptEngine, ScriptError,
@@ -228,6 +230,17 @@ pub struct EngineRuntime {
     /// in the next frame snapshot.
     #[cfg(feature = "subsystem-scripting-csharp")]
     pending_physics_queries: Vec<engine_script::OwnedGameplayPhysicsQuery>,
+    /// Validated component queries drained from scripts during the current
+    /// update. The runtime executes them against the active World right after
+    /// the frame's commands apply and stages results for the next snapshot.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pending_component_queries: Vec<engine_script::OwnedGameplayComponentQuery>,
+    /// Component query results computed after the latest script update. They
+    /// are delivered to scripts with exactly one frame snapshot and then
+    /// replaced, mirroring the frame-local physics query results.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    script_component_query_results:
+        std::collections::BTreeMap<String, Vec<engine_script::GameplayComponentQueryResult>>,
 }
 
 impl EngineRuntime {
@@ -295,6 +308,10 @@ impl EngineRuntime {
             pending_scene_request: None,
             #[cfg(feature = "subsystem-scripting-csharp")]
             pending_physics_queries: Vec::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            pending_component_queries: Vec::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_component_query_results: std::collections::BTreeMap::new(),
         }
     }
 
@@ -411,6 +428,8 @@ impl EngineRuntime {
         {
             self.pending_scene_request = None;
             self.pending_physics_queries.clear();
+            self.pending_component_queries.clear();
+            self.script_component_query_results.clear();
             self.attach_scene_scripts(&scene);
         }
 
@@ -454,6 +473,8 @@ impl EngineRuntime {
         {
             self.pending_scene_request = None;
             self.pending_physics_queries.clear();
+            self.pending_component_queries.clear();
+            self.script_component_query_results.clear();
             self.attach_scene_scripts(&scene);
         }
 
@@ -829,6 +850,8 @@ impl EngineRuntime {
         self.script_host_name = host_name;
         self.pending_scene_request = None;
         self.pending_physics_queries.clear();
+        self.pending_component_queries.clear();
+        self.script_component_query_results.clear();
         Ok(())
     }
 
@@ -997,6 +1020,10 @@ impl EngineRuntime {
         let (commands, command_diagnostics) = self.script_engine.drain_gameplay_commands();
         diagnostics.extend(command_diagnostics);
         diagnostics.extend(self.apply_script_gameplay_commands(commands));
+        // Component queries issued during this update snapshot the world
+        // after this frame's commands applied, so next frame's results
+        // observe same-frame component writes.
+        diagnostics.extend(self.execute_script_component_queries());
         self.collector.push_script_diags(diagnostics);
     }
 
@@ -1064,6 +1091,9 @@ impl EngineRuntime {
         // the first-frame context does not overwrite the managed change.
         let (commands, mut command_diags) = self.script_engine.drain_gameplay_commands();
         command_diags.extend(self.apply_script_gameplay_commands(commands));
+        // Component queries issued from OnCreate are answered with the first
+        // OnUpdate snapshot instead of waiting for a full extra frame.
+        command_diags.extend(self.execute_script_component_queries());
         self.collector.push_script_diags(command_diags);
     }
 
@@ -1102,6 +1132,11 @@ impl EngineRuntime {
                     input_transitions: input_transitions.clone(),
                     physics_events: physics_events.get(&entity_id).cloned().unwrap_or_default(),
                     physics_query_results: physics_query_results
+                        .get(&entity_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    component_query_results: self
+                        .script_component_query_results
                         .get(&entity_id)
                         .cloned()
                         .unwrap_or_default(),
@@ -1444,6 +1479,154 @@ impl EngineRuntime {
                     self.pending_physics_queries
                         .push(engine_script::OwnedGameplayPhysicsQuery { entity_id, query });
                 }
+                GameplayCommand::ComponentQuery { query } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "query a component",
+                        ));
+                        continue;
+                    }
+                    if let Err(reason) = query.validate() {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_COMPONENT_QUERY_INVALID",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' produced an invalid component query: {reason}"
+                            ),
+                        ));
+                        continue;
+                    }
+                    if !script_components::is_script_component_type(&query.component_type) {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_COMPONENT_UNKNOWN",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' queried component '{}' on entity '{}', but that type is not script-accessible; {}",
+                                query.component_type,
+                                query.entity_id,
+                                supported_script_component_description()
+                            ),
+                        ));
+                        continue;
+                    }
+                    if self.pending_component_queries.len()
+                        >= engine_script::MAX_PENDING_COMPONENT_QUERIES
+                    {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_COMPONENT_QUERY_OVERFLOW",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' exceeded the pending component query budget of {} per frame",
+                                engine_script::MAX_PENDING_COMPONENT_QUERIES
+                            ),
+                        ));
+                        continue;
+                    }
+                    self.pending_component_queries
+                        .push(engine_script::OwnedGameplayComponentQuery { entity_id, query });
+                }
+                GameplayCommand::SetComponent {
+                    entity_id: target_id,
+                    component_type,
+                    fields,
+                } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "write a component",
+                        ));
+                        continue;
+                    }
+                    let wire_validation = engine_script::validate_entity_id(&target_id)
+                        .and_then(|_| engine_script::validate_component_type_key(&component_type))
+                        .and_then(|_| engine_script::validate_component_fields(&fields));
+                    if let Err(reason) = wire_validation {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_COMPONENT_INVALID",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' produced an invalid set_component for entity '{target_id}': {reason}"
+                            ),
+                        ));
+                        continue;
+                    }
+                    if !script_components::is_script_component_type(&component_type) {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_COMPONENT_UNKNOWN",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' tried to write component '{component_type}' on entity '{target_id}', but that type is not script-accessible; {}",
+                                supported_script_component_description()
+                            ),
+                        ));
+                        continue;
+                    }
+                    let outcome = self.world_slot.with_world_mut(|world| {
+                        script_components::apply_script_component_write(
+                            world,
+                            &target_id,
+                            &component_type,
+                            &fields,
+                        )
+                    });
+                    match outcome {
+                        Some(Ok(())) => {}
+                        Some(Err(script_components::ScriptComponentWriteError::UnknownEntity)) => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_COMPONENT_TARGET_MISSING",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' wrote component '{component_type}' for entity '{target_id}', but that entity does not exist"
+                                ),
+                            ));
+                        }
+                        Some(Err(
+                            script_components::ScriptComponentWriteError::PayloadRejected {
+                                rejected,
+                                known,
+                            },
+                        )) => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_COMPONENT_PAYLOAD_INVALID",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' wrote component '{component_type}' on entity '{target_id}' with fields the component rejected: {}; known fields: {}",
+                                    rejected.join(", "),
+                                    known.join(", ")
+                                ),
+                            ));
+                        }
+                        Some(Err(script_components::ScriptComponentWriteError::Unsupported)) => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_COMPONENT_UNKNOWN",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' tried to write component '{component_type}' on entity '{target_id}', but that type is not script-accessible; {}",
+                                    supported_script_component_description()
+                                ),
+                            ));
+                        }
+                        Some(Err(script_components::ScriptComponentWriteError::ApplyFailed)) => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_COMPONENT_APPLY_FAILED",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' wrote component '{component_type}' on entity '{target_id}', but the validated component could not be committed to storage"
+                                ),
+                            ));
+                        }
+                        None => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_WORLD_MISSING",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' component write for entity '{target_id}' could not be applied because no World is active"
+                                ),
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -1469,6 +1652,78 @@ impl EngineRuntime {
                 self.pending_scene_request = Some(scene_request);
             }
         }
+        diagnostics
+    }
+
+    /// Execute the component queries drained from the latest script update
+    /// and stage the results for the next frame snapshot.
+    ///
+    /// Queries run against the active World after this frame's commands
+    /// apply, so answers observe same-frame component writes. Results are
+    /// frame-local: they replace the previous staging map and are consumed by
+    /// exactly one following script tick.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn execute_script_component_queries(&mut self) -> Vec<Diagnostic> {
+        let pending = std::mem::take(&mut self.pending_component_queries);
+        if pending.is_empty() {
+            self.script_component_query_results.clear();
+            return Vec::new();
+        }
+        let mut diagnostics = Vec::new();
+        let mut results: std::collections::BTreeMap<
+            String,
+            Vec<engine_script::GameplayComponentQueryResult>,
+        > = std::collections::BTreeMap::new();
+        for engine_script::OwnedGameplayComponentQuery { entity_id, query } in pending {
+            let outcome = self.world_slot.with_world(|world| {
+                script_components::read_script_component(
+                    world,
+                    &query.entity_id,
+                    &query.component_type,
+                )
+            });
+            use engine_script::GameplayComponentQueryResult as QueryResult;
+            use script_components::ScriptComponentRead as Read;
+            let result = match outcome {
+                Some(Read::Snapshot(fields)) => QueryResult::Snapshot {
+                    query_id: query.query_id,
+                    entity_id: query.entity_id,
+                    component_type: query.component_type,
+                    fields,
+                },
+                Some(Read::Missing) => QueryResult::Missing {
+                    query_id: query.query_id,
+                    entity_id: query.entity_id,
+                    component_type: query.component_type,
+                },
+                Some(Read::Unsupported) => {
+                    diagnostics.push(script_component_diagnostic(
+                        "SCRIPT_COMPONENT_UNKNOWN",
+                        &entity_id,
+                        format!(
+                            "script entity '{entity_id}' queried component '{}' on entity '{}', but that type is not script-accessible; {}",
+                            query.component_type,
+                            query.entity_id,
+                            supported_script_component_description()
+                        ),
+                    ));
+                    continue;
+                }
+                None => {
+                    diagnostics.push(script_component_diagnostic(
+                        "SCRIPT_WORLD_MISSING",
+                        &entity_id,
+                        format!(
+                            "script entity '{entity_id}' component query on entity '{}' could not run because no World is active",
+                            query.entity_id
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            results.entry(entity_id).or_default().push(result);
+        }
+        self.script_component_query_results = results;
         diagnostics
     }
 
@@ -2247,6 +2502,24 @@ fn script_owner_missing_diagnostic(entity_id: &str, action: &str) -> Diagnostic 
     );
     diagnostic.entity = Some(entity_id.to_owned());
     diagnostic
+}
+
+/// Build an entity-scoped script diagnostic for the typed component bridge.
+#[cfg(feature = "subsystem-scripting-csharp")]
+fn script_component_diagnostic(code: &str, entity_id: &str, message: String) -> Diagnostic {
+    let mut diagnostic = Diagnostic::new(code, DiagnosticSeverity::Error, "script", message);
+    diagnostic.entity = Some(entity_id.to_owned());
+    diagnostic
+}
+
+/// Human-readable list of the component type keys scripts may access, used
+/// by `SCRIPT_COMPONENT_UNKNOWN` diagnostics.
+#[cfg(feature = "subsystem-scripting-csharp")]
+fn supported_script_component_description() -> String {
+    format!(
+        "supported component types: {}",
+        script_components::script_component_types().join(", ")
+    )
 }
 
 #[cfg(feature = "subsystem-scripting-csharp")]
