@@ -44,6 +44,7 @@ pub use validation::{
     validate_scene, validate_scene_for_authoring, SceneAuthoringFailure,
     SceneAuthoringValidationError, SCENE_ONLY_COMPONENT_TYPES,
 };
+pub use world::merge::{DestroySubtreeError, DestroyedSubtree, MergeError};
 pub use world::{PersistentEntityCreateError, World};
 pub use world_slot::{WeakWorldSlot, WorldSlot};
 

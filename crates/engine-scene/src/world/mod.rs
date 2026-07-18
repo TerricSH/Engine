@@ -11,6 +11,7 @@ use engine_serialize::{
 };
 use thiserror::Error;
 
+pub(crate) mod merge;
 pub(crate) mod scene;
 
 // Entity only has a 32-bit generation field, so use a process-wide,

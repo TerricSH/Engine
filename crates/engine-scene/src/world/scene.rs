@@ -325,7 +325,6 @@ impl World {
             }
             world.storages = storages;
         }
-        let strict_components = world.component_registry.is_some();
 
         // Preserve scene-level metadata.
         world.scene_settings = scene.scene_settings.clone();
@@ -336,39 +335,62 @@ impl World {
         world.scene_dependencies = scene.dependencies.clone();
         world.diagnostics_policy = scene.diagnostics_policy;
 
+        let (_created, mut insert_diagnostics) = world.insert_scene_entities(scene);
+        diagnostics.append(&mut insert_diagnostics);
+        SceneLoadReport { world, diagnostics }
+    }
+
+    /// Insert every entity of `scene` into this world using the two-pass
+    /// allocate-then-populate flow shared by scene loading and live merging.
+    ///
+    /// The caller must guarantee that the scene's persistent IDs neither
+    /// collide with existing world mappings nor repeat inside the scene
+    /// itself: [`from_scene`](World::from_scene) loads into a fresh world,
+    /// while [`World::merge_scene`] pre-validates conflicts before calling
+    /// this. Returns the created entities in scene order together with any
+    /// component-population diagnostics (only produced when a component
+    /// registry is installed, mirroring [`build_from_scene`](Self::build_from_scene)).
+    pub(crate) fn insert_scene_entities(
+        &mut self,
+        scene: &Scene,
+    ) -> (Vec<Entity>, Vec<SceneLoadDiagnostic>) {
+        let mut diagnostics = Vec::new();
+        let strict_components = self.component_registry.is_some();
+        let mut created = Vec::with_capacity(scene.entities.len());
+
         // First pass: allocate entities and record persistent_id mappings.
         for entity_record in &scene.entities {
-            let entity = world.create_entity();
-            world.set_enabled(entity, entity_record.enabled);
+            let entity = self.create_entity();
+            created.push(entity);
+            self.set_enabled(entity, entity_record.enabled);
             let idx = entity.index() as usize;
             // Record persistent_id mapping.
-            world
-                .persistent_to_entity
+            self.persistent_to_entity
                 .insert(entity_record.persistent_id.clone(), entity);
-            if world.entity_to_persistent.len() <= idx {
-                world.entity_to_persistent.resize(idx + 1, None);
+            if self.entity_to_persistent.len() <= idx {
+                self.entity_to_persistent.resize(idx + 1, None);
             }
-            world.entity_to_persistent[idx] = Some(entity_record.persistent_id.clone());
-            world.entity_parents[idx] = entity_record.parent.clone();
+            self.entity_to_persistent[idx] = Some(entity_record.persistent_id.clone());
+            self.entity_parents[idx] = entity_record.parent.clone();
 
             // Copy EntityRecord.name to a Name component.
             if let Some(ref name) = entity_record.name {
-                world.add_component(entity, Name(name.clone()));
+                self.add_component(entity, Name(name.clone()));
             }
         }
 
         // Second pass: populate components with resolved references.
         for entity_record in &scene.entities {
-            let Some(&entity) = world.persistent_to_entity.get(&entity_record.persistent_id) else {
+            let Some(&entity) = self.persistent_to_entity.get(&entity_record.persistent_id) else {
                 continue;
             };
 
             for (comp_type_id, comp_record) in &entity_record.components {
-                world.component_schema_versions[entity.index() as usize]
+                self.component_schema_versions[entity.index() as usize]
                     .insert(comp_type_id.clone(), comp_record.schema_version);
                 if !comp_record.enabled {
                     if strict_components {
-                        if let Err(diagnostic) = world.validate_disabled_component(
+                        if let Err(diagnostic) = self.validate_disabled_component(
                             entity,
                             comp_type_id,
                             &comp_record.fields,
@@ -376,18 +398,18 @@ impl World {
                             diagnostics.push(diagnostic);
                         }
                     }
-                    world.disabled_components[entity.index() as usize]
+                    self.disabled_components[entity.index() as usize]
                         .insert(comp_type_id.clone(), comp_record.clone());
                     continue;
                 }
                 if strict_components {
                     if let Err(diagnostic) =
-                        world.populate_component_checked(entity, comp_type_id, &comp_record.fields)
+                        self.populate_component_checked(entity, comp_type_id, &comp_record.fields)
                     {
                         diagnostics.push(diagnostic);
                     }
                 } else {
-                    world.populate_component(entity, comp_type_id, &comp_record.fields);
+                    self.populate_component(entity, comp_type_id, &comp_record.fields);
                 }
             }
 
@@ -395,14 +417,14 @@ impl World {
             // to an enabled Transform when present, while retaining support
             // for older scenes that encoded the parent only in Transform.
             if let Some(parent_id) = entity_record.parent.as_ref() {
-                let parent = world.persistent_to_entity.get(parent_id).copied();
-                if let Some(transform) = world.get_mut::<Transform>(entity) {
+                let parent = self.persistent_to_entity.get(parent_id).copied();
+                if let Some(transform) = self.get_mut::<Transform>(entity) {
                     transform.parent = parent;
                 }
             }
         }
 
-        SceneLoadReport { world, diagnostics }
+        (created, diagnostics)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
