@@ -40,9 +40,9 @@ const SCRIPT_SDK_PROJECT: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
     <Nullable>enable</Nullable>
     <AssemblyName>EngineGameplay</AssemblyName>
     <RootNamespace>Engine</RootNamespace>
-    <Version>0.2.0</Version>
-    <AssemblyVersion>0.2.0.0</AssemblyVersion>
-    <FileVersion>0.2.0.0</FileVersion>
+    <Version>0.3.0</Version>
+    <AssemblyVersion>0.3.0.0</AssemblyVersion>
+    <FileVersion>0.3.0.0</FileVersion>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
@@ -86,14 +86,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.2.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.3.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.2.0";
+    public const string Version = "0.3.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
@@ -1041,6 +1041,28 @@ public sealed class ScriptScene
             }));
     }
 
+    // Prefab instantiation is deferred until every script callback for this
+    // frame has completed, exactly like CreateEntity. prefabId is the cooked
+    // prefab asset id from the project manifest. The spawned root takes the
+    // first free persistent id from prefabId, prefabId-2, ...; every other
+    // spawned entity takes '<rootId>.<prefab-local id>'. The new hierarchy
+    // becomes visible through Entities/FindEntity on the next frame.
+    public void Spawn(string prefabId)
+    {
+        ValidatePrefabId(prefabId, nameof(prefabId));
+        _pendingCommands.Add(GameplayCommandState.SpawnPrefab(prefabId, null));
+    }
+
+    // The translation override replaces the prefab root's Transform
+    // translation; the prefab's own rotation and scale are preserved.
+    public void Spawn(string prefabId, Vector3 translation)
+    {
+        ValidatePrefabId(prefabId, nameof(prefabId));
+        _pendingCommands.Add(GameplayCommandState.SpawnPrefab(
+            prefabId,
+            new[] { translation.X, translation.Y, translation.Z }));
+    }
+
     // Queue a scene change for the engine to perform after the current script
     // update. sceneId is a key from game.project.json's `scenes` object.
     public void Load(string sceneId)
@@ -1120,6 +1142,21 @@ public sealed class ScriptScene
                 "Entity ids must contain 1 to 128 ASCII letters, digits, hyphens, " +
                 "underscores, or dots (but not '.' or '..'); entity ids are not file paths.",
                 parameterName);
+    }
+
+    private static void ValidatePrefabId(string? prefabId, string parameterName)
+    {
+        try
+        {
+            ValidateEntityId(prefabId, parameterName);
+        }
+        catch (ArgumentException)
+        {
+            throw new ArgumentException(
+                "Prefab ids must contain 1 to 128 ASCII letters, digits, hyphens, " +
+                "underscores, or dots (but not '.' or '..'); prefab ids are not file paths.",
+                parameterName);
+        }
     }
 }
 
@@ -1764,6 +1801,14 @@ internal sealed class GameplayCommandState
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? SceneId { get; init; }
 
+    [JsonPropertyName("prefab_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PrefabId { get; init; }
+
+    [JsonPropertyName("translation")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Translation { get; init; }
+
     [JsonPropertyName("command")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public UiCommandState? UiCommand { get; init; }
@@ -1803,6 +1848,14 @@ internal sealed class GameplayCommandState
 
     public static GameplayCommandState LoadScene(string sceneId) =>
         new() { Type = "load_scene", SceneId = sceneId };
+
+    public static GameplayCommandState SpawnPrefab(string prefabId, float[]? translation) =>
+        new()
+        {
+            Type = "spawn_prefab",
+            PrefabId = prefabId,
+            Translation = translation
+        };
 
     public static GameplayCommandState UI(UiCommandState command) =>
         new() { Type = "ui", UiCommand = command };
@@ -3117,10 +3170,16 @@ mod tests {
         assert!(STARTER_SCRIPT_API_SOURCE
             .contains("public void CreateEntity(string entityId, Vector3 translation)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Creation is deferred"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void Spawn(string prefabId)"));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public void Spawn(string prefabId, Vector3 translation)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Prefab instantiation is deferred"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"prefab_id\")]"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public void Load(string sceneId)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"set_entity_transform\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"create_entity\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"destroy_entity\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"spawn_prefab\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"load_scene\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"create_canvas\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"add_element\""));

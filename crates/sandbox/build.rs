@@ -114,7 +114,7 @@ fn hash_frontend_sources(manifest_dir: &Path) -> Result<String, String> {
     for directory in FRONTEND_DIRECTORIES {
         collect_files(manifest_dir, Path::new(directory), &mut inputs)?;
     }
-    inputs.sort_by(|left, right| normalized(left).cmp(&normalized(right)));
+    inputs.sort_by_key(|path| normalized(path));
     inputs.dedup();
 
     let mut hash = Sha256::new();

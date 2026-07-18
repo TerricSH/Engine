@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use engine_scene::{EntityRecord, Scene};
+use engine_scene::{ComponentRecord, EntityRecord, Scene};
 use engine_script::{ScriptComponent, ScriptEngine, ScriptValue};
 use engine_serialize::{AssetId, Value};
 
@@ -87,7 +87,17 @@ const RESERVED_SCRIPT_KEYS: &[&str] = &["assembly_id", "class_name"];
 /// [`SCRIPT_COMPONENT_TYPE`].
 pub fn extract_script_component(entity: &EntityRecord) -> Option<ScriptComponent> {
     let comp = entity.components.get(SCRIPT_COMPONENT_TYPE)?;
+    extract_script_component_from_record(comp)
+}
 
+/// Try to extract a [`ScriptComponent`] from a single component record.
+///
+/// This is the record-level companion to [`extract_script_component`]: prefab
+/// instantiation keeps `engine.script` records as scene-only metadata instead
+/// of materialising them into the ECS world, so the runtime re-attaches them
+/// to spawned entities straight from the record. Returns `None` when the
+/// record does not carry the required `assembly_id` / `class_name` strings.
+pub fn extract_script_component_from_record(comp: &ComponentRecord) -> Option<ScriptComponent> {
     // Pull structured fields
     let assembly_id = match comp.fields.get("assembly_id") {
         Some(Value::Str(s)) => s.clone(),

@@ -463,6 +463,20 @@ pub enum GameplayCommand {
     LoadScene {
         scene_id: String,
     },
+    /// Instantiate a cooked prefab asset at the frame boundary.
+    ///
+    /// The runtime resolves `prefab_id` against the prefab assets loaded from
+    /// the project's cooked asset batch. The spawned instance root receives
+    /// the first free persistent id from `prefab_id`, `prefab_id-2`, and so
+    /// on; every other prefab entity receives `<rootId>.<prefab-local id>`
+    /// (with the same `-N` conflict suffix). `translation`, when present,
+    /// overrides the root entity's translation while keeping the prefab's
+    /// rotation and scale.
+    SpawnPrefab {
+        prefab_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        translation: Option<[f32; 3]>,
+    },
     /// Mutate retained runtime UI through the managed class API.
     Ui {
         command: GameplayUiCommand,
@@ -495,6 +509,18 @@ impl GameplayCommand {
             Self::DestroySelf => Ok(()),
             Self::DestroyEntity { entity_id } => validate_entity_id(entity_id),
             Self::LoadScene { scene_id } => validate_scene_id(scene_id),
+            Self::SpawnPrefab {
+                prefab_id,
+                translation,
+            } => {
+                validate_prefab_id(prefab_id)?;
+                if let Some(translation) = translation {
+                    if !translation.iter().all(|value| value.is_finite()) {
+                        return Err("spawn translation must contain only finite values".into());
+                    }
+                }
+                Ok(())
+            }
             Self::Ui { command } => command.validate(),
             Self::PhysicsQuery { query } => query.validate(),
         }
@@ -800,6 +826,20 @@ pub fn validate_scene_id(scene_id: &str) -> Result<(), String> {
     }
 }
 
+/// Validate a cooked prefab asset identifier used by `Scene.Spawn`.
+///
+/// The spawned instance root takes this id as the base of its persistent
+/// entity id, so prefab ids share the wire-safe identifier contract of
+/// persistent entity ids. Authors choose asset ids, so keeping the two
+/// contracts aligned is always possible.
+pub fn validate_prefab_id(prefab_id: &str) -> Result<(), String> {
+    validate_entity_id(prefab_id).map_err(|_| {
+        format!(
+            "invalid prefab id {prefab_id:?}: expected a cooked prefab asset id containing 1 to 128 ASCII letters, digits, hyphens, underscores, or dots (but not '.' or '..'); prefab ids are not file paths"
+        )
+    })
+}
+
 /// A validated command paired with the entity that owns the script instance.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwnedGameplayCommand {
@@ -1058,6 +1098,68 @@ mod tests {
         ] {
             assert!(command.validate().is_err());
         }
+    }
+
+    #[test]
+    fn spawn_prefab_command_has_a_stable_validated_contract() {
+        let bare = GameplayCommand::SpawnPrefab {
+            prefab_id: "prefab-enemy".into(),
+            translation: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"type":"spawn_prefab","prefab_id":"prefab-enemy"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(
+                r#"{"type":"spawn_prefab","prefab_id":"prefab-enemy"}"#
+            )
+            .unwrap(),
+            bare
+        );
+        assert!(bare.validate().is_ok());
+
+        let placed = GameplayCommand::SpawnPrefab {
+            prefab_id: "prefab-enemy".into(),
+            translation: Some([1.0, 2.0, 3.0]),
+        };
+        assert_eq!(
+            serde_json::to_string(&placed).unwrap(),
+            r#"{"type":"spawn_prefab","prefab_id":"prefab-enemy","translation":[1.0,2.0,3.0]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(
+                r#"{"type":"spawn_prefab","prefab_id":"prefab-enemy","translation":[1,2,3]}"#
+            )
+            .unwrap(),
+            placed
+        );
+        assert!(placed.validate().is_ok());
+
+        for command in [
+            GameplayCommand::SpawnPrefab {
+                prefab_id: "../enemy".into(),
+                translation: None,
+            },
+            GameplayCommand::SpawnPrefab {
+                prefab_id: "prefabs/enemy".into(),
+                translation: None,
+            },
+            GameplayCommand::SpawnPrefab {
+                prefab_id: String::new(),
+                translation: None,
+            },
+            GameplayCommand::SpawnPrefab {
+                prefab_id: "prefab-enemy".into(),
+                translation: Some([f32::NAN, 0.0, 0.0]),
+            },
+        ] {
+            assert!(command.validate().is_err(), "{command:?}");
+        }
+        assert!(validate_prefab_id("prefab-enemy").is_ok());
+        assert!(validate_prefab_id("prefab.enemy_01").is_ok());
+        let error = validate_prefab_id("prefabs/enemy").unwrap_err();
+        assert!(error.contains("not file paths"), "{error}");
     }
 
     #[test]

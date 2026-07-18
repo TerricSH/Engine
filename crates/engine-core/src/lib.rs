@@ -1141,6 +1141,21 @@ impl EngineRuntime {
         &mut self,
         commands: Vec<engine_script::OwnedGameplayCommand>,
     ) -> Vec<Diagnostic> {
+        self.apply_script_gameplay_commands_with_depth(commands, 0)
+    }
+
+    /// Apply validated script commands at the frame boundary.
+    ///
+    /// `depth` bounds the synchronous `Scene.Spawn` → `OnCreate` → command
+    /// chain: prefabs spawned from a spawned script's `OnCreate` are applied
+    /// recursively so each new instance completes its lifecycle within the
+    /// same frame boundary, up to [`MAX_SCRIPT_SPAWN_DEPTH`].
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn apply_script_gameplay_commands_with_depth(
+        &mut self,
+        commands: Vec<engine_script::OwnedGameplayCommand>,
+        depth: usize,
+    ) -> Vec<Diagnostic> {
         if commands.is_empty() {
             return Vec::new();
         }
@@ -1314,6 +1329,51 @@ impl EngineRuntime {
                         scene_request = Some(request);
                     }
                 }
+                GameplayCommand::SpawnPrefab {
+                    prefab_id,
+                    translation,
+                } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            &format!("spawn prefab '{prefab_id}'"),
+                        ));
+                        continue;
+                    }
+                    if let Err(reason) = engine_script::validate_prefab_id(&prefab_id) {
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_PREFAB_ID_INVALID",
+                            DiagnosticSeverity::Error,
+                            "script",
+                            format!("script entity '{entity_id}' {reason}"),
+                        );
+                        diagnostic.entity = Some(entity_id);
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                    if translation.is_some_and(|translation| {
+                        !translation.iter().all(|value| value.is_finite())
+                    }) {
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_PREFAB_TRANSFORM_INVALID",
+                            DiagnosticSeverity::Error,
+                            "script",
+                            format!(
+                                "script entity '{entity_id}' requested prefab '{prefab_id}' with a non-finite spawn translation"
+                            ),
+                        );
+                        diagnostic.entity = Some(entity_id);
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                    self.spawn_script_prefab(
+                        &entity_id,
+                        &prefab_id,
+                        translation,
+                        &mut diagnostics,
+                        depth,
+                    );
+                }
                 GameplayCommand::Ui { command } => {
                     if !script_command_owner_exists(&self.world_slot, &entity_id) {
                         diagnostics.push(script_owner_missing_diagnostic(
@@ -1410,6 +1470,330 @@ impl EngineRuntime {
             }
         }
         diagnostics
+    }
+
+    /// Instantiate one cooked prefab for a `Scene.Spawn` command.
+    ///
+    /// The prefab is resolved from the runtime's cooked `prefab` extension
+    /// assets (never from script-supplied paths), instantiated transactionally
+    /// through the same component restoration path scenes use, and assigned
+    /// deterministic persistent IDs. `engine.script` records ride along as
+    /// scene-only metadata and are attached to the script engine with the same
+    /// lifecycle as scene-authored scripts: `OnCreate` runs immediately, and
+    /// its commands are applied recursively within this frame boundary.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn spawn_script_prefab(
+        &mut self,
+        requested_by: &str,
+        prefab_id: &str,
+        translation: Option<[f32; 3]>,
+        diagnostics: &mut Vec<Diagnostic>,
+        depth: usize,
+    ) {
+        let asset_id = AssetId::new(prefab_id);
+        let Some(root_handle) = self.extension_asset::<engine_scene::Prefab>("prefab", &asset_id)
+        else {
+            let mut diagnostic = Diagnostic::new(
+                "SCRIPT_PREFAB_UNKNOWN",
+                DiagnosticSeverity::Error,
+                "script",
+                format!(
+                    "script entity '{requested_by}' requested unknown prefab '{prefab_id}'; {}",
+                    self.available_prefab_description()
+                ),
+            );
+            diagnostic.entity = Some(requested_by.to_owned());
+            diagnostics.push(diagnostic);
+            return;
+        };
+        let root_prefab = root_handle.get().clone();
+
+        // Nested prefab references resolve against the same cooked batch.
+        let mut resolver = engine_scene::PrefabRegistry::new();
+        let mut visiting = std::collections::BTreeSet::new();
+        if let Err(missing) =
+            self.collect_prefab_graph(&asset_id, &root_prefab, &mut resolver, &mut visiting)
+        {
+            let mut diagnostic = Diagnostic::new(
+                "SCRIPT_PREFAB_GRAPH_INCOMPLETE",
+                DiagnosticSeverity::Error,
+                "script",
+                format!(
+                    "script entity '{requested_by}' requested prefab '{prefab_id}', but its nested prefab '{missing}' is not loaded; declare and cook every referenced prefab asset"
+                ),
+            );
+            diagnostic.entity = Some(requested_by.to_owned());
+            diagnostics.push(diagnostic);
+            return;
+        }
+
+        let outcome = self.world_slot.with_world_mut(|world| {
+            match engine_scene::instantiate_prefab(world, &root_prefab, Some(&resolver)) {
+                Ok(result) => {
+                    match assign_spawned_persistent_ids(world, prefab_id, &result) {
+                        Ok(assigned) => {
+                            if let Some(translation) = translation {
+                                apply_spawn_translation(world, result.root_entity, translation);
+                            }
+                            Ok((result, assigned))
+                        }
+                        Err(reason) => {
+                            // Roll the whole instance back so a failed spawn
+                            // cannot leave anonymous or partially named
+                            // entities behind.
+                            for entity in result.all_entities.iter().rev() {
+                                let _ = world.destroy_entity(*entity);
+                            }
+                            Err(reason)
+                        }
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        let (result, assigned) = match outcome {
+            Some(Ok(spawned)) => spawned,
+            Some(Err(reason)) => {
+                let mut diagnostic = Diagnostic::new(
+                    "SCRIPT_PREFAB_SPAWN_FAILED",
+                    DiagnosticSeverity::Error,
+                    "script",
+                    format!(
+                        "script entity '{requested_by}' could not spawn prefab '{prefab_id}': {reason}"
+                    ),
+                );
+                diagnostic.entity = Some(requested_by.to_owned());
+                diagnostics.push(diagnostic);
+                return;
+            }
+            None => {
+                diagnostics.push(Diagnostic::new(
+                    "SCRIPT_WORLD_MISSING",
+                    DiagnosticSeverity::Error,
+                    "script",
+                    format!(
+                        "script entity '{requested_by}' could not spawn prefab '{prefab_id}' because no World is active"
+                    ),
+                ));
+                return;
+            }
+        };
+
+        // Attach scene-only `engine.script` records with the same lifecycle
+        // scene-authored scripts receive.
+        let id_by_entity: std::collections::HashMap<engine_scene::Entity, String> =
+            assigned.into_iter().collect();
+        let mut attached_any = false;
+        for (entity, component_type_id, record) in &result.scene_only_components {
+            if component_type_id != script::SCRIPT_COMPONENT_TYPE {
+                continue;
+            }
+            let Some(entity_id) = id_by_entity.get(entity) else {
+                continue;
+            };
+            let Some(component) = script::extract_script_component_from_record(record) else {
+                let mut diagnostic = Diagnostic::new(
+                    "SCRIPT_SPAWN_ATTACH_FAILED",
+                    DiagnosticSeverity::Error,
+                    "script",
+                    format!(
+                        "spawned entity '{entity_id}' has an invalid engine.script record: 'assembly_id' and 'class_name' strings are required"
+                    ),
+                );
+                diagnostic.entity = Some(entity_id.clone());
+                diagnostics.push(diagnostic);
+                continue;
+            };
+            match self.script_engine.attach_script(
+                entity_id,
+                &self.script_host_name.clone(),
+                &component,
+            ) {
+                Ok(()) => attached_any = true,
+                Err(error) => {
+                    let mut diagnostic = Diagnostic::new(
+                        "SCRIPT_SPAWN_ATTACH_FAILED",
+                        DiagnosticSeverity::Error,
+                        "script",
+                        format!(
+                            "failed to attach script '{}' to spawned entity '{entity_id}': {error}",
+                            component.class_name
+                        ),
+                    );
+                    diagnostic.entity = Some(entity_id.clone());
+                    diagnostics.push(diagnostic);
+                }
+            }
+        }
+        if !attached_any {
+            return;
+        }
+
+        // Run OnCreate for the newly attached instances and apply the
+        // commands they enqueue (including further spawns) at this same frame
+        // boundary, bounded by MAX_SCRIPT_SPAWN_DEPTH.
+        let contexts = self.script_gameplay_contexts(
+            &self.script_input_actions.clone(),
+            &GameplayInputTransitions::default(),
+            &std::collections::BTreeMap::new(),
+            &[],
+            &std::collections::BTreeMap::new(),
+        );
+        diagnostics.extend(self.script_engine.set_gameplay_contexts(&contexts));
+        diagnostics.extend(self.script_engine.create_instances());
+        let (commands, command_diagnostics) = self.script_engine.drain_gameplay_commands();
+        diagnostics.extend(command_diagnostics);
+        if commands.is_empty() {
+            return;
+        }
+        if depth >= MAX_SCRIPT_SPAWN_DEPTH {
+            diagnostics.push(Diagnostic::new(
+                "SCRIPT_SPAWN_DEPTH_EXCEEDED",
+                DiagnosticSeverity::Error,
+                "script",
+                format!(
+                    "prefab spawn chains from OnCreate callbacks exceeded the depth budget of {MAX_SCRIPT_SPAWN_DEPTH}; remaining commands were deferred"
+                ),
+            ));
+            return;
+        }
+        diagnostics.extend(self.apply_script_gameplay_commands_with_depth(commands, depth + 1));
+    }
+
+    /// Human-readable list of the loaded cooked prefab assets for actionable
+    /// `Scene.Spawn` error messages.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn available_prefab_description(&self) -> String {
+        let available = self
+            .loaded_extension_asset_ids
+            .get("prefab")
+            .map(|ids| {
+                ids.iter()
+                    .map(|id| id.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        if available.is_empty() {
+            "no prefab assets are loaded; declare .prefab.ron sources in the project's source manifest and cook the project".to_string()
+        } else {
+            format!("loaded prefabs: {available}")
+        }
+    }
+
+    /// Register the reachable nested-prefab graph of `root` with the resolver.
+    ///
+    /// Cycles are left to the instantiation validator, which reports them as
+    /// structured errors; this walk only proves that every referenced child is
+    /// present in the cooked batch.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn collect_prefab_graph(
+        &self,
+        asset_id: &AssetId,
+        prefab: &engine_scene::Prefab,
+        resolver: &mut engine_scene::PrefabRegistry,
+        visiting: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        if !visiting.insert(asset_id.id.clone()) {
+            return Ok(());
+        }
+        for child_ref in &prefab.child_prefab_refs {
+            let child_id = &child_ref.prefab_asset;
+            let child = self
+                .extension_asset::<engine_scene::Prefab>("prefab", child_id)
+                .ok_or_else(|| child_id.id.clone())?;
+            let child = child.get().clone();
+            self.collect_prefab_graph(child_id, &child, resolver, visiting)?;
+            resolver.register(child_id.id.clone(), child);
+        }
+        Ok(())
+    }
+}
+
+/// Maximum synchronous `Scene.Spawn` → `OnCreate` recursion depth per frame
+/// boundary. A script whose `OnCreate` spawns another scripted prefab cannot
+/// recurse without bound inside one command drain.
+#[cfg(feature = "subsystem-scripting-csharp")]
+const MAX_SCRIPT_SPAWN_DEPTH: usize = 8;
+
+/// Assign deterministic persistent IDs to a freshly instantiated prefab.
+///
+/// The root entity receives the first free id from `<prefabId>`,
+/// `<prefabId>-2`, `<prefabId>-3`, …; every other spawned entity receives
+/// `<rootId>.<prefab-local id>` with the same `-N` conflict suffix. The
+/// result pairs each entity with its assigned id in spawn order, root first.
+#[cfg(feature = "subsystem-scripting-csharp")]
+fn assign_spawned_persistent_ids(
+    world: &mut World,
+    prefab_id: &str,
+    result: &engine_scene::PrefabInstantiateResult,
+) -> Result<Vec<(engine_scene::Entity, String)>, String> {
+    let mut assigned: Vec<(engine_scene::Entity, String)> =
+        Vec::with_capacity(result.all_entities.len());
+    for entity in &result.all_entities {
+        let base = if *entity == result.root_entity {
+            prefab_id.to_string()
+        } else {
+            let local_id = world
+                .get::<engine_scene::PrefabInstanceRef>(*entity)
+                .map(|reference| reference.entity_persistent_id.clone())
+                .unwrap_or_else(|| format!("entity-{}", entity.index()));
+            let root_id = &assigned
+                .first()
+                .expect("the root entity is always assigned first")
+                .1;
+            format!("{root_id}.{local_id}")
+        };
+        let candidate = first_free_persistent_id(world, &base).ok_or_else(|| {
+            format!("could not allocate a unique persistent entity id below '{base}'")
+        })?;
+        engine_script::validate_entity_id(&candidate).map_err(|reason| {
+            format!("prefab '{prefab_id}' produced an unusable spawned entity id: {reason}")
+        })?;
+        world
+            .assign_persistent_id(*entity, candidate.clone())
+            .map_err(|error| error.to_string())?;
+        assigned.push((*entity, candidate));
+    }
+    Ok(assigned)
+}
+
+/// First unused persistent id from `base`, `base-2`, `base-3`, … within the
+/// 128-byte persistent-id budget.
+#[cfg(feature = "subsystem-scripting-csharp")]
+fn first_free_persistent_id(world: &World, base: &str) -> Option<String> {
+    if world.entity_by_persistent_id(base).is_none() {
+        return Some(base.to_string());
+    }
+    for suffix in 2_u64.. {
+        let candidate = format!("{base}-{suffix}");
+        if candidate.len() > 128 {
+            return None;
+        }
+        if world.entity_by_persistent_id(&candidate).is_none() {
+            return Some(candidate);
+        }
+    }
+    unreachable!("the u64 suffix space cannot be exhausted in memory")
+}
+
+/// Apply the optional `Scene.Spawn` translation override to the spawned root.
+/// A prefab root without a Transform gains one so the spawn position is never
+/// silently dropped; rotation and scale from the prefab are preserved.
+#[cfg(feature = "subsystem-scripting-csharp")]
+fn apply_spawn_translation(world: &mut World, root: engine_scene::Entity, translation: [f32; 3]) {
+    let translation = glam::Vec3::from_array(translation);
+    if let Some(transform) = world.get_mut::<engine_scene::components::Transform>(root) {
+        transform.translation = translation;
+    } else {
+        world.add_component(
+            root,
+            engine_scene::components::Transform {
+                translation,
+                ..Default::default()
+            },
+        );
     }
 }
 
@@ -3470,6 +3854,359 @@ mod tests {
             .with_world(|world| {
                 assert!(world.entity_by_persistent_id("cube-01").is_none());
                 assert!(world.entity_by_persistent_id("after-destroy").is_none());
+            })
+            .expect("runtime must keep an active World");
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn script_spawn_test_transform_record(translation: [f32; 3]) -> engine_scene::ComponentRecord {
+        engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: std::collections::BTreeMap::from([
+                (
+                    "translation".to_string(),
+                    engine_serialize::Value::Vec3(translation),
+                ),
+                (
+                    "rotation".to_string(),
+                    engine_serialize::Value::Quat([
+                        0.0,
+                        0.0,
+                        std::f32::consts::FRAC_1_SQRT_2,
+                        std::f32::consts::FRAC_1_SQRT_2,
+                    ]),
+                ),
+                (
+                    "scale".to_string(),
+                    engine_serialize::Value::Vec3([2.0, 2.0, 2.0]),
+                ),
+            ]),
+        }
+    }
+
+    /// Two-entity prefab: root `root` with a rotated/scaled Transform and a
+    /// child `bolt`, so tests can assert deterministic id assignment,
+    /// hierarchy parenting, and translation overrides.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn script_spawn_test_prefab(prefab_id: &str) -> engine_scene::Prefab {
+        let mut prefab = engine_scene::Prefab::new(AssetId::new(prefab_id));
+        prefab.add_entity(engine_scene::EntityRecord {
+            persistent_id: "root".to_string(),
+            parent: None,
+            name: Some("Root".to_string()),
+            enabled: true,
+            components: std::collections::BTreeMap::from([(
+                "engine.transform".to_string(),
+                script_spawn_test_transform_record([1.0, 2.0, 3.0]),
+            )]),
+        });
+        prefab.add_entity(engine_scene::EntityRecord {
+            persistent_id: "bolt".to_string(),
+            parent: Some("root".to_string()),
+            name: Some("Bolt".to_string()),
+            enabled: true,
+            components: std::collections::BTreeMap::from([(
+                "engine.transform".to_string(),
+                script_spawn_test_transform_record([0.0, 1.0, 0.0]),
+            )]),
+        });
+        prefab
+    }
+
+    /// Install a cooked prefab into the runtime exactly like the cooked-batch
+    /// loader does: typed payload in the asset registry plus the extension
+    /// type-id registration that `extension_asset::<Prefab>("prefab", ..)`
+    /// consults.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn register_script_prefab(
+        runtime: &mut EngineRuntime,
+        prefab_id: &str,
+        prefab: engine_scene::Prefab,
+    ) {
+        let asset_id = AssetId::new(prefab_id);
+        runtime
+            .asset_registry_mut()
+            .insert_typed(asset_id.clone(), prefab);
+        runtime
+            .loaded_extension_asset_ids
+            .entry("prefab".to_string())
+            .or_default()
+            .insert(asset_id);
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn spawn_prefab_command(
+        owner: &str,
+        prefab_id: &str,
+        translation: Option<[f32; 3]>,
+    ) -> engine_script::OwnedGameplayCommand {
+        engine_script::OwnedGameplayCommand {
+            entity_id: owner.to_string(),
+            command: GameplayCommand::SpawnPrefab {
+                prefab_id: prefab_id.to_string(),
+                translation,
+            },
+        }
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn script_spawn_prefab_assigns_deterministic_ids_and_enters_next_snapshot() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::from_scene(&engine_scene::sample_scene()));
+        register_script_prefab(
+            &mut runtime,
+            "prefab-x",
+            script_spawn_test_prefab("prefab-x"),
+        );
+
+        let diagnostics = runtime.apply_script_gameplay_commands(vec![
+            spawn_prefab_command("cube-01", "prefab-x", None),
+            spawn_prefab_command("cube-01", "prefab-x", None),
+        ]);
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected spawn diagnostics: {diagnostics:?}"
+        );
+        runtime
+            .with_world(|world| {
+                assert_eq!(world.alive_count(), 6);
+                for id in ["prefab-x", "prefab-x.bolt", "prefab-x-2", "prefab-x-2.bolt"] {
+                    assert!(
+                        world.entity_by_persistent_id(id).is_some(),
+                        "missing spawned entity '{id}'"
+                    );
+                }
+                let root = world
+                    .entity_by_persistent_id("prefab-x")
+                    .expect("first spawn keeps the bare prefab id");
+                let root_transform = world
+                    .get::<engine_scene::components::Transform>(root)
+                    .expect("spawned root must keep its Transform");
+                assert_eq!(root_transform.translation.to_array(), [1.0, 2.0, 3.0]);
+                let child = world
+                    .entity_by_persistent_id("prefab-x.bolt")
+                    .expect("child id derives from the prefab-local id");
+                let child_transform = world
+                    .get::<engine_scene::components::Transform>(child)
+                    .expect("spawned child must keep its Transform");
+                assert_eq!(child_transform.parent, Some(root));
+            })
+            .expect("runtime must keep an active World");
+        let snapshots = runtime.script_gameplay_entity_snapshots();
+        for id in ["prefab-x", "prefab-x.bolt", "prefab-x-2", "prefab-x-2.bolt"] {
+            assert!(
+                snapshots.contains_key(id),
+                "next script context must include spawned entity '{id}'"
+            );
+        }
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn script_spawn_prefab_unknown_id_reports_actionable_diagnostic() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::from_scene(&engine_scene::sample_scene()));
+        register_script_prefab(
+            &mut runtime,
+            "prefab-x",
+            script_spawn_test_prefab("prefab-x"),
+        );
+
+        let diagnostics = runtime.apply_script_gameplay_commands(vec![spawn_prefab_command(
+            "cube-01",
+            "prefab-missing",
+            None,
+        )]);
+
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.code, "SCRIPT_PREFAB_UNKNOWN");
+        assert_eq!(diagnostic.entity.as_deref(), Some("cube-01"));
+        runtime
+            .with_world(|world| {
+                assert_eq!(world.alive_count(), 2);
+            })
+            .expect("runtime must keep an active World");
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn script_spawn_prefab_invalid_requests_never_partially_spawn() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::from_scene(&engine_scene::sample_scene()));
+        register_script_prefab(
+            &mut runtime,
+            "prefab-x",
+            script_spawn_test_prefab("prefab-x"),
+        );
+
+        let diagnostics = runtime.apply_script_gameplay_commands(vec![
+            spawn_prefab_command("cube-01", "../invalid", None),
+            spawn_prefab_command("cube-01", "prefab-x", Some([f32::NAN, 0.0, 0.0])),
+            spawn_prefab_command("missing-owner", "prefab-x", None),
+        ]);
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SCRIPT_PREFAB_ID_INVALID"));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SCRIPT_PREFAB_TRANSFORM_INVALID"));
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SCRIPT_COMMAND_OWNER_MISSING"));
+        runtime
+            .with_world(|world| {
+                assert_eq!(world.alive_count(), 2);
+                assert!(world.entity_by_persistent_id("prefab-x").is_none());
+            })
+            .expect("runtime must keep an active World");
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn script_spawn_prefab_translation_override_preserves_prefab_rotation_and_scale() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::from_scene(&engine_scene::sample_scene()));
+        register_script_prefab(
+            &mut runtime,
+            "prefab-x",
+            script_spawn_test_prefab("prefab-x"),
+        );
+
+        let diagnostics = runtime.apply_script_gameplay_commands(vec![spawn_prefab_command(
+            "cube-01",
+            "prefab-x",
+            Some([7.0, 8.0, 9.0]),
+        )]);
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected spawn diagnostics: {diagnostics:?}"
+        );
+        runtime
+            .with_world(|world| {
+                let root = world
+                    .entity_by_persistent_id("prefab-x")
+                    .expect("spawned root must exist");
+                let transform = world
+                    .get::<engine_scene::components::Transform>(root)
+                    .expect("spawned root must keep its Transform");
+                assert_eq!(transform.translation.to_array(), [7.0, 8.0, 9.0]);
+                assert_eq!(
+                    transform.rotation.to_array(),
+                    [
+                        0.0,
+                        0.0,
+                        std::f32::consts::FRAC_1_SQRT_2,
+                        std::f32::consts::FRAC_1_SQRT_2
+                    ],
+                    "the override must not reset the prefab rotation"
+                );
+                assert_eq!(
+                    transform.scale.to_array(),
+                    [2.0, 2.0, 2.0],
+                    "the override must not reset the prefab scale"
+                );
+                let child = world
+                    .entity_by_persistent_id("prefab-x.bolt")
+                    .expect("spawned child must exist");
+                let child_transform = world
+                    .get::<engine_scene::components::Transform>(child)
+                    .expect("spawned child must keep its Transform");
+                assert_eq!(
+                    child_transform.translation.to_array(),
+                    [0.0, 1.0, 0.0],
+                    "the override only applies to the root"
+                );
+            })
+            .expect("runtime must keep an active World");
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn script_spawn_prefab_attaches_scene_only_scripts_and_creates_instances() {
+        let _guard = serial_ffi_world_test();
+        use engine_script::MockHost;
+
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.register_script_host(Box::new(MockHost::new()));
+        runtime.set_script_host_name("mock");
+        runtime
+            .load_script_assembly("game", "mock", b"managed")
+            .expect("mock assembly should load");
+        runtime.set_world(World::from_scene(&engine_scene::sample_scene()));
+
+        let mut prefab = engine_scene::Prefab::new(AssetId::new("prefab-scripted"));
+        prefab.add_entity(engine_scene::EntityRecord {
+            persistent_id: "root".to_string(),
+            parent: None,
+            name: Some("Root".to_string()),
+            enabled: true,
+            components: std::collections::BTreeMap::from([
+                (
+                    "engine.transform".to_string(),
+                    script_spawn_test_transform_record([0.0; 3]),
+                ),
+                (
+                    "engine.script".to_string(),
+                    engine_scene::ComponentRecord {
+                        schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+                        enabled: true,
+                        fields: std::collections::BTreeMap::from([
+                            (
+                                "assembly_id".to_string(),
+                                engine_serialize::Value::Str("game".to_string()),
+                            ),
+                            (
+                                "class_name".to_string(),
+                                engine_serialize::Value::Str("Game.Spawned".to_string()),
+                            ),
+                        ]),
+                    },
+                ),
+            ]),
+        });
+        register_script_prefab(&mut runtime, "prefab-scripted", prefab);
+
+        assert_eq!(runtime.script_engine.managers()[0].instance_count(), 0);
+        let diagnostics = runtime.apply_script_gameplay_commands(vec![spawn_prefab_command(
+            "cube-01",
+            "prefab-scripted",
+            None,
+        )]);
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected spawn diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(
+            runtime.script_engine.managers()[0].instance_count(),
+            1,
+            "the scene-only engine.script record must attach to the spawned entity"
+        );
+
+        let diagnostics = runtime.apply_script_gameplay_commands(vec![spawn_prefab_command(
+            "cube-01",
+            "prefab-scripted",
+            None,
+        )]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected spawn diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(runtime.script_engine.managers()[0].instance_count(), 2);
+        runtime
+            .with_world(|world| {
+                assert!(world.entity_by_persistent_id("prefab-scripted").is_some());
+                assert!(world.entity_by_persistent_id("prefab-scripted-2").is_some());
             })
             .expect("runtime must keep an active World");
     }

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::component::Component;
 use crate::components::{Bounds, Camera, Light, Name, Renderable, Transform};
 use crate::prefab::{Prefab, MAX_PREFAB_NESTING_DEPTH};
+use crate::validation::SCENE_ONLY_COMPONENT_TYPES;
 use crate::{Entity, World};
 
 /// ECS component attached to every entity created from a prefab.
@@ -37,6 +38,13 @@ pub struct PrefabInstantiateResult {
     pub root_entity: Entity,
     /// Every entity created by this transaction, including nested prefabs.
     pub all_entities: Vec<Entity>,
+    /// Scene-only component records (for example `engine.script`) stripped
+    /// from ECS materialisation and returned for their dedicated subsystem.
+    ///
+    /// Each entry carries the created entity, the component type id, and the
+    /// full record including its `enabled` flag, mirroring how strict scene
+    /// loading keeps these records out of the ECS World.
+    pub scene_only_components: Vec<(Entity, String, crate::ComponentRecord)>,
 }
 
 /// A structured prefab validation or instantiation failure.
@@ -330,6 +338,12 @@ impl GraphValidator<'_> {
             }
 
             for (component_type_id, component) in &record.components {
+                // Scene-only component types (such as `engine.script`) are
+                // metadata for their dedicated subsystem, not ECS content;
+                // strict scene loading strips them the same way.
+                if SCENE_ONLY_COMPONENT_TYPES.contains(&component_type_id.as_str()) {
+                    continue;
+                }
                 let fields = merge_defaults(
                     &component.fields,
                     prefab.component_defaults.get(component_type_id),
@@ -532,6 +546,7 @@ impl Instantiator<'_> {
         let instance_id = generate_instance_id();
         let mut entity_map = BTreeMap::new();
         let mut local_entities = Vec::with_capacity(prefab.hierarchy.len());
+        let mut scene_only_components = Vec::new();
 
         for record in &prefab.hierarchy {
             let entity = world.create_entity();
@@ -565,6 +580,17 @@ impl Instantiator<'_> {
             }
 
             for (component_type_id, component) in &record.components {
+                // Scene-only component types (such as `engine.script`) are
+                // collected for their dedicated subsystem instead of being
+                // materialised into ECS storage, matching strict scene loads.
+                if SCENE_ONLY_COMPONENT_TYPES.contains(&component_type_id.as_str()) {
+                    scene_only_components.push((
+                        entity,
+                        component_type_id.clone(),
+                        component.clone(),
+                    ));
+                    continue;
+                }
                 if !component.enabled {
                     continue;
                 }
@@ -679,11 +705,13 @@ impl Instantiator<'_> {
                 })?;
             child_transform.parent = Some(parent);
             all_entities.extend(child_result.all_entities);
+            scene_only_components.extend(child_result.scene_only_components);
         }
 
         Ok(PrefabInstantiateResult {
             root_entity,
             all_entities,
+            scene_only_components,
         })
     }
 }
@@ -740,6 +768,50 @@ mod tests {
         let mut prefab = Prefab::new(AssetId::new(asset_id));
         prefab.add_entity(entity(id, None));
         prefab
+    }
+
+    #[test]
+    fn scene_only_components_are_collected_instead_of_materialised() {
+        let mut script_components = BTreeMap::new();
+        script_components.insert(Transform::TYPE_ID.to_string(), transform_record());
+        script_components.insert(
+            "engine.script".to_string(),
+            ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: BTreeMap::from([
+                    (
+                        "assembly_id".to_string(),
+                        engine_serialize::Value::Str("GameScripts".to_string()),
+                    ),
+                    (
+                        "class_name".to_string(),
+                        engine_serialize::Value::Str("Game.Enemy".to_string()),
+                    ),
+                ]),
+            },
+        );
+        let mut prefab = Prefab::new(AssetId::new("prefabs/scripted.prefab"));
+        prefab.add_entity(EntityRecord {
+            persistent_id: "enemy".to_string(),
+            parent: None,
+            name: Some("Enemy".to_string()),
+            enabled: true,
+            components: script_components,
+        });
+
+        let mut world = World::new();
+        let result = instantiate_prefab(&mut world, &prefab, None).unwrap();
+        assert_eq!(result.all_entities.len(), 1);
+        assert_eq!(result.scene_only_components.len(), 1);
+        let (entity, type_id, record) = &result.scene_only_components[0];
+        assert_eq!(*entity, result.root_entity);
+        assert_eq!(type_id, "engine.script");
+        assert!(record.enabled);
+        // The script metadata never entered ECS storage, and its presence did
+        // not fail the strict constructibility validation.
+        assert!(world.get_any(result.root_entity, "engine.script").is_none());
+        assert!(world.get::<Transform>(result.root_entity).is_some());
     }
 
     #[test]

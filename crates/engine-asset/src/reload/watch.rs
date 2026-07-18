@@ -104,10 +104,10 @@ impl WatchCoordinator {
         let mut ready_paths = self
             .buffer
             .iter()
-            .filter_map(|(path, (last_observed, _))| {
-                (now.saturating_duration_since(*last_observed) >= self.debounce)
-                    .then(|| path.clone())
+            .filter(|(_, (last_observed, _))| {
+                now.saturating_duration_since(*last_observed) >= self.debounce
             })
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         ready_paths.sort();
         ready_paths

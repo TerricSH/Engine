@@ -30,7 +30,10 @@ pub use prefab::{
     validate_prefab_structure, Prefab, PrefabChildRef, PrefabValidationError, PREFAB_CONTRACT,
     PREFAB_SCHEMA_VERSION,
 };
-pub use prefab_instance::{PrefabInstanceRef, PrefabInstantiateResult, PrefabLoad, PrefabRegistry};
+pub use prefab_instance::{
+    instantiate_prefab, instantiate_prefab_from_asset, PrefabInstanceRef, PrefabInstantiateError,
+    PrefabInstantiateResult, PrefabLoad, PrefabRegistry,
+};
 pub use registry::{
     AssetTypeExtension, AssetTypeMeta, AssetTypeRegistry, ComponentExtension, ComponentMeta,
     ComponentRegistry,

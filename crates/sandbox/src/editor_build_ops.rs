@@ -1180,13 +1180,12 @@ fn terminate_child_tree(child: &mut Child) -> Result<(), String> {
     let status = command
         .status()
         .map_err(|error| format!("could not start taskkill for build cancellation: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else if child
-        .try_wait()
-        .map_err(|error| format!("could not query build process after taskkill: {error}"))?
-        .is_some()
-    {
+    let terminated = status.success()
+        || child
+            .try_wait()
+            .map_err(|error| format!("could not query build process after taskkill: {error}"))?
+            .is_some();
+    if terminated {
         Ok(())
     } else {
         Err(format!(

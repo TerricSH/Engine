@@ -33,6 +33,10 @@ pub enum PersistentEntityCreateError {
     EmptyId,
     #[error("persistent entity id '{0}' already exists")]
     DuplicateId(String),
+    #[error("entity handle is stale")]
+    StaleEntity,
+    #[error("entity already has persistent id '{0}'")]
+    AlreadyPersistent(String),
 }
 
 /// The ECS World — owns all entities and component storages.
@@ -177,6 +181,44 @@ impl World {
         self.entity_to_persistent[index] = Some(persistent_id.clone());
         self.persistent_to_entity.insert(persistent_id, entity);
         Ok(entity)
+    }
+
+    /// Assign a persistent scene ID to an already-live entity.
+    ///
+    /// This is the post-hoc counterpart of [`Self::create_persistent_entity`]
+    /// for instantiation paths that allocate ECS entities before their
+    /// script-visible IDs are known (for example prefab instantiation). Empty
+    /// and duplicate IDs are rejected before any mapping changes, and a stale
+    /// or already-identified entity is rejected as well.
+    pub fn assign_persistent_id(
+        &mut self,
+        entity: Entity,
+        persistent_id: impl Into<String>,
+    ) -> Result<(), PersistentEntityCreateError> {
+        let persistent_id = persistent_id.into();
+        if persistent_id.is_empty() {
+            return Err(PersistentEntityCreateError::EmptyId);
+        }
+        if self.persistent_to_entity.contains_key(&persistent_id) {
+            return Err(PersistentEntityCreateError::DuplicateId(persistent_id));
+        }
+        if !self.entities.is_alive(entity) {
+            return Err(PersistentEntityCreateError::StaleEntity);
+        }
+        let index = entity.index() as usize;
+        if index < self.entity_to_persistent.len() && self.entity_to_persistent[index].is_some() {
+            return Err(PersistentEntityCreateError::AlreadyPersistent(
+                self.entity_to_persistent[index]
+                    .clone()
+                    .expect("checked to be Some"),
+            ));
+        }
+        if self.entity_to_persistent.len() <= index {
+            self.entity_to_persistent.resize(index + 1, None);
+        }
+        self.entity_to_persistent[index] = Some(persistent_id.clone());
+        self.persistent_to_entity.insert(persistent_id, entity);
+        Ok(())
     }
 
     /// Destroy an entity and all of its components.
@@ -908,6 +950,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("new-id".into(), recycled)]
         );
+    }
+
+    #[test]
+    fn assign_persistent_id_binds_live_entities_and_rejects_conflicts() {
+        let mut world = World::new();
+        let entity = world.create_entity();
+        let other = world.create_entity();
+
+        assert_eq!(
+            world.assign_persistent_id(entity, ""),
+            Err(PersistentEntityCreateError::EmptyId)
+        );
+        assert!(world.persistent_id(entity).is_none());
+
+        world
+            .assign_persistent_id(entity, "spawned-01")
+            .expect("first assignment succeeds");
+        assert_eq!(world.persistent_id(entity), Some("spawned-01"));
+        assert_eq!(world.entity_by_persistent_id("spawned-01"), Some(entity));
+
+        assert_eq!(
+            world.assign_persistent_id(other, "spawned-01"),
+            Err(PersistentEntityCreateError::DuplicateId(
+                "spawned-01".into()
+            ))
+        );
+        assert_eq!(
+            world.assign_persistent_id(entity, "spawned-02"),
+            Err(PersistentEntityCreateError::AlreadyPersistent(
+                "spawned-01".into()
+            ))
+        );
+        assert!(world.persistent_id(other).is_none());
+
+        assert!(world.destroy_entity(other));
+        assert_eq!(
+            world.assign_persistent_id(other, "stale"),
+            Err(PersistentEntityCreateError::StaleEntity)
+        );
+        assert!(world.entity_by_persistent_id("stale").is_none());
+
+        // Destroying the entity releases its ID for a recycled handle.
+        assert!(world.destroy_entity(entity));
+        let recycled = world.create_entity();
+        world
+            .assign_persistent_id(recycled, "spawned-01")
+            .expect("destroyed entity releases its persistent id");
+        assert_eq!(world.entity_by_persistent_id("spawned-01"), Some(recycled));
     }
 
     #[test]

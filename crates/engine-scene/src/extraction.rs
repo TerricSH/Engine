@@ -879,10 +879,11 @@ fn authored_camera_viewport(camera: &components::Camera) -> Rect {
     };
     // Invalid authored values are diagnosed before projection. Use a stable
     // fallback here so validation errors do not also manufacture NaN matrices.
-    viewport
-        .is_valid_normalized()
-        .then_some(viewport)
-        .unwrap_or(Rect::FULL)
+    if viewport.is_valid_normalized() {
+        viewport
+    } else {
+        Rect::FULL
+    }
 }
 
 fn effective_camera_viewport(camera: &components::Camera, context: RenderViewportContext) -> Rect {

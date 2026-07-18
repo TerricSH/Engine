@@ -125,8 +125,8 @@ remain data-only.
 
 ## Current gaps
 
-The current boundary does not yet expose arbitrary component access, general
-prefab instantiation, full physics queries/movement, or every audio, animation,
+The current boundary does not yet expose arbitrary component access, full
+physics queries/movement, or every audio, animation,
 and navigation operation. A game needing one of these should add a generic
 engine capability and Script API binding; it should not put game-specific code
 into the Rust implementation.

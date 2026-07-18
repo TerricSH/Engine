@@ -328,9 +328,7 @@ fn update_slider_value(
     element_id: ElementId,
     pointer_x: f32,
 ) -> Option<(ElementId, f32)> {
-    let Some(element) = canvas.get_element_mut(element_id) else {
-        return None;
-    };
+    let element = canvas.get_element_mut(element_id)?;
     let UiElementKind::Slider {
         value, min, max, ..
     } = &mut element.kind

@@ -53,9 +53,9 @@ pub use lifecycle::{ON_CREATE, ON_DESTROY, ON_START, ON_UPDATE};
 pub use component::{ScriptComponent, ScriptInstanceState, ScriptManager};
 pub use engine::ScriptEngine;
 pub use gameplay::{
-    validate_entity_id, validate_scene_id, validate_script_transform, GameplayCommand,
-    GameplayContext, GameplayEntitySnapshot, GameplayInputTransitions, GameplayInputValue,
-    GameplayPhysicsEvent, GameplayPhysicsEventKind, GameplayPhysicsQuery,
+    validate_entity_id, validate_prefab_id, validate_scene_id, validate_script_transform,
+    GameplayCommand, GameplayContext, GameplayEntitySnapshot, GameplayInputTransitions,
+    GameplayInputValue, GameplayPhysicsEvent, GameplayPhysicsEventKind, GameplayPhysicsQuery,
     GameplayPhysicsQueryResult, GameplayUiColor, GameplayUiCommand, GameplayUiElement,
     GameplayUiEvent, GameplayUiLayout, GameplayUiScaleMode, GameplayUiValue, OwnedGameplayCommand,
     OwnedGameplayPhysicsQuery, ScriptTransform, MAX_PENDING_PHYSICS_QUERIES,

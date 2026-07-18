@@ -1847,6 +1847,7 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
     let mut asset_ids = BTreeSet::new();
     let mut portable_asset_ids = BTreeSet::new();
     let mut declared_asset_types = BTreeMap::new();
+    let mut prefab_sources: Vec<(String, String)> = Vec::new();
     let mut declared_asset_count = 0usize;
     for manifest_path in &manifest_paths {
         let content = std::fs::read_to_string(manifest_path)
@@ -1878,6 +1879,9 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
                         manifest_path.display()
                     )
                 })?;
+            if asset.asset_type == AssetType::Prefab {
+                prefab_sources.push((asset.id.id.clone(), asset.source_path.clone()));
+            }
             declared_asset_types.insert(asset.id.id, asset.asset_type);
             declared_asset_count += 1;
         }
@@ -1887,6 +1891,13 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
         validate_existing_cooked_assets(&project, &declared_asset_types, &mut strict_runtime)?;
 
     let builtins = BTreeSet::from(["mesh-cube".to_string(), "mat-default".to_string()]);
+    let prefab_count = validate_project_prefabs(
+        &project,
+        &prefab_sources,
+        &asset_ids,
+        &declared_asset_types,
+        &builtins,
+    )?;
     let mut all_scene_dependencies = BTreeSet::new();
     for (scene_id, _, scene) in &loaded_scenes {
         let scene_dependencies = scene
@@ -1921,6 +1932,7 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
         "entities": total_entities,
         "source_manifests": manifest_paths.len(),
         "declared_assets": declared_asset_count,
+        "prefabs": prefab_count,
         "cooked_assets": cooked_report.discovered_assets,
         "loaded_render_assets": cooked_report.loaded_render_assets(),
         "loaded_extension_assets": cooked_report.loaded_extension_assets,
@@ -1935,6 +1947,121 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
     .expect("JSON value serialization cannot fail");
     emit_report(&report, report_path)?;
     Ok(())
+}
+
+/// Validate every prefab declared in the project's source manifests.
+///
+/// Each `.prefab.ron` source must parse and pass structural validation, every
+/// `Value::Asset` referenced from component fields (including component
+/// default overrides) must be a declared asset or an engine builtin, every
+/// nested child prefab reference must point at another declared `Prefab`
+/// asset, and the full nested graph must be free of missing children and
+/// cycles. Returns the number of validated prefabs for the check report.
+fn validate_project_prefabs(
+    project: &GameProject,
+    prefab_sources: &[(String, String)],
+    asset_ids: &BTreeSet<String>,
+    declared_asset_types: &BTreeMap<String, AssetType>,
+    builtins: &BTreeSet<String>,
+) -> Result<usize, String> {
+    let mut parsed = Vec::with_capacity(prefab_sources.len());
+    for (id, source_path) in prefab_sources {
+        let path = project.asset_source.join(source_path);
+        let bytes = std::fs::read(&path).map_err(|error| {
+            format!(
+                "could not read prefab source '{}' declared as '{id}': {error}",
+                path.display()
+            )
+        })?;
+        let prefab = engine_scene::parse_prefab_source(&bytes)
+            .map_err(|error| format!("prefab '{id}' source is invalid: {error}"))?;
+        parsed.push((id.clone(), prefab));
+    }
+
+    let mut registry = engine_scene::PrefabRegistry::new();
+    for (id, prefab) in &parsed {
+        let mut dependencies = BTreeSet::new();
+        for entity in &prefab.hierarchy {
+            for component in entity.components.values() {
+                for value in component.fields.values() {
+                    collect_prefab_value_asset_dependencies(value, &mut dependencies);
+                }
+            }
+        }
+        for defaults in prefab.component_defaults.values() {
+            for value in defaults.values() {
+                collect_prefab_value_asset_dependencies(value, &mut dependencies);
+            }
+        }
+        let missing = dependencies
+            .iter()
+            .filter(|dependency| {
+                !asset_ids.contains(&dependency.id) && !builtins.contains(&dependency.id)
+            })
+            .map(|dependency| dependency.id.clone())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "prefab '{id}' references undeclared assets: {}",
+                missing.join(", ")
+            ));
+        }
+
+        for child_ref in &prefab.child_prefab_refs {
+            let child_id = &child_ref.prefab_asset.id;
+            match declared_asset_types.get(child_id) {
+                Some(AssetType::Prefab) => {}
+                Some(other) => {
+                    return Err(format!(
+                        "prefab '{id}' references nested prefab '{child_id}', but that asset is declared as {other:?}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "prefab '{id}' references undeclared nested prefab '{child_id}'"
+                    ));
+                }
+            }
+        }
+        registry.register(id.clone(), prefab.clone());
+    }
+
+    for (id, prefab) in &parsed {
+        engine_scene::validate_prefab(prefab, &registry).map_err(|errors| {
+            let messages = errors
+                .iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("prefab '{id}' failed graph validation: {messages}")
+        })?;
+    }
+    Ok(parsed.len())
+}
+
+/// Recursive companion to `Scene::collect_asset_dependencies` for prefab
+/// component fields: collects every `Value::Asset`, including assets nested
+/// in `Value::List` and `Value::Map`.
+fn collect_prefab_value_asset_dependencies(
+    value: &engine_serialize::Value,
+    dependencies: &mut BTreeSet<AssetId>,
+) {
+    match value {
+        engine_serialize::Value::Asset(asset) => {
+            dependencies.insert(asset.clone());
+        }
+        engine_serialize::Value::List(values) => {
+            for value in values {
+                collect_prefab_value_asset_dependencies(value, dependencies);
+            }
+        }
+        engine_serialize::Value::Map(values) => {
+            for value in values.values() {
+                collect_prefab_value_asset_dependencies(value, dependencies);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn validate_project_asset_type(
@@ -3406,5 +3533,233 @@ mod tests {
         assert!(runtime
             .extension_asset::<NavMesh>("navmesh", &AssetId::new("navmesh.level"))
             .is_some());
+    }
+
+    fn check_test_prefab_source(
+        asset_id: &str,
+        mesh_id: &str,
+        child_prefab: Option<&str>,
+    ) -> String {
+        let mut transform_fields = BTreeMap::new();
+        transform_fields.insert(
+            "translation".to_string(),
+            engine_serialize::Value::Vec3([0.0, 0.0, 0.0]),
+        );
+        transform_fields.insert(
+            "rotation".to_string(),
+            engine_serialize::Value::Quat([0.0, 0.0, 0.0, 1.0]),
+        );
+        transform_fields.insert(
+            "scale".to_string(),
+            engine_serialize::Value::Vec3([1.0, 1.0, 1.0]),
+        );
+        let mut renderable_fields = BTreeMap::new();
+        renderable_fields.insert(
+            "mesh".to_string(),
+            engine_serialize::Value::Asset(AssetId::new(mesh_id)),
+        );
+        renderable_fields.insert(
+            "material".to_string(),
+            engine_serialize::Value::Asset(AssetId::new("mat-default")),
+        );
+        let mut components = BTreeMap::new();
+        components.insert(
+            "engine.transform".to_string(),
+            engine_scene::ComponentRecord {
+                schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: transform_fields,
+            },
+        );
+        components.insert(
+            "engine.renderable".to_string(),
+            engine_scene::ComponentRecord {
+                schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: renderable_fields,
+            },
+        );
+        let mut prefab = engine_scene::Prefab::new(AssetId::new(asset_id));
+        prefab.add_entity(engine_scene::EntityRecord {
+            persistent_id: "root".to_string(),
+            parent: None,
+            name: Some("Root".to_string()),
+            enabled: true,
+            components,
+        });
+        if let Some(child) = child_prefab {
+            prefab
+                .child_prefab_refs
+                .push(engine_scene::prefab::PrefabChildRef {
+                    entity_persistent_id: "root".to_string(),
+                    prefab_asset: AssetId::new(child),
+                });
+        }
+        engine_scene::serialize_prefab_source(&prefab).unwrap()
+    }
+
+    fn write_check_test_manifest(root: &Path, entries: Vec<SourceAssetEntry>) {
+        let manifest = SourceManifest {
+            schema_version: CURRENT_MANIFEST_VERSION,
+            assets: entries,
+        };
+        let mut manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
+        manifest_json.push('\n');
+        std::fs::write(root.join("assets/source/game.manifest"), manifest_json).unwrap();
+    }
+
+    fn check_test_entry(id: &str, asset_type: AssetType, source_path: &str) -> SourceAssetEntry {
+        SourceAssetEntry {
+            id: AssetId::new(id),
+            asset_type,
+            source_path: source_path.into(),
+            cook_rules: CookRules::default(),
+        }
+    }
+
+    #[test]
+    fn check_project_validates_prefab_sources_and_reports_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("prefab-project");
+        create_project(&root, Some("Prefab Project"), false).unwrap();
+        let prefab_dir = root.join("assets/source/Prefabs");
+        std::fs::create_dir_all(&prefab_dir).unwrap();
+        std::fs::write(
+            prefab_dir.join("enemy.prefab.ron"),
+            check_test_prefab_source("prefab-enemy", "mesh-cube", None),
+        )
+        .unwrap();
+        write_check_test_manifest(
+            &root,
+            vec![check_test_entry(
+                "prefab-enemy",
+                AssetType::Prefab,
+                "Prefabs/enemy.prefab.ron",
+            )],
+        );
+
+        let report_path = root.join("build/check.json");
+        check_project(&root, Some(&report_path)).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["prefabs"], 1);
+    }
+
+    #[test]
+    fn check_project_rejects_prefab_with_undeclared_asset_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("prefab-missing-dep");
+        create_project(&root, Some("Prefab Missing Dependency"), false).unwrap();
+        let prefab_dir = root.join("assets/source/Prefabs");
+        std::fs::create_dir_all(&prefab_dir).unwrap();
+        std::fs::write(
+            prefab_dir.join("enemy.prefab.ron"),
+            check_test_prefab_source("prefab-enemy", "mesh-missing", None),
+        )
+        .unwrap();
+        write_check_test_manifest(
+            &root,
+            vec![check_test_entry(
+                "prefab-enemy",
+                AssetType::Prefab,
+                "Prefabs/enemy.prefab.ron",
+            )],
+        );
+
+        let error = check_project(&root, None).unwrap_err();
+        assert!(
+            error.contains("prefab 'prefab-enemy' references undeclared assets: mesh-missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn check_project_rejects_undeclared_and_non_prefab_nested_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("prefab-nested");
+        create_project(&root, Some("Prefab Nested"), false).unwrap();
+        let prefab_dir = root.join("assets/source/Prefabs");
+        std::fs::create_dir_all(&prefab_dir).unwrap();
+        std::fs::write(
+            prefab_dir.join("parent.prefab.ron"),
+            check_test_prefab_source("prefab-parent", "mesh-cube", Some("prefab-child")),
+        )
+        .unwrap();
+        std::fs::write(
+            prefab_dir.join("child.prefab.ron"),
+            check_test_prefab_source("prefab-child", "mesh-cube", None),
+        )
+        .unwrap();
+
+        write_check_test_manifest(
+            &root,
+            vec![check_test_entry(
+                "prefab-parent",
+                AssetType::Prefab,
+                "Prefabs/parent.prefab.ron",
+            )],
+        );
+        let error = check_project(&root, None).unwrap_err();
+        assert!(
+            error.contains(
+                "prefab 'prefab-parent' references undeclared nested prefab 'prefab-child'"
+            ),
+            "{error}"
+        );
+
+        // Declaring the child with the wrong asset type is also rejected: the
+        // runtime resolves nested references against cooked prefabs only.
+        std::fs::write(
+            root.join("assets/source/checker.ppm"),
+            b"P3\n1 1\n255\n0 0 0\n",
+        )
+        .unwrap();
+        write_check_test_manifest(
+            &root,
+            vec![
+                check_test_entry(
+                    "prefab-parent",
+                    AssetType::Prefab,
+                    "Prefabs/parent.prefab.ron",
+                ),
+                check_test_entry("prefab-child", AssetType::Texture, "checker.ppm"),
+            ],
+        );
+        let error = check_project(&root, None).unwrap_err();
+        assert!(
+            error.contains("but that asset is declared as Texture"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn check_project_rejects_nested_prefab_cycles() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("prefab-cycle");
+        create_project(&root, Some("Prefab Cycle"), false).unwrap();
+        let prefab_dir = root.join("assets/source/Prefabs");
+        std::fs::create_dir_all(&prefab_dir).unwrap();
+        std::fs::write(
+            prefab_dir.join("a.prefab.ron"),
+            check_test_prefab_source("prefab-a", "mesh-cube", Some("prefab-b")),
+        )
+        .unwrap();
+        std::fs::write(
+            prefab_dir.join("b.prefab.ron"),
+            check_test_prefab_source("prefab-b", "mesh-cube", Some("prefab-a")),
+        )
+        .unwrap();
+        write_check_test_manifest(
+            &root,
+            vec![
+                check_test_entry("prefab-a", AssetType::Prefab, "Prefabs/a.prefab.ron"),
+                check_test_entry("prefab-b", AssetType::Prefab, "Prefabs/b.prefab.ron"),
+            ],
+        );
+
+        let error = check_project(&root, None).unwrap_err();
+        assert!(error.contains("failed graph validation"), "{error}");
     }
 }
