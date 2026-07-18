@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use engine_serialize::Value;
 
 use crate::components::{BodyType, Collider, ColliderShape, PhysicsMaterial, RigidBody};
+use crate::gravity::{GravityFalloff, GravityMode, GravitySource};
 
 // ══════════════════════════════════════════════════════════════════════════════
 // RigidBody
@@ -225,6 +226,78 @@ pub(super) fn deserialize_physics_material(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// GravitySource
+// ══════════════════════════════════════════════════════════════════════════════
+
+pub(super) fn serialize_gravity_source(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
+    let source = component
+        .downcast_ref::<GravitySource>()
+        .expect("GravitySource expected");
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "mode".into(),
+        Value::Enum(match source.mode {
+            GravityMode::Directional => "Directional".into(),
+            GravityMode::Point => "Point".into(),
+        }),
+    );
+    fields.insert("enabled".into(), Value::Bool(source.enabled));
+    fields.insert("strength".into(), Value::Float32(source.strength));
+    fields.insert("direction".into(), Value::Vec3(source.direction.to_array()));
+    fields.insert("center".into(), Value::Vec3(source.center.to_array()));
+    fields.insert(
+        "falloff".into(),
+        Value::Enum(match source.falloff {
+            GravityFalloff::None => "None".into(),
+            GravityFalloff::Linear => "Linear".into(),
+            GravityFalloff::InverseSquare => "InverseSquare".into(),
+        }),
+    );
+    if let Some(radius) = source.max_radius {
+        fields.insert("max_radius".into(), Value::Float32(radius));
+    }
+    fields
+}
+
+pub(super) fn deserialize_gravity_source(
+    fields: &BTreeMap<String, Value>,
+) -> Box<dyn std::any::Any> {
+    let defaults = GravitySource::default();
+    let mode = match fields.get("mode") {
+        Some(Value::Enum(mode)) if mode == "Point" => GravityMode::Point,
+        _ => GravityMode::Directional,
+    };
+    let enabled = bool_field(fields, "enabled").unwrap_or(true);
+    // Every stored value must stay finite: non-finite scene data falls back
+    // to the component defaults so resolution never sees NaN/inf.
+    let strength = float_field(fields, "strength")
+        .filter(|value| value.is_finite())
+        .unwrap_or(defaults.strength);
+    let direction = vec3_field(fields, "direction")
+        .filter(|value| value.is_finite())
+        .unwrap_or(defaults.direction);
+    let center = vec3_field(fields, "center")
+        .filter(|value| value.is_finite())
+        .unwrap_or(defaults.center);
+    let falloff = match fields.get("falloff") {
+        Some(Value::Enum(falloff)) if falloff == "Linear" => GravityFalloff::Linear,
+        Some(Value::Enum(falloff)) if falloff == "InverseSquare" => GravityFalloff::InverseSquare,
+        _ => GravityFalloff::None,
+    };
+    let max_radius =
+        float_field(fields, "max_radius").filter(|value| value.is_finite() && *value > 0.0);
+    Box::new(GravitySource {
+        mode,
+        enabled,
+        strength,
+        direction,
+        center,
+        falloff,
+        max_radius,
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // ColliderShape default (for deserialization fallback)
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -246,6 +319,13 @@ fn float_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<f32> {
     match fields.get(key)? {
         Value::Float32(v) => Some(*v),
         Value::Float64(v) => Some(*v as f32),
+        _ => None,
+    }
+}
+
+fn vec3_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<glam::Vec3> {
+    match fields.get(key)? {
+        Value::Vec3(values) => Some(glam::Vec3::from_array(*values)),
         _ => None,
     }
 }

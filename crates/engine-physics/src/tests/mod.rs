@@ -1660,3 +1660,872 @@ fn from_rapier_vec_converts_nalgebra_to_glam() {
     assert_eq!(glam_v.y, 5.0);
     assert_eq!(glam_v.z, 6.0);
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Gravity Source Component Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+use crate::{
+    resolve_effective_gravity, sum_source_gravity, GravityFalloff, GravityMode, GravitySource,
+};
+
+fn approx_vec3(actual: glam::Vec3, expected: glam::Vec3, label: &str) {
+    assert!(
+        (actual - expected).length() < 1e-5,
+        "{label}: expected {expected:?}, got {actual:?}"
+    );
+}
+
+#[test]
+fn gravity_source_default_values() {
+    let source = GravitySource::default();
+    assert_eq!(source.mode, GravityMode::Directional);
+    assert!(source.enabled);
+    assert_eq!(source.strength, 9.81);
+    assert_eq!(source.direction, glam::Vec3::new(0.0, -1.0, 0.0));
+    assert_eq!(source.center, glam::Vec3::ZERO);
+    assert_eq!(source.falloff, GravityFalloff::None);
+    assert_eq!(source.max_radius, None);
+}
+
+#[test]
+fn gravity_source_type_id() {
+    assert_eq!(GravitySource::TYPE_ID, "engine.gravity_source");
+    assert_ne!(GravitySource::TYPE_ID, RigidBody::TYPE_ID);
+    assert_ne!(GravitySource::TYPE_ID, Collider::TYPE_ID);
+}
+
+#[test]
+fn gravity_source_constructors() {
+    let directional = GravitySource::directional(glam::Vec3::new(2.0, 0.0, 0.0), 3.5);
+    assert_eq!(directional.mode, GravityMode::Directional);
+    assert_eq!(directional.direction, glam::Vec3::new(2.0, 0.0, 0.0));
+    assert_eq!(directional.strength, 3.5);
+
+    let point = GravitySource::point(glam::Vec3::new(1.0, 2.0, 3.0), 12.0)
+        .with_falloff(GravityFalloff::InverseSquare)
+        .with_max_radius(50.0);
+    assert_eq!(point.mode, GravityMode::Point);
+    assert_eq!(point.center, glam::Vec3::new(1.0, 2.0, 3.0));
+    assert_eq!(point.falloff, GravityFalloff::InverseSquare);
+    assert_eq!(point.max_radius, Some(50.0));
+}
+
+#[test]
+fn gravity_source_contribution_directional_normalizes() {
+    let source = GravitySource::directional(glam::Vec3::new(0.0, 3.0, 0.0), 6.0);
+    let contribution = source
+        .contribution(glam::Vec3::new(100.0, -50.0, 25.0))
+        .expect("directional source reaches every position");
+    approx_vec3(
+        contribution,
+        glam::Vec3::new(0.0, 6.0, 0.0),
+        "directional contribution is normalised direction times strength",
+    );
+}
+
+#[test]
+fn gravity_source_contribution_directional_rejects_zero_direction() {
+    let source = GravitySource::directional(glam::Vec3::ZERO, 9.81);
+    assert_eq!(source.contribution(glam::Vec3::ZERO), None);
+}
+
+#[test]
+fn gravity_source_contribution_disabled_source() {
+    let mut source = GravitySource::directional(glam::Vec3::new(0.0, -1.0, 0.0), 9.81);
+    source.enabled = false;
+    assert_eq!(source.contribution(glam::Vec3::ZERO), None);
+}
+
+#[test]
+fn gravity_source_contribution_point_no_falloff() {
+    let source = GravitySource::point(glam::Vec3::ZERO, 9.81);
+    let contribution = source
+        .contribution(glam::Vec3::new(10.0, 0.0, 0.0))
+        .expect("body is inside the field");
+    approx_vec3(
+        contribution,
+        glam::Vec3::new(-9.81, 0.0, 0.0),
+        "point source pulls towards the centre at full strength",
+    );
+}
+
+#[test]
+fn gravity_source_contribution_point_linear_falloff() {
+    let source = GravitySource::point(glam::Vec3::ZERO, 10.0)
+        .with_falloff(GravityFalloff::Linear)
+        .with_max_radius(20.0);
+    let contribution = source
+        .contribution(glam::Vec3::new(10.0, 0.0, 0.0))
+        .expect("body is inside max_radius");
+    approx_vec3(
+        contribution,
+        glam::Vec3::new(-5.0, 0.0, 0.0),
+        "linear falloff halves the strength at half the radius",
+    );
+
+    // At exactly max_radius the ramp reaches zero, but the body is still in
+    // range, so the fallback stays suppressed.
+    let edge = source.contribution(glam::Vec3::new(20.0, 0.0, 0.0));
+    assert_eq!(edge, Some(glam::Vec3::ZERO));
+}
+
+#[test]
+fn gravity_source_contribution_point_linear_without_radius_is_constant() {
+    let source = GravitySource::point(glam::Vec3::ZERO, 10.0).with_falloff(GravityFalloff::Linear);
+    let contribution = source
+        .contribution(glam::Vec3::new(123.0, 0.0, 0.0))
+        .expect("no range limit");
+    approx_vec3(
+        contribution,
+        glam::Vec3::new(-10.0, 0.0, 0.0),
+        "linear falloff without max_radius behaves like no falloff",
+    );
+}
+
+#[test]
+fn gravity_source_contribution_point_inverse_square() {
+    let source =
+        GravitySource::point(glam::Vec3::ZERO, 20.0).with_falloff(GravityFalloff::InverseSquare);
+    // At 2 m: strength / d^2 = 20 / 4 = 5 towards the centre.
+    let contribution = source
+        .contribution(glam::Vec3::new(0.0, 2.0, 0.0))
+        .expect("body is inside the field");
+    approx_vec3(
+        contribution,
+        glam::Vec3::new(0.0, -5.0, 0.0),
+        "inverse-square falloff quarters strength at double distance",
+    );
+    // At 1 m the acceleration equals strength exactly.
+    let at_one_metre = source
+        .contribution(glam::Vec3::new(1.0, 0.0, 0.0))
+        .expect("body is inside the field");
+    approx_vec3(
+        at_one_metre,
+        glam::Vec3::new(-20.0, 0.0, 0.0),
+        "inverse-square strength is the acceleration at one metre",
+    );
+}
+
+#[test]
+fn gravity_source_contribution_point_outside_max_radius() {
+    let source = GravitySource::point(glam::Vec3::ZERO, 9.81).with_max_radius(5.0);
+    assert_eq!(source.contribution(glam::Vec3::new(5.1, 0.0, 0.0)), None);
+    assert!(source
+        .contribution(glam::Vec3::new(4.9, 0.0, 0.0))
+        .is_some());
+}
+
+#[test]
+fn gravity_source_contribution_point_at_centre_is_zero() {
+    let source = GravitySource::point(glam::Vec3::new(1.0, 2.0, 3.0), 9.81);
+    assert_eq!(
+        source.contribution(glam::Vec3::new(1.0, 2.0, 3.0)),
+        Some(glam::Vec3::ZERO),
+        "a body at the exact centre floats instead of falling back to global gravity"
+    );
+}
+
+#[test]
+fn gravity_source_contribution_negative_strength_repels() {
+    let source = GravitySource::point(glam::Vec3::ZERO, -4.0);
+    let contribution = source
+        .contribution(glam::Vec3::new(2.0, 0.0, 0.0))
+        .expect("body is inside the field");
+    approx_vec3(
+        contribution,
+        glam::Vec3::new(4.0, 0.0, 0.0),
+        "negative strength pushes bodies away from the centre",
+    );
+}
+
+#[test]
+fn gravity_source_contribution_rejects_non_finite_configuration() {
+    let mut source = GravitySource::directional(glam::Vec3::new(0.0, -1.0, 0.0), f32::NAN);
+    assert_eq!(source.contribution(glam::Vec3::ZERO), None);
+
+    source = GravitySource::directional(glam::Vec3::new(f32::INFINITY, 0.0, 0.0), 1.0);
+    assert_eq!(source.contribution(glam::Vec3::ZERO), None);
+
+    let mut point = GravitySource::point(glam::Vec3::ZERO, 9.81);
+    point.center = glam::Vec3::new(f32::NAN, 0.0, 0.0);
+    assert_eq!(point.contribution(glam::Vec3::ZERO), None);
+
+    // Non-positive or non-finite max_radius values are treated as unlimited.
+    point = GravitySource::point(glam::Vec3::ZERO, 9.81).with_max_radius(-3.0);
+    assert!(point
+        .contribution(glam::Vec3::new(100.0, 0.0, 0.0))
+        .is_some());
+    point.max_radius = Some(f32::NAN);
+    assert!(point
+        .contribution(glam::Vec3::new(100.0, 0.0, 0.0))
+        .is_some());
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Gravity Resolution (Combination Semantics) Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn resolve_effective_gravity_falls_back_without_sources() {
+    let global = glam::Vec3::new(0.0, -9.81, 0.0);
+    let sources: Vec<GravitySource> = Vec::new();
+    assert_eq!(
+        resolve_effective_gravity(sources.iter(), glam::Vec3::ZERO, global),
+        global
+    );
+    assert_eq!(sum_source_gravity(sources.iter(), glam::Vec3::ZERO), None);
+}
+
+#[test]
+fn resolve_effective_gravity_falls_back_when_all_sources_out_of_range() {
+    let global = glam::Vec3::new(0.0, -9.81, 0.0);
+    let sources =
+        [GravitySource::point(glam::Vec3::new(1000.0, 0.0, 0.0), 50.0).with_max_radius(10.0)];
+    assert_eq!(
+        resolve_effective_gravity(sources.iter(), glam::Vec3::ZERO, global),
+        global
+    );
+}
+
+#[test]
+fn resolve_effective_gravity_sums_contributing_sources() {
+    let global = glam::Vec3::new(0.0, -9.81, 0.0);
+    let sources = [
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 2.0),
+        GravitySource::directional(glam::Vec3::new(0.0, 1.0, 0.0), 3.0),
+    ];
+    approx_vec3(
+        resolve_effective_gravity(sources.iter(), glam::Vec3::ZERO, global),
+        glam::Vec3::new(2.0, 3.0, 0.0),
+        "contributions from all in-range sources are summed",
+    );
+}
+
+#[test]
+fn resolve_effective_gravity_cancelling_sources_do_not_fall_back() {
+    let global = glam::Vec3::new(0.0, -9.81, 0.0);
+    let sources = [
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 5.0),
+        GravitySource::directional(glam::Vec3::new(-1.0, 0.0, 0.0), 5.0),
+    ];
+    assert_eq!(
+        resolve_effective_gravity(sources.iter(), glam::Vec3::ZERO, global),
+        glam::Vec3::ZERO,
+        "a zero-sum field is a real field: the global fallback stays suppressed"
+    );
+}
+
+#[test]
+fn resolve_effective_gravity_skips_disabled_sources() {
+    let global = glam::Vec3::new(0.0, -9.81, 0.0);
+    let mut disabled = GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 5.0);
+    disabled.enabled = false;
+    let sources = [disabled];
+    assert_eq!(
+        resolve_effective_gravity(sources.iter(), glam::Vec3::ZERO, global),
+        global
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Gravity Source Serde Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn roundtrip_gravity_source(source: &GravitySource) -> GravitySource {
+    let fields = crate::serde::serialize_gravity_source(source);
+    let restored = crate::serde::deserialize_gravity_source(&fields);
+    *restored
+        .downcast::<GravitySource>()
+        .expect("gravity source roundtrip type")
+}
+
+#[test]
+fn gravity_source_serde_roundtrip_directional() {
+    let source = GravitySource::directional(glam::Vec3::new(0.5, -0.5, 0.25), 3.25);
+    assert_eq!(roundtrip_gravity_source(&source), source);
+}
+
+#[test]
+fn gravity_source_serde_roundtrip_point_with_falloff_and_radius() {
+    let source = GravitySource::point(glam::Vec3::new(4.0, 5.0, 6.0), 42.0)
+        .with_falloff(GravityFalloff::InverseSquare)
+        .with_max_radius(120.0);
+    assert_eq!(roundtrip_gravity_source(&source), source);
+}
+
+#[test]
+fn gravity_source_serde_omits_absent_max_radius() {
+    let source = GravitySource::point(glam::Vec3::ZERO, 9.81);
+    let fields = crate::serde::serialize_gravity_source(&source);
+    assert!(!fields.contains_key("max_radius"));
+    assert_eq!(
+        fields.get("mode"),
+        Some(&engine_serialize::Value::Enum("Point".into()))
+    );
+    assert_eq!(roundtrip_gravity_source(&source), source);
+}
+
+#[test]
+fn gravity_source_deserialize_defaults_for_missing_fields() {
+    let restored = crate::serde::deserialize_gravity_source(&std::collections::BTreeMap::new());
+    assert_eq!(
+        *restored.downcast::<GravitySource>().unwrap(),
+        GravitySource::default()
+    );
+}
+
+#[test]
+fn gravity_source_deserialize_sanitizes_non_finite_values() {
+    use engine_serialize::Value;
+    let fields = std::collections::BTreeMap::from([
+        ("mode".into(), Value::Enum("Point".into())),
+        ("strength".into(), Value::Float32(f32::NAN)),
+        ("direction".into(), Value::Vec3([f32::INFINITY, 0.0, 0.0])),
+        ("center".into(), Value::Vec3([0.0, f32::NAN, 0.0])),
+        ("falloff".into(), Value::Enum("Linear".into())),
+        ("max_radius".into(), Value::Float32(f32::NEG_INFINITY)),
+    ]);
+    let restored = crate::serde::deserialize_gravity_source(&fields);
+    let restored = restored.downcast::<GravitySource>().unwrap();
+    assert_eq!(restored.mode, GravityMode::Point);
+    assert_eq!(restored.strength, GravitySource::default().strength);
+    assert_eq!(restored.direction, GravitySource::default().direction);
+    assert_eq!(restored.center, glam::Vec3::ZERO);
+    assert_eq!(restored.falloff, GravityFalloff::Linear);
+    assert_eq!(restored.max_radius, None);
+    assert!(
+        restored.strength.is_finite()
+            && restored.direction.is_finite()
+            && restored.center.is_finite()
+    );
+}
+
+#[test]
+fn gravity_source_deserialize_rejects_non_positive_max_radius() {
+    use engine_serialize::Value;
+    for radius in [0.0, -1.0] {
+        let fields = std::collections::BTreeMap::from([
+            ("mode".into(), Value::Enum("Point".into())),
+            ("max_radius".into(), Value::Float32(radius)),
+        ]);
+        let restored = crate::serde::deserialize_gravity_source(&fields);
+        assert_eq!(
+            restored.downcast::<GravitySource>().unwrap().max_radius,
+            None,
+            "max_radius {radius} must be treated as unlimited"
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Gravity Source Script-Bridge Round-Trip Tests
+//
+// Mirror the merge -> deserialize -> serialize validation the script
+// component bridge applies (commit e49b6fd): a write is accepted only when
+// every provided field survives the round-trip unchanged.
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn script_style_merge_write(
+    base: &std::collections::BTreeMap<String, engine_serialize::Value>,
+    write: &std::collections::BTreeMap<String, engine_serialize::Value>,
+) -> Result<GravitySource, Vec<String>> {
+    let mut merged = base.clone();
+    for (name, value) in write {
+        merged.insert(name.clone(), value.clone());
+    }
+    let candidate = crate::serde::deserialize_gravity_source(&merged);
+    let reserialized = crate::serde::serialize_gravity_source(candidate.as_ref());
+    let rejected: Vec<String> = write
+        .keys()
+        .filter(|name| reserialized.get(*name) != merged.get(*name))
+        .cloned()
+        .collect();
+    if rejected.is_empty() {
+        Ok(*candidate.downcast::<GravitySource>().unwrap())
+    } else {
+        Err(rejected)
+    }
+}
+
+#[test]
+fn gravity_source_script_merge_write_roundtrips() {
+    use engine_serialize::Value;
+    let base = crate::serde::serialize_gravity_source(&GravitySource::default());
+    let write = std::collections::BTreeMap::from([
+        ("mode".into(), Value::Enum("Point".into())),
+        ("center".into(), Value::Vec3([10.0, 0.0, -4.0])),
+        ("strength".into(), Value::Float32(25.0)),
+        ("falloff".into(), Value::Enum("InverseSquare".into())),
+        ("max_radius".into(), Value::Float32(80.0)),
+    ]);
+    let applied = script_style_merge_write(&base, &write).expect("valid write is accepted");
+    assert_eq!(applied.mode, GravityMode::Point);
+    assert_eq!(applied.center, glam::Vec3::new(10.0, 0.0, -4.0));
+    assert_eq!(applied.strength, 25.0);
+    assert_eq!(applied.falloff, GravityFalloff::InverseSquare);
+    assert_eq!(applied.max_radius, Some(80.0));
+    // Fields the write did not mention keep their previous values.
+    assert_eq!(applied.direction, GravitySource::default().direction);
+    assert!(applied.enabled);
+
+    // A second write over the updated snapshot toggles the source off.
+    let updated = crate::serde::serialize_gravity_source(&applied);
+    let toggle = std::collections::BTreeMap::from([("enabled".into(), Value::Bool(false))]);
+    let toggled = script_style_merge_write(&updated, &toggle).expect("toggle write is accepted");
+    assert!(!toggled.enabled);
+    assert_eq!(toggled.mode, GravityMode::Point);
+}
+
+#[test]
+fn gravity_source_script_write_rejects_unknown_fields_and_bad_enums() {
+    use engine_serialize::Value;
+    let base = crate::serde::serialize_gravity_source(&GravitySource::default());
+
+    let unknown = std::collections::BTreeMap::from([("gravity".into(), Value::Float32(1.0))]);
+    assert_eq!(
+        script_style_merge_write(&base, &unknown),
+        Err(vec!["gravity".to_string()])
+    );
+
+    let bad_mode = std::collections::BTreeMap::from([("mode".into(), Value::Enum("Warp".into()))]);
+    assert_eq!(
+        script_style_merge_write(&base, &bad_mode),
+        Err(vec!["mode".to_string()])
+    );
+
+    let bad_falloff =
+        std::collections::BTreeMap::from([("falloff".into(), Value::Enum("Wobbly".into()))]);
+    assert_eq!(
+        script_style_merge_write(&base, &bad_falloff),
+        Err(vec!["falloff".to_string()])
+    );
+
+    let wrong_type =
+        std::collections::BTreeMap::from([("strength".into(), Value::Str("heavy".into()))]);
+    assert_eq!(
+        script_style_merge_write(&base, &wrong_type),
+        Err(vec!["strength".to_string()])
+    );
+
+    // Rejected writes never partially apply: the base snapshot is untouched.
+    let unchanged = crate::serde::deserialize_gravity_source(&base);
+    assert_eq!(
+        *unchanged.downcast::<GravitySource>().unwrap(),
+        GravitySource::default()
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Gravity Source Scene Load / Validation Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn physics_test_registry() -> std::sync::Arc<engine_scene::ComponentRegistry> {
+    let mut registry = engine_scene::ComponentRegistry::new();
+    registry.register_core();
+    crate::register_physics_extensions(&mut registry, None);
+    std::sync::Arc::new(registry)
+}
+
+fn gravity_test_scene(
+    fields: std::collections::BTreeMap<String, engine_serialize::Value>,
+) -> engine_scene::Scene {
+    engine_scene::Scene {
+        schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+        engine_version: "0.1.0".to_string(),
+        scene_id: "gravity-scene".to_string(),
+        name: "Gravity Scene".to_string(),
+        entities: vec![engine_scene::EntityRecord {
+            persistent_id: "planet-01".to_string(),
+            parent: None,
+            name: Some("Planet".to_string()),
+            enabled: true,
+            components: std::collections::BTreeMap::from([(
+                "engine.gravity_source".to_string(),
+                engine_scene::ComponentRecord {
+                    schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+                    enabled: true,
+                    fields,
+                },
+            )]),
+        }],
+        scene_settings: engine_scene::SceneSettings::default(),
+        dependencies: Vec::new(),
+        diagnostics_policy: engine_scene::DiagnosticsPolicy::Strict,
+    }
+}
+
+#[test]
+fn gravity_source_scene_load_roundtrip() {
+    use engine_serialize::Value;
+    let scene = gravity_test_scene(std::collections::BTreeMap::from([
+        ("mode".into(), Value::Enum("Point".into())),
+        ("enabled".into(), Value::Bool(true)),
+        ("strength".into(), Value::Float32(30.0)),
+        ("center".into(), Value::Vec3([0.0, -100.0, 0.0])),
+        ("falloff".into(), Value::Enum("InverseSquare".into())),
+        ("max_radius".into(), Value::Float32(500.0)),
+    ]));
+    let registry = physics_test_registry();
+    let world = engine_scene::World::try_from_scene_with_registry(&scene, registry)
+        .expect("gravity source scene loads through the strict registry path");
+
+    let entity = world.entity_by_persistent_id("planet-01").unwrap();
+    let source = world
+        .get::<GravitySource>(entity)
+        .expect("source materialized");
+    assert_eq!(source.mode, GravityMode::Point);
+    assert_eq!(source.strength, 30.0);
+    assert_eq!(source.center, glam::Vec3::new(0.0, -100.0, 0.0));
+    assert_eq!(source.falloff, GravityFalloff::InverseSquare);
+    assert_eq!(source.max_radius, Some(500.0));
+
+    // Saving the world reproduces the authored component fields.
+    let saved = world.to_scene();
+    let record = &saved.entities[0].components["engine.gravity_source"];
+    assert_eq!(
+        record.fields.get("mode"),
+        Some(&Value::Enum("Point".into()))
+    );
+    assert_eq!(
+        record.fields.get("falloff"),
+        Some(&Value::Enum("InverseSquare".into()))
+    );
+    assert_eq!(
+        record.fields.get("max_radius"),
+        Some(&Value::Float32(500.0))
+    );
+}
+
+#[test]
+fn gravity_source_scene_load_sanitizes_non_finite_fields() {
+    use engine_serialize::Value;
+    let scene = gravity_test_scene(std::collections::BTreeMap::from([
+        ("mode".into(), Value::Enum("Point".into())),
+        ("strength".into(), Value::Float32(f32::NAN)),
+        ("center".into(), Value::Vec3([f32::INFINITY, 0.0, 0.0])),
+    ]));
+    let registry = physics_test_registry();
+    let world = engine_scene::World::try_from_scene_with_registry(&scene, registry)
+        .expect("scene with non-finite source data still loads");
+    let entity = world.entity_by_persistent_id("planet-01").unwrap();
+    let source = world.get::<GravitySource>(entity).unwrap();
+    assert!(source.strength.is_finite());
+    assert!(source.center.is_finite());
+}
+
+#[test]
+fn gravity_source_authoring_validation_accepts_component() {
+    use engine_serialize::Value;
+    let scene = gravity_test_scene(std::collections::BTreeMap::from([
+        ("mode".into(), Value::Enum("Point".into())),
+        ("strength".into(), Value::Float32(12.5)),
+        ("center".into(), Value::Vec3([1.0, 2.0, 3.0])),
+        ("falloff".into(), Value::Enum("Linear".into())),
+        ("max_radius".into(), Value::Float32(25.0)),
+    ]));
+    let registry = physics_test_registry();
+    engine_scene::validate_scene_for_authoring(&scene, Some(&registry))
+        .expect("authoring preflight accepts gravity source components");
+}
+
+#[test]
+fn gravity_source_registers_with_script_binding() {
+    let registry = physics_test_registry();
+    let extension = registry
+        .get(GravitySource::TYPE_ID)
+        .expect("gravity source registered");
+    assert!(extension.meta.has_editor);
+    assert!(extension.meta.has_script_binding);
+    assert!(extension.serialize.is_some());
+    assert!(extension.deserialize.is_some());
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Gravity Source Physics Step Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn ecs_with_dynamic_body(position: glam::Vec3) -> (World, Entity) {
+    let mut ecs = World::new();
+    let entity = ecs.create_entity();
+    ecs.add_component(
+        entity,
+        Transform {
+            translation: position,
+            ..Default::default()
+        },
+    );
+    ecs.add_component(entity, RigidBody::default());
+    ecs.add_component(entity, Collider::default());
+    (ecs, entity)
+}
+
+fn step_n(world: &mut PhysicsWorld, ecs: &mut World, frames: usize) {
+    for _ in 0..frames {
+        world.step(1.0 / 60.0, ecs);
+    }
+}
+
+#[test]
+fn gravity_source_point_pulls_body_toward_center() {
+    // No global gravity: the point source is the only acceleration.
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::new(0.0, 10.0, 0.0));
+    let planet = ecs.create_entity();
+    ecs.add_component(planet, GravitySource::point(glam::Vec3::ZERO, 9.81));
+
+    step_n(&mut world, &mut ecs, 30);
+
+    let transform = ecs.get::<Transform>(body).unwrap();
+    assert!(
+        transform.translation.y < 10.0,
+        "body should fall towards the planet centre: y={}",
+        transform.translation.y
+    );
+    assert!(
+        transform.translation.x.abs() < 1e-4 && transform.translation.z.abs() < 1e-4,
+        "pull is purely radial: {:?}",
+        transform.translation
+    );
+}
+
+#[test]
+fn gravity_source_directional_overrides_global_direction() {
+    let mut world = PhysicsWorld::new(glam::Vec3::new(0.0, -9.81, 0.0));
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::ZERO);
+    let field = ecs.create_entity();
+    ecs.add_component(
+        field,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+
+    step_n(&mut world, &mut ecs, 30);
+
+    let transform = ecs.get::<Transform>(body).unwrap();
+    assert!(
+        transform.translation.x > 0.01,
+        "body should accelerate along the directional field: {:?}",
+        transform.translation
+    );
+    assert!(
+        transform.translation.y.abs() < 1e-6,
+        "the directional field replaces the global -Y gravity for this body: {:?}",
+        transform.translation
+    );
+}
+
+#[test]
+fn gravity_source_out_of_range_body_keeps_global_gravity() {
+    let mut world = PhysicsWorld::new(glam::Vec3::new(0.0, -9.81, 0.0));
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::new(0.0, 10.0, 0.0));
+    let planet = ecs.create_entity();
+    ecs.add_component(
+        planet,
+        GravitySource::point(glam::Vec3::new(1000.0, 0.0, 0.0), 50.0).with_max_radius(10.0),
+    );
+
+    step_n(&mut world, &mut ecs, 30);
+
+    let transform = ecs.get::<Transform>(body).unwrap();
+    assert!(
+        transform.translation.y < 10.0,
+        "body outside every source range still falls under global gravity: y={}",
+        transform.translation.y
+    );
+    assert!(
+        transform.translation.x.abs() < 1e-4,
+        "no sideways pull from the out-of-range source: {:?}",
+        transform.translation
+    );
+}
+
+#[test]
+fn gravity_source_cancelling_fields_keep_body_in_place() {
+    let mut world = PhysicsWorld::new(glam::Vec3::new(0.0, -9.81, 0.0));
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::ZERO);
+    let field_a = ecs.create_entity();
+    ecs.add_component(
+        field_a,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+    let field_b = ecs.create_entity();
+    ecs.add_component(
+        field_b,
+        GravitySource::directional(glam::Vec3::new(-1.0, 0.0, 0.0), 9.81),
+    );
+
+    step_n(&mut world, &mut ecs, 30);
+
+    let transform = ecs.get::<Transform>(body).unwrap();
+    approx_vec3(
+        transform.translation,
+        glam::Vec3::ZERO,
+        "cancelling fields suppress the global fallback and leave the body in place",
+    );
+}
+
+#[test]
+fn gravity_source_respects_body_gravity_scale() {
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::ZERO);
+    ecs.add_component(
+        body,
+        RigidBody {
+            gravity_scale: 0.5,
+            ..RigidBody::default()
+        },
+    );
+    let field = ecs.create_entity();
+    ecs.add_component(
+        field,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+
+    step_n(&mut world, &mut ecs, 30);
+    let half_displacement = ecs.get::<Transform>(body).unwrap().translation.x;
+
+    // Reference run at full gravity scale.
+    let mut world_full = PhysicsWorld::new(glam::Vec3::ZERO);
+    let (mut ecs_full, body_full) = ecs_with_dynamic_body(glam::Vec3::ZERO);
+    let field_full = ecs_full.create_entity();
+    ecs_full.add_component(
+        field_full,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+    step_n(&mut world_full, &mut ecs_full, 30);
+    let full_displacement = ecs_full.get::<Transform>(body_full).unwrap().translation.x;
+
+    assert!(full_displacement > 0.01);
+    let ratio = half_displacement / full_displacement;
+    assert!(
+        (ratio - 0.5).abs() < 1e-3,
+        "gravity_scale 0.5 should halve the source-driven acceleration: ratio={ratio}"
+    );
+}
+
+#[test]
+fn gravity_source_removed_restores_global_gravity() {
+    let mut world = PhysicsWorld::new(glam::Vec3::new(0.0, -9.81, 0.0));
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::ZERO);
+    let field = ecs.create_entity();
+    ecs.add_component(
+        field,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+
+    step_n(&mut world, &mut ecs, 10);
+    let driven = ecs.get::<Transform>(body).unwrap().translation;
+    assert!(driven.x > 0.0, "field drives the body sideways: {driven:?}");
+    assert_eq!(driven.y, 0.0, "global gravity is replaced while driven");
+
+    // Remove the source: the body falls back to the configured global
+    // gravity on the next step.
+    ecs.remove_component::<GravitySource>(field);
+    step_n(&mut world, &mut ecs, 30);
+
+    let restored = ecs.get::<Transform>(body).unwrap().translation;
+    assert!(
+        restored.y < 0.0,
+        "body resumes global -Y gravity after the source is removed: {restored:?}"
+    );
+}
+
+#[test]
+fn gravity_source_disabled_component_restores_global_gravity() {
+    let mut world = PhysicsWorld::new(glam::Vec3::new(0.0, -9.81, 0.0));
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::ZERO);
+    let field = ecs.create_entity();
+    ecs.add_component(
+        field,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+
+    step_n(&mut world, &mut ecs, 10);
+    assert!(ecs.get::<Transform>(body).unwrap().translation.x > 0.0);
+
+    ecs.get_mut::<GravitySource>(field).unwrap().enabled = false;
+    step_n(&mut world, &mut ecs, 30);
+
+    let restored = ecs.get::<Transform>(body).unwrap().translation;
+    assert!(
+        restored.y < 0.0,
+        "disabling the source restores global gravity: {restored:?}"
+    );
+}
+
+#[test]
+fn gravity_source_live_edit_takes_effect_next_step() {
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::ZERO);
+    let field = ecs.create_entity();
+    ecs.add_component(
+        field,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+
+    step_n(&mut world, &mut ecs, 10);
+    let after_first_phase = ecs.get::<Transform>(body).unwrap().translation.x;
+    assert!(after_first_phase > 0.0);
+
+    // Edit the component in place (this is what a script write through the
+    // component bridge commits): the reversed field applies from the very
+    // next physics step without recreating the body.
+    ecs.get_mut::<GravitySource>(field).unwrap().direction = glam::Vec3::new(-1.0, 0.0, 0.0);
+    step_n(&mut world, &mut ecs, 20);
+
+    let after_second_phase = ecs.get::<Transform>(body).unwrap().translation.x;
+    assert!(
+        after_second_phase < after_first_phase,
+        "live field edit reverses the body's motion: {after_first_phase} -> {after_second_phase}"
+    );
+}
+
+#[test]
+fn gravity_source_does_not_move_static_bodies() {
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let mut ecs = World::new();
+    let body = ecs.create_entity();
+    ecs.add_component(body, Transform::default());
+    ecs.add_component(
+        body,
+        RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+    );
+    ecs.add_component(body, Collider::default());
+    let field = ecs.create_entity();
+    ecs.add_component(
+        field,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+
+    step_n(&mut world, &mut ecs, 30);
+
+    approx_vec3(
+        ecs.get::<Transform>(body).unwrap().translation,
+        glam::Vec3::ZERO,
+        "static bodies ignore gravity sources",
+    );
+}
+
+#[test]
+fn gravity_source_on_disabled_entity_does_not_contribute() {
+    let mut world = PhysicsWorld::new(glam::Vec3::new(0.0, -9.81, 0.0));
+    let (mut ecs, body) = ecs_with_dynamic_body(glam::Vec3::new(0.0, 10.0, 0.0));
+    let field = ecs.create_entity();
+    ecs.add_component(
+        field,
+        GravitySource::directional(glam::Vec3::new(1.0, 0.0, 0.0), 9.81),
+    );
+    ecs.set_enabled(field, false);
+
+    step_n(&mut world, &mut ecs, 30);
+
+    let transform = ecs.get::<Transform>(body).unwrap();
+    assert!(
+        transform.translation.y < 10.0 && transform.translation.x.abs() < 1e-4,
+        "sources on disabled entities are ignored; global gravity applies: {:?}",
+        transform.translation
+    );
+}

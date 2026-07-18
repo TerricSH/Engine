@@ -767,6 +767,25 @@ impl RapierBackend {
 
     // ── Force / impulse ─────────────────────────────────────────────────
 
+    /// Set the gravity scale of a registered body without waking it.
+    ///
+    /// Used by the gravity-source system to zero the global-gravity
+    /// multiplier on source-driven bodies and to restore the ECS-authored
+    /// scale when a body leaves every source's range.
+    pub(crate) fn set_body_gravity_scale(&mut self, entity: Entity, scale: f32) {
+        if let Some(&handle) = self.body_map.get(&entity) {
+            if let Some(body) = self.bodies.get_mut(handle) {
+                body.set_gravity_scale(scale, false);
+            }
+        }
+    }
+
+    /// Total mass of a registered body (additional mass plus collider mass).
+    pub(crate) fn body_mass(&self, entity: Entity) -> Option<f32> {
+        let handle = self.body_map.get(&entity)?;
+        Some(self.bodies.get(*handle)?.mass())
+    }
+
     /// Apply a force at the centre of mass.
     pub fn apply_force(&mut self, entity: Entity, force: glam::Vec3) {
         if let Some(&handle) = self.body_map.get(&entity) {

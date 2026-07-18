@@ -127,7 +127,8 @@ remain data-only.
 
 The current boundary exposes typed script access to a curated component set
 (`engine.camera`, `engine.light`, `engine.audio_source`,
-`engine.physics.rigid_body`, `engine.physics.collider`) through the deferred
+`engine.physics.rigid_body`, `engine.physics.collider`,
+`engine.gravity_source`) through the deferred
 `Components.Query`/`Components.SetComponent` bridge; Transform keeps its
 dedicated snapshot path. It does not yet expose arbitrary component access
 beyond that set, full physics queries/movement, or every audio, animation,

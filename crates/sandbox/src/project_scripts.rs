@@ -1266,7 +1266,8 @@ public sealed class ComponentSnapshot
 
 // Deferred read/write access to the engine's built-in components beyond
 // Transform. Supported component type keys: engine.camera, engine.light,
-// engine.audio_source, engine.physics.rigid_body, engine.physics.collider.
+// engine.audio_source, engine.physics.rigid_body, engine.physics.collider,
+// engine.gravity_source.
 // Reads are deferred queries executed at the frame boundary, mirroring
 // ScriptPhysics: Query returns a frame-local handle and TryGet delivers the
 // snapshot with the next frame. Writes merge the provided fields into the

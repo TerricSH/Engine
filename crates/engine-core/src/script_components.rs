@@ -43,6 +43,8 @@ pub(crate) fn script_component_types() -> &'static [&'static str] {
         "engine.physics.rigid_body",
         #[cfg(feature = "gameplay")]
         "engine.physics.collider",
+        #[cfg(feature = "gameplay")]
+        "engine.gravity_source",
     ]
 }
 
@@ -204,6 +206,7 @@ mod tests {
         {
             assert!(types.contains(&"engine.physics.rigid_body"));
             assert!(types.contains(&"engine.physics.collider"));
+            assert!(types.contains(&"engine.gravity_source"));
         }
         // Transform and retained UI stay on their dedicated paths.
         assert!(!types.contains(&"engine.transform"));

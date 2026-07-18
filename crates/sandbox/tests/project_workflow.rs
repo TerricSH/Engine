@@ -1333,8 +1333,10 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
     private ComponentQuery _lightQuery;
     private ComponentQuery _cameraQuery;
     private ComponentQuery _missingQuery;
+    private ComponentQuery _gravityQuery;
     private ComponentQuery _updatedAudioQuery;
     private ComponentQuery _updatedLightQuery;
+    private ComponentQuery _updatedGravityQuery;
     public int UpdateCount = 0;
 
     public void OnCreate()
@@ -1358,6 +1360,7 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
             _lightQuery = Components.Query("light-directional", "engine.light");
             _cameraQuery = Components.Query("camera-main", "engine.camera");
             _missingQuery = Components.Query("cube-01", "engine.light");
+            _gravityQuery = Components.Query("planet-01", "engine.gravity_source");
             return;
         }
         if (UpdateCount == 2)
@@ -1392,6 +1395,21 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
                 throw new InvalidOperationException("unexpected camera clear color");
             if (Components.TryGet(_missingQuery, out _) || !Components.IsMissing(_missingQuery))
                 throw new InvalidOperationException("absent component must report IsMissing");
+            if (!Components.TryGet(_gravityQuery, out var gravity))
+                throw new InvalidOperationException("gravity snapshot missing on the next frame");
+            if (gravity.EntityId != "planet-01" || gravity.ComponentType != "engine.gravity_source")
+                throw new InvalidOperationException("gravity snapshot identity mismatch");
+            if (gravity.GetEnum("mode") != "Point")
+                throw new InvalidOperationException("unexpected gravity mode");
+            if (Math.Abs(gravity.GetFloat("strength") - 42.0f) > 1e-6f)
+                throw new InvalidOperationException("unexpected gravity strength");
+            var gravityCenter = gravity.GetVector3("center");
+            if (Math.Abs(gravityCenter.Y - (-100.0f)) > 1e-3f)
+                throw new InvalidOperationException("unexpected gravity center");
+            if (gravity.GetEnum("falloff") != "InverseSquare")
+                throw new InvalidOperationException("unexpected gravity falloff");
+            if (Math.Abs(gravity.GetFloat("max_radius") - 500.0f) > 1e-3f)
+                throw new InvalidOperationException("unexpected gravity max radius");
 
             // Merge writes: only the provided fields change on the target.
             var cube = Scene.GetEntity("cube-01");
@@ -1399,8 +1417,11 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
             cube.SetComponentField("engine.audio_source", "playing", true);
             Scene.GetEntity("light-directional")
                 .SetComponentField("engine.light", "intensity", 9.0f);
+            Scene.GetEntity("planet-01")
+                .SetComponentField("engine.gravity_source", "strength", 12.5f);
             _updatedAudioQuery = Components.Query("cube-01", "engine.audio_source");
             _updatedLightQuery = Components.Query("light-directional", "engine.light");
+            _updatedGravityQuery = Components.Query("planet-01", "engine.gravity_source");
             return;
         }
         if (UpdateCount >= 3)
@@ -1421,6 +1442,13 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
                 throw new InvalidOperationException("updated light snapshot missing");
             if (Math.Abs(light.GetFloat("intensity") - 9.0f) > 1e-6f)
                 throw new InvalidOperationException("light intensity write did not apply");
+            if (!Components.TryGet(_updatedGravityQuery, out var gravity))
+                throw new InvalidOperationException("updated gravity snapshot missing");
+            if (Math.Abs(gravity.GetFloat("strength") - 12.5f) > 1e-6f)
+                throw new InvalidOperationException("gravity strength write did not apply");
+            // Fields the write did not mention survive the merge.
+            if (Math.Abs(gravity.GetFloat("max_radius") - 500.0f) > 1e-3f)
+                throw new InvalidOperationException("gravity write dropped unwritten fields");
         }
     }
 }
@@ -1488,6 +1516,53 @@ fn csharp_component_access_round_trips_through_the_process_host() {
             ]),
         },
     );
+    // A planet entity exercises engine.gravity_source through the same bridge.
+    scene.entities.push(engine_scene::EntityRecord {
+        persistent_id: "planet-01".into(),
+        parent: None,
+        name: Some("Planet".into()),
+        enabled: true,
+        components: std::collections::BTreeMap::from([
+            (
+                "engine.transform".into(),
+                engine_scene::ComponentRecord {
+                    schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+                    enabled: true,
+                    fields: std::collections::BTreeMap::from([
+                        (
+                            "translation".into(),
+                            engine_serialize::Value::Vec3([0.0, -100.0, 0.0]),
+                        ),
+                        (
+                            "rotation".into(),
+                            engine_serialize::Value::Quat([0.0, 0.0, 0.0, 1.0]),
+                        ),
+                        ("scale".into(), engine_serialize::Value::Vec3([1.0; 3])),
+                    ]),
+                },
+            ),
+            (
+                "engine.gravity_source".into(),
+                engine_scene::ComponentRecord {
+                    schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+                    enabled: true,
+                    fields: std::collections::BTreeMap::from([
+                        ("mode".into(), engine_serialize::Value::Enum("Point".into())),
+                        ("strength".into(), engine_serialize::Value::Float32(42.0)),
+                        (
+                            "center".into(),
+                            engine_serialize::Value::Vec3([0.0, -100.0, 0.0]),
+                        ),
+                        (
+                            "falloff".into(),
+                            engine_serialize::Value::Enum("InverseSquare".into()),
+                        ),
+                        ("max_radius".into(), engine_serialize::Value::Float32(500.0)),
+                    ]),
+                },
+            ),
+        ]),
+    });
     scene
         .save_to_file(&scene_path)
         .expect("save component probe scene");

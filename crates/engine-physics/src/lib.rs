@@ -5,6 +5,7 @@ pub mod components;
 mod convert;
 mod debug;
 pub mod events;
+pub mod gravity;
 pub mod joints;
 pub mod queries;
 mod serde;
@@ -16,6 +17,10 @@ pub use convert::{from_rapier_vec, to_rapier_vec};
 pub use debug::{ColliderDebugInfo, PhysicsDebugDraw};
 pub use events::{
     CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind,
+};
+pub use gravity::{
+    resolve_effective_gravity, sum_source_gravity, GravityFalloff, GravityMode, GravitySource,
+    GRAVITY_SOURCE_MIN_DISTANCE,
 };
 pub use joints::{JointDescriptor, JointHandle, JointLimits, JointMotor, JointType};
 pub use queries::{
@@ -94,6 +99,24 @@ pub fn register_physics_extensions(
             },
             serialize: Some(serde::serialize_physics_material),
             deserialize: Some(serde::deserialize_physics_material),
+        })
+        .ok();
+
+    // ── GravitySource ──────────────────────────────────────────────────
+    component_registry
+        .register(ComponentExtension {
+            meta: ComponentMeta {
+                type_id: crate::GravitySource::TYPE_ID,
+                display_name: "Gravity Source",
+                schema_version: (0, 1, 0),
+                has_editor: true,
+                has_script_binding: true,
+            },
+            storage_factory: || -> Box<dyn ComponentStorageDyn> {
+                Box::new(SparseSet::<crate::GravitySource>::new())
+            },
+            serialize: Some(serde::serialize_gravity_source),
+            deserialize: Some(serde::deserialize_gravity_source),
         })
         .ok();
 

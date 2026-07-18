@@ -175,9 +175,9 @@ To author a spawnable prefab, write a `Prefab-v0.1.0` RON document under the con
 
 `Physics.Raycast(origin, direction, maxDistance)` and `Physics.OverlapSphere(center, radius)` query the physics world. Queries are deferred: each call validates its arguments (non-finite values, a zero-length ray direction, or a non-positive distance/radius throw immediately and surface as script errors), returns a `PhysicsQuery` handle, and the engine executes the query against the physics world at the frame boundary. The result arrives with the next frame's context. `Physics.TryGetRaycastHit(query, out var hit)` reports the closest hit's `EntityId`, `Entity`, world-space `Point` and `Normal`, and `Distance`, returning false on a miss; `Physics.TryGetOverlapResult(query, out var entityIds)` reports the overlapped persistent entity ids. Results are frame-local — delivered in exactly one frame and expired afterwards — and a handle never resolves on the frame that issued it. Ray distance and sphere radius are clamped to `ScriptPhysics.MaxQueryDistance` (10,000), and overlap results are sorted and bounded to `ScriptPhysics.MaxOverlapResults` (64). Queries report persistent entity ids, never raw ECS handles; sensors such as trigger volumes are excluded from query results.
 
-`Components.Query(entityId, componentType)` and `Entity.QueryComponent(componentType)` read the engine's built-in components beyond Transform. The supported component type keys are `engine.camera`, `engine.light`, `engine.audio_source`, `engine.physics.rigid_body`, and `engine.physics.collider`; any other key is rejected with a `SCRIPT_COMPONENT_UNKNOWN` script error listing the supported set. Reads are deferred exactly like physics queries: `Query` returns a frame-local `ComponentQuery` handle, the engine snapshots the component's fields at the frame boundary (after that frame's commands apply, so same-frame writes are observed), and `Components.TryGet(query, out var snapshot)` delivers the `ComponentSnapshot` with the next frame's context. A handle never resolves on its issuing frame, results are frame-local, and `Components.IsMissing(query)` reports that the entity exists but does not have the component (querying an unknown entity reports missing as well rather than failing). Snapshots expose typed getters — `GetBool`, `GetInt`, `GetUInt`, `GetFloat`, `GetString`, `GetEnum`, `GetAsset`, `GetVector3`, `GetQuaternion`, `GetColor`, `GetList`, and `GetMap` — over the same field map the scene format uses; `HasField` checks presence, and reading an unknown field or with the wrong getter type throws.
+`Components.Query(entityId, componentType)` and `Entity.QueryComponent(componentType)` read the engine's built-in components beyond Transform. The supported component type keys are `engine.camera`, `engine.light`, `engine.audio_source`, `engine.physics.rigid_body`, `engine.physics.collider`, and `engine.gravity_source`; any other key is rejected with a `SCRIPT_COMPONENT_UNKNOWN` script error listing the supported set. Reads are deferred exactly like physics queries: `Query` returns a frame-local `ComponentQuery` handle, the engine snapshots the component's fields at the frame boundary (after that frame's commands apply, so same-frame writes are observed), and `Components.TryGet(query, out var snapshot)` delivers the `ComponentSnapshot` with the next frame's context. A handle never resolves on its issuing frame, results are frame-local, and `Components.IsMissing(query)` reports that the entity exists but does not have the component (querying an unknown entity reports missing as well rather than failing). Snapshots expose typed getters — `GetBool`, `GetInt`, `GetUInt`, `GetFloat`, `GetString`, `GetEnum`, `GetAsset`, `GetVector3`, `GetQuaternion`, `GetColor`, `GetList`, and `GetMap` — over the same field map the scene format uses; `HasField` checks presence, and reading an unknown field or with the wrong getter type throws.
 
-`Components.Set(entityId, componentType, fields)`, `Components.SetField(entityId, componentType, field, value)`, and the matching `Entity.SetComponent`/`Entity.SetComponentField` helpers write component fields. Writes are deferred merge commands committed after all script callbacks finish: each provided field merges over the entity's current component (or over authored defaults when the entity lacks the component), so unmentioned fields keep their values. Field values are `ComponentValue` instances produced by the `ComponentValue.From*` factories (with implicit conversions from `bool`, `int`, `long`, `uint`, `ulong`, `float`, `string`, `Vector3`, and `Quaternion`). The engine validates every write against the component's scene schema — unknown fields, wrong value types, and invalid enum cases are rejected with a `SCRIPT_COMPONENT_PAYLOAD_INVALID` script error listing the rejected and known fields — so a failed write never partially applies. Two backend caveats: writes to `engine.physics.rigid_body`/`engine.physics.collider` update ECS state (read-back and scene saves observe them) but do not re-sync bodies already created in the physics simulation, and `engine.audio_source` writes take effect through the audio output reconciler on targets that enable it.
+`Components.Set(entityId, componentType, fields)`, `Components.SetField(entityId, componentType, field, value)`, and the matching `Entity.SetComponent`/`Entity.SetComponentField` helpers write component fields. Writes are deferred merge commands committed after all script callbacks finish: each provided field merges over the entity's current component (or over authored defaults when the entity lacks the component), so unmentioned fields keep their values. Field values are `ComponentValue` instances produced by the `ComponentValue.From*` factories (with implicit conversions from `bool`, `int`, `long`, `uint`, `ulong`, `float`, `string`, `Vector3`, and `Quaternion`). The engine validates every write against the component's scene schema — unknown fields, wrong value types, and invalid enum cases are rejected with a `SCRIPT_COMPONENT_PAYLOAD_INVALID` script error listing the rejected and known fields — so a failed write never partially applies. Three backend caveats: writes to `engine.physics.rigid_body`/`engine.physics.collider` update ECS state (read-back and scene saves observe them) but do not re-sync bodies already created in the physics simulation, `engine.gravity_source` writes take effect on the next physics step because the step re-reads sources from the ECS world, and `engine.audio_source` writes take effect through the audio output reconciler on targets that enable it.
 
 The process host uses a frame snapshot/command model: entity Transforms and input values are sent before lifecycle execution, then validated commands are committed after all scripts finish. This avoids re-entering the single JSON pipe from inside `OnUpdate`. Consequently, scripts do not observe another script's same-frame writes.
 
@@ -328,3 +328,80 @@ builds can use `runtime-subsystems` without `runtime-audio-output`, so asset,
 component, cooking, and validation tests do not require an audio device.
 
 Project scenes remain portable RON files in this version. The Windows packager rewrites `cooked_assets` to `assets/cooked`, copies every cataloged scene, omits source assets, records each scene ID/path/hash in release metadata, and verifies the resulting package by launching it from its staging directory.
+
+## Runtime physics gravity sources
+
+An entity with `engine.gravity_source` shapes the gravity experienced by
+dynamic rigid bodies, so games can build planet-style point gravity or
+directional gravity fields instead of relying only on the scene's global
+gravity vector (`scene_settings.gravity`, default `(0, -9.81, 0)`). Fields:
+
+- `mode` — `Directional` for a constant field along `direction`, or `Point`
+  for a planet-style field pulling towards the world-space `center`.
+- `enabled` — a disabled source contributes nothing; sources on disabled
+  entities are skipped as well.
+- `strength` — acceleration in m/s²; negative values repel instead of
+  attracting. For point sources with `InverseSquare` falloff this is the
+  acceleration one metre from the centre.
+- `direction` — pull direction for `Directional` mode. It is normalised at
+  resolution time; a zero or non-finite vector contributes nothing.
+- `center` — world-space centre for `Point` mode.
+- `falloff` — `None` (full strength everywhere in range), `Linear` (full
+  strength at the centre ramping to zero at `max_radius`; behaves like `None`
+  when no radius is set), or `InverseSquare` (`strength / d²`).
+- `max_radius` — optional range limit in metres for `Point` mode. Non-finite
+  or non-positive values are treated as unlimited range.
+
+Effective gravity is resolved per dynamic body per fixed physics step. Every
+enabled source that reaches the body contributes an acceleration vector and
+the contributions are **summed** (superposition); when at least one source
+contributes, the sum replaces the global gravity for that body — even when it
+cancels to zero — and the body's own `gravity_scale` still multiplies the
+result. A body no source reaches (no sources exist, all are disabled, or the
+body is outside every point source's `max_radius`) keeps the configured
+global gravity exactly as before. Source-driven bodies receive their gravity
+as per-step impulses so arbitrary pull directions work, and are kept awake
+while a field drives them; bodies back on global gravity keep the usual sleep
+behaviour. Static and kinematic bodies are never affected.
+
+A minimal planet setup in a `.scene.ron` entity record:
+
+```ron
+(
+    persistent_id: "planet-01",
+    parent: None,
+    name: Some("Planet"),
+    enabled: true,
+    components: {
+        "engine.transform": (
+            schema_version: (major: 0, minor: 1, patch: 0),
+            enabled: true,
+            fields: {
+                "translation": Vec3((0.0, 0.0, 0.0)),
+            },
+        ),
+        "engine.gravity_source": (
+            schema_version: (major: 0, minor: 1, patch: 0),
+            enabled: true,
+            fields: {
+                "mode": Enum("Point"),
+                "strength": Float32(50.0),
+                "center": Vec3((0.0, 0.0, 0.0)),
+                "falloff": Enum("InverseSquare"),
+                "max_radius": Float32(250.0),
+            },
+        ),
+    },
+)
+```
+
+A dynamic `engine.physics.rigid_body` spawned at `(10, 0, 0)` then
+accelerates towards the planet at `50 / 10² = 0.5 m/s²`, while a second body
+beyond 250 m keeps falling straight down under the scene's global gravity.
+
+`engine.gravity_source` is part of the script component bridge, so C# reads
+and writes it through `Components.Query`/`Components.Set` like the other
+built-in components. Unlike `engine.physics.rigid_body` writes, gravity
+source writes are re-read by the physics step and therefore take effect on
+the next fixed step — a script can, for example, move `center` every frame to
+track a flying planet or toggle `enabled` to switch the field off.

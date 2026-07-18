@@ -7,9 +7,10 @@ use crate::backend::{RapierBackend, RaycastHit};
 use crate::components::{ColliderShape, RigidBody};
 use crate::debug::{ColliderDebugInfo, PhysicsDebugDraw};
 use crate::events::{CollisionEvent, PhysicsEvents, TriggerEvent};
+use crate::gravity::{sum_source_gravity, GravitySource};
 use crate::joints::{JointDescriptor, JointHandle};
 use crate::queries::{OverlapQuery, QueryBatcher, QueryResults, RaycastQuery, SweepQuery};
-use crate::{Collider, Entity, PhysicsMaterial, Transform};
+use crate::{BodyType, Collider, Entity, PhysicsMaterial, Transform};
 
 // ── PhysicsCommand ──────────────────────────────────────────────────────────
 
@@ -57,6 +58,11 @@ pub struct PhysicsWorld {
     debug_colliders: Arc<Mutex<Vec<ColliderDebugInfo>>>,
     /// Accumulated queries waiting for batched execution.
     query_batcher: QueryBatcher,
+    /// Dynamic bodies whose Rapier gravity scale is currently zeroed because
+    /// at least one [`GravitySource`] shapes their effective gravity. Used to
+    /// restore the ECS-authored `gravity_scale` when a body falls back to the
+    /// global gravity.
+    gravity_overridden: HashSet<Entity>,
 }
 
 impl PhysicsWorld {
@@ -72,6 +78,7 @@ impl PhysicsWorld {
             pending_triggers: Vec::new(),
             debug_colliders: Arc::new(Mutex::new(Vec::new())),
             query_batcher: QueryBatcher::new(),
+            gravity_overridden: HashSet::new(),
         }
     }
 
@@ -175,6 +182,10 @@ impl PhysicsWorld {
 
         while self.accumulator >= self.fixed_timestep && steps_taken < max_steps {
             self.backend.integration.dt = self.fixed_timestep;
+
+            // Resolve per-body gravity from active gravity sources for this
+            // fixed step (no-op fast path when no sources exist).
+            self.apply_gravity_sources(world);
 
             // Run one physics step and capture both collision and trigger events.
             let events = self.backend.step();
@@ -329,6 +340,90 @@ impl PhysicsWorld {
                 }
             }
         }
+    }
+
+    // ── Gravity sources ───────────────────────────────────────────────
+
+    /// Apply effective per-body gravity from active [`GravitySource`]
+    /// components for the next fixed step.
+    ///
+    /// Semantics (see the `gravity` module docs): contributions from all
+    /// in-range sources are summed per dynamic body; bodies no source reaches
+    /// keep the configured global gravity. Rapier only supports a single
+    /// global gravity vector scaled per body, so source-driven bodies get
+    /// their Rapier gravity scale zeroed and receive the effective gravity
+    /// (times their ECS `gravity_scale`) as a mass-normalised impulse each
+    /// fixed step, which supports arbitrary pull directions. Bodies that fall
+    /// back to global gravity have their ECS-authored scale restored.
+    ///
+    /// Because sources are re-read from the ECS world every fixed step,
+    /// runtime edits to `GravitySource` components (including script writes
+    /// through the component bridge) take effect on the next physics step.
+    fn apply_gravity_sources(&mut self, world: &crate::World) {
+        let sources: Vec<&GravitySource> = world
+            .query::<GravitySource>()
+            .map(|(_, source)| source)
+            .collect();
+
+        let mut still_overridden: HashSet<Entity> = HashSet::new();
+
+        if !sources.is_empty() {
+            let dt = self.fixed_timestep;
+            let body_entities: Vec<Entity> = self.backend.body_map.keys().copied().collect();
+            for entity in body_entities {
+                // Gravity only acts on enabled dynamic bodies.
+                let Some(rigid_body) = world.get::<RigidBody>(entity) else {
+                    continue;
+                };
+                if rigid_body.body_type != BodyType::Dynamic || !rigid_body.enabled {
+                    continue;
+                }
+                let Some((position, _)) = self.backend.sync_body_transform(entity) else {
+                    continue;
+                };
+
+                let Some(acceleration) = sum_source_gravity(sources.iter().copied(), position)
+                else {
+                    continue;
+                };
+
+                // Zero the global-gravity multiplier once; the per-step
+                // impulse below fully drives this body's gravity.
+                if !self.gravity_overridden.contains(&entity) {
+                    self.backend.set_body_gravity_scale(entity, 0.0);
+                }
+                still_overridden.insert(entity);
+
+                let scaled = acceleration * rigid_body.gravity_scale;
+                if scaled.length_squared() <= f32::EPSILON {
+                    // Fields cancel out (or the body sits at a source
+                    // centre): no impulse, so the body may still sleep.
+                    continue;
+                }
+                let mass = self.backend.body_mass(entity).unwrap_or(0.0);
+                if mass <= 0.0 {
+                    continue;
+                }
+                // dv = a·dt is mass-independent, so impulse = m·a·dt.
+                self.backend.apply_impulse(entity, scaled * (mass * dt));
+            }
+        }
+
+        // Restore the ECS-authored gravity scale on bodies that fell back to
+        // the global gravity (out of range, sources removed/disabled, or no
+        // sources left in the world at all).
+        let to_restore: Vec<Entity> = self
+            .gravity_overridden
+            .difference(&still_overridden)
+            .copied()
+            .collect();
+        for entity in to_restore {
+            if let Some(rigid_body) = world.get::<RigidBody>(entity) {
+                self.backend
+                    .set_body_gravity_scale(entity, rigid_body.gravity_scale);
+            }
+        }
+        self.gravity_overridden = still_overridden;
     }
 
     // ── Collision events ────────────────────────────────────────────────

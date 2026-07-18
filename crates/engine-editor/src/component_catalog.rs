@@ -13,6 +13,7 @@ pub const BOUNDS_COMPONENT: &str = "engine.bounds";
 pub const RIGID_BODY_COMPONENT: &str = "engine.physics.rigid_body";
 pub const COLLIDER_COMPONENT: &str = "engine.physics.collider";
 pub const PHYSICS_MATERIAL_COMPONENT: &str = "engine.physics.physics_material";
+pub const GRAVITY_SOURCE_COMPONENT: &str = "engine.gravity_source";
 pub const CHARACTER_CONTROLLER_COMPONENT: &str = "engine.character_controller";
 pub const AUDIO_LISTENER_COMPONENT: &str = "engine.audio_listener";
 pub const UI_CANVAS_COMPONENT: &str = "engine.canvas";
@@ -218,6 +219,17 @@ fn physics_material(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
     ])))
 }
 
+fn gravity_source(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
+    Ok(record(BTreeMap::from([
+        ("mode".into(), Value::Enum("Point".into())),
+        ("enabled".into(), Value::Bool(true)),
+        ("strength".into(), Value::Float32(9.81)),
+        ("direction".into(), Value::Vec3([0.0, -1.0, 0.0])),
+        ("center".into(), Value::Vec3([0.0, 0.0, 0.0])),
+        ("falloff".into(), Value::Enum("None".into())),
+    ])))
+}
+
 fn character_controller(entity: &EntityRecord) -> Result<ComponentRecord, EditorError> {
     let position = entity
         .components
@@ -285,7 +297,7 @@ fn nav_agent(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
     Ok(record(fields))
 }
 
-const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 14] = [
+const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 15] = [
     ComponentDescriptor {
         type_id: TRANSFORM_COMPONENT,
         display_name: "Transform",
@@ -353,6 +365,14 @@ const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 14] = [
             COLLIDER_COMPONENT,
         ],
         factory: physics_material,
+    },
+    ComponentDescriptor {
+        type_id: GRAVITY_SOURCE_COMPONENT,
+        display_name: "Gravity Source",
+        category: "Physics",
+        removable: true,
+        required_components: &[TRANSFORM_COMPONENT],
+        factory: gravity_source,
     },
     ComponentDescriptor {
         type_id: CHARACTER_CONTROLLER_COMPONENT,
