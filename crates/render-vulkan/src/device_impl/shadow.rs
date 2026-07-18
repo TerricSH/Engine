@@ -953,6 +953,66 @@ mod tests {
     }
 
     #[test]
+    fn camera_relative_view_produces_consistent_cascade_matrices() {
+        // ENG-01: cascades derive from the same view matrix the scene pass
+        // uses, so a consistent camera-relative shift must map shifted world
+        // points to (nearly) the same light-clip coordinates as the absolute
+        // frame — shadows come free with the shift.
+        let origin = Vec3::new(100_000.0, 0.0, 100_000.0);
+        let rotation = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_4);
+        let view_absolute = Mat4::from_rotation_translation(rotation, origin).inverse();
+        let view_relative = Mat4::from_quat(rotation).inverse(); // translation-free
+
+        let projection = Mat4::perspective_rh(55.0f32.to_radians(), 16.0 / 9.0, 0.1, 500.0);
+        let (near, far) = VulkanDevice::derive_rh_zo_clip_planes(&projection).unwrap();
+        let light_direction = Vec3::new(0.4, -1.0, 0.25);
+
+        let (splits_absolute, vps_absolute) = VulkanDevice::compute_cascade_data(
+            &view_absolute,
+            &projection,
+            near,
+            far,
+            light_direction,
+        )
+        .expect("absolute view should produce valid cascades");
+        let (splits_relative, vps_relative) = VulkanDevice::compute_cascade_data(
+            &view_relative,
+            &projection,
+            near,
+            far,
+            light_direction,
+        )
+        .expect("camera-relative view should produce valid cascades");
+
+        // View-space split distances are translation-invariant.
+        for (absolute, relative) in splits_absolute.iter().zip(splits_relative.iter()) {
+            assert_approx(*relative, *absolute);
+        }
+
+        // A consistently shifted point must land on the same light-clip
+        // coordinate in both frames. Tolerance: the absolute frame itself
+        // quantizes the point and matrices to a ~8 mm grid at 100 km, so
+        // the frames cannot agree below that floor.
+        for (vp_absolute, vp_relative) in vps_absolute.iter().zip(vps_relative.iter()) {
+            for local in [
+                Vec3::new(1.5, -0.25, -3.0),
+                Vec3::new(-2.0, 0.5, -12.0),
+                Vec3::new(0.25, 1.0, -60.0),
+            ] {
+                let point_absolute = origin + rotation * local;
+                let point_relative = point_absolute - origin;
+                let clip_absolute = vp_absolute.project_point3(point_absolute);
+                let clip_relative = vp_relative.project_point3(point_relative);
+                let mismatch = (clip_absolute - clip_relative).length();
+                assert!(
+                    mismatch <= 2.0e-2,
+                    "cascade light-clip mismatch {mismatch} between absolute and camera-relative frames"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn invalid_shadow_inputs_are_rejected_without_a_fixed_fallback() {
         assert_eq!(
             VulkanDevice::normalize_shadow_light_direction(Vec3::ZERO),

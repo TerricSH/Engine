@@ -54,6 +54,14 @@ pub struct SceneSettings {
     pub environment_map: Option<AssetId>,
     pub tone_mapping: ToneMapping,
     pub pass_graph_config: PassGraphConfig,
+    /// Opt-in camera-relative rendering (ENG-01): renderer extraction emits
+    /// the base view matrix with its translation removed and shifts every
+    /// emitted world position by `-base_camera_position`, restoring f32
+    /// precision for content far from the world origin. Rendering-only:
+    /// scene data, physics, and scripts keep absolute f32 world coordinates.
+    /// Defaults to `false` so existing scenes render unchanged.
+    #[serde(default)]
+    pub camera_relative_rendering: bool,
 }
 
 impl Default for SceneSettings {
@@ -67,6 +75,7 @@ impl Default for SceneSettings {
             environment_map: None,
             tone_mapping: ToneMapping::Aces,
             pass_graph_config: PassGraphConfig::default(),
+            camera_relative_rendering: false,
         }
     }
 }

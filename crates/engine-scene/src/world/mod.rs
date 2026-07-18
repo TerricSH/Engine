@@ -124,6 +124,14 @@ impl World {
         &self.scene_settings
     }
 
+    /// Mutate the scene-level settings of a live world.
+    ///
+    /// Changes take effect on the next extraction/system pass; they are not
+    /// written back to the scene file the world was loaded from.
+    pub fn scene_settings_mut(&mut self) -> &mut SceneSettings {
+        &mut self.scene_settings
+    }
+
     // ── Entity management ─────────────────────────────────────────────
 
     /// Create a new entity and return its handle.

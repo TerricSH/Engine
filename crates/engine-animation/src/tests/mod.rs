@@ -772,8 +772,10 @@ fn skinned_extract_replaces_the_matching_static_drawable() {
 
 /// Worst-case |f32 (view·model)·origin − f64 reference| for a skinned item
 /// 2 m ahead of a camera `(distance, 0, distance)` from the origin, over
-/// eight camera yaws. Returns (view-space error m, relative error).
-fn measure_far_origin_skinned(distance: f32) -> (f64, f64) {
+/// eight camera yaws. Returns (view-space error m, relative error). The f64
+/// reference is mode-agnostic: the camera-relative shift cancels in
+/// `view * model`, so both modes target the same view-space truth.
+fn measure_far_origin_skinned(distance: f32, camera_relative: bool) -> (f64, f64) {
     let mut worst_error_m = 0.0_f64;
     let mut worst_relative = 0.0_f64;
     for step in 0..8 {
@@ -799,6 +801,7 @@ fn measure_far_origin_skinned(distance: f32) -> (f64, f64) {
         );
 
         let mut world = engine_scene::World::new();
+        world.scene_settings_mut().camera_relative_rendering = camera_relative;
         let camera = world.create_entity();
         world.add_component(camera, engine_scene::components::Camera::default());
         world.add_component(
@@ -890,9 +893,9 @@ fn measure_far_origin_skinned(distance: f32) -> (f64, f64) {
 
 #[test]
 fn far_origin_skinned_world_transform_quantizes_like_static_path() {
-    let (_, near_relative) = measure_far_origin_skinned(1.0e3);
-    let (_, mid_relative) = measure_far_origin_skinned(1.0e4);
-    let (far_error_m, far_relative) = measure_far_origin_skinned(1.0e5);
+    let (_, near_relative) = measure_far_origin_skinned(1.0e3, false);
+    let (_, mid_relative) = measure_far_origin_skinned(1.0e4, false);
+    let (far_error_m, far_relative) = measure_far_origin_skinned(1.0e5, false);
     println!(
         "worst-case skinned relative view-space error: 1km={near_relative:.3e}, 10km={mid_relative:.3e}, 100km={far_relative:.3e}"
     );
@@ -913,6 +916,87 @@ fn far_origin_skinned_world_transform_quantizes_like_static_path() {
         "expected absolute view-space error on the skinned path at 100 km, got {far_error_m:.3e} m"
     );
     let _ = (near_relative, mid_relative);
+}
+
+#[test]
+fn camera_relative_rendering_collapses_far_origin_skinned_error() {
+    let near = measure_far_origin_skinned(1.0e3, true);
+    let mid = measure_far_origin_skinned(1.0e4, true);
+    let far = measure_far_origin_skinned(1.0e5, true);
+    for (label, (error_m, relative)) in [("1km", near), ("10km", mid), ("100km", far)] {
+        println!(
+            "camera-relative skinned worst-case {label:>5}: view_space_error={error_m:.3e} m (relative {relative:.3e})"
+        );
+        assert!(
+            relative <= 1.0e-4,
+            "camera-relative skinned view-space error at {label} must collapse to ≤1e-4, got {relative:.3e}"
+        );
+    }
+}
+
+#[test]
+fn bridge_skinned_items_shifts_world_transform_when_camera_relative_enabled() {
+    let build = |camera_relative: bool| {
+        let mut world = engine_scene::World::new();
+        world.scene_settings_mut().camera_relative_rendering = camera_relative;
+        let camera = world.create_entity();
+        world.add_component(camera, engine_scene::components::Camera::default());
+        world.add_component(
+            camera,
+            engine_scene::components::Transform {
+                translation: Vec3::new(100.0, 0.0, 0.0),
+                ..Default::default()
+            },
+        );
+        let skinned = world.create_entity();
+        world.add_component(
+            skinned,
+            engine_scene::components::Renderable {
+                mesh_asset: "mesh-skinned-shift".into(),
+                material_asset: "mat-skinned-shift".into(),
+                visible: true,
+                cast_shadows: false,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            skinned,
+            engine_scene::components::Transform {
+                translation: Vec3::new(100.0, 0.0, -2.0),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            skinned,
+            SkeletonComponent {
+                skeleton_asset: Some("skel-shift".into()),
+                bind_shape: [0.5, 0.5, 0.5],
+            },
+        );
+
+        let mut skeletons = std::collections::HashMap::new();
+        skeletons.insert("skel-shift".to_string(), test_skeleton());
+        let clips = std::collections::HashMap::new();
+        let producer = SkinnedExtractProducer::new();
+        bridge_skinned_items(&mut world, &skeletons, &clips, &producer, 0.0);
+        let pending = producer.drain();
+        assert_eq!(pending.len(), 1);
+        Mat4::from_cols_array_2d(&pending[0].world_transform)
+            .w_axis
+            .truncate()
+    };
+
+    // Flag off (default): the skinned world transform stays absolute.
+    let absolute_translation = build(false);
+    assert!(absolute_translation.abs_diff_eq(Vec3::new(100.0, 0.0, -2.0), 1.0e-6));
+
+    // Flag on: translated by `-base_camera_position`, matching the shift
+    // extraction applies to static drawables and views.
+    let relative_translation = build(true);
+    assert!(
+        relative_translation.abs_diff_eq(Vec3::new(0.0, 0.0, -2.0), 1.0e-5),
+        "skinned world transform should be camera-relative, got {relative_translation:?}"
+    );
 }
 
 // ── Debug draw tests ───────────────────────────────────────────────────

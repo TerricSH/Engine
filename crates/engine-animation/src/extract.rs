@@ -153,6 +153,12 @@ pub fn bridge_skinned_items(
 ) {
     use crate::{AnimationPlayer, IkTargetComponent, SkeletonComponent};
 
+    // ENG-01 camera-relative rendering: skinned items bypass engine-scene's
+    // world-transform resolve, so extraction cannot shift them. Apply the
+    // same `-origin` translation here or skinned meshes render offset from
+    // the camera-relative frame by the origin magnitude.
+    let relative_origin = engine_scene::camera_relative_render_origin(world);
+
     let clip_list: Vec<(&str, crate::AnimationClip)> = clips
         .iter()
         .map(|(id, clip)| (id.as_str(), clip.clone()))
@@ -218,6 +224,10 @@ pub fn bridge_skinned_items(
         let world_mat = glam::Mat4::from_translation(transform.translation)
             * glam::Mat4::from_quat(transform.rotation)
             * glam::Mat4::from_scale(transform.scale);
+        let world_mat = match relative_origin {
+            Some(origin) => glam::Mat4::from_translation(-origin) * world_mat,
+            None => world_mat,
+        };
 
         // Compute a conservative local-space AABB from animated joint
         // positions. Skin matrices include inverse-bind transforms and are not

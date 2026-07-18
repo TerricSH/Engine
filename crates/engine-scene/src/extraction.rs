@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use engine_renderer::{
-    AxisAlignedBox, BlendMode, ClearFlags, ExtractionStats, LightItem, Rect, RenderFrameInput,
-    RenderView, RenderableItem, ShadowMode, ViewCompose,
+    AxisAlignedBox, BlendMode, ClearFlags, DebugPrimitive, DebugPrimitiveKind, ExtractionStats,
+    LightItem, Rect, RenderFrameInput, RenderView, RenderableItem, ShadowMode, ViewCompose,
 };
 use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, PersistentId};
 
@@ -300,12 +300,7 @@ pub fn extract_renderer_input_from_world_with_viewport(
     // settings) use the lowest-priority camera as their Base view.
     let active_camera = world.scene_settings().active_camera.as_deref();
     cameras.sort_by(|left, right| {
-        let left_is_active = left.1.as_deref() == active_camera;
-        let right_is_active = right.1.as_deref() == active_camera;
-        right_is_active
-            .cmp(&left_is_active)
-            .then_with(|| left.0.cmp(&right.0))
-            .then_with(|| left.1.cmp(&right.1))
+        compare_camera_order(active_camera, left.0, &left.1, right.0, &right.1)
     });
     let base_camera = &cameras[0].2;
     input.render_options.msaa_samples = base_camera.msaa_samples;
@@ -315,6 +310,20 @@ pub fn extract_renderer_input_from_world_with_viewport(
         base_camera.iso,
         base_camera.ev_compensation,
     );
+
+    // ENG-01 camera-relative rendering: when enabled, every emitted view,
+    // drawable, light, and debug primitive is translated by `-origin`, where
+    // `origin` is the base camera's resolved world position. The base view
+    // matrix becomes translation-free, so the shader chain
+    // `proj * view * (model * pos)` evaluates at the magnitude of
+    // camera-relative offsets instead of absolute world coordinates.
+    // Frustum culling stays in absolute space, so the flag never changes
+    // which drawables and lights are culled.
+    let relative_origin = world
+        .scene_settings()
+        .camera_relative_rendering
+        .then(|| cameras[0].3.transform_point3(glam::Vec3::ZERO));
+    let relative_shift = relative_origin.map(|origin| glam::Mat4::from_translation(-origin));
 
     let camera_frustums: Vec<[glam::Vec4; 6]> = cameras
         .iter()
@@ -329,7 +338,14 @@ pub fn extract_renderer_input_from_world_with_viewport(
         .collect();
 
     for (view_idx, (priority, pid, camera, world_matrix, _entity)) in cameras.iter().enumerate() {
-        let view = compute_view_matrix(*world_matrix);
+        // Camera-relative v1 shifts every view by the *base* camera origin.
+        // For the base view this removes the translation exactly; overlay
+        // views keep their offset from the base camera, so an overlay far
+        // from the base camera is only as precise as that relative offset.
+        let render_world = relative_shift
+            .map(|shift| shift * *world_matrix)
+            .unwrap_or(*world_matrix);
+        let view = compute_view_matrix(render_world);
         let proj =
             compute_projection_matrix(camera, effective_camera_aspect(camera, viewport_context));
 
@@ -393,12 +409,20 @@ pub fn extract_renderer_input_from_world_with_viewport(
         let pid = world.persistent_id(entity).map(|s| s.to_string());
         let bounds = world.get::<components::Bounds>(entity);
 
-        let world_matrix = world_matrices
+        let absolute_world = world_matrices
             .get(&entity)
             .copied()
             .unwrap_or(glam::Mat4::IDENTITY);
-        let world_mat = world_matrix.to_cols_array();
-        let (center, half_extents, world_bounds) = transform_bounds_to_world(bounds, world_matrix);
+        // Culling uses the absolute world transform against absolute camera
+        // frustums, so the flag never changes culling decisions. Emitted
+        // transforms and bounds are then translated into camera-relative
+        // space when the flag is enabled.
+        let (center, half_extents, _) = transform_bounds_to_world(bounds, absolute_world);
+        let render_world = relative_shift
+            .map(|shift| shift * absolute_world)
+            .unwrap_or(absolute_world);
+        let world_mat = render_world.to_cols_array();
+        let (_, _, world_bounds) = transform_bounds_to_world(bounds, render_world);
 
         let Some(layer_bit) = render_layer_bit(&renderable.render_layer) else {
             diagnostics.push(unknown_render_layer_diagnostic(
@@ -499,8 +523,13 @@ pub fn extract_renderer_input_from_world_with_viewport(
             .get(&entity)
             .copied()
             .unwrap_or(glam::Mat4::IDENTITY);
-        let position = world_matrix.transform_point3(glam::Vec3::ZERO).to_array();
-        let direction = world_matrix
+        // A pure translation shift does not change `transform_vector3`, so
+        // light directions are unaffected; positions become camera-relative.
+        let render_world = relative_shift
+            .map(|shift| shift * world_matrix)
+            .unwrap_or(world_matrix);
+        let position = render_world.transform_point3(glam::Vec3::ZERO).to_array();
+        let direction = render_world
             .transform_vector3(glam::Vec3::from(light.direction))
             .normalize_or_zero()
             .to_array();
@@ -537,6 +566,14 @@ pub fn extract_renderer_input_from_world_with_viewport(
         culled_lights,
     });
 
+    // Extraction emits no debug primitives today, but any that arrive on
+    // this path are shifted like everything else. Primitives injected by
+    // render extension producers after extraction are the producer's
+    // responsibility (see [`camera_relative_render_origin`]).
+    if let Some(origin) = relative_origin {
+        translate_debug_primitives(&mut input.debug_primitives, -origin);
+    }
+
     if diagnostics.iter().any(|diagnostic| {
         matches!(
             diagnostic.severity,
@@ -547,6 +584,93 @@ pub fn extract_renderer_input_from_world_with_viewport(
     }
 
     Ok(input)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Camera-relative rendering (ENG-01)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Ordering for render views: the scene's active camera first, then
+/// ascending priority, then persistent id for determinism. Shared by
+/// extraction and [`camera_relative_render_origin`] so both always agree on
+/// which camera supplies the base view — and therefore the render origin.
+fn compare_camera_order(
+    active_camera: Option<&str>,
+    left_priority: i32,
+    left_pid: &Option<PersistentId>,
+    right_priority: i32,
+    right_pid: &Option<PersistentId>,
+) -> std::cmp::Ordering {
+    let left_is_active = left_pid.as_deref() == active_camera;
+    let right_is_active = right_pid.as_deref() == active_camera;
+    right_is_active
+        .cmp(&left_is_active)
+        .then_with(|| left_priority.cmp(&right_priority))
+        .then_with(|| left_pid.cmp(right_pid))
+}
+
+/// World-space position of the base-view camera — the camera-relative
+/// render origin used when `SceneSettings::camera_relative_rendering` is
+/// enabled.
+///
+/// The base camera is chosen with the same active-camera/priority ordering
+/// as renderer extraction, so callers stay consistent with the extracted
+/// [`RenderView`]s. Returns `None` when the flag is disabled or the world
+/// has no camera.
+///
+/// Render extension producers that emit world-space items outside the
+/// canonical extraction path (for example skinned meshes) must translate
+/// them by `-origin` when this returns `Some`; otherwise those items render
+/// offset from the camera-relative frame by the origin magnitude.
+pub fn camera_relative_render_origin(world: &World) -> Option<glam::Vec3> {
+    if !world.scene_settings().camera_relative_rendering {
+        return None;
+    }
+    let world_matrices = resolve_world_transforms(world).ok()?;
+    let active_camera = world.scene_settings().active_camera.as_deref();
+    let mut cameras: Vec<(i32, Option<PersistentId>, crate::Entity)> = world
+        .query::<components::Camera>()
+        .map(|(entity, camera)| {
+            (
+                camera.priority,
+                world.persistent_id(entity).map(str::to_owned),
+                entity,
+            )
+        })
+        .collect();
+    cameras.sort_by(|left, right| {
+        compare_camera_order(active_camera, left.0, &left.1, right.0, &right.1)
+    });
+    let base_entity = cameras.first()?.2;
+    let world_matrix = world_matrices
+        .get(&base_entity)
+        .copied()
+        .unwrap_or(glam::Mat4::IDENTITY);
+    Some(world_matrix.transform_point3(glam::Vec3::ZERO))
+}
+
+/// Translate every position carried by debug primitives. Pure translation:
+/// radii, half-extents, and rotations are unaffected.
+fn translate_debug_primitives(primitives: &mut [DebugPrimitive], offset: glam::Vec3) {
+    for primitive in primitives {
+        match &mut primitive.primitive_kind {
+            DebugPrimitiveKind::Line { from, to } => {
+                *from = (glam::Vec3::from(*from) + offset).to_array();
+                *to = (glam::Vec3::from(*to) + offset).to_array();
+            }
+            DebugPrimitiveKind::Triangle { a, b, c } => {
+                *a = (glam::Vec3::from(*a) + offset).to_array();
+                *b = (glam::Vec3::from(*b) + offset).to_array();
+                *c = (glam::Vec3::from(*c) + offset).to_array();
+            }
+            DebugPrimitiveKind::Sphere { center, .. } | DebugPrimitiveKind::Box { center, .. } => {
+                *center = (glam::Vec3::from(*center) + offset).to_array();
+            }
+            DebugPrimitiveKind::Text { position, .. } => {
+                *position = (glam::Vec3::from(*position) + offset).to_array();
+            }
+        }
+    }
 }
 
 // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
@@ -1838,6 +1962,7 @@ mod tests {
     fn far_origin_world(
         distance: f32,
         yaw_radians: f32,
+        camera_relative: bool,
     ) -> (World, crate::Entity, crate::Entity, glam::DVec3) {
         let camera_translation = glam::Vec3::new(distance, 0.0, distance);
         let camera_rotation = glam::Quat::from_rotation_y(yaw_radians);
@@ -1846,6 +1971,7 @@ mod tests {
         let drawable_pos64 = camera_pos64 + forward64 * 2.0;
 
         let mut world = World::new();
+        world.scene_settings.camera_relative_rendering = camera_relative;
         let camera = world.create_entity();
         world.add_component(camera, components::Camera::default());
         world.add_component(
@@ -1886,8 +2012,15 @@ mod tests {
     /// Extract one benchmark frame and compare the f32 matrix chain against
     /// an f64 evaluation of the same stored f32 transforms. The f64
     /// reference isolates pipeline rounding from authored-data quantization.
-    fn measure_far_origin_sample(distance: f32, yaw_radians: f32) -> FarOriginMeasurement {
-        let (world, camera, drawable, drawable_pos64) = far_origin_world(distance, yaw_radians);
+    /// The reference is mode-agnostic: the camera-relative shift cancels in
+    /// `view * model`, so both modes target the same f64 view-space truth.
+    fn measure_far_origin_sample(
+        distance: f32,
+        yaw_radians: f32,
+        camera_relative: bool,
+    ) -> FarOriginMeasurement {
+        let (world, camera, drawable, drawable_pos64) =
+            far_origin_world(distance, yaw_radians, camera_relative);
         let camera_component = world.get::<components::Camera>(camera).unwrap().clone();
         let camera_transform = world.get::<components::Transform>(camera).unwrap().clone();
         let drawable_transform = world
@@ -1951,7 +2084,7 @@ mod tests {
     /// Worst-case measurement over eight camera yaws at the given distance.
     /// Single-sample f32 rounding is essentially random; the worst case over
     /// several orientations is what content actually suffers in practice.
-    fn measure_far_origin_precision(distance: f32) -> FarOriginMeasurement {
+    fn measure_far_origin_precision(distance: f32, camera_relative: bool) -> FarOriginMeasurement {
         let mut aggregate = FarOriginMeasurement {
             data_quantization_m: 0.0,
             model_translation_error_m: 0.0,
@@ -1961,7 +2094,7 @@ mod tests {
         };
         for step in 0..8 {
             let yaw = step as f32 * std::f32::consts::FRAC_PI_4;
-            let sample = measure_far_origin_sample(distance, yaw);
+            let sample = measure_far_origin_sample(distance, yaw, camera_relative);
             println!(
                 "  distance={distance:>7} m yaw={:>3}°: data_quantization={:.3e} m, model_error={:.3e} m, view_space_error={:.3e} m (relative {:.3e}), ndc_xy_error={:.3e}",
                 step * 45,
@@ -1991,7 +2124,7 @@ mod tests {
     fn far_origin_world_transform_quantizes_to_distance_dependent_grid() {
         // f32 ulp at 1/10/100 km — the stored-position grid spacing.
         for (distance, expected_ulp_m) in [(1.0e3_f32, 1.2e-4), (1.0e4, 9.8e-4), (1.0e5, 7.8e-3)] {
-            let m = measure_far_origin_precision(distance);
+            let m = measure_far_origin_precision(distance, false);
             println!(
                 "distance={distance:>7} m: data_quantization={:.3e} m, model_translation_error={:.3e} m",
                 m.data_quantization_m, m.model_translation_error_m
@@ -2013,9 +2146,9 @@ mod tests {
 
     #[test]
     fn far_origin_view_space_error_grows_into_visible_jitter() {
-        let near = measure_far_origin_precision(1.0e3);
-        let mid = measure_far_origin_precision(1.0e4);
-        let far = measure_far_origin_precision(1.0e5);
+        let near = measure_far_origin_precision(1.0e3, false);
+        let mid = measure_far_origin_precision(1.0e4, false);
+        let far = measure_far_origin_precision(1.0e5, false);
         for (label, m) in [("1km", &near), ("10km", &mid), ("100km", &far)] {
             println!(
                 "worst-case {label:>5}: view_space_error={:.3e} m (relative {:.3e}), ndc_xy_error={:.3e}",
@@ -2056,6 +2189,509 @@ mod tests {
             far.ndc_xy_error > 1.0e-4,
             "expected visible NDC jitter at 100 km, got {:.3e}",
             far.ndc_xy_error
+        );
+    }
+
+    // ── Camera-relative rendering (ENG-01 Phase 1) ───────────────────────────
+
+    #[test]
+    fn camera_relative_rendering_collapses_far_origin_error() {
+        let absolute = measure_far_origin_precision(1.0e5, false);
+        let near = measure_far_origin_precision(1.0e3, true);
+        let mid = measure_far_origin_precision(1.0e4, true);
+        let far = measure_far_origin_precision(1.0e5, true);
+        for (label, m) in [("1km", &near), ("10km", &mid), ("100km", &far)] {
+            println!(
+                "camera-relative worst-case {label:>5}: view_space_error={:.3e} m (relative {:.3e}), ndc_xy_error={:.3e}",
+                m.view_space_error_m, m.view_space_relative_error, m.ndc_xy_error
+            );
+        }
+
+        // Phase 1 acceptance: the Phase 0 baseline measured 5.5e-3 relative
+        // view-space error and 7.8e-3 NDC error at 100 km with the flag off.
+        for (label, m) in [("1km", &near), ("10km", &mid), ("100km", &far)] {
+            assert!(
+                m.view_space_relative_error <= 1.0e-4,
+                "camera-relative view-space error at {label} must collapse to ≤1e-4, got {:.3e}",
+                m.view_space_relative_error
+            );
+            assert!(
+                m.ndc_xy_error <= 1.0e-4,
+                "camera-relative NDC error at {label} must collapse to ≤1e-4, got {:.3e}",
+                m.ndc_xy_error
+            );
+        }
+        // At least 100x better than the absolute pipeline at 100 km.
+        assert!(
+            far.view_space_error_m <= absolute.view_space_error_m * 0.01,
+            "camera-relative error {:.3e} m should be ≥100x below absolute error {:.3e} m",
+            far.view_space_error_m,
+            absolute.view_space_error_m
+        );
+    }
+
+    #[test]
+    fn camera_relative_rendering_emits_translation_free_base_view_and_relative_drawable() {
+        let (mut world, _camera, _drawable, drawable_pos64) =
+            far_origin_world(1.0e5, std::f32::consts::FRAC_PI_4, true);
+        // Re-extract from the same world with the flag enabled.
+        world.scene_settings.camera_relative_rendering = true;
+        let input = extract_renderer_input_from_world(&world, 0).expect("extracts");
+
+        // Base view matrix is translation-free: the camera sits at the
+        // camera-relative origin.
+        let view = glam::Mat4::from_cols_array(&input.views[0].view_matrix);
+        assert!(
+            view.w_axis.truncate().length() <= 1.0e-6,
+            "base view must be translation-free, got w_axis {:?}",
+            view.w_axis
+        );
+
+        // The drawable world transform is translated by exactly `-origin`,
+        // where origin is the base camera's stored world position.
+        let origin = camera_relative_render_origin(&world).expect("flag enabled");
+        let model = glam::Mat4::from_cols_array(&input.drawables[0].world_transform);
+        let expected_translation = glam::Vec3::new(
+            drawable_pos64.x as f32,
+            drawable_pos64.y as f32,
+            drawable_pos64.z as f32,
+        ) - origin;
+        assert!(
+            model
+                .w_axis
+                .truncate()
+                .abs_diff_eq(expected_translation, 1.0e-4),
+            "drawable translation {:?} should be camera-relative {:?}",
+            model.w_axis,
+            expected_translation
+        );
+
+        // Emitted bounds move with the drawable.
+        let bounds_center = glam::Vec3::from(input.drawables[0].bounds.min)
+            + glam::Vec3::from(input.drawables[0].bounds.max);
+        assert!(
+            (bounds_center * 0.5).abs_diff_eq(expected_translation, 1.0e-4),
+            "drawable bounds should shift with the transform"
+        );
+    }
+
+    #[test]
+    fn camera_relative_rendering_uses_resolved_parented_camera_position() {
+        let mut world = World::new();
+        world.scene_settings.camera_relative_rendering = true;
+
+        let parent = world.create_entity();
+        let parent_transform = components::Transform {
+            translation: glam::Vec3::new(1.0e5, 50.0, 1.0e5),
+            rotation: glam::Quat::from_rotation_y(0.3),
+            scale: glam::Vec3::splat(2.0),
+            parent: None,
+        };
+        world.add_component(parent, parent_transform.clone());
+
+        let camera = world.create_entity();
+        let camera_transform = components::Transform {
+            translation: glam::Vec3::new(3.0, -1.0, 2.0),
+            rotation: glam::Quat::from_rotation_x(0.1),
+            scale: glam::Vec3::ONE,
+            parent: Some(parent),
+        };
+        world.add_component(camera, camera_transform.clone());
+        world.add_component(camera, components::Camera::default());
+
+        // The origin is the *resolved* world position of the parented camera.
+        let expected_world = glam::Mat4::from_scale_rotation_translation(
+            parent_transform.scale,
+            parent_transform.rotation,
+            parent_transform.translation,
+        ) * glam::Mat4::from_scale_rotation_translation(
+            camera_transform.scale,
+            camera_transform.rotation,
+            camera_transform.translation,
+        );
+        let expected_origin = expected_world.transform_point3(glam::Vec3::ZERO);
+        let origin = camera_relative_render_origin(&world).expect("flag enabled");
+        assert!(
+            origin.abs_diff_eq(expected_origin, 1.0e-3),
+            "origin {origin:?} should be the resolved camera position {expected_origin:?}"
+        );
+
+        let input = extract_renderer_input_from_world(&world, 0).expect("extracts");
+        let view = glam::Mat4::from_cols_array(&input.views[0].view_matrix);
+        assert!(
+            view.w_axis.truncate().length() <= 1.0e-5,
+            "parented base view must be translation-free, got {:?}",
+            view.w_axis
+        );
+
+        // The shifted view equals the inverse of the camera world matrix
+        // translated by `-origin` (shift-then-invert, exactly as extraction
+        // builds it).
+        let expected_view =
+            (glam::Mat4::from_translation(-expected_origin) * expected_world).inverse();
+        assert_mat4_approx(&input.views[0].view_matrix, expected_view);
+    }
+
+    #[test]
+    fn camera_relative_rendering_shifts_lights_but_not_directions() {
+        let mut world = World::new();
+        world.scene_settings.camera_relative_rendering = true;
+
+        let camera = world.create_entity();
+        world.add_component(camera, components::Camera::default());
+        world.add_component(
+            camera,
+            components::Transform {
+                translation: glam::Vec3::new(1.0e5, 0.0, 1.0e5),
+                rotation: glam::Quat::from_rotation_y(0.7),
+                scale: glam::Vec3::ONE,
+                parent: None,
+            },
+        );
+
+        let point_light = world.create_entity();
+        world.add_component(
+            point_light,
+            components::Transform {
+                translation: glam::Vec3::new(100_003.0, 1.5, 99_998.0),
+                rotation: glam::Quat::from_rotation_z(0.4),
+                scale: glam::Vec3::ONE,
+                parent: None,
+            },
+        );
+        world.add_component(
+            point_light,
+            components::Light {
+                kind: components::LightKind::Point,
+                color: [1.0; 3],
+                intensity: 5.0,
+                range: 25.0,
+                spot_angles: None,
+                shadow_mode: 0,
+                direction: [0.0, -1.0, 0.0],
+            },
+        );
+
+        let relative = extract_renderer_input_from_world(&world, 0).expect("extracts");
+        let origin = camera_relative_render_origin(&world).unwrap();
+        let expected_position = glam::Vec3::new(100_003.0, 1.5, 99_998.0) - origin;
+        assert!(
+            glam::Vec3::from(relative.lights[0].position).abs_diff_eq(expected_position, 1.0e-3),
+            "light position {:?} should be camera-relative {:?}",
+            relative.lights[0].position,
+            expected_position
+        );
+
+        // Directions are translation-invariant: identical to the absolute
+        // extraction, bit for bit.
+        world.scene_settings.camera_relative_rendering = false;
+        let absolute = extract_renderer_input_from_world(&world, 0).expect("extracts");
+        assert_eq!(relative.lights[0].direction, absolute.lights[0].direction);
+        let expected_absolute_position = glam::Vec3::new(100_003.0, 1.5, 99_998.0);
+        assert!(
+            glam::Vec3::from(absolute.lights[0].position)
+                .abs_diff_eq(expected_absolute_position, 1.0e-3),
+            "absolute-mode light position stays in world space"
+        );
+    }
+
+    #[test]
+    fn camera_relative_rendering_overlay_view_keeps_offset_from_base_camera() {
+        let mut world = World::new();
+        world.scene_settings.camera_relative_rendering = true;
+
+        let base_translation = glam::Vec3::new(1.0e5, 0.0, 1.0e5);
+        let base = world.create_entity();
+        world.add_component(
+            base,
+            components::Camera {
+                priority: -10,
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            base,
+            components::Transform {
+                translation: base_translation,
+                ..Default::default()
+            },
+        );
+
+        let overlay_translation = base_translation + glam::Vec3::new(0.0, 2.0, -3.0);
+        let overlay = world.create_entity();
+        world.add_component(
+            overlay,
+            components::Camera {
+                priority: 10,
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            overlay,
+            components::Transform {
+                translation: overlay_translation,
+                ..Default::default()
+            },
+        );
+
+        let input = extract_renderer_input_from_world(&world, 0).expect("extracts");
+        assert_eq!(input.views.len(), 2);
+
+        // Base view is translation-free.
+        let base_view = glam::Mat4::from_cols_array(&input.views[0].view_matrix);
+        assert!(base_view.w_axis.truncate().length() <= 1.0e-6);
+
+        // The overlay view keeps the overlay camera's offset from the *base*
+        // origin (the documented v1 approximation): it equals the inverse of
+        // the overlay world matrix translated by `-origin`.
+        let origin = camera_relative_render_origin(&world).unwrap();
+        assert!(origin.abs_diff_eq(base_translation, 1.0e-3));
+        let expected_overlay_view = (glam::Mat4::from_translation(-origin)
+            * glam::Mat4::from_translation(overlay_translation))
+        .inverse();
+        assert_mat4_approx(&input.views[1].view_matrix, expected_overlay_view);
+        // It is *not* translation-free: the 2/-3 m offset from the base
+        // camera is preserved in camera-relative space.
+        let overlay_view = glam::Mat4::from_cols_array(&input.views[1].view_matrix);
+        assert!(
+            (overlay_view.w_axis.truncate().length() - (2.0_f32 * 2.0 + 3.0 * 3.0).sqrt()).abs()
+                <= 1.0e-3,
+            "overlay view should keep its offset from the base camera"
+        );
+    }
+
+    #[test]
+    fn camera_relative_render_origin_follows_the_active_camera_setting() {
+        let mut world = World::new();
+        world.scene_settings.camera_relative_rendering = true;
+
+        // No cameras: no origin.
+        assert_eq!(camera_relative_render_origin(&world), None);
+
+        let first = world.create_persistent_entity("camera-first").unwrap();
+        world.add_component(
+            first,
+            components::Camera {
+                priority: -10,
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            first,
+            components::Transform {
+                translation: glam::Vec3::new(10.0, 0.0, 0.0),
+                ..Default::default()
+            },
+        );
+        let second = world.create_persistent_entity("camera-second").unwrap();
+        world.add_component(
+            second,
+            components::Camera {
+                priority: 10,
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            second,
+            components::Transform {
+                translation: glam::Vec3::new(20.0, 0.0, 0.0),
+                ..Default::default()
+            },
+        );
+
+        // Without an active-camera override the lowest-priority camera wins.
+        assert_eq!(
+            camera_relative_render_origin(&world),
+            Some(glam::Vec3::new(10.0, 0.0, 0.0))
+        );
+        // The scene's active camera always supplies the origin.
+        world.scene_settings.active_camera = Some("camera-second".to_string());
+        assert_eq!(
+            camera_relative_render_origin(&world),
+            Some(glam::Vec3::new(20.0, 0.0, 0.0))
+        );
+
+        // Disabled flag: no origin regardless of cameras.
+        world.scene_settings.camera_relative_rendering = false;
+        assert_eq!(camera_relative_render_origin(&world), None);
+    }
+
+    #[test]
+    fn camera_relative_rendering_preserves_rendered_view_space_near_origin() {
+        // The shift must not change what is rendered: `view * model` is
+        // invariant. Near the origin both modes agree to f32 noise.
+        let mut world = World::new();
+        let camera = world.create_entity();
+        world.add_component(camera, components::Camera::default());
+        world.add_component(
+            camera,
+            components::Transform {
+                translation: glam::Vec3::new(3.0, 2.0, 5.0),
+                rotation: glam::Quat::from_rotation_y(0.6),
+                scale: glam::Vec3::ONE,
+                parent: None,
+            },
+        );
+        let drawable = world.create_entity();
+        world.add_component(
+            drawable,
+            components::Renderable {
+                mesh_asset: "mesh-invariance".into(),
+                material_asset: "mat-invariance".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            drawable,
+            components::Transform {
+                translation: glam::Vec3::new(4.0, 1.0, -2.0),
+                rotation: glam::Quat::from_rotation_z(0.9),
+                scale: glam::Vec3::new(2.0, 0.5, 1.5),
+                parent: None,
+            },
+        );
+
+        let absolute = extract_renderer_input_from_world(&world, 0).expect("extracts");
+        world.scene_settings.camera_relative_rendering = true;
+        let relative = extract_renderer_input_from_world(&world, 0).expect("extracts");
+
+        let absolute_chain = glam::Mat4::from_cols_array(&absolute.views[0].view_matrix)
+            * glam::Mat4::from_cols_array(&absolute.drawables[0].world_transform);
+        let relative_chain = glam::Mat4::from_cols_array(&relative.views[0].view_matrix)
+            * glam::Mat4::from_cols_array(&relative.drawables[0].world_transform);
+        for (index, (absolute, relative)) in absolute_chain
+            .to_cols_array()
+            .iter()
+            .zip(relative_chain.to_cols_array().iter())
+            .enumerate()
+        {
+            assert!(
+                (absolute - relative).abs() <= 1.0e-5,
+                "view·model element {index} changed under the shift: {absolute} vs {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_relative_shift_translates_debug_primitive_positions() {
+        let offset = glam::Vec3::new(-100.0, 25.0, -40.0);
+        let mut primitives = vec![
+            DebugPrimitive {
+                source_system: "test".into(),
+                severity: DiagnosticSeverity::Info,
+                primitive_kind: DebugPrimitiveKind::Line {
+                    from: [101.0, -25.0, 41.0],
+                    to: [100.0, -25.0, 40.0],
+                },
+                color: [1.0; 4],
+                lifetime_frames: 1,
+            },
+            DebugPrimitive {
+                source_system: "test".into(),
+                severity: DiagnosticSeverity::Info,
+                primitive_kind: DebugPrimitiveKind::Sphere {
+                    center: [104.0, -27.0, 43.0],
+                    radius: 2.5,
+                },
+                color: [1.0; 4],
+                lifetime_frames: 1,
+            },
+            DebugPrimitive {
+                source_system: "test".into(),
+                severity: DiagnosticSeverity::Info,
+                primitive_kind: DebugPrimitiveKind::Box {
+                    center: [105.0, -28.0, 44.0],
+                    half_extents: [1.0, 2.0, 3.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                color: [1.0; 4],
+                lifetime_frames: 1,
+            },
+            DebugPrimitive {
+                source_system: "test".into(),
+                severity: DiagnosticSeverity::Info,
+                primitive_kind: DebugPrimitiveKind::Triangle {
+                    a: [100.0, -25.0, 40.0],
+                    b: [101.0, -25.0, 40.0],
+                    c: [100.0, -24.0, 40.0],
+                },
+                color: [1.0; 4],
+                lifetime_frames: 1,
+            },
+            DebugPrimitive {
+                source_system: "test".into(),
+                severity: DiagnosticSeverity::Info,
+                primitive_kind: DebugPrimitiveKind::Text {
+                    position: [102.0, -26.0, 42.0],
+                    text: "label".into(),
+                    size_px: 12.0,
+                },
+                color: [1.0; 4],
+                lifetime_frames: 1,
+            },
+        ];
+
+        translate_debug_primitives(&mut primitives, offset);
+
+        let shifted = |p: [f32; 3]| (glam::Vec3::from(p) + offset).to_array();
+        match &primitives[0].primitive_kind {
+            DebugPrimitiveKind::Line { from, to } => {
+                assert_eq!(*from, shifted([101.0, -25.0, 41.0]));
+                assert_eq!(*to, shifted([100.0, -25.0, 40.0]));
+            }
+            other => panic!("unexpected primitive: {other:?}"),
+        }
+        match &primitives[1].primitive_kind {
+            DebugPrimitiveKind::Sphere { center, radius } => {
+                assert_eq!(*center, shifted([104.0, -27.0, 43.0]));
+                assert_eq!(*radius, 2.5, "radius is translation-invariant");
+            }
+            other => panic!("unexpected primitive: {other:?}"),
+        }
+        match &primitives[2].primitive_kind {
+            DebugPrimitiveKind::Box {
+                center,
+                half_extents,
+                rotation,
+            } => {
+                assert_eq!(*center, shifted([105.0, -28.0, 44.0]));
+                assert_eq!(*half_extents, [1.0, 2.0, 3.0]);
+                assert_eq!(*rotation, [0.0, 0.0, 0.0, 1.0]);
+            }
+            other => panic!("unexpected primitive: {other:?}"),
+        }
+        match &primitives[3].primitive_kind {
+            DebugPrimitiveKind::Triangle { a, b, c } => {
+                assert_eq!(*a, shifted([100.0, -25.0, 40.0]));
+                assert_eq!(*b, shifted([101.0, -25.0, 40.0]));
+                assert_eq!(*c, shifted([100.0, -24.0, 40.0]));
+            }
+            other => panic!("unexpected primitive: {other:?}"),
+        }
+        match &primitives[4].primitive_kind {
+            DebugPrimitiveKind::Text {
+                position, size_px, ..
+            } => {
+                assert_eq!(*position, shifted([102.0, -26.0, 42.0]));
+                assert_eq!(*size_px, 12.0);
+            }
+            other => panic!("unexpected primitive: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn camera_relative_rendering_is_disabled_by_default() {
+        assert!(!crate::scene::SceneSettings::default().camera_relative_rendering);
+        // Existing scenes deserialize with the flag off (serde default).
+        let mut world = World::new();
+        add_default_camera(&mut world);
+        let input = extract_renderer_input_from_world(&world, 0).expect("extracts");
+        let view = glam::Mat4::from_cols_array(&input.views[0].view_matrix);
+        assert!(
+            view.w_axis.truncate().length() <= 1.0e-6,
+            "default camera at origin is translation-free in both modes"
         );
     }
 }
