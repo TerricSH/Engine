@@ -349,6 +349,29 @@ impl World {
             .filter(|entity| self.entities.is_alive(*entity))
     }
 
+    /// Persistent ID of the entity's effective hierarchy parent, if any.
+    ///
+    /// Mirrors the serialization rule used by [`to_scene`](World::to_scene):
+    /// an entity with a `Transform` resolves through its `parent` handle
+    /// (a parent without a persistent ID yields `None`), while an entity
+    /// without a `Transform` falls back to the persistent side-table link
+    /// recorded at load/merge time.
+    pub fn parent_persistent_id(&self, entity: Entity) -> Option<&str> {
+        if !self.entities.is_alive(entity) {
+            return None;
+        }
+        if self.has::<Transform>(entity) {
+            return self
+                .get::<Transform>(entity)
+                .and_then(|transform| transform.parent)
+                .and_then(|parent| self.persistent_id(parent));
+        }
+        let idx = entity.index() as usize;
+        self.entity_parents
+            .get(idx)
+            .and_then(|parent| parent.as_deref())
+    }
+
     /// Iterate every live entity that has a persistent scene identifier.
     ///
     /// Persistent ids, rather than generational ECS handles, are the stable

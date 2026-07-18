@@ -209,6 +209,33 @@ impl World {
         report.persistent_ids.dedup();
         Ok(report)
     }
+
+    /// Detach `entity` from its current parent, promoting it to a hierarchy
+    /// root without moving it.
+    ///
+    /// Both hierarchy links are cleared: the `Transform.parent` handle and
+    /// the persistent side-table entry used for entities without an enabled
+    /// Transform. The entity's local Transform is left untouched, matching
+    /// the re-rooting behaviour of [`destroy_entity`](World::destroy_entity).
+    /// Subtree operations such as
+    /// [`destroy_subtree_by_persistent_ids`](World::destroy_subtree_by_persistent_ids)
+    /// no longer reach the entity through its former parent, which is exactly
+    /// what cell streaming needs to keep resident entities alive while the
+    /// rest of their authoring cell unloads. Returns `false` for stale
+    /// handles.
+    pub fn detach_from_parent(&mut self, entity: Entity) -> bool {
+        if !self.entities.is_alive(entity) {
+            return false;
+        }
+        if let Some(transform) = self.get_mut::<Transform>(entity) {
+            transform.parent = None;
+        }
+        let idx = entity.index() as usize;
+        if idx < self.entity_parents.len() {
+            self.entity_parents[idx] = None;
+        }
+        true
+    }
 }
 
 /// Validate a merge before any world mutation.
@@ -837,5 +864,67 @@ mod tests {
             diagnostics.is_empty(),
             "world must stay valid after subtree unload: {diagnostics:?}"
         );
+    }
+
+    #[test]
+    fn detach_from_parent_re_roots_transform_and_side_table_links() {
+        let mut world = World::from_scene(&hierarchy_scene());
+        let child = world.entity_by_persistent_id("child").expect("child");
+        let grandchild = world
+            .entity_by_persistent_id("grandchild")
+            .expect("grandchild");
+
+        assert!(world.detach_from_parent(child));
+        assert_eq!(world.get::<Transform>(child).and_then(|t| t.parent), None);
+        // Detaching is a re-root, not a move: the child keeps its own subtree.
+        assert_eq!(
+            world.get::<Transform>(grandchild).and_then(|t| t.parent),
+            Some(child)
+        );
+        let roundtripped = world.to_scene();
+        let child_record = roundtripped
+            .entities
+            .iter()
+            .find(|entity| entity.persistent_id == "child")
+            .expect("child record");
+        assert_eq!(child_record.parent, None);
+
+        // A detached entity is outside every former ancestor's subtree.
+        let report = world
+            .destroy_subtree_by_persistent_ids(&["root".to_string()])
+            .expect("destroy former parent subtree");
+        assert_eq!(report.persistent_ids, vec!["root".to_string()]);
+        assert!(world.entity_by_persistent_id("child").is_some());
+        assert!(world.entity_by_persistent_id("grandchild").is_some());
+    }
+
+    #[test]
+    fn detach_from_parent_covers_transformless_links_and_stale_handles() {
+        let scene = scene_with_records(
+            "transformless",
+            vec![
+                record("root", None),
+                record("child", Some("root")),
+                record("leaf", Some("child")),
+            ],
+        );
+        let mut world = World::from_scene(&scene);
+        let child = world.entity_by_persistent_id("child").expect("child");
+        assert!(world.get::<Transform>(child).is_none());
+
+        assert!(world.detach_from_parent(child));
+        let report = world
+            .destroy_subtree_by_persistent_ids(&["root".to_string()])
+            .expect("destroy root");
+        assert_eq!(report.persistent_ids, vec!["root".to_string()]);
+        assert!(world.entity_by_persistent_id("child").is_some());
+        assert!(world.entity_by_persistent_id("leaf").is_some());
+
+        let stale = {
+            let entity = world.create_entity();
+            world.destroy_entity(entity);
+            entity
+        };
+        assert!(!world.detach_from_parent(stale));
     }
 }

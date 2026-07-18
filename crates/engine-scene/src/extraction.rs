@@ -626,6 +626,21 @@ pub fn camera_relative_render_origin(world: &World) -> Option<glam::Vec3> {
     if !world.scene_settings().camera_relative_rendering {
         return None;
     }
+    active_camera_world_position(world)
+}
+
+/// World-space position of the base-view camera, independent of any render
+/// option flags.
+///
+/// The base camera is chosen with the exact active-camera/priority ordering
+/// used by renderer extraction, so the returned position is always the one
+/// the primary [`RenderView`] renders from. Returns `None` when the world
+/// has no enabled camera or the camera transform chain is invalid.
+///
+/// Runtime systems that need to know where the player is looking from —
+/// world-partition cell streaming, LOD selection, audio listener fallbacks —
+/// should use this instead of re-implementing camera selection.
+pub fn active_camera_world_position(world: &World) -> Option<glam::Vec3> {
     let world_matrices = resolve_world_transforms(world).ok()?;
     let active_camera = world.scene_settings().active_camera.as_deref();
     let mut cameras: Vec<(i32, Option<PersistentId>, crate::Entity)> = world
@@ -2514,6 +2529,40 @@ mod tests {
         // Disabled flag: no origin regardless of cameras.
         world.scene_settings.camera_relative_rendering = false;
         assert_eq!(camera_relative_render_origin(&world), None);
+    }
+
+    #[test]
+    fn active_camera_world_position_ignores_render_flags_and_reads_hierarchy() {
+        let mut world = World::new();
+        // No camera at all: no position, regardless of flags.
+        assert_eq!(active_camera_world_position(&world), None);
+
+        let root = world.create_persistent_entity("rig").unwrap();
+        world.add_component(
+            root,
+            components::Transform {
+                translation: glam::Vec3::new(100.0, 0.0, 0.0),
+                ..Default::default()
+            },
+        );
+        let camera = world.create_persistent_entity("camera-main").unwrap();
+        world.add_component(camera, components::Camera::default());
+        world.add_component(
+            camera,
+            components::Transform {
+                translation: glam::Vec3::new(1.0, 2.0, 3.0),
+                parent: Some(root),
+                ..Default::default()
+            },
+        );
+
+        // The flag-gated origin stays off while the position resolves
+        // through the parent chain.
+        assert_eq!(camera_relative_render_origin(&world), None);
+        assert_eq!(
+            active_camera_world_position(&world),
+            Some(glam::Vec3::new(101.0, 2.0, 3.0))
+        );
     }
 
     #[test]
