@@ -91,9 +91,84 @@ such as a dense gameplay cell over a large background cell.
 
 `project check` validates the partition file when it is present (schema, cell
 IDs, scene references, and bounds) and reports the cell count as
-`partition_cells` in its JSON report. **Cell streaming is not yet active**: the
-runtime still loads only the startup scene, and the manifest is currently an
-authoring/validation contract that future streaming phases will consume.
+`partition_cells` in its JSON report. It also enforces the streaming
+compatibility rules the runtime driver relies on: cell scenes must not contain
+`engine.script` components (scripts in cells are not supported in this
+version; attach scripts in the startup scene instead), persistent entity IDs
+must be unique across cells, and a cell that does not reference the startup
+scene must not share entity IDs with it (a cell that intentionally reuses the
+startup scene's content must reference the startup scene itself — the driver
+then adopts the already-live entities instead of merging duplicates).
+
+### Runtime cell streaming (`--stream-cells`)
+
+Cell streaming is opt-in per run: `sandbox project run --stream-cells` (or
+`sandbox game --stream-cells`) activates it for both headless and windowed
+players, requiring a `world.partition.json` at the project root. Without the
+flag the runtime loads only the startup scene, exactly as before.
+
+Each frame, at the existing frame boundary (after `update()` and scene
+transition processing, before `render()`), the streaming driver resolves the
+active camera's world position and computes the desired cell set with
+hysteresis: an unloaded cell becomes desired when the camera enters
+`bounds * 1.0`, while an already loading or loaded cell stays desired until
+the camera leaves `bounds * 1.15`. The exit margin prevents boundary
+ping-ponging.
+
+Every cell moves through a small state machine: `Unloaded → LoadingAssets →
+Merging → Loaded`, and `Loaded → Unloading → Unloaded`. A cell's cooked asset
+dependencies are decoded on the Phase-3 background asset stream
+(`enqueue_cooked_asset_stream` / `drain_cooked_asset_stream`); the scene merge
+is committed only after every dependency is installed. Merges and unloads
+commit under per-frame budgets (1 merge, 4 unloads per frame boundary), and
+unloads commit before merges so departing content frees IDs first. Queued
+commits are cancelled when the camera changes the desired set in time — a
+pending unload is dropped if its cell becomes desired again, and a pending
+merge is dropped if its cell falls out of range. A cell whose cooked
+artifacts are missing (run `sandbox project cook`) or whose merge fails
+enters a terminal `Failed` state, surfaces a `CELL_STREAM` diagnostic, and
+never retries until the next scene load.
+
+Residency rules protect content that no longer belongs to its authoring cell:
+
+- **Runtime-created entities never unload.** A persistent entity that appears
+  in the world without being merged by the driver (for example
+  `Scene.CreateEntity` / `Scene.Spawn` output) becomes resident automatically.
+- **Entities that leave their authoring cell never unload.** A merged cell
+  entity whose world position moves outside its cell bounds (exit factor
+  applied) becomes resident; on unload it is detached from its cell hierarchy
+  instead of destroyed, and a later re-merge of the cell skips its old record
+  instead of duplicating it.
+
+Physics follows the world incrementally: after any frame boundary that
+committed merges or unloads, the player calls
+`GameLoop::resync_physics_from_world()`, which runs
+`PhysicsWorld::sync_from_ecs` — newly merged entities gain bodies, unloaded
+entities lose theirs, and every untouched body keeps its exact simulation
+state (no physics world rebuild).
+
+A scene transition (`Scene.Load`) replaces the whole world; the driver then
+rebaselines — the resident set clears, failed cells reset, and cells stream
+from scratch around the new scene. A cell whose entire entity set is already
+live after a load (typically one referencing the startup scene) is adopted as
+`Loaded` without merging. Headless run reports expose the final streaming
+state under `cell_streaming` (loaded cells, total merges/unloads, resident
+count, per-cell states).
+
+Authoring notes and current limitations:
+
+- Keep the active camera in the startup scene. Camera entities in cell scenes
+  still merge and become ordinary additional cameras (priority ordering
+  picks the active one), so cells should not author cameras.
+- Shared cooked assets are never unloaded; there is no per-cell asset
+  reference counting yet (follow-up work).
+- Once a cell's asset stream is enqueued it is never cancelled; leaving the
+  cell's bounds before the merge only skips the merge, and the committed
+  assets stay installed.
+- Save/rollback semantics remain whole-scene only; a failed scene transition
+  rolls back to the retained scene snapshot exactly as without streaming.
+- The editor is unaffected: streaming is a player-runtime behaviour and the
+  editor continues to open whole scenes.
 
 ## Commands
 
@@ -108,7 +183,7 @@ sandbox project cook <project>
 sandbox project sync-script-api <project>
 sandbox project build-scripts <project>
 sandbox project build <project>
-sandbox project run <project> [--headless] [--frames N] [--report PATH]
+sandbox project run <project> [--headless] [--frames N] [--report PATH] [--stream-cells]
 sandbox project editor <project>
 ```
 

@@ -1,6 +1,8 @@
 use std::path::Path;
 
+use engine_asset::partition::WorldPartition;
 use engine_asset::project::GameProject;
+use engine_core::cell_stream::{CellStreamingConfig, CellStreamingDriver};
 use engine_core::game_loop::GameLoop;
 use engine_core::{CookedAssetLoadReport, EngineConfig, EngineRuntime, SceneLoadRequest};
 use engine_scene::Scene;
@@ -24,9 +26,10 @@ pub fn run_project(request: ProjectRunRequest) -> Result<(), String> {
             scene,
             request.frames.unwrap_or(3),
             request.report.as_deref(),
+            request.stream_cells,
         )
     } else {
-        run_windowed(project, scene, request.frames)
+        run_windowed(project, scene, request.frames, request.stream_cells)
     }
 }
 
@@ -105,6 +108,45 @@ fn create_game_loop(
     game_loop.init_physics();
     game_loop.validate_ready().map_err(format_diagnostics)?;
     Ok((game_loop, cooked_report))
+}
+
+/// Build the world-partition cell streaming driver when `--stream-cells` is
+/// set. The flag requires a `world.partition.json` at the project root;
+/// without the flag no driver is constructed and streaming stays off.
+fn create_cell_streaming_driver(
+    project: &GameProject,
+    stream_cells: bool,
+) -> Result<Option<CellStreamingDriver>, String> {
+    if !stream_cells {
+        return Ok(None);
+    }
+    let partition = WorldPartition::load_for_project(project)
+        .map_err(|error| format!("world partition validation failed: {error}"))?
+        .ok_or_else(|| {
+            "--stream-cells requires a world.partition.json at the project root".to_string()
+        })?;
+    CellStreamingDriver::new(&partition, project, CellStreamingConfig::default())
+        .map(Some)
+        .map_err(|error| format!("world partition cell streaming setup failed: {error}"))
+}
+
+/// Advance cell streaming at the frame boundary: rebaseline after scene
+/// transitions, tick the driver, and re-sync physics when the world changed.
+fn tick_cell_streaming(
+    game_loop: &mut GameLoop,
+    driver: &mut Option<CellStreamingDriver>,
+    scene_transitions: usize,
+) {
+    let Some(driver) = driver.as_mut() else {
+        return;
+    };
+    if scene_transitions > 0 {
+        driver.rebaseline(&game_loop.runtime);
+    }
+    let report = driver.tick(&mut game_loop.runtime);
+    if report.world_changed() {
+        game_loop.resync_physics_from_world();
+    }
 }
 
 fn transition_to_project_scene(
@@ -359,22 +401,30 @@ fn run_headless(
     scene: Scene,
     frames: u64,
     report_path: Option<&Path>,
+    stream_cells: bool,
 ) -> Result<(), String> {
     let (mut game_loop, cooked_report) = create_game_loop(&project, scene)?;
     game_loop
         .runtime
         .set_renderer_backend(Box::<crate::qa::QaBackend>::default());
+    let mut cell_streaming = create_cell_streaming_driver(&project, stream_cells)?;
+    if let Some(driver) = cell_streaming.as_mut() {
+        driver.rebaseline(&game_loop.runtime);
+    }
     let mut total_draw_calls = 0u64;
     let mut total_triangles = 0u64;
     let mut last_visible_drawables = 0u32;
     let mut current_scene_id = project.startup_scene_id().to_string();
     let mut scene_transitions =
         process_pending_scene_transitions(&mut game_loop, &project, &mut current_scene_id)?;
+    tick_cell_streaming(&mut game_loop, &mut cell_streaming, scene_transitions);
     for frame in 0..frames {
         game_loop.update(1.0 / 60.0);
         crate::project_scripts::fail_on_script_errors(&game_loop.runtime, "update")?;
-        scene_transitions +=
+        let frame_transitions =
             process_pending_scene_transitions(&mut game_loop, &project, &mut current_scene_id)?;
+        scene_transitions += frame_transitions;
+        tick_cell_streaming(&mut game_loop, &mut cell_streaming, frame_transitions);
         let stats = game_loop.render(frame).map_err(format_diagnostics)?;
         total_draw_calls += u64::from(stats.draw_calls);
         total_triangles += stats.triangles;
@@ -391,6 +441,20 @@ fn run_headless(
         crate::project_scripts::script_int_field_sum(&game_loop.runtime, "UpdateCount");
     let script_entity_translations =
         crate::project_scripts::script_entity_translations(&game_loop.runtime);
+    let cell_streaming_report = cell_streaming.as_ref().map(|driver| {
+        serde_json::json!({
+            "enabled": true,
+            "loaded_cells": driver.loaded_cells(),
+            "total_merges": driver.total_merges(),
+            "total_unloads": driver.total_unloads(),
+            "resident_entities": driver.resident_ids().len(),
+            "cell_states": driver
+                .cell_states()
+                .into_iter()
+                .map(|(cell_id, state)| (cell_id, format!("{state:?}")))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        })
+    });
 
     let report = serde_json::to_string_pretty(&serde_json::json!({
         "schema": "ProjectRunReport-v0",
@@ -415,6 +479,7 @@ fn run_headless(
         "script_started_instances": script_started_instances,
         "script_update_count": script_update_count,
         "script_entity_translations": script_entity_translations,
+        "cell_streaming": cell_streaming_report,
         "script_errors": 0,
         "passed": true
     }))
@@ -447,7 +512,12 @@ fn format_diagnostics(diagnostics: Vec<engine_serialize::Diagnostic>) -> String 
 }
 
 #[cfg(feature = "backend-vulkan")]
-fn run_windowed(project: GameProject, scene: Scene, max_frames: Option<u64>) -> Result<(), String> {
+fn run_windowed(
+    project: GameProject,
+    scene: Scene,
+    max_frames: Option<u64>,
+    stream_cells: bool,
+) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
@@ -461,6 +531,8 @@ fn run_windowed(project: GameProject, scene: Scene, max_frames: Option<u64>) -> 
         project: GameProject,
         scene: Scene,
         game_loop: Option<GameLoop>,
+        cell_streaming: Option<CellStreamingDriver>,
+        stream_cells: bool,
         frame: u64,
         max_frames: Option<u64>,
         previous_frame: Instant,
@@ -518,15 +590,36 @@ fn run_windowed(project: GameProject, scene: Scene, max_frames: Option<u64>) -> 
                     game_loop.runtime.set_renderer_backend(backend);
                     #[cfg(feature = "runtime-subsystems")]
                     game_loop.set_ui_viewport_size(size.width, size.height);
-                    if let Err(error) = process_pending_scene_transitions(
+                    match create_cell_streaming_driver(&self.project, self.stream_cells) {
+                        Ok(mut driver) => {
+                            if let Some(driver) = driver.as_mut() {
+                                driver.rebaseline(&game_loop.runtime);
+                            }
+                            self.cell_streaming = driver;
+                        }
+                        Err(error) => {
+                            self.failed.store(true, Ordering::Release);
+                            tracing::error!(%error, "cell streaming setup failed");
+                            return;
+                        }
+                    }
+                    let initial_transitions = match process_pending_scene_transitions(
                         &mut game_loop,
                         &self.project,
                         &mut self.current_scene_id,
                     ) {
-                        self.failed.store(true, Ordering::Release);
-                        tracing::error!(%error, "initial scene transition failed");
-                        return;
-                    }
+                        Ok(transitions) => transitions,
+                        Err(error) => {
+                            self.failed.store(true, Ordering::Release);
+                            tracing::error!(%error, "initial scene transition failed");
+                            return;
+                        }
+                    };
+                    tick_cell_streaming(
+                        &mut game_loop,
+                        &mut self.cell_streaming,
+                        initial_transitions,
+                    );
                     self.game_loop = Some(game_loop);
                     self.previous_frame = Instant::now();
                     window.request_redraw();
@@ -568,13 +661,15 @@ fn run_windowed(project: GameProject, scene: Scene, max_frames: Option<u64>) -> 
                     {
                         return self.fail(error);
                     }
-                    if let Err(error) = process_pending_scene_transitions(
+                    let frame_transitions = match process_pending_scene_transitions(
                         game_loop,
                         &self.project,
                         &mut self.current_scene_id,
                     ) {
-                        return self.fail(error);
-                    }
+                        Ok(transitions) => transitions,
+                        Err(error) => return self.fail(error),
+                    };
+                    tick_cell_streaming(game_loop, &mut self.cell_streaming, frame_transitions);
                     if let Err(diagnostics) = game_loop.render(self.frame) {
                         return self.fail(format_diagnostics(diagnostics));
                     }
@@ -606,6 +701,8 @@ fn run_windowed(project: GameProject, scene: Scene, max_frames: Option<u64>) -> 
         project: project.clone(),
         scene,
         game_loop: None,
+        cell_streaming: None,
+        stream_cells,
         frame: 0,
         max_frames,
         previous_frame: Instant::now(),
@@ -634,6 +731,7 @@ fn run_windowed(
     _project: GameProject,
     _scene: Scene,
     _max_frames: Option<u64>,
+    _stream_cells: bool,
 ) -> Result<(), String> {
     Err("windowed project run requires the `backend-vulkan` feature; use --headless or rebuild with Vulkan support".into())
 }
@@ -681,6 +779,222 @@ mod tests {
         assert!(manifest_path.is_file());
         let project = GameProject::load(&root).unwrap();
         (temp, project)
+    }
+
+    fn transform_record(translation: [f32; 3]) -> engine_scene::ComponentRecord {
+        engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: BTreeMap::from([
+                (
+                    "translation".into(),
+                    engine_serialize::Value::Vec3(translation),
+                ),
+                (
+                    "rotation".into(),
+                    engine_serialize::Value::Quat([0.0, 0.0, 0.0, 1.0]),
+                ),
+                ("scale".into(), engine_serialize::Value::Vec3([1.0; 3])),
+            ]),
+        }
+    }
+
+    fn cube_renderable_record() -> engine_scene::ComponentRecord {
+        engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: BTreeMap::from([
+                (
+                    "mesh".into(),
+                    engine_serialize::Value::Asset(engine_serialize::AssetId::new("mesh-cube")),
+                ),
+                (
+                    "material".into(),
+                    engine_serialize::Value::Asset(engine_serialize::AssetId::new("mat-default")),
+                ),
+                ("visible".into(), engine_serialize::Value::Bool(true)),
+                (
+                    "render_layer".into(),
+                    engine_serialize::Value::Str("Default".into()),
+                ),
+                ("cast_shadows".into(), engine_serialize::Value::Bool(true)),
+            ]),
+        }
+    }
+
+    /// Project with a world partition: `cell_two` covers the origin and
+    /// streams `level_two` (one cube with unique IDs) around the camera.
+    fn cell_streaming_project_fixture() -> (tempfile::TempDir, GameProject) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let scene_dir = root.join("assets/scenes");
+        let source = root.join("assets/source");
+        let cooked = root.join("build/cooked");
+        std::fs::create_dir_all(&scene_dir).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&cooked).unwrap();
+
+        // Startup scene: the sample scene plus a mutable camera transform.
+        let mut main = engine_scene::sample_scene();
+        main.scene_id = "main".into();
+        main.entities
+            .iter_mut()
+            .find(|entity| entity.persistent_id == "camera-main")
+            .expect("sample scene camera")
+            .components
+            .insert("engine.transform".into(), transform_record([0.0; 3]));
+        main.save_to_file(&scene_dir.join("main.scene.ron"))
+            .unwrap();
+
+        // Cell scene: unique entity IDs, no camera of its own.
+        let mut level_two = engine_scene::sample_scene();
+        level_two.scene_id = "level_two".into();
+        level_two.name = "Streamed Cell".into();
+        level_two.scene_settings.active_camera = None;
+        level_two.entities = vec![engine_scene::EntityRecord {
+            persistent_id: "cube-two".into(),
+            parent: None,
+            name: Some("Streamed Cube".into()),
+            enabled: true,
+            components: BTreeMap::from([
+                ("engine.transform".into(), transform_record([1.0, 0.0, 0.0])),
+                ("engine.renderable".into(), cube_renderable_record()),
+            ]),
+        }];
+        level_two
+            .save_to_file(&scene_dir.join("level_two.scene.ron"))
+            .unwrap();
+
+        std::fs::write(
+            root.join(engine_asset::partition::WORLD_PARTITION_FILE_NAME),
+            format!(
+                "{{ \"schema\": \"{}\", \"cells\": {{ \"cell_two\": {{ \"scene\": \"level_two\", \"bounds\": {{ \"center\": [0.0, 0.0, 0.0], \"half_extents\": [10.0, 10.0, 10.0] }} }} }} }}\n",
+                engine_asset::partition::WORLD_PARTITION_SCHEMA
+            ),
+        )
+        .unwrap();
+
+        let mut manifest = ProjectManifest::new("Cell Streaming Test");
+        manifest.startup_scene = PathBuf::from("main");
+        manifest.input_actions = None;
+        manifest.scenes = BTreeMap::from([
+            ("main".into(), PathBuf::from("assets/scenes/main.scene.ron")),
+            (
+                "level_two".into(),
+                PathBuf::from("assets/scenes/level_two.scene.ron"),
+            ),
+        ]);
+        manifest.write_to_root(&root).unwrap();
+        let project = GameProject::load(&root).unwrap();
+        (temp, project)
+    }
+
+    fn set_main_camera_position(game_loop: &mut GameLoop, position: [f32; 3]) {
+        game_loop.runtime.with_world_mut(|world| {
+            let camera = world.entity_by_persistent_id("camera-main").unwrap();
+            world
+                .get_mut::<engine_scene::components::Transform>(camera)
+                .unwrap()
+                .translation = glam::Vec3::from(position);
+        });
+    }
+
+    fn has_persistent_entity(game_loop: &GameLoop, id: &str) -> bool {
+        game_loop
+            .runtime
+            .with_world(|world| world.entity_by_persistent_id(id).is_some())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn cell_streaming_is_opt_in_and_requires_a_partition_manifest() {
+        let (_temp, project) = cell_streaming_project_fixture();
+        // Without the flag no driver is constructed even when a partition
+        // manifest exists; with the flag the partition builds a driver.
+        assert!(create_cell_streaming_driver(&project, false)
+            .unwrap()
+            .is_none());
+        assert!(create_cell_streaming_driver(&project, true)
+            .unwrap()
+            .is_some());
+
+        // The flag without a partition manifest is an explicit error.
+        let (_temp2, no_partition) = scene_project_fixture();
+        let error = create_cell_streaming_driver(&no_partition, true)
+            .err()
+            .expect("streaming without a partition manifest must fail");
+        assert!(error.contains("world.partition.json"), "{error}");
+    }
+
+    #[test]
+    fn headless_cell_streaming_loads_and_unloads_cells_around_the_camera() {
+        let (_temp, project) = cell_streaming_project_fixture();
+        let scene = Scene::load_from_file(project.startup_scene_path()).unwrap();
+        let (mut game_loop, _) = create_game_loop(&project, scene).unwrap();
+        game_loop
+            .runtime
+            .set_renderer_backend(Box::<crate::qa::QaBackend>::default());
+        let mut driver = create_cell_streaming_driver(&project, true).unwrap();
+        driver.as_mut().unwrap().rebaseline(&game_loop.runtime);
+        let mut current_scene_id = project.startup_scene_id().to_string();
+
+        // Frame boundary with the camera at the origin: the cell streams in.
+        let transitions =
+            process_pending_scene_transitions(&mut game_loop, &project, &mut current_scene_id)
+                .unwrap();
+        tick_cell_streaming(&mut game_loop, &mut driver, transitions);
+        assert!(has_persistent_entity(&game_loop, "cube-two"));
+        assert_eq!(
+            driver.as_ref().unwrap().loaded_cells(),
+            vec!["cell_two".to_string()]
+        );
+
+        // The camera leaves the cell bounds: the cell unloads at the next
+        // frame boundary.
+        game_loop.update(1.0 / 60.0);
+        set_main_camera_position(&mut game_loop, [100.0, 0.0, 0.0]);
+        let transitions =
+            process_pending_scene_transitions(&mut game_loop, &project, &mut current_scene_id)
+                .unwrap();
+        tick_cell_streaming(&mut game_loop, &mut driver, transitions);
+        assert!(!has_persistent_entity(&game_loop, "cube-two"));
+        assert!(driver.as_ref().unwrap().loaded_cells().is_empty());
+
+        // The camera returns: the cell streams back in.
+        game_loop.update(1.0 / 60.0);
+        set_main_camera_position(&mut game_loop, [0.0, 0.0, 0.0]);
+        let transitions =
+            process_pending_scene_transitions(&mut game_loop, &project, &mut current_scene_id)
+                .unwrap();
+        tick_cell_streaming(&mut game_loop, &mut driver, transitions);
+        assert!(has_persistent_entity(&game_loop, "cube-two"));
+        let driver = driver.unwrap();
+        assert_eq!(driver.total_merges(), 2);
+        assert_eq!(driver.total_unloads(), 1);
+    }
+
+    #[test]
+    fn headless_run_report_includes_cell_streaming_state() {
+        let (_temp, project) = cell_streaming_project_fixture();
+        let scene = Scene::load_from_file(project.startup_scene_path()).unwrap();
+        let report_path = project.root.join("build/run-report.json");
+        run_headless(project, scene, 3, Some(&report_path), true).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["cell_streaming"]["enabled"], true);
+        assert_eq!(
+            report["cell_streaming"]["loaded_cells"],
+            serde_json::json!(["cell_two"])
+        );
+        assert_eq!(report["cell_streaming"]["total_merges"], 1);
+        assert_eq!(report["cell_streaming"]["total_unloads"], 0);
+        assert_eq!(report["cell_streaming"]["resident_entities"], 0);
+        assert_eq!(
+            report["cell_streaming"]["cell_states"]["cell_two"],
+            "Loaded"
+        );
     }
 
     #[test]

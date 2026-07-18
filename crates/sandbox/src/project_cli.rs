@@ -24,6 +24,9 @@ pub struct ProjectRunRequest {
     pub headless: bool,
     pub frames: Option<u64>,
     pub report: Option<PathBuf>,
+    /// Opt in to world-partition cell streaming (`--stream-cells`). Requires a
+    /// `world.partition.json` at the project root.
+    pub stream_cells: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,11 +116,13 @@ pub fn parse_run_request(args: &[String]) -> Result<ProjectRunRequest, String> {
     let mut headless = false;
     let mut frames = None;
     let mut report = None;
+    let mut stream_cells = false;
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
         match argument.as_str() {
             "--headless" => headless = true,
+            "--stream-cells" => stream_cells = true,
             "--frames" => {
                 index += 1;
                 let value = args
@@ -134,7 +139,8 @@ pub fn parse_run_request(args: &[String]) -> Result<ProjectRunRequest, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: sandbox project run <project> [--headless] [--frames N]".into(),
+                    "usage: sandbox project run <project> [--headless] [--frames N] [--stream-cells]"
+                        .into(),
                 );
             }
             _ if argument.starts_with("--frames=") => {
@@ -165,6 +171,7 @@ pub fn parse_run_request(args: &[String]) -> Result<ProjectRunRequest, String> {
         headless,
         frames,
         report,
+        stream_cells,
     })
 }
 
@@ -184,7 +191,7 @@ pub fn print_global_help() {
            sandbox project sync-script-api <project>\n\
            sandbox project build-scripts <project>\n\
            sandbox project build <project>\n\
-           sandbox project run <project> [--headless] [--frames N] [--report PATH]\n\
+           sandbox project run <project> [--headless] [--frames N] [--report PATH] [--stream-cells]\n\
            sandbox project editor <project>\n\n\
          Short aliases:\n\
            sandbox game <project> [--headless] [--frames N]\n\
@@ -1795,11 +1802,6 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
                 scene_path.display()
             )
         })?;
-        let inspection = super::project_scripts::inspect_project_scripts(&project, &scene)
-            .map_err(|error| format!("scene '{scene_id}' script validation failed: {error}"))?;
-        script_assembly = inspection.assembly_id;
-        script_components += inspection.component_count;
-
         let errors = validate_scene(&scene)
             .into_iter()
             .filter(|diagnostic| {
@@ -1816,8 +1818,41 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
                 errors.join("\n")
             ));
         }
+        total_entities += scene.entities.len();
+        scene_entities.insert(scene_id.clone(), scene.entities.len());
+        loaded_scenes.push((scene_id, scene_path, scene));
+    }
 
-        let mut ecs_scene = scene.clone();
+    // The optional world partition manifest is validated against the scene
+    // catalog when present, including the streaming compatibility rules the
+    // runtime driver enforces (no scripts in cells, persistent entity IDs
+    // unique across cells, no ID overlap with the startup scene unless the
+    // cell references the startup scene itself).
+    let partition = engine_asset::partition::WorldPartition::load_for_project(&project)
+        .map_err(|error| format!("world partition validation failed: {error}"))?;
+    if let Some(partition) = &partition {
+        let scene_refs = loaded_scenes
+            .iter()
+            .map(|(scene_id, _, scene)| (scene_id.clone(), scene))
+            .collect::<BTreeMap<String, &Scene>>();
+        engine_core::cell_stream::validate_partition_cell_scenes(
+            partition,
+            project.startup_scene_id(),
+            &scene_refs,
+        )
+        .map_err(|error| format!("world partition validation failed: {error}"))?;
+    }
+    let partition_cells = partition
+        .map(|partition| partition.cells.len())
+        .unwrap_or(0);
+
+    for (scene_id, _, scene) in &loaded_scenes {
+        let inspection = super::project_scripts::inspect_project_scripts(&project, scene)
+            .map_err(|error| format!("scene '{scene_id}' script validation failed: {error}"))?;
+        script_assembly = inspection.assembly_id;
+        script_components += inspection.component_count;
+
+        let mut ecs_scene = (*scene).clone();
         for entity in &mut ecs_scene.entities {
             entity.components.remove("engine.script");
         }
@@ -1831,18 +1866,7 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
                     .join("\n");
                 format!("scene '{scene_id}' could not be restored into an ECS World:\n{messages}")
             })?;
-        total_entities += scene.entities.len();
-        scene_entities.insert(scene_id.clone(), scene.entities.len());
-        loaded_scenes.push((scene_id, scene_path, scene));
     }
-
-    // The optional world partition manifest is validated against the scene
-    // catalog when present. Cell streaming is not yet active at runtime.
-    let partition = engine_asset::partition::WorldPartition::load_for_project(&project)
-        .map_err(|error| format!("world partition validation failed: {error}"))?;
-    let partition_cells = partition
-        .map(|partition| partition.cells.len())
-        .unwrap_or(0);
 
     let manifest_paths = source_manifest_paths(&project.asset_source)?;
     if manifest_paths.is_empty() {
@@ -3046,6 +3070,18 @@ mod tests {
         assert!(request.headless);
         assert_eq!(request.frames, Some(4));
         assert_eq!(request.report, None);
+        assert!(!request.stream_cells);
+    }
+
+    #[test]
+    fn parses_stream_cells_project_run() {
+        let request = parse_run_request(&[
+            "my-game".into(),
+            "--headless".into(),
+            "--stream-cells".into(),
+        ])
+        .unwrap();
+        assert!(request.stream_cells);
     }
 
     #[test]
@@ -3673,7 +3709,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("partition-project");
         create_project(&root, Some("Partition Project"), false).unwrap();
-        create_project_scene(&root, "level_two", None).unwrap();
+        let level_path = create_project_scene(&root, "level_two", None).unwrap();
+        // Cell scene entity IDs must be unique across cells and must not
+        // overlap the startup scene (unless the cell references the startup
+        // scene itself), so re-namespace the starter content of level_two.
+        let mut level_two = Scene::load_from_file(&level_path).unwrap();
+        for entity in &mut level_two.entities {
+            entity.persistent_id = format!("{}-two", entity.persistent_id);
+        }
+        level_two.scene_settings.active_camera = level_two
+            .scene_settings
+            .active_camera
+            .map(|camera| format!("{camera}-two"));
+        level_two.save_to_file(&level_path).unwrap();
         write_world_partition(
             &root,
             "\"cell_main\": { \"scene\": \"main\", \"bounds\": { \"center\": [0.0, 0.0, 0.0], \"half_extents\": [64.0, 16.0, 64.0] } },\n\
@@ -3687,6 +3735,70 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
         assert_eq!(report["passed"], true);
         assert_eq!(report["partition_cells"], 2);
+    }
+
+    #[test]
+    fn check_project_rejects_partition_cells_sharing_entity_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("partition-duplicate-ids");
+        create_project(&root, Some("Partition Duplicate IDs"), false).unwrap();
+        // level_two keeps the starter entity IDs, so it shares them with main.
+        create_project_scene(&root, "level_two", None).unwrap();
+        write_world_partition(
+            &root,
+            "\"cell_main\": { \"scene\": \"main\", \"bounds\": { \"center\": [0.0, 0.0, 0.0], \"half_extents\": [64.0, 16.0, 64.0] } },\n\
+             \"cell_two\": { \"scene\": \"level_two\", \"bounds\": { \"center\": [128.0, 0.0, 0.0], \"half_extents\": [32.0, 8.0, 32.0] } }",
+        );
+
+        let error = check_project(&root, None).unwrap_err();
+        assert!(
+            error.contains("cell scene entity ids must be unique across cells"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn check_project_rejects_script_components_in_partition_cells() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("partition-script-cell");
+        create_project(&root, Some("Partition Script Cell"), false).unwrap();
+        let level_path = create_project_scene(&root, "level_two", None).unwrap();
+        let mut level_two = Scene::load_from_file(&level_path).unwrap();
+        for entity in &mut level_two.entities {
+            entity.persistent_id = format!("{}-two", entity.persistent_id);
+        }
+        level_two.scene_settings.active_camera = level_two
+            .scene_settings
+            .active_camera
+            .map(|camera| format!("{camera}-two"));
+        level_two.entities.push(engine_scene::EntityRecord {
+            persistent_id: "scripted-two".to_string(),
+            parent: None,
+            name: Some("Scripted".to_string()),
+            enabled: true,
+            components: BTreeMap::from([(
+                "engine.script".to_string(),
+                engine_scene::ComponentRecord {
+                    schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+                    enabled: true,
+                    fields: BTreeMap::from([(
+                        "script".to_string(),
+                        engine_serialize::Value::Str("Game.Enemy".to_string()),
+                    )]),
+                },
+            )]),
+        });
+        level_two.save_to_file(&level_path).unwrap();
+        write_world_partition(
+            &root,
+            "\"cell_two\": { \"scene\": \"level_two\", \"bounds\": { \"center\": [128.0, 0.0, 0.0], \"half_extents\": [32.0, 8.0, 32.0] } }",
+        );
+
+        let error = check_project(&root, None).unwrap_err();
+        assert!(
+            error.contains("scripts in partition cells are not supported"),
+            "{error}"
+        );
     }
 
     #[test]

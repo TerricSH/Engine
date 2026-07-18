@@ -618,6 +618,25 @@ impl GameLoop {
         &self.physics_events
     }
 
+    /// Re-synchronise the physics world after direct ECS world mutations
+    /// that bypass [`load_scene`](Self::load_scene) — world-partition cell
+    /// streaming merges/unloads commit at the frame boundary and call this.
+    ///
+    /// With the `gameplay` feature this runs the incremental
+    /// `PhysicsWorld::sync_from_ecs`: bodies and colliders are created for
+    /// newly merged entities and removed for unloaded ones, while every
+    /// untouched entity keeps its exact simulation state. Scene-level
+    /// physics settings (gravity) cannot change through cell merges because
+    /// merges preserve world scene metadata, so no full rebuild is needed.
+    /// Without the `gameplay` feature this is a no-op.
+    pub fn resync_physics_from_world(&mut self) {
+        #[cfg(feature = "gameplay")]
+        if let Some(ref mut physics) = self.physics {
+            self.runtime
+                .with_world(|world| physics.sync_from_ecs(world));
+        }
+    }
+
     /// Take the most recent physics event snapshot, leaving it empty.
     #[cfg(feature = "gameplay")]
     pub fn take_physics_events(&mut self) -> PhysicsEvents {

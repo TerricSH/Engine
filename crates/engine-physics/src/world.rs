@@ -236,6 +236,16 @@ impl PhysicsWorld {
 
     // ── ECS synchronisation ─────────────────────────────────────────────
 
+    /// Whether the backend currently has a body registered for `entity`.
+    pub fn has_body(&self, entity: Entity) -> bool {
+        self.backend.has_body(entity)
+    }
+
+    /// Number of bodies currently registered in the backend.
+    pub fn body_count(&self) -> usize {
+        self.backend.body_map.len()
+    }
+
     /// Synchronise ECS components → Rapier backend.
     ///
     /// Creates bodies/colliders for entities that have the relevant

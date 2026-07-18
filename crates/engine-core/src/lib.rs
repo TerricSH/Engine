@@ -6,6 +6,8 @@ pub mod cooked_assets;
 pub use cooked_assets::*;
 pub mod asset_stream;
 pub use asset_stream::*;
+pub mod cell_stream;
+pub use cell_stream::{CellStreamingConfig, CellStreamingDriver};
 
 use engine_asset::{AssetHandle, AssetRegistry};
 use engine_renderer::{
