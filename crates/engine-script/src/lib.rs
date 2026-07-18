@@ -55,9 +55,11 @@ pub use engine::ScriptEngine;
 pub use gameplay::{
     validate_entity_id, validate_scene_id, validate_script_transform, GameplayCommand,
     GameplayContext, GameplayEntitySnapshot, GameplayInputTransitions, GameplayInputValue,
-    GameplayPhysicsEvent, GameplayPhysicsEventKind, GameplayUiColor, GameplayUiCommand,
-    GameplayUiElement, GameplayUiEvent, GameplayUiLayout, GameplayUiScaleMode, GameplayUiValue,
-    OwnedGameplayCommand, ScriptTransform,
+    GameplayPhysicsEvent, GameplayPhysicsEventKind, GameplayPhysicsQuery,
+    GameplayPhysicsQueryResult, GameplayUiColor, GameplayUiCommand, GameplayUiElement,
+    GameplayUiEvent, GameplayUiLayout, GameplayUiScaleMode, GameplayUiValue, OwnedGameplayCommand,
+    OwnedGameplayPhysicsQuery, ScriptTransform, MAX_PENDING_PHYSICS_QUERIES,
+    MAX_PHYSICS_OVERLAP_RESULTS, MAX_PHYSICS_QUERY_DISTANCE,
 };
 pub use host::{
     MockHost, MockScriptInstance, NullScriptHost, ScriptError, ScriptHandle, ScriptHost,

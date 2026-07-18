@@ -464,6 +464,13 @@ pub struct GameLoop {
     previous_script_input_actions:
         std::collections::BTreeMap<String, engine_script::GameplayInputValue>,
 
+    /// Physics query results computed after the previous update's script
+    /// drain. They are delivered to scripts with exactly one frame snapshot
+    /// and then discarded, mirroring the frame-local physics events.
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    script_physics_query_results:
+        std::collections::BTreeMap<String, Vec<engine_script::GameplayPhysicsQueryResult>>,
+
     /// Kinematic character controller driven by `update_character`.
     pub character: Option<CharacterController>,
 
@@ -501,6 +508,8 @@ impl GameLoop {
             input_map: InputActionMap::new("player".to_string(), "gameplay".to_string()),
             #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
             previous_script_input_actions: std::collections::BTreeMap::new(),
+            #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+            script_physics_query_results: std::collections::BTreeMap::new(),
             character: None,
             character_entity: None,
             #[cfg(feature = "runtime-subsystems")]
@@ -533,6 +542,7 @@ impl GameLoop {
         {
             let input_actions = self.resolved_script_input_actions();
             self.runtime.set_script_input_actions(input_actions);
+            self.script_physics_query_results.clear();
         }
         self.runtime.load_scene(scene)?;
         #[cfg(feature = "runtime-subsystems")]
@@ -722,23 +732,35 @@ impl GameLoop {
             let input_actions = self.resolved_script_input_actions();
             let input_transitions = self.resolved_script_input_transitions(&input_actions);
             let physics_events = self.resolved_script_physics_events();
-            self.runtime.tick_scripts_with_frame_input_and_ui(
-                dt,
-                &input_actions,
-                &input_transitions,
-                &physics_events,
-                &script_ui_events,
-            );
+            let physics_query_results = std::mem::take(&mut self.script_physics_query_results);
+            self.runtime
+                .tick_scripts_with_frame_input_ui_and_physics_queries(
+                    dt,
+                    &input_actions,
+                    &input_transitions,
+                    &physics_events,
+                    &script_ui_events,
+                    &physics_query_results,
+                );
             self.previous_script_input_actions = input_actions;
+            // Queries drained from this tick execute against the freshly
+            // stepped physics world; scripts observe the results with the
+            // next frame snapshot.
+            self.execute_script_physics_queries();
         }
         #[cfg(all(feature = "subsystem-scripting-csharp", not(feature = "gameplay")))]
-        self.runtime.tick_scripts_with_frame_input_and_ui(
-            dt,
-            &std::collections::BTreeMap::new(),
-            &engine_script::GameplayInputTransitions::default(),
-            &std::collections::BTreeMap::new(),
-            &script_ui_events,
-        );
+        {
+            self.runtime.tick_scripts_with_frame_input_and_ui(
+                dt,
+                &std::collections::BTreeMap::new(),
+                &engine_script::GameplayInputTransitions::default(),
+                &std::collections::BTreeMap::new(),
+                &script_ui_events,
+            );
+            // Without a physics world no query can be answered; drop drained
+            // queries so the runtime queue cannot accumulate.
+            let _ = self.runtime.take_pending_physics_queries();
+        }
 
         #[cfg(feature = "runtime-subsystems")]
         self.update_runtime_animation(dt);
@@ -1456,6 +1478,112 @@ impl GameLoop {
                 by_entity
             })
             .unwrap_or_default()
+    }
+
+    /// Execute the physics queries drained from the latest script update and
+    /// stage the results for the next frame snapshot.
+    ///
+    /// Queries run against the physics world after this frame's step and ECS
+    /// sync, so answers are consistent with the physics events delivered in
+    /// the same update. Results are frame-local: they replace the previous
+    /// staging map and are consumed by the next script tick.
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    fn execute_script_physics_queries(&mut self) {
+        let pending = self.runtime.take_pending_physics_queries();
+        if pending.is_empty() {
+            return;
+        }
+        let mut results = std::collections::BTreeMap::<
+            String,
+            Vec<engine_script::GameplayPhysicsQueryResult>,
+        >::new();
+        for engine_script::OwnedGameplayPhysicsQuery { entity_id, query } in pending {
+            let result = self.execute_script_physics_query(&query);
+            results.entry(entity_id).or_default().push(result);
+        }
+        self.script_physics_query_results = results;
+    }
+
+    /// Run one validated script physics query against the physics world,
+    /// translating backend hits into persistent entity ids so scripts never
+    /// observe raw ECS handles.
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    fn execute_script_physics_query(
+        &self,
+        query: &engine_script::GameplayPhysicsQuery,
+    ) -> engine_script::GameplayPhysicsQueryResult {
+        use engine_script::{GameplayPhysicsQuery, GameplayPhysicsQueryResult};
+
+        match *query {
+            GameplayPhysicsQuery::Raycast {
+                query_id,
+                origin,
+                direction,
+                max_distance,
+            } => {
+                let miss = || GameplayPhysicsQueryResult::RaycastMiss { query_id };
+                let Some(physics) = self.physics.as_ref() else {
+                    return miss();
+                };
+                let direction = Vec3::from(direction).normalize_or_zero();
+                if direction == Vec3::ZERO {
+                    return miss();
+                }
+                let max_distance = max_distance.min(engine_script::MAX_PHYSICS_QUERY_DISTANCE);
+                let Some(hit) = physics.raycast(Vec3::from(origin), direction, max_distance) else {
+                    return miss();
+                };
+                let entity_id = self
+                    .runtime
+                    .with_world(|world| world.persistent_id(hit.entity).map(str::to_owned))
+                    .flatten();
+                match entity_id {
+                    Some(entity_id) => GameplayPhysicsQueryResult::RaycastHit {
+                        query_id,
+                        entity_id,
+                        point: hit.point.to_array(),
+                        normal: hit.normal.to_array(),
+                        distance: hit.distance,
+                    },
+                    // A collider without a persistent id cannot be named to
+                    // scripts, so the query reports no usable hit.
+                    None => miss(),
+                }
+            }
+            GameplayPhysicsQuery::OverlapSphere {
+                query_id,
+                center,
+                radius,
+            } => {
+                let mut entity_ids = Vec::new();
+                if let Some(physics) = self.physics.as_ref() {
+                    let radius = radius.min(engine_script::MAX_PHYSICS_QUERY_DISTANCE);
+                    let hits = physics.query_proximity(
+                        &engine_physics::ColliderShape::Ball { radius },
+                        Vec3::from(center),
+                    );
+                    let persistent_ids = self
+                        .runtime
+                        .with_world(|world| {
+                            hits.iter()
+                                .filter_map(|entity| {
+                                    world.persistent_id(*entity).map(str::to_owned)
+                                })
+                                .collect::<std::collections::BTreeSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    entity_ids.extend(
+                        persistent_ids
+                            .into_iter()
+                            .take(engine_script::MAX_PHYSICS_OVERLAP_RESULTS),
+                    );
+                }
+                GameplayPhysicsQueryResult::OverlapSphere {
+                    query_id,
+                    entity_ids,
+                }
+            }
+        }
     }
 
     #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
@@ -3122,5 +3250,269 @@ mod gameplay_script_bridge_tests {
                 .map(|scene| scene.scene_id.as_str()),
             Some("scene-gate04-valid")
         );
+    }
+
+    struct PhysicsQueryInstance {
+        contexts: Arc<std::sync::Mutex<Vec<GameplayContext>>>,
+        commands: Vec<GameplayCommand>,
+        issued: bool,
+    }
+
+    impl ScriptInstance for PhysicsQueryInstance {
+        fn call(
+            &mut self,
+            function: &str,
+            _args: &[ScriptValue],
+        ) -> Result<ScriptValue, ScriptError> {
+            if function == engine_script::ON_UPDATE && !self.issued {
+                self.issued = true;
+                let raycast = |query_id, direction| GameplayCommand::PhysicsQuery {
+                    query: engine_script::GameplayPhysicsQuery::Raycast {
+                        query_id,
+                        origin: [0.0, 5.0, 0.0],
+                        direction,
+                        max_distance: 10.0,
+                    },
+                };
+                // Downward ray hits the owning cube's top face at y = 0.5;
+                // the upward ray misses every collider.
+                self.commands.push(raycast(11, [0.0, -1.0, 0.0]));
+                self.commands.push(raycast(12, [0.0, 1.0, 0.0]));
+                self.commands.push(GameplayCommand::PhysicsQuery {
+                    query: engine_script::GameplayPhysicsQuery::OverlapSphere {
+                        query_id: 13,
+                        center: [0.0, 0.0, 0.0],
+                        radius: 1.0,
+                    },
+                });
+            }
+            Ok(ScriptValue::Null)
+        }
+
+        fn set_field(&mut self, _name: &str, _value: ScriptValue) -> Result<(), ScriptError> {
+            Ok(())
+        }
+
+        fn get_field(&self, _name: &str) -> Option<ScriptValue> {
+            None
+        }
+
+        fn set_gameplay_context(&mut self, context: &GameplayContext) -> Result<(), ScriptError> {
+            self.contexts.lock().unwrap().push(context.clone());
+            Ok(())
+        }
+
+        fn drain_gameplay_commands(&mut self) -> Result<Vec<GameplayCommand>, ScriptError> {
+            Ok(std::mem::take(&mut self.commands))
+        }
+    }
+
+    struct PhysicsQueryHost {
+        contexts: Arc<std::sync::Mutex<Vec<GameplayContext>>>,
+    }
+
+    impl ScriptHost for PhysicsQueryHost {
+        fn name(&self) -> &str {
+            "physics-query-test"
+        }
+
+        fn load_assembly(
+            &mut self,
+            id: &str,
+            _assembly_data: &[u8],
+        ) -> Result<ScriptHandle, ScriptError> {
+            Ok(ScriptHandle::new(id))
+        }
+
+        fn instantiate(
+            &mut self,
+            _handle: &ScriptHandle,
+            _class_name: &str,
+        ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
+            Ok(Box::new(PhysicsQueryInstance {
+                contexts: Arc::clone(&self.contexts),
+                commands: Vec::new(),
+                issued: false,
+            }))
+        }
+
+        fn unload(&mut self, _handle: &ScriptHandle) -> Result<(), ScriptError> {
+            Ok(())
+        }
+    }
+
+    fn physics_query_game_loop(contexts: &Arc<std::sync::Mutex<Vec<GameplayContext>>>) -> GameLoop {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop
+            .runtime
+            .register_script_host(Box::new(PhysicsQueryHost {
+                contexts: Arc::clone(contexts),
+            }));
+        game_loop.runtime.set_script_host_name("physics-query-test");
+        game_loop
+            .runtime
+            .load_script_assembly("game", "physics-query-test", b"test")
+            .unwrap();
+
+        let mut scene = engine_scene::sample_scene();
+        let target = scene
+            .entities
+            .iter_mut()
+            .find(|entity| entity.persistent_id == "cube-01")
+            .unwrap();
+        target.components.insert(
+            "engine.transform".into(),
+            engine_scene::ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: BTreeMap::new(),
+            },
+        );
+        target.components.insert(
+            "engine.physics.rigid_body".into(),
+            engine_scene::ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: BTreeMap::from([("body_type".into(), Value::Enum("Static".into()))]),
+            },
+        );
+        target.components.insert(
+            "engine.physics.collider".into(),
+            engine_scene::ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: BTreeMap::new(),
+            },
+        );
+        target.components.insert(
+            "engine.script".into(),
+            engine_scene::ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: BTreeMap::from([
+                    ("assembly_id".into(), Value::Str("game".into())),
+                    ("class_name".into(), Value::Str("Probe".into())),
+                ]),
+            },
+        );
+        game_loop.load_scene(scene).unwrap();
+        game_loop
+    }
+
+    #[test]
+    fn physics_queries_report_persistent_ids_in_the_next_frame_snapshot() {
+        use engine_script::GameplayPhysicsQueryResult;
+
+        let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut game_loop = physics_query_game_loop(&contexts);
+
+        // Frame 1: the script issues its queries; no results yet.
+        game_loop.update(1.0 / 60.0);
+        let first = contexts.lock().unwrap().last().unwrap().clone();
+        assert!(first.physics_query_results.is_empty());
+
+        // Frame 2: results arrive keyed by the script-chosen query ids.
+        game_loop.update(1.0 / 60.0);
+        let second = contexts.lock().unwrap().last().unwrap().clone();
+        assert_eq!(second.entity_id, "cube-01");
+        assert_eq!(second.physics_query_results.len(), 3);
+
+        let hit = second
+            .physics_query_results
+            .iter()
+            .find_map(|result| match result {
+                GameplayPhysicsQueryResult::RaycastHit {
+                    query_id: 11,
+                    entity_id,
+                    point,
+                    normal,
+                    distance,
+                } => Some((entity_id.clone(), *point, *normal, *distance)),
+                _ => None,
+            })
+            .expect("raycast hit result for query 11");
+        assert_eq!(hit.0, "cube-01");
+        assert!((hit.1[1] - 0.5).abs() < 1.0e-4, "hit point: {:?}", hit.1);
+        assert!(
+            hit.1[0].abs() < 1.0e-4 && hit.1[2].abs() < 1.0e-4,
+            "hit point: {:?}",
+            hit.1
+        );
+        assert!(
+            (hit.2[1] - 1.0).abs() < 1.0e-4 && hit.2[0].abs() < 1.0e-4 && hit.2[2].abs() < 1.0e-4,
+            "hit normal: {:?}",
+            hit.2
+        );
+        assert!((hit.3 - 4.5).abs() < 1.0e-4, "hit distance: {}", hit.3);
+
+        assert!(second.physics_query_results.iter().any(|result| matches!(
+            result,
+            GameplayPhysicsQueryResult::RaycastMiss { query_id: 12 }
+        )));
+        assert!(second.physics_query_results.iter().any(|result| matches!(
+            result,
+            GameplayPhysicsQueryResult::OverlapSphere { query_id: 13, entity_ids }
+                if entity_ids == &vec!["cube-01".to_string()]
+        )));
+
+        // Frame 3: results are frame-local and expire with the next snapshot.
+        game_loop.update(1.0 / 60.0);
+        let third = contexts.lock().unwrap().last().unwrap().clone();
+        assert!(third.physics_query_results.is_empty());
+        assert!(game_loop
+            .runtime
+            .diagnostics_collector()
+            .script_diagnostics
+            .is_empty());
+    }
+
+    #[test]
+    fn invalid_physics_queries_report_script_diagnostics_and_never_execute() {
+        use engine_script::GameplayPhysicsQueryResult;
+
+        let contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop
+            .runtime
+            .register_script_host(Box::new(ContextRecordingHost {
+                contexts: Arc::clone(&contexts),
+            }));
+        game_loop.runtime.set_script_host_name("context-recording");
+        game_loop
+            .runtime
+            .load_script_assembly("game", "context-recording", b"test")
+            .unwrap();
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+
+        // A typed host can bypass the JSON decoder, so the runtime
+        // re-validates before staging anything for the physics world.
+        let invalid = engine_script::OwnedGameplayCommand {
+            entity_id: "cube-01".into(),
+            command: GameplayCommand::PhysicsQuery {
+                query: engine_script::GameplayPhysicsQuery::Raycast {
+                    query_id: 1,
+                    origin: [f32::NAN, 0.0, 0.0],
+                    direction: [0.0, -1.0, 0.0],
+                    max_distance: 10.0,
+                },
+            },
+        };
+        let diagnostics = game_loop
+            .runtime
+            .apply_script_gameplay_commands(vec![invalid]);
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SCRIPT_PHYSICS_QUERY_INVALID"));
+        assert!(game_loop.runtime.take_pending_physics_queries().is_empty());
+
+        // The invalid query never reaches a script snapshot.
+        game_loop.update(1.0 / 60.0);
+        assert!(contexts.lock().unwrap().iter().all(|context| context
+            .physics_query_results
+            .iter()
+            .all(|result| !matches!(
+                result,
+                GameplayPhysicsQueryResult::RaycastHit { query_id: 1, .. }
+            ))));
     }
 }

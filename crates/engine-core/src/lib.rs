@@ -222,6 +222,12 @@ pub struct EngineRuntime {
     script_input_actions: std::collections::BTreeMap<String, GameplayInputValue>,
     #[cfg(feature = "subsystem-scripting-csharp")]
     pending_scene_request: Option<SceneLoadRequest>,
+    /// Validated physics queries drained from scripts during the current
+    /// update. The owning [`crate::game_loop::GameLoop`] executes them
+    /// against its physics world at the frame boundary and delivers results
+    /// in the next frame snapshot.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pending_physics_queries: Vec<engine_script::OwnedGameplayPhysicsQuery>,
 }
 
 impl EngineRuntime {
@@ -287,6 +293,8 @@ impl EngineRuntime {
             script_input_actions: std::collections::BTreeMap::new(),
             #[cfg(feature = "subsystem-scripting-csharp")]
             pending_scene_request: None,
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            pending_physics_queries: Vec::new(),
         }
     }
 
@@ -402,6 +410,7 @@ impl EngineRuntime {
         #[cfg(feature = "subsystem-scripting-csharp")]
         {
             self.pending_scene_request = None;
+            self.pending_physics_queries.clear();
             self.attach_scene_scripts(&scene);
         }
 
@@ -444,6 +453,7 @@ impl EngineRuntime {
         #[cfg(feature = "subsystem-scripting-csharp")]
         {
             self.pending_scene_request = None;
+            self.pending_physics_queries.clear();
             self.attach_scene_scripts(&scene);
         }
 
@@ -818,6 +828,7 @@ impl EngineRuntime {
         self.script_engine = candidate;
         self.script_host_name = host_name;
         self.pending_scene_request = None;
+        self.pending_physics_queries.clear();
         Ok(())
     }
 
@@ -849,6 +860,18 @@ impl EngineRuntime {
         {
             None
         }
+    }
+
+    /// Take the validated physics queries drained from scripts during the
+    /// current update, leaving the queue empty.
+    ///
+    /// The owning game loop executes these against its physics world at the
+    /// frame boundary and delivers results in the next frame snapshot.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn take_pending_physics_queries(
+        &mut self,
+    ) -> Vec<engine_script::OwnedGameplayPhysicsQuery> {
+        std::mem::take(&mut self.pending_physics_queries)
     }
 
     /// Tick all scripts — call this each frame before `render_frame`.
@@ -928,6 +951,36 @@ impl EngineRuntime {
         physics_events: &std::collections::BTreeMap<String, Vec<GameplayPhysicsEvent>>,
         ui_events: &[GameplayUiEvent],
     ) {
+        self.tick_scripts_with_frame_input_ui_and_physics_queries(
+            dt,
+            input_actions,
+            input_transitions,
+            physics_events,
+            ui_events,
+            &std::collections::BTreeMap::new(),
+        );
+    }
+
+    /// Tick scripts with the complete frame snapshot, including retained UI
+    /// clicks and the physics query results computed by the owning
+    /// [`GameLoop`](crate::game_loop::GameLoop) after the previous update.
+    ///
+    /// Query results are frame snapshots. Callers must pass an empty map on
+    /// frames without freshly computed results so stale answers cannot be
+    /// observed.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn tick_scripts_with_frame_input_ui_and_physics_queries(
+        &mut self,
+        dt: f32,
+        input_actions: &std::collections::BTreeMap<String, GameplayInputValue>,
+        input_transitions: &GameplayInputTransitions,
+        physics_events: &std::collections::BTreeMap<String, Vec<GameplayPhysicsEvent>>,
+        ui_events: &[GameplayUiEvent],
+        physics_query_results: &std::collections::BTreeMap<
+            String,
+            Vec<engine_script::GameplayPhysicsQueryResult>,
+        >,
+    ) {
         self.script_input_actions.clone_from(input_actions);
         engine_ffi::world_bridge::activate_coroutine_runtime(&self.world_slot);
         engine_ffi::r#async::dispatch_main_thread_callbacks();
@@ -937,6 +990,7 @@ impl EngineRuntime {
             input_transitions,
             physics_events,
             ui_events,
+            physics_query_results,
         );
         let mut diagnostics = self.script_engine.set_gameplay_contexts(&contexts);
         diagnostics.extend(self.script_engine.update(dt));
@@ -997,6 +1051,7 @@ impl EngineRuntime {
             &GameplayInputTransitions::default(),
             &std::collections::BTreeMap::new(),
             &[],
+            &std::collections::BTreeMap::new(),
         );
         let context_diags = self.script_engine.set_gameplay_contexts(&contexts);
         self.collector.push_script_diags(context_diags);
@@ -1019,6 +1074,10 @@ impl EngineRuntime {
         input_transitions: &GameplayInputTransitions,
         physics_events: &std::collections::BTreeMap<String, Vec<GameplayPhysicsEvent>>,
         ui_events: &[GameplayUiEvent],
+        physics_query_results: &std::collections::BTreeMap<
+            String,
+            Vec<engine_script::GameplayPhysicsQueryResult>,
+        >,
     ) -> std::collections::BTreeMap<String, GameplayContext> {
         let entity_ids = self
             .script_engine
@@ -1042,6 +1101,10 @@ impl EngineRuntime {
                     input_actions: input_actions.clone(),
                     input_transitions: input_transitions.clone(),
                     physics_events: physics_events.get(&entity_id).cloned().unwrap_or_default(),
+                    physics_query_results: physics_query_results
+                        .get(&entity_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     ui_events: ui_events.to_vec(),
                     entities: entities.clone(),
                 };
@@ -1280,6 +1343,46 @@ impl EngineRuntime {
                         diagnostic.entity = Some(entity_id);
                         diagnostics.push(diagnostic);
                     }
+                }
+                GameplayCommand::PhysicsQuery { query } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "request a physics query",
+                        ));
+                        continue;
+                    }
+                    if let Err(reason) = query.validate() {
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_PHYSICS_QUERY_INVALID",
+                            DiagnosticSeverity::Error,
+                            "script",
+                            format!(
+                                "script entity '{entity_id}' produced an invalid physics query: {reason}"
+                            ),
+                        );
+                        diagnostic.entity = Some(entity_id);
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                    if self.pending_physics_queries.len()
+                        >= engine_script::MAX_PENDING_PHYSICS_QUERIES
+                    {
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_PHYSICS_QUERY_OVERFLOW",
+                            DiagnosticSeverity::Error,
+                            "script",
+                            format!(
+                                "script entity '{entity_id}' exceeded the pending physics query budget of {} per frame",
+                                engine_script::MAX_PENDING_PHYSICS_QUERIES
+                            ),
+                        );
+                        diagnostic.entity = Some(entity_id);
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                    self.pending_physics_queries
+                        .push(engine_script::OwnedGameplayPhysicsQuery { entity_id, query });
                 }
             }
         }

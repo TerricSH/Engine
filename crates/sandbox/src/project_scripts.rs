@@ -40,9 +40,9 @@ const SCRIPT_SDK_PROJECT: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
     <Nullable>enable</Nullable>
     <AssemblyName>EngineGameplay</AssemblyName>
     <RootNamespace>Engine</RootNamespace>
-    <Version>0.1.0</Version>
-    <AssemblyVersion>0.1.0.0</AssemblyVersion>
-    <FileVersion>0.1.0.0</FileVersion>
+    <Version>0.2.0</Version>
+    <AssemblyVersion>0.2.0.0</AssemblyVersion>
+    <FileVersion>0.2.0.0</FileVersion>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
@@ -86,14 +86,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.1.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.2.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.1.0";
+    public const string Version = "0.2.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
@@ -822,17 +822,141 @@ public sealed class PhysicsEvent
     public Entity? Other => _scene.FindEntity(OtherEntityId);
 }
 
-public sealed class ScriptPhysics
+// Correlates a deferred physics query with its result. Queries execute at
+// the next frame boundary; the handle is frame-local and only meaningful to
+// TryGetRaycastHit/TryGetOverlapResult on the frame after it was issued.
+public readonly record struct PhysicsQuery(uint Id);
+
+public sealed class RaycastHit
 {
     private readonly ScriptScene _scene;
+
+    internal RaycastHit(PhysicsQueryResultState state, ScriptScene scene)
+    {
+        EntityId = state.EntityId
+            ?? throw new InvalidOperationException("raycast hit arrived without an entity id");
+        var point = state.Point
+            ?? throw new InvalidOperationException("raycast hit arrived without a point");
+        var normal = state.Normal
+            ?? throw new InvalidOperationException("raycast hit arrived without a normal");
+        Point = new Vector3(point[0], point[1], point[2]);
+        Normal = new Vector3(normal[0], normal[1], normal[2]);
+        Distance = state.Distance
+            ?? throw new InvalidOperationException("raycast hit arrived without a distance");
+        _scene = scene;
+    }
+
+    public string EntityId { get; }
+    public Vector3 Point { get; }
+    public Vector3 Normal { get; }
+    public float Distance { get; }
+    public Entity? Entity => _scene.FindEntity(EntityId);
+}
+
+public sealed class ScriptPhysics
+{
+    // Mirrors the native query bounds: ray distance and sphere radius are
+    // clamped to MaxQueryDistance and overlap results are bounded to
+    // MaxOverlapResults sorted entity ids.
+    public const float MaxQueryDistance = 10000.0f;
+    public const int MaxOverlapResults = 64;
+
+    private const float MinDirectionLengthSquared = 1e-12f;
+
+    private readonly ScriptScene _scene;
     private IReadOnlyList<PhysicsEventState> _events = Array.Empty<PhysicsEventState>();
+    private readonly Dictionary<uint, PhysicsQueryResultState> _queryResults = new();
+    private readonly List<PhysicsQueryState> _pendingQueries = new();
+    private uint _nextQueryId = 1;
 
     internal ScriptPhysics(ScriptScene scene) => _scene = scene;
 
     public IReadOnlyList<PhysicsEvent> Events =>
         _events.Select(state => new PhysicsEvent(state, _scene)).ToArray();
 
-    internal void Replace(IReadOnlyList<PhysicsEventState> events) => _events = events;
+    // Queries are deferred: the engine validates and executes them against
+    // the physics world at the frame boundary and delivers results with the
+    // next frame's context. Invalid arguments throw before anything is
+    // queued, surfacing as a script error for this frame.
+    public PhysicsQuery Raycast(Vector3 origin, Vector3 direction, float maxDistance)
+    {
+        UIValidation.Finite(origin.X, nameof(origin));
+        UIValidation.Finite(origin.Y, nameof(origin));
+        UIValidation.Finite(origin.Z, nameof(origin));
+        UIValidation.Finite(direction.X, nameof(direction));
+        UIValidation.Finite(direction.Y, nameof(direction));
+        UIValidation.Finite(direction.Z, nameof(direction));
+        if (direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z
+            <= MinDirectionLengthSquared)
+            throw new ArgumentException("Raycast direction must be non-zero", nameof(direction));
+        UIValidation.Positive(maxDistance, nameof(maxDistance));
+        var query = AllocateQuery();
+        _pendingQueries.Add(PhysicsQueryState.Raycast(
+            query.Id,
+            origin,
+            direction,
+            Math.Min(maxDistance, MaxQueryDistance)));
+        return query;
+    }
+
+    public PhysicsQuery OverlapSphere(Vector3 center, float radius)
+    {
+        UIValidation.Finite(center.X, nameof(center));
+        UIValidation.Finite(center.Y, nameof(center));
+        UIValidation.Finite(center.Z, nameof(center));
+        UIValidation.Positive(radius, nameof(radius));
+        var query = AllocateQuery();
+        _pendingQueries.Add(PhysicsQueryState.OverlapSphere(
+            query.Id,
+            center,
+            Math.Min(radius, MaxQueryDistance)));
+        return query;
+    }
+
+    public bool TryGetRaycastHit(PhysicsQuery query, out RaycastHit hit)
+    {
+        if (_queryResults.TryGetValue(query.Id, out var state) && state.Kind == "raycast_hit")
+        {
+            hit = new RaycastHit(state, _scene);
+            return true;
+        }
+        hit = null!;
+        return false;
+    }
+
+    public bool TryGetOverlapResult(PhysicsQuery query, out IReadOnlyList<string> entityIds)
+    {
+        if (_queryResults.TryGetValue(query.Id, out var state) && state.Kind == "overlap_sphere")
+        {
+            entityIds = state.EntityIds ?? (IReadOnlyList<string>)Array.Empty<string>();
+            return true;
+        }
+        entityIds = null!;
+        return false;
+    }
+
+    internal void Replace(
+        IReadOnlyList<PhysicsEventState> events,
+        IReadOnlyList<PhysicsQueryResultState> queryResults)
+    {
+        _events = events;
+        _queryResults.Clear();
+        foreach (var result in queryResults)
+            _queryResults[result.QueryId] = result;
+    }
+
+    internal void DrainTo(List<GameplayCommandState> commands)
+    {
+        commands.AddRange(_pendingQueries.Select(GameplayCommandState.PhysicsQuery));
+        _pendingQueries.Clear();
+    }
+
+    private PhysicsQuery AllocateQuery()
+    {
+        if (_nextQueryId == uint.MaxValue)
+            throw new InvalidOperationException("Script exhausted its physics query ids");
+        return new PhysicsQuery(_nextQueryId++);
+    }
 }
 
 // A frame-local view of one persistent ECS entity. Entity ids are resolved by
@@ -1036,7 +1160,7 @@ public abstract class EngineBehaviour
         EntityId = context.EntityId;
         Input.Replace(context.InputActions, context.InputTransitions);
         UI.Replace(context.UiEvents);
-        Physics.Replace(context.PhysicsEvents);
+        Physics.Replace(context.PhysicsEvents, context.PhysicsQueryResults);
         _transform = context.Transform == null
             ? null
             : new ScriptTransform(context.Transform, () => _transformDirty = true);
@@ -1053,6 +1177,7 @@ public abstract class EngineBehaviour
             commands.Add(GameplayCommandState.SetTransform(_transform.State));
         Scene.DrainTo(commands);
         UI.DrainTo(commands);
+        Physics.DrainTo(commands);
         var json = JsonSerializer.Serialize(commands, JsonOptions);
         _transformDirty = false;
         return json;
@@ -1078,6 +1203,9 @@ internal sealed class GameplayContextState
 
     [JsonPropertyName("physics_events")]
     public List<PhysicsEventState> PhysicsEvents { get; set; } = new();
+
+    [JsonPropertyName("physics_query_results")]
+    public List<PhysicsQueryResultState> PhysicsQueryResults { get; set; } = new();
 
     [JsonPropertyName("ui_events")]
     public List<GameplayUiEventState> UiEvents { get; set; } = new();
@@ -1108,6 +1236,82 @@ internal sealed class PhysicsEventState
 
     [JsonPropertyName("other_entity_id")]
     public string OtherEntityId { get; set; } = "";
+}
+
+internal sealed class PhysicsQueryResultState
+{
+    [JsonPropertyName("kind")]
+    public string Kind { get; set; } = "";
+
+    [JsonPropertyName("query_id")]
+    public uint QueryId { get; set; }
+
+    [JsonPropertyName("entity_id")]
+    public string? EntityId { get; set; }
+
+    [JsonPropertyName("entity_ids")]
+    public List<string>? EntityIds { get; set; }
+
+    [JsonPropertyName("point")]
+    public float[]? Point { get; set; }
+
+    [JsonPropertyName("normal")]
+    public float[]? Normal { get; set; }
+
+    [JsonPropertyName("distance")]
+    public float? Distance { get; set; }
+}
+
+internal sealed class PhysicsQueryState
+{
+    [JsonPropertyName("kind")]
+    public required string Kind { get; init; }
+
+    [JsonPropertyName("query_id")]
+    public required uint QueryId { get; init; }
+
+    [JsonPropertyName("origin")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Origin { get; init; }
+
+    [JsonPropertyName("direction")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Direction { get; init; }
+
+    [JsonPropertyName("max_distance")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? MaxDistance { get; init; }
+
+    [JsonPropertyName("center")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Center { get; init; }
+
+    [JsonPropertyName("radius")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? Radius { get; init; }
+
+    public static PhysicsQueryState Raycast(
+        uint queryId,
+        Vector3 origin,
+        Vector3 direction,
+        float maxDistance) =>
+        new()
+        {
+            Kind = "raycast",
+            QueryId = queryId,
+            Origin = new[] { origin.X, origin.Y, origin.Z },
+            Direction = new[] { direction.X, direction.Y, direction.Z },
+            MaxDistance = maxDistance
+        };
+
+    public static PhysicsQueryState OverlapSphere(uint queryId, Vector3 center, float radius) =>
+        new()
+        {
+            Kind = "overlap_sphere",
+            QueryId = queryId,
+            Center = new[] { center.X, center.Y, center.Z },
+            Radius = radius
+        };
 }
 
 internal sealed class GameplayUiEventState
@@ -1564,6 +1768,10 @@ internal sealed class GameplayCommandState
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public UiCommandState? UiCommand { get; init; }
 
+    [JsonPropertyName("query")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PhysicsQueryState? Query { get; init; }
+
     public static GameplayCommandState SetTransform(TransformState transform) =>
         new() { Type = "set_transform", Transform = transform };
 
@@ -1598,6 +1806,9 @@ internal sealed class GameplayCommandState
 
     public static GameplayCommandState UI(UiCommandState command) =>
         new() { Type = "ui", UiCommand = command };
+
+    public static GameplayCommandState PhysicsQuery(PhysicsQueryState query) =>
+        new() { Type = "physics_query", Query = query };
 }
 "#;
 
@@ -2865,6 +3076,16 @@ mod tests {
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class Entity"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ScriptPhysics"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public IReadOnlyList<PhysicsEvent> Events"));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public readonly record struct PhysicsQuery(uint Id)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class RaycastHit"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery Raycast("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery OverlapSphere("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetRaycastHit("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetOverlapResult("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"physics_query\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"physics_query_results\")]"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Physics.DrainTo(commands)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool WasPressed(string actionName)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool WasReleased(string actionName)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public IReadOnlyList<GameplayUiEvent> Events"));

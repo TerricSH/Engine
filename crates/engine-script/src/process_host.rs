@@ -754,6 +754,103 @@ mod tests {
     }
 
     #[test]
+    fn gameplay_command_decoder_accepts_validated_physics_queries() {
+        let commands = decode_gameplay_commands(
+            "inst-0001",
+            r#"[
+                {"type":"physics_query","query":{"kind":"raycast","query_id":7,"origin":[0,5,0],"direction":[0,-1,0],"max_distance":10}},
+                {"type":"physics_query","query":{"kind":"overlap_sphere","query_id":8,"center":[0,0,0],"radius":2.5}}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            commands[0],
+            GameplayCommand::PhysicsQuery {
+                query: crate::GameplayPhysicsQuery::Raycast {
+                    query_id: 7,
+                    origin: [0.0, 5.0, 0.0],
+                    direction: [0.0, -1.0, 0.0],
+                    max_distance: 10.0,
+                }
+            }
+        );
+        assert_eq!(
+            commands[1],
+            GameplayCommand::PhysicsQuery {
+                query: crate::GameplayPhysicsQuery::OverlapSphere {
+                    query_id: 8,
+                    center: [0.0, 0.0, 0.0],
+                    radius: 2.5,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn gameplay_command_decoder_rejects_invalid_physics_queries() {
+        for json in [
+            // Zero-length direction cannot define a ray.
+            r#"[{"type":"physics_query","query":{"kind":"raycast","query_id":7,"origin":[0,5,0],"direction":[0,0,0],"max_distance":10}}]"#,
+            // Non-positive travel distance.
+            r#"[{"type":"physics_query","query":{"kind":"raycast","query_id":7,"origin":[0,5,0],"direction":[0,-1,0],"max_distance":0}}]"#,
+            // Non-positive radius.
+            r#"[{"type":"physics_query","query":{"kind":"overlap_sphere","query_id":8,"center":[0,0,0],"radius":-1}}]"#,
+        ] {
+            let error = decode_gameplay_commands("inst-0001", json).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("invalid command 0"), "{message}");
+        }
+
+        // Overflowing JSON numbers fail even earlier, at the parse boundary,
+        // so non-finite query values cannot cross the wire at all.
+        for json in [
+            r#"[{"type":"physics_query","query":{"kind":"raycast","query_id":7,"origin":[0,5,0],"direction":[0,-1,0],"max_distance":1e999}}]"#,
+            r#"[{"type":"physics_query","query":{"kind":"overlap_sphere","query_id":8,"center":[0,1e999,0],"radius":2.5}}]"#,
+        ] {
+            assert!(
+                decode_gameplay_commands("inst-0001", json).is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_host_context_encoder_preserves_physics_query_results() {
+        let mut context: GameplayContext =
+            serde_json::from_str(r#"{"entity_id":"player","transform":null,"input_actions":{}}"#)
+                .unwrap();
+        context.physics_query_results = vec![
+            crate::GameplayPhysicsQueryResult::RaycastHit {
+                query_id: 7,
+                entity_id: "cube-01".into(),
+                point: [0.0, 0.5, 0.0],
+                normal: [0.0, 1.0, 0.0],
+                distance: 4.5,
+            },
+            crate::GameplayPhysicsQueryResult::RaycastMiss { query_id: 8 },
+            crate::GameplayPhysicsQueryResult::OverlapSphere {
+                query_id: 9,
+                entity_ids: vec!["cube-01".into()],
+            },
+        ];
+
+        let context_json = encode_gameplay_context("inst-physics", &context).unwrap();
+        let encoded: serde_json::Value = serde_json::from_str(&context_json).unwrap();
+        assert_eq!(
+            encoded["physics_query_results"],
+            serde_json::json!([
+                {"kind":"raycast_hit","query_id":7,"entity_id":"cube-01","point":[0.0,0.5,0.0],"normal":[0.0,1.0,0.0],"distance":4.5},
+                {"kind":"raycast_miss","query_id":8},
+                {"kind":"overlap_sphere","query_id":9,"entity_ids":["cube-01"]}
+            ])
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayContext>(&context_json).unwrap(),
+            context
+        );
+    }
+
+    #[test]
     fn process_script_instance_debug() {
         // Construction requires a real child process (SharedScriptIO holds
         // ChildStdin + ChildStdout), so we verify via type-name reflection.

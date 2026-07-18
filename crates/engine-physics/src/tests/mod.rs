@@ -406,6 +406,110 @@ fn query_proximity_no_overlap() {
     );
 }
 
+#[test]
+fn raycast_reports_closest_hit_with_normal() {
+    // Two colliders along the ray: the nearest one must win and report its
+    // face normal, which gameplay queries surface to scripts.
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let rb = RigidBody {
+        body_type: BodyType::Static,
+        ..RigidBody::default()
+    };
+
+    let near = Transform {
+        translation: glam::Vec3::new(0.0, 0.5, 0.0),
+        ..Transform::default()
+    };
+    world.backend.create_body(entity(0), &rb, &near);
+    world
+        .backend
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
+
+    let far = Transform {
+        translation: glam::Vec3::new(0.0, -2.0, 0.0),
+        ..Transform::default()
+    };
+    world.backend.create_body(entity(1), &rb, &far);
+    world
+        .backend
+        .create_collider(entity(1), &Collider::default(), entity(1), None);
+    world.backend.sync_query_pipeline();
+
+    let hit = world
+        .raycast(glam::Vec3::new(0.0, 5.0, 0.0), glam::Vec3::NEG_Y, 20.0)
+        .expect("ray should hit the nearest collider");
+
+    assert_eq!(hit.entity, entity(0), "nearest collider should win");
+    assert!(
+        (hit.distance - 4.0).abs() < 1e-4,
+        "distance should reach the near collider top face, got {}",
+        hit.distance
+    );
+    assert!(
+        (hit.normal - glam::Vec3::Y).length() < 1e-4,
+        "downward ray should report the upward face normal, got {:?}",
+        hit.normal
+    );
+    assert!(
+        (hit.point - glam::Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4,
+        "hit point should sit on the near collider top face, got {:?}",
+        hit.point
+    );
+}
+
+#[test]
+fn sphere_overlap_reports_all_overlapping_colliders() {
+    // A sphere overlap should report every collider it touches while ignoring
+    // colliders outside its radius, mirroring gameplay overlap queries.
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let rb = RigidBody {
+        body_type: BodyType::Static,
+        ..RigidBody::default()
+    };
+
+    world
+        .backend
+        .create_body(entity(0), &rb, &Transform::default());
+    world
+        .backend
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
+
+    let second = Transform {
+        translation: glam::Vec3::new(1.5, 0.0, 0.0),
+        ..Transform::default()
+    };
+    world.backend.create_body(entity(1), &rb, &second);
+    world
+        .backend
+        .create_collider(entity(1), &Collider::default(), entity(1), None);
+
+    let distant = Transform {
+        translation: glam::Vec3::new(10.0, 0.0, 0.0),
+        ..Transform::default()
+    };
+    world.backend.create_body(entity(2), &rb, &distant);
+    world
+        .backend
+        .create_collider(entity(2), &Collider::default(), entity(2), None);
+    world.backend.sync_query_pipeline();
+
+    let hits = world.query_proximity(&ColliderShape::Ball { radius: 2.0 }, glam::Vec3::ZERO);
+
+    assert_eq!(hits.len(), 2, "overlap should report exactly two hits");
+    assert!(
+        hits.contains(&entity(0)),
+        "overlap should include the collider at the query center"
+    );
+    assert!(
+        hits.contains(&entity(1)),
+        "overlap should include the nearby collider"
+    );
+    assert!(
+        !hits.contains(&entity(2)),
+        "overlap should exclude the distant collider"
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Collision Event Tests
 // ══════════════════════════════════════════════════════════════════════════════

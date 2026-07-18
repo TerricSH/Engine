@@ -79,6 +79,134 @@ pub struct GameplayPhysicsEvent {
     pub other_entity_id: String,
 }
 
+/// Upper bound applied to script physics query distances and radii.
+///
+/// Script-provided distances are clamped to this value before touching the
+/// physics backend so a misbehaving script cannot force unbounded native
+/// work through the gameplay bridge.
+pub const MAX_PHYSICS_QUERY_DISTANCE: f32 = 10_000.0;
+
+/// Maximum persistent entity ids returned by a single overlap query.
+pub const MAX_PHYSICS_OVERLAP_RESULTS: usize = 64;
+
+/// Maximum script physics queries the runtime buffers from one command
+/// drain. Queries beyond the cap are rejected with a script diagnostic.
+pub const MAX_PENDING_PHYSICS_QUERIES: usize = 256;
+
+/// Active physics query requested by a script through the gameplay bridge.
+///
+/// Queries travel as deferred gameplay commands: the engine validates and
+/// executes them against the physics world at the frame boundary and
+/// delivers the matching [`GameplayPhysicsQueryResult`] with the next
+/// frame's snapshot. Scripts correlate requests and results through the
+/// caller-chosen `query_id`; scripts never receive raw ECS handles or
+/// backend objects.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GameplayPhysicsQuery {
+    /// Cast a ray and report the closest collider hit, if any.
+    Raycast {
+        /// Script-chosen correlator echoed back with the result.
+        query_id: u32,
+        /// World-space ray origin.
+        origin: [f32; 3],
+        /// Ray direction. Does not need to be normalised; the engine
+        /// normalises before querying. Must not be zero length.
+        direction: [f32; 3],
+        /// Maximum travel distance, clamped to [`MAX_PHYSICS_QUERY_DISTANCE`].
+        max_distance: f32,
+    },
+    /// Find every collider overlapping a world-space sphere.
+    OverlapSphere {
+        /// Script-chosen correlator echoed back with the result.
+        query_id: u32,
+        /// World-space sphere centre.
+        center: [f32; 3],
+        /// Sphere radius, clamped to [`MAX_PHYSICS_QUERY_DISTANCE`].
+        radius: f32,
+    },
+}
+
+impl GameplayPhysicsQuery {
+    /// The script-chosen correlator carried by this query.
+    pub fn query_id(&self) -> u32 {
+        match self {
+            Self::Raycast { query_id, .. } | Self::OverlapSphere { query_id, .. } => *query_id,
+        }
+    }
+
+    /// Validate untrusted query data received from a script host.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Raycast {
+                origin,
+                direction,
+                max_distance,
+                ..
+            } => {
+                if !origin.iter().all(|value| value.is_finite()) {
+                    return Err("raycast origin must contain only finite values".into());
+                }
+                if !direction.iter().all(|value| value.is_finite()) {
+                    return Err("raycast direction must contain only finite values".into());
+                }
+                if direction.iter().map(|value| value * value).sum::<f32>() <= f32::EPSILON {
+                    return Err("raycast direction must not be zero length".into());
+                }
+                if !max_distance.is_finite() || *max_distance <= 0.0 {
+                    return Err("raycast max_distance must be finite and greater than zero".into());
+                }
+                Ok(())
+            }
+            Self::OverlapSphere { center, radius, .. } => {
+                if !center.iter().all(|value| value.is_finite()) {
+                    return Err("overlap sphere center must contain only finite values".into());
+                }
+                if !radius.is_finite() || *radius <= 0.0 {
+                    return Err("overlap sphere radius must be finite and greater than zero".into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Outcome of a script physics query, delivered with the next frame
+/// snapshot following the frame that issued the query.
+///
+/// Results are frame-local: they appear in exactly one snapshot and are not
+/// repeated. Every result echoes the issuing query's `query_id`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GameplayPhysicsQueryResult {
+    /// A raycast found a collider attached to the given persistent entity.
+    RaycastHit {
+        /// Correlator from the issuing query.
+        query_id: u32,
+        /// Persistent entity id of the closest hit — never a raw ECS handle.
+        entity_id: String,
+        /// World-space intersection point.
+        point: [f32; 3],
+        /// World-space surface normal at the intersection.
+        normal: [f32; 3],
+        /// Distance from the ray origin to the intersection.
+        distance: f32,
+    },
+    /// A raycast found no collider within range.
+    RaycastMiss {
+        /// Correlator from the issuing query.
+        query_id: u32,
+    },
+    /// Persistent entity ids overlapped by a sphere query, sorted and
+    /// bounded to [`MAX_PHYSICS_OVERLAP_RESULTS`].
+    OverlapSphere {
+        /// Correlator from the issuing query.
+        query_id: u32,
+        /// Overlapping persistent entity ids — never raw ECS handles.
+        entity_ids: Vec<String>,
+    },
+}
+
 /// Resulting value carried by a stateful runtime-UI event.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
@@ -276,6 +404,15 @@ pub struct GameplayContext {
     /// Collision and trigger events involving the owning entity this frame.
     #[serde(default)]
     pub physics_events: Vec<GameplayPhysicsEvent>,
+    /// Results of physics queries issued by the owning script instance in a
+    /// previous frame.
+    ///
+    /// Queries are deferred commands: the engine executes them at the frame
+    /// boundary and answers with the next frame's snapshot. `default` keeps
+    /// contexts produced before physics queries existed compatible with the
+    /// current script hosts.
+    #[serde(default)]
+    pub physics_query_results: Vec<GameplayPhysicsQueryResult>,
     /// Runtime UI clicks delivered during this frame.
     ///
     /// `default` keeps contexts produced before gameplay UI events were added
@@ -330,6 +467,13 @@ pub enum GameplayCommand {
     Ui {
         command: GameplayUiCommand,
     },
+    /// Request an active physics query against the current physics world.
+    ///
+    /// The query is validated and executed at the frame boundary; the result
+    /// arrives in the next frame's [`GameplayContext::physics_query_results`].
+    PhysicsQuery {
+        query: GameplayPhysicsQuery,
+    },
 }
 
 impl GameplayCommand {
@@ -352,6 +496,7 @@ impl GameplayCommand {
             Self::DestroyEntity { entity_id } => validate_entity_id(entity_id),
             Self::LoadScene { scene_id } => validate_scene_id(scene_id),
             Self::Ui { command } => command.validate(),
+            Self::PhysicsQuery { query } => query.validate(),
         }
     }
 }
@@ -662,6 +807,14 @@ pub struct OwnedGameplayCommand {
     pub command: GameplayCommand,
 }
 
+/// A validated physics query paired with the entity that owns the script
+/// instance that issued it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnedGameplayPhysicsQuery {
+    pub entity_id: String,
+    pub query: GameplayPhysicsQuery,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +841,20 @@ mod tests {
                 kind: GameplayPhysicsEventKind::CollisionEntered,
                 other_entity_id: "floor".into(),
             }],
+            physics_query_results: vec![
+                GameplayPhysicsQueryResult::RaycastHit {
+                    query_id: 7,
+                    entity_id: "floor".into(),
+                    point: [1.0, 0.5, 0.0],
+                    normal: [0.0, 1.0, 0.0],
+                    distance: 4.5,
+                },
+                GameplayPhysicsQueryResult::RaycastMiss { query_id: 8 },
+                GameplayPhysicsQueryResult::OverlapSphere {
+                    query_id: 9,
+                    entity_ids: vec!["floor".into()],
+                },
+            ],
             ui_events: vec![GameplayUiEvent {
                 canvas_id: "main-menu".into(),
                 element_id: 17,
@@ -712,6 +879,9 @@ mod tests {
         assert!(json.contains(r#""pressed":["jump"]"#));
         assert!(json.contains(r#""kind":"collision_entered""#));
         assert!(json.contains(
+            r#""physics_query_results":[{"kind":"raycast_hit","query_id":7,"entity_id":"floor","point":[1.0,0.5,0.0],"normal":[0.0,1.0,0.0],"distance":4.5},{"kind":"raycast_miss","query_id":8},{"kind":"overlap_sphere","query_id":9,"entity_ids":["floor"]}]"#
+        ));
+        assert!(json.contains(
             r#""ui_events":[{"canvas_id":"main-menu","element_id":17,"callback_id":"start-game"}]"#
         ));
         assert_eq!(
@@ -728,6 +898,7 @@ mod tests {
         assert!(context.entities.is_empty());
         assert_eq!(context.script_api, GAMEPLAY_SCRIPT_API_SCHEMA);
         assert!(context.physics_events.is_empty());
+        assert!(context.physics_query_results.is_empty());
         assert!(context.ui_events.is_empty());
         assert_eq!(
             context.input_transitions,
@@ -1001,5 +1172,157 @@ mod tests {
             assert!(error.contains("game.project.json `scenes`"), "{error}");
         }
         assert!(validate_scene_id(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn physics_query_command_has_a_stable_validated_contract() {
+        let raycast = GameplayCommand::PhysicsQuery {
+            query: GameplayPhysicsQuery::Raycast {
+                query_id: 7,
+                origin: [0.0, 5.0, 0.0],
+                direction: [0.0, -1.0, 0.0],
+                max_distance: 10.0,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&raycast).unwrap(),
+            r#"{"type":"physics_query","query":{"kind":"raycast","query_id":7,"origin":[0.0,5.0,0.0],"direction":[0.0,-1.0,0.0],"max_distance":10.0}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(&serde_json::to_string(&raycast).unwrap())
+                .unwrap(),
+            raycast
+        );
+        assert!(raycast.validate().is_ok());
+
+        let overlap = GameplayCommand::PhysicsQuery {
+            query: GameplayPhysicsQuery::OverlapSphere {
+                query_id: 8,
+                center: [1.0, 2.0, 3.0],
+                radius: 2.5,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&overlap).unwrap(),
+            r#"{"type":"physics_query","query":{"kind":"overlap_sphere","query_id":8,"center":[1.0,2.0,3.0],"radius":2.5}}"#
+        );
+        assert!(overlap.validate().is_ok());
+
+        let GameplayCommand::PhysicsQuery { query } = &raycast else {
+            panic!("expected physics query command");
+        };
+        assert_eq!(query.query_id(), 7);
+    }
+
+    #[test]
+    fn physics_query_results_have_a_stable_json_contract() {
+        let hit = GameplayPhysicsQueryResult::RaycastHit {
+            query_id: 3,
+            entity_id: "cube-01".into(),
+            point: [0.0, 0.5, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            distance: 4.5,
+        };
+        assert_eq!(
+            serde_json::to_string(&hit).unwrap(),
+            r#"{"kind":"raycast_hit","query_id":3,"entity_id":"cube-01","point":[0.0,0.5,0.0],"normal":[0.0,1.0,0.0],"distance":4.5}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsQueryResult>(
+                r#"{"kind":"raycast_hit","query_id":3,"entity_id":"cube-01","point":[0,0.5,0],"normal":[0,1,0],"distance":4.5}"#
+            )
+            .unwrap(),
+            hit
+        );
+
+        let miss = GameplayPhysicsQueryResult::RaycastMiss { query_id: 4 };
+        assert_eq!(
+            serde_json::to_string(&miss).unwrap(),
+            r#"{"kind":"raycast_miss","query_id":4}"#
+        );
+
+        let overlap = GameplayPhysicsQueryResult::OverlapSphere {
+            query_id: 5,
+            entity_ids: vec!["cube-01".into(), "physics-peer".into()],
+        };
+        assert_eq!(
+            serde_json::to_string(&overlap).unwrap(),
+            r#"{"kind":"overlap_sphere","query_id":5,"entity_ids":["cube-01","physics-peer"]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsQueryResult>(
+                &serde_json::to_string(&overlap).unwrap()
+            )
+            .unwrap(),
+            overlap
+        );
+    }
+
+    #[test]
+    fn untrusted_physics_queries_reject_non_finite_and_degenerate_values() {
+        let nan_origin = GameplayPhysicsQuery::Raycast {
+            query_id: 1,
+            origin: [f32::NAN, 0.0, 0.0],
+            direction: [0.0, -1.0, 0.0],
+            max_distance: 10.0,
+        };
+        assert!(nan_origin.validate().unwrap_err().contains("finite"));
+
+        let infinite_direction = GameplayPhysicsQuery::Raycast {
+            query_id: 1,
+            origin: [0.0; 3],
+            direction: [f32::INFINITY, 0.0, 0.0],
+            max_distance: 10.0,
+        };
+        assert!(infinite_direction
+            .validate()
+            .unwrap_err()
+            .contains("finite"));
+
+        let zero_direction = GameplayPhysicsQuery::Raycast {
+            query_id: 1,
+            origin: [0.0; 3],
+            direction: [0.0; 3],
+            max_distance: 10.0,
+        };
+        assert!(zero_direction
+            .validate()
+            .unwrap_err()
+            .contains("zero length"));
+
+        for invalid_command in [
+            GameplayCommand::PhysicsQuery {
+                query: GameplayPhysicsQuery::Raycast {
+                    query_id: 1,
+                    origin: [0.0; 3],
+                    direction: [0.0, -1.0, 0.0],
+                    max_distance: 0.0,
+                },
+            },
+            GameplayCommand::PhysicsQuery {
+                query: GameplayPhysicsQuery::Raycast {
+                    query_id: 1,
+                    origin: [0.0; 3],
+                    direction: [0.0, -1.0, 0.0],
+                    max_distance: f32::INFINITY,
+                },
+            },
+            GameplayCommand::PhysicsQuery {
+                query: GameplayPhysicsQuery::OverlapSphere {
+                    query_id: 2,
+                    center: [0.0, f32::NAN, 0.0],
+                    radius: 1.0,
+                },
+            },
+            GameplayCommand::PhysicsQuery {
+                query: GameplayPhysicsQuery::OverlapSphere {
+                    query_id: 2,
+                    center: [0.0; 3],
+                    radius: -1.0,
+                },
+            },
+        ] {
+            assert!(invalid_command.validate().is_err());
+        }
     }
 }

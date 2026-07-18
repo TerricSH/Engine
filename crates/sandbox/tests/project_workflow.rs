@@ -877,3 +877,179 @@ fn csharp_project_builds_and_runs_managed_lifecycle() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[cfg(feature = "subsystem-scripting-csharp")]
+const MANAGED_PHYSICS_PROBE_BEHAVIOUR: &str = r#"using Engine;
+
+namespace GameScripts;
+
+public sealed class PhysicsProbeBehaviour : EngineBehaviour
+{
+    private PhysicsQuery _hitQuery;
+    private PhysicsQuery _missQuery;
+    private PhysicsQuery _overlapQuery;
+    public int UpdateCount = 0;
+
+    public void OnCreate()
+    {
+    }
+
+    public void OnStart()
+    {
+    }
+
+    public void OnUpdate(float deltaTime)
+    {
+        UpdateCount += 1;
+        if (UpdateCount == 1)
+        {
+            // Query handles never resolve on the frame that issued them.
+            if (Physics.TryGetRaycastHit(_hitQuery, out _))
+                throw new InvalidOperationException("query resolved on its issuing frame");
+            _hitQuery = Physics.Raycast(
+                new Vector3(0.0f, 5.0f, 0.0f),
+                new Vector3(0.0f, -1.0f, 0.0f),
+                10.0f);
+            _missQuery = Physics.Raycast(
+                new Vector3(0.0f, 5.0f, 0.0f),
+                new Vector3(0.0f, 1.0f, 0.0f),
+                10.0f);
+            _overlapQuery = Physics.OverlapSphere(new Vector3(0.0f, 0.0f, 0.0f), 1.0f);
+            return;
+        }
+        if (UpdateCount == 2)
+        {
+            if (!Physics.TryGetRaycastHit(_hitQuery, out var hit))
+                throw new InvalidOperationException("raycast hit missing on the next frame");
+            if (hit.EntityId != "cube-01" || hit.Entity?.Id != "cube-01")
+                throw new InvalidOperationException("raycast hit the wrong entity");
+            if (Math.Abs(hit.Distance - 4.5f) > 1e-3f)
+                throw new InvalidOperationException($"unexpected raycast distance {hit.Distance}");
+            if (Math.Abs(hit.Point.Y - 0.5f) > 1e-3f || Math.Abs(hit.Normal.Y - 1.0f) > 1e-3f)
+                throw new InvalidOperationException("raycast hit geometry mismatch");
+            if (Physics.TryGetRaycastHit(_missQuery, out _))
+                throw new InvalidOperationException("miss raycast resolved as a hit");
+            if (!Physics.TryGetOverlapResult(_overlapQuery, out var entityIds) ||
+                !entityIds.Contains("cube-01"))
+                throw new InvalidOperationException("overlap sphere missed cube-01");
+        }
+        if (UpdateCount >= 3)
+        {
+            // Results are frame-local and expire after their delivery frame.
+            if (Physics.TryGetRaycastHit(_hitQuery, out _) ||
+                Physics.TryGetOverlapResult(_overlapQuery, out _))
+                throw new InvalidOperationException("frame-local query results must expire");
+        }
+    }
+}
+"#;
+
+// Exercise the deferred physics query pipeline end to end: generated C#
+// Physics.Raycast/OverlapSphere -> gameplay command -> process host -> native
+// Rapier query -> next frame's gameplay context -> managed result lookup.
+#[cfg(feature = "subsystem-scripting-csharp")]
+#[test]
+fn csharp_physics_queries_round_trip_through_the_process_host() {
+    let root = unique_project_root();
+    let output = run(&[
+        "project",
+        "new",
+        path_text(&root),
+        "--name",
+        "Physics Probe Game",
+        "--with-csharp",
+    ]);
+    assert_success(&output, "physics query project new");
+
+    let source = root.join("scripts/GameScripts/PhysicsProbeBehaviour.cs");
+    std::fs::write(&source, MANAGED_PHYSICS_PROBE_BEHAVIOUR)
+        .expect("write physics probe behaviour");
+
+    // Attach the probe to cube-01 with an explicit origin transform, a static
+    // rigid body, and the default unit collider so the ray and overlap
+    // results are deterministic.
+    let scene_path = root.join("assets/scenes/main.scene.ron");
+    let mut scene = Scene::load_from_file(&scene_path).expect("load physics probe scene");
+    let entity = scene
+        .entities
+        .iter_mut()
+        .find(|entity| entity.persistent_id == "cube-01")
+        .expect("physics probe fixture entity");
+    entity.components.insert(
+        "engine.transform".into(),
+        engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: std::collections::BTreeMap::from([
+                (
+                    "translation".into(),
+                    engine_serialize::Value::Vec3([0.0; 3]),
+                ),
+                (
+                    "rotation".into(),
+                    engine_serialize::Value::Quat([0.0, 0.0, 0.0, 1.0]),
+                ),
+                ("scale".into(), engine_serialize::Value::Vec3([1.0; 3])),
+            ]),
+        },
+    );
+    entity.components.insert(
+        "engine.physics.rigid_body".into(),
+        engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: std::collections::BTreeMap::from([(
+                "body_type".into(),
+                engine_serialize::Value::Enum("Static".into()),
+            )]),
+        },
+    );
+    entity.components.insert(
+        "engine.physics.collider".into(),
+        engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: std::collections::BTreeMap::new(),
+        },
+    );
+    entity.components.insert(
+        "engine.script".into(),
+        engine_scene::ComponentRecord {
+            schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
+            enabled: true,
+            fields: std::collections::BTreeMap::from([
+                (
+                    "assembly_id".into(),
+                    engine_serialize::Value::Str("GameScripts".into()),
+                ),
+                (
+                    "class_name".into(),
+                    engine_serialize::Value::Str("GameScripts.PhysicsProbeBehaviour".into()),
+                ),
+            ]),
+        },
+    );
+    scene
+        .save_to_file(&scene_path)
+        .expect("save physics probe scene");
+
+    let report_path = root.join("csharp-physics-query-run.json");
+    let output = run(&[
+        "game",
+        path_text(&root),
+        "--headless",
+        "--frames",
+        "3",
+        "--report",
+        path_text(&report_path),
+    ]);
+    assert_success(&output, "managed physics query round trip");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report_path).expect("read physics query report"))
+            .expect("parse physics query report");
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["script_errors"], 0);
+    assert_eq!(report["script_update_count"], 3);
+
+    let _ = std::fs::remove_dir_all(root);
+}

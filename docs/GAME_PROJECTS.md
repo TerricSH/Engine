@@ -150,6 +150,13 @@ public void OnUpdate(float deltaTime)
             Console.WriteLine($"trigger entered by {physicsEvent.OtherEntityId}");
     }
 
+    // Physics queries are deferred: issue the query now and read its result
+    // from the returned handle on the next frame.
+    if (Input.WasPressed("fire"))
+        _groundProbe = Physics.Raycast(position, new Vector3(0.0f, -1.0f, 0.0f), 10.0f);
+    if (Physics.TryGetRaycastHit(_groundProbe, out var groundHit))
+        Console.WriteLine($"ray hit {groundHit.EntityId} at {groundHit.Point}");
+
     if (UI.WasClicked("start-game"))
         Scene.Load("level_one");
 
@@ -161,6 +168,8 @@ public void OnUpdate(float deltaTime)
 `Scene.Entities`, `Scene.Exists(id)`, `Scene.FindEntity(id)`, and `Scene.GetEntity(id)` operate on the current frame's persistent-entity snapshot. `Scene.CreateEntity(id)` and `Scene.CreateEntity(id, translation)` enqueue a new persistent entity with an identity Transform or the requested translation. Creation is validated and committed at the frame boundary, so the entity becomes queryable in the next frame; duplicate same-frame IDs use deterministic first-wins semantics. `Scene.DestroySelf()`, `Scene.Destroy(id)`, and `Entity.Destroy()` use the same deferred mutation boundary. Scripts never receive raw ECS handles.
 
 `Physics.Events` contains the owning entity's collision and trigger events for the current frame. Event kinds are `collision_entered`, `collision_stayed`, `collision_exited`, `trigger_entered`, `trigger_stayed`, and `trigger_exited`; `OtherEntityId` and `Other` identify the other persistent scene entity. The native physics queue is drained every frame even when no script consumes it, so events cannot accumulate indefinitely.
+
+`Physics.Raycast(origin, direction, maxDistance)` and `Physics.OverlapSphere(center, radius)` query the physics world. Queries are deferred: each call validates its arguments (non-finite values, a zero-length ray direction, or a non-positive distance/radius throw immediately and surface as script errors), returns a `PhysicsQuery` handle, and the engine executes the query against the physics world at the frame boundary. The result arrives with the next frame's context. `Physics.TryGetRaycastHit(query, out var hit)` reports the closest hit's `EntityId`, `Entity`, world-space `Point` and `Normal`, and `Distance`, returning false on a miss; `Physics.TryGetOverlapResult(query, out var entityIds)` reports the overlapped persistent entity ids. Results are frame-local — delivered in exactly one frame and expired afterwards — and a handle never resolves on the frame that issued it. Ray distance and sphere radius are clamped to `ScriptPhysics.MaxQueryDistance` (10,000), and overlap results are sorted and bounded to `ScriptPhysics.MaxOverlapResults` (64). Queries report persistent entity ids, never raw ECS handles; sensors such as trigger volumes are excluded from query results.
 
 The process host uses a frame snapshot/command model: entity Transforms and input values are sent before lifecycle execution, then validated commands are committed after all scripts finish. This avoids re-entering the single JSON pipe from inside `OnUpdate`. Consequently, scripts do not observe another script's same-frame writes.
 
@@ -179,7 +188,7 @@ script errors instead of being silently ignored.
 
 `UI.Events` contains the runtime UI clicks routed during the current script update. Each `GameplayUiEvent` retains its `CanvasId`, numeric `ElementId`, and optional `CallbackId`; events without a callback ID remain visible in the list. `UI.WasClicked(callbackId)` is a convenience query using an exact, case-sensitive callback-ID match. This bridge currently emits click events only. It does not automatically change or expose Toggle, Checkbox, or Slider values; game code must not infer value changes from a click alone.
 
-This bridge does not yet provide prefab instantiation, arbitrary component access for newly-created entities, named callback methods such as `OnCollisionEnter`, physics-aware movement commands, or in-process `Engine.API` calls. Runtime creation currently supplies a Transform; collision and trigger data is consumed through `Physics.Events`. `ProcessHost` scripts must use this IPC gameplay API; direct `engine-ffi` P/Invoke remains intentionally rejected across processes.
+This bridge does not yet provide prefab instantiation, arbitrary component access for newly-created entities, named callback methods such as `OnCollisionEnter`, physics-aware movement commands, or in-process `Engine.API` calls. Runtime creation currently supplies a Transform; collision and trigger data is consumed through `Physics.Events`, and spatial queries through the deferred `Physics.Raycast`/`Physics.OverlapSphere` handles. `ProcessHost` scripts must use this IPC gameplay API; direct `engine-ffi` P/Invoke remains intentionally rejected across processes.
 
 The editor scene panel lists the catalog, creates and opens scenes, and can set
 the startup scene. Switching away from a dirty scene requires an explicit
