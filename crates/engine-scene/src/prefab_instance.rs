@@ -994,7 +994,7 @@ mod tests {
                     display_name: "Flaky",
                     schema_version: (0, 1, 0),
                     has_editor: false,
-                    has_script_binding: false,
+                    script_access: crate::ScriptAccess::None,
                 },
                 storage_factory: flaky_storage,
                 serialize: None,

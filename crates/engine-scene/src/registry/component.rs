@@ -10,6 +10,52 @@ use crate::prefab_instance::PrefabInstanceRef;
 // Metadata
 // ---------------------------------------------------------------------------
 
+/// How gameplay scripts may access a registered component through the
+/// generic `Components` API.
+///
+/// This is the target-shape access model for the script component bridge; the
+/// legacy `has_script_binding` boolean maps onto it (`true` →
+/// [`ScriptAccess::ReadWrite`], `false` → [`ScriptAccess::None`]). Access is
+/// only ever *effective* when the registry entry also carries both scene
+/// serde hooks — the same hooks the scene loader uses — so scripts and scene
+/// files share one field layout per component.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScriptAccess {
+    /// Not accessible to scripts.
+    #[default]
+    None,
+    /// Scripts may query field snapshots; writes are rejected with a
+    /// read-only diagnostic.
+    ReadOnly,
+    /// Scripts may query field snapshots and merge-write fields.
+    ReadWrite,
+    /// Scripts reach the component through a dedicated, higher-fidelity API
+    /// (Transform commands, retained UI canvas handles), never the generic
+    /// `Components` API.
+    DedicatedApi,
+}
+
+impl ScriptAccess {
+    /// Legacy `has_script_binding` semantics: any non-[`None`](Self::None)
+    /// access level means the component participates in script bindings
+    /// somewhere (generic bridge or a dedicated API).
+    pub fn has_script_binding(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Whether the generic `Components` API may query this component, given
+    /// that the required serde hooks are present.
+    pub fn is_queryable(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    /// Whether the generic `Components` API may write this component, given
+    /// that the required serde hooks are present.
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+}
+
 /// Metadata about a registered component type.
 #[derive(Clone, Debug)]
 pub struct ComponentMeta {
@@ -17,7 +63,15 @@ pub struct ComponentMeta {
     pub display_name: &'static str,
     pub schema_version: (u16, u16, u16),
     pub has_editor: bool,
-    pub has_script_binding: bool,
+    pub script_access: ScriptAccess,
+}
+
+impl ComponentMeta {
+    /// Legacy `has_script_binding` view of [`ComponentMeta::script_access`]:
+    /// `true` for any non-[`ScriptAccess::None`] level.
+    pub fn has_script_binding(&self) -> bool {
+        self.script_access.has_script_binding()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -118,14 +172,14 @@ impl ComponentRegistry {
     /// instance linkage.
     pub fn register_core(&mut self) {
         macro_rules! core_ext {
-            ($ty:ty, $display:expr, $has_editor:expr, $has_script:expr) => {{
+            ($ty:ty, $display:expr, $has_editor:expr, $access:expr) => {{
                 let ext = ComponentExtension {
                     meta: ComponentMeta {
                         type_id: <$ty as Component>::TYPE_ID,
                         display_name: $display,
                         schema_version: (0, 1, 0),
                         has_editor: $has_editor,
-                        has_script_binding: $has_script,
+                        script_access: $access,
                     },
                     storage_factory: || -> Box<dyn ComponentStorageDyn> {
                         Box::new(SparseSet::<$ty>::new())
@@ -136,14 +190,14 @@ impl ComponentRegistry {
                 // Unwrap: core components are registered only once.
                 self.register(ext).ok();
             }};
-            ($ty:ty, $display:expr, $has_editor:expr, $has_script:expr, $ser:expr, $de:expr) => {{
+            ($ty:ty, $display:expr, $has_editor:expr, $access:expr, $ser:expr, $de:expr) => {{
                 let ext = ComponentExtension {
                     meta: ComponentMeta {
                         type_id: <$ty as Component>::TYPE_ID,
                         display_name: $display,
                         schema_version: (0, 1, 0),
                         has_editor: $has_editor,
-                        has_script_binding: $has_script,
+                        script_access: $access,
                     },
                     storage_factory: || -> Box<dyn ComponentStorageDyn> {
                         Box::new(SparseSet::<$ty>::new())
@@ -156,14 +210,14 @@ impl ComponentRegistry {
             }};
         }
 
-        core_ext!(Name, "Name", true, false);
-        core_ext!(Transform, "Transform", true, false);
-        core_ext!(Renderable, "Renderable", true, false);
+        core_ext!(Name, "Name", true, ScriptAccess::None);
+        core_ext!(Transform, "Transform", true, ScriptAccess::DedicatedApi);
+        core_ext!(Renderable, "Renderable", true, ScriptAccess::None);
         core_ext!(
             Camera,
             "Camera",
             true,
-            true,
+            ScriptAccess::ReadWrite,
             crate::components::serialize_camera,
             crate::components::deserialize_camera
         );
@@ -171,12 +225,17 @@ impl ComponentRegistry {
             Light,
             "Light",
             true,
-            true,
+            ScriptAccess::ReadWrite,
             crate::components::serialize_light,
             crate::components::deserialize_light
         );
-        core_ext!(Bounds, "Bounds", true, false);
-        core_ext!(PrefabInstanceRef, "Prefab Instance", false, false);
+        core_ext!(Bounds, "Bounds", true, ScriptAccess::None);
+        core_ext!(
+            PrefabInstanceRef,
+            "Prefab Instance",
+            false,
+            ScriptAccess::None
+        );
     }
 
     /// Iterate over all registered extensions in insertion order.

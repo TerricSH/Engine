@@ -56,7 +56,7 @@ pub fn register_physics_extensions(
                 display_name: "RigidBody",
                 schema_version: (0, 1, 0),
                 has_editor: true,
-                has_script_binding: true,
+                script_access: engine_scene::registry::ScriptAccess::ReadWrite,
             },
             storage_factory: || -> Box<dyn ComponentStorageDyn> {
                 Box::new(SparseSet::<RigidBody>::new())
@@ -74,7 +74,7 @@ pub fn register_physics_extensions(
                 display_name: "Collider",
                 schema_version: (0, 1, 0),
                 has_editor: true,
-                has_script_binding: true,
+                script_access: engine_scene::registry::ScriptAccess::ReadWrite,
             },
             storage_factory: || -> Box<dyn ComponentStorageDyn> {
                 Box::new(SparseSet::<Collider>::new())
@@ -92,7 +92,7 @@ pub fn register_physics_extensions(
                 display_name: "PhysicsMaterial",
                 schema_version: (0, 1, 0),
                 has_editor: true,
-                has_script_binding: true,
+                script_access: engine_scene::registry::ScriptAccess::ReadWrite,
             },
             storage_factory: || -> Box<dyn ComponentStorageDyn> {
                 Box::new(SparseSet::<PhysicsMaterial>::new())
@@ -110,7 +110,7 @@ pub fn register_physics_extensions(
                 display_name: "Gravity Source",
                 schema_version: (0, 1, 0),
                 has_editor: true,
-                has_script_binding: true,
+                script_access: engine_scene::registry::ScriptAccess::ReadWrite,
             },
             storage_factory: || -> Box<dyn ComponentStorageDyn> {
                 Box::new(SparseSet::<crate::GravitySource>::new())

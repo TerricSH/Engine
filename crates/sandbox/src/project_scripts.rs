@@ -1272,9 +1272,17 @@ public sealed class ComponentSnapshot
 }
 
 // Deferred read/write access to the engine's built-in components beyond
-// Transform. Supported component type keys: engine.camera, engine.light,
-// engine.audio_source, engine.physics.rigid_body, engine.physics.collider,
-// engine.gravity_source.
+// Transform. Access is registry-driven: a component type is reachable when
+// its engine registry entry declares a script access level and carries scene
+// serde hooks — there is no client-side allow-list. The queryable set is
+// currently engine.camera, engine.light, engine.audio_source,
+// engine.audio_listener, engine.physics.rigid_body, engine.physics.collider,
+// engine.physics.physics_material, engine.gravity_source, engine.nav_agent,
+// and — query-only — engine.character_controller; docs/COMPONENT_SCRIPT_ACCESS.md
+// holds the full audited matrix. Writes to query-only components fail with a
+// SCRIPT_COMPONENT_READ_ONLY script error, unknown or dedicated-API keys
+// (engine.transform, engine.canvas) fail with SCRIPT_COMPONENT_UNKNOWN, and
+// malformed fields with SCRIPT_COMPONENT_PAYLOAD_INVALID.
 // Reads are deferred queries executed at the frame boundary, mirroring
 // ScriptPhysics: Query returns a frame-local handle and TryGet delivers the
 // snapshot with the next frame. Writes merge the provided fields into the

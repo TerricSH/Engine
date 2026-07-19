@@ -125,20 +125,25 @@ remain data-only.
 
 ## Current gaps
 
-The current boundary exposes typed script access to a curated component set
-(`engine.camera`, `engine.light`, `engine.audio_source`,
-`engine.physics.rigid_body`, `engine.physics.collider`,
-`engine.gravity_source`) through the deferred
-`Components.Query`/`Components.SetComponent` bridge; Transform keeps its
-dedicated snapshot path. It does not yet expose arbitrary component access
-beyond that set, full physics queries/movement, or every audio, animation,
-and navigation operation. A game needing one of these should add a generic
-engine capability and Script API binding; it should not put game-specific code
-into the Rust implementation.
+The current boundary exposes typed script access to a registry-driven
+component set through the deferred `Components.Query`/`Components.SetComponent`
+bridge. A component becomes script-accessible when its component-registry
+entry declares a `ScriptAccess` level of `ReadOnly` or `ReadWrite` **and**
+carries scene serialization hooks — there is no separate allow-list in engine
+code. Transform keeps its dedicated snapshot path and UI canvases their
+retained handles (`DedicatedApi`). The per-component access matrix lives in
+`docs/COMPONENT_SCRIPT_ACCESS.md` and is enforced by a drift guard. The
+bridge does not yet expose arbitrary component access beyond the registered
+set, full physics queries/movement, or every audio, animation, and navigation
+operation. A game needing one of these should add a generic engine capability
+and Script API binding; it should not put game-specific code into the Rust
+implementation.
 
-Adding a component to the curated set is an opt-in recipe: register scene
+Adding a component to the bridge is an opt-in recipe: register scene
 serialization hooks for the component in the component registry (so scripts
-and the scene format share one field schema), then add the component's type
-key to the allow-list in `engine-core`'s `script_components` module. Reads
-snapshots through those hooks and writes merge validated fields back through
-them, so no script-specific serializer is ever hand-written twice.
+and the scene format share one field schema), declare its `ScriptAccess`
+level on the same registry entry, and record the decision in the audit
+annotations in `engine-core`'s `component_audit` module (the drift guard
+fails until `docs/COMPONENT_SCRIPT_ACCESS.md` is regenerated). Reads snapshot
+through those hooks and writes merge validated fields back through them, so
+no script-specific serializer is ever hand-written twice.

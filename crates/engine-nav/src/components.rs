@@ -245,7 +245,7 @@ pub fn register_nav_extensions(
             display_name: "AI Agent",
             schema_version: (0, 1, 0),
             has_editor: true,
-            has_script_binding: true,
+            script_access: engine_scene::registry::ScriptAccess::ReadWrite,
         },
         storage_factory: || -> Box<dyn ComponentStorageDyn> {
             Box::new(SparseSet::<AiAgent>::new())

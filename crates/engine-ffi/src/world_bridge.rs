@@ -96,7 +96,11 @@ pub fn activate_world(slot: &WorldSlot, component_registry: &ComponentRegistry) 
     let entries = component_registry
         .iter()
         .filter(|extension| {
-            extension.meta.has_script_binding
+            // Legacy FFI surface: every component with any script binding
+            // (generic bridge or dedicated API) keeps its type-table entry;
+            // the generic Components bridge applies its own ScriptAccess
+            // enforcement on top.
+            extension.meta.has_script_binding()
                 && extension.serialize.is_some()
                 && extension.deserialize.is_some()
         })

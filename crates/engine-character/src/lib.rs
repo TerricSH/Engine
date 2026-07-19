@@ -69,7 +69,11 @@ pub fn register_character_extensions(
             display_name: "Character Controller",
             schema_version: (0, 1, 0),
             has_editor: true,
-            has_script_binding: true,
+            // Read-only for scripts: the generic merge-write path rebuilds the
+            // component from its scene field map, which would drop
+            // serde-skipped runtime state (pending commands, landing timer,
+            // ground normal). Querying the state snapshot is safe.
+            script_access: engine_scene::registry::ScriptAccess::ReadOnly,
         },
         storage_factory: || -> Box<dyn ComponentStorageDyn> {
             Box::new(SparseSet::<CharacterController>::new())

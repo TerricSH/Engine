@@ -2064,7 +2064,7 @@ mod tests {
                     display_name: "Validated External",
                     schema_version: (0, 1, 0),
                     has_editor: true,
-                    has_script_binding: false,
+                    script_access: engine_scene::ScriptAccess::None,
                 },
                 storage_factory: test_external_storage,
                 serialize: None,

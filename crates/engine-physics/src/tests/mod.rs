@@ -2361,7 +2361,11 @@ fn gravity_source_registers_with_script_binding() {
         .get(GravitySource::TYPE_ID)
         .expect("gravity source registered");
     assert!(extension.meta.has_editor);
-    assert!(extension.meta.has_script_binding);
+    assert!(extension.meta.has_script_binding());
+    assert_eq!(
+        extension.meta.script_access,
+        engine_scene::ScriptAccess::ReadWrite
+    );
     assert!(extension.serialize.is_some());
     assert!(extension.deserialize.is_some());
 }

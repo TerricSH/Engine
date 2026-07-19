@@ -1087,7 +1087,9 @@ pub fn register_ui_extensions(component_registry: &mut engine_scene::registry::C
             display_name: "UI Canvas",
             schema_version: (0, 1, 0),
             has_editor: true,
-            has_script_binding: true,
+            // Scripts drive canvases through the retained `UICanvas` managed
+            // handles, never the generic Components bridge.
+            script_access: engine_scene::registry::ScriptAccess::DedicatedApi,
         },
         storage_factory: || -> Box<dyn ComponentStorageDyn> {
             Box::new(SparseSet::<Canvas>::new())

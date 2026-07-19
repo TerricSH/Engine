@@ -1,16 +1,25 @@
 //! Typed script component bridge.
 //!
-//! The gameplay script API exposes a curated, game-agnostic set of built-in
-//! components beyond Transform. A component type becomes script-accessible
-//! only when **both** of the following hold:
+//! The gameplay script API exposes built-in components beyond Transform
+//! through the generic `Components` bridge. Access is **registry-driven**:
+//! there is no hardcoded allow-list. A component type becomes accessible when
+//! **all** of the following hold for its entry in the active world's
+//! [`engine_scene::registry::ComponentRegistry`]:
 //!
-//! 1. Its stable type key appears in [`script_component_types`], the explicit
-//!    curated allow-list. Feature-gated component families (audio, physics)
-//!    are listed only when their feature is compiled in.
-//! 2. The active world's [`engine_scene::registry::ComponentRegistry`]
-//!    carries the type with serialize/deserialize hooks — the same hooks the
-//!    scene loader uses for `.scene.ron` files, so scripts and scene files
-//!    share one field layout per component.
+//! 1. `ComponentMeta::script_access` is [`engine_scene::registry::ScriptAccess::ReadOnly`] or
+//!    [`engine_scene::registry::ScriptAccess::ReadWrite`]. `ScriptAccess::None` opts out entirely and
+//!    [`engine_scene::registry::ScriptAccess::DedicatedApi`] routes the component through its own
+//!    higher-fidelity script path (Transform commands, retained UI canvas
+//!    handles) instead of this bridge.
+//! 2. The entry carries both scene serde hooks — the same hooks the scene
+//!    loader uses for `.scene.ron` files, so scripts and scene files share
+//!    one field layout per component.
+//!
+//! `ReadOnly` components answer queries but reject writes with a distinct
+//! `ReadOnly` outcome (surfaced as `SCRIPT_COMPONENT_READ_ONLY`); anything
+//! else that is unreachable is reported as unsupported (surfaced as
+//! `SCRIPT_COMPONENT_UNKNOWN`), keeping unknown-type and known-but-forbidden
+//! diagnostics distinct.
 //!
 //! Reads snapshot a component through its serialize hook and convert the
 //! scene field map into wire values. Writes merge script-provided fields over
@@ -26,31 +35,68 @@ use std::sync::Arc;
 use engine_scene::World;
 use engine_script::GameplayComponentValue;
 
-/// The curated, game-agnostic component type keys exposed to gameplay
-/// scripts.
-///
-/// Transform is intentionally absent (it has a dedicated, higher-fidelity
-/// script path) and retained UI canvases are absent (they are driven through
-/// the managed `UICanvas` handles). New components opt in by registering
-/// scene serde hooks and adding their type key here.
-pub(crate) fn script_component_types() -> &'static [&'static str] {
-    &[
-        "engine.camera",
-        "engine.light",
-        #[cfg(feature = "runtime-subsystems")]
-        "engine.audio_source",
-        #[cfg(feature = "gameplay")]
-        "engine.physics.rigid_body",
-        #[cfg(feature = "gameplay")]
-        "engine.physics.collider",
-        #[cfg(feature = "gameplay")]
-        "engine.gravity_source",
-    ]
+/// How the generic `Components` bridge may treat one component type key,
+/// resolved from the active world's component registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptComponentResolution {
+    /// Queries and writes are both allowed.
+    ReadWrite,
+    /// Queries are allowed; writes are rejected as read-only.
+    ReadOnly,
+    /// The type key is not script-accessible through this bridge: it is
+    /// unregistered, opted out (`ScriptAccess::None`), routed through a
+    /// dedicated API (`ScriptAccess::DedicatedApi`), or missing one of the
+    /// required scene serde hooks.
+    Unsupported,
 }
 
-/// Whether `type_id` is eligible for script component access in this build.
-pub(crate) fn is_script_component_type(type_id: &str) -> bool {
-    script_component_types().contains(&type_id)
+/// Resolve the bridge access for `component_type` from `world`'s component
+/// registry. This is the single source of truth for script component access;
+/// adding a component to the bridge is a registry change, never an
+/// engine-core code change.
+pub(crate) fn resolve_script_component(
+    world: &World,
+    component_type: &str,
+) -> ScriptComponentResolution {
+    let Some(extension) = world
+        .component_registry()
+        .and_then(|registry| registry.get(component_type))
+    else {
+        return ScriptComponentResolution::Unsupported;
+    };
+    let access = extension.meta.script_access;
+    if !access.is_queryable() {
+        return ScriptComponentResolution::Unsupported;
+    }
+    if extension.serialize.is_none() || extension.deserialize.is_none() {
+        return ScriptComponentResolution::Unsupported;
+    }
+    if access.is_writable() {
+        ScriptComponentResolution::ReadWrite
+    } else {
+        ScriptComponentResolution::ReadOnly
+    }
+}
+
+/// The sorted type keys scripts may currently query through the bridge, used
+/// by `SCRIPT_COMPONENT_UNKNOWN` diagnostics.
+pub(crate) fn supported_script_component_types(world: &World) -> Vec<&'static str> {
+    let mut types = world
+        .component_registry()
+        .map(|registry| {
+            registry
+                .iter()
+                .filter(|extension| {
+                    extension.meta.script_access.is_queryable()
+                        && extension.serialize.is_some()
+                        && extension.deserialize.is_some()
+                })
+                .map(|extension| extension.meta.type_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    types.sort_unstable();
+    types
 }
 
 /// Outcome of reading one component for a script query.
@@ -71,7 +117,7 @@ pub(crate) fn read_script_component(
     entity_id: &str,
     component_type: &str,
 ) -> ScriptComponentRead {
-    if !is_script_component_type(component_type) {
+    if resolve_script_component(world, component_type) == ScriptComponentResolution::Unsupported {
         return ScriptComponentRead::Unsupported;
     }
     let Some(extension) = world
@@ -103,6 +149,9 @@ pub(crate) fn read_script_component(
 pub(crate) enum ScriptComponentWriteError {
     /// The type key is not script-accessible in this build.
     Unsupported,
+    /// The component is script-queryable but not script-writable
+    /// ([`engine_scene::registry::ScriptAccess::ReadOnly`]).
+    ReadOnly,
     /// The target persistent entity does not exist.
     UnknownEntity,
     /// One or more provided fields were not accepted by the component's serde
@@ -131,8 +180,10 @@ pub(crate) fn apply_script_component_write(
 ) -> Result<(), ScriptComponentWriteError> {
     use ScriptComponentWriteError as Error;
 
-    if !is_script_component_type(component_type) {
-        return Err(Error::Unsupported);
+    match resolve_script_component(world, component_type) {
+        ScriptComponentResolution::ReadWrite => {}
+        ScriptComponentResolution::ReadOnly => return Err(Error::ReadOnly),
+        ScriptComponentResolution::Unsupported => return Err(Error::Unsupported),
     }
     let Some(registry) = world.component_registry().map(Arc::clone) else {
         return Err(Error::Unsupported);
@@ -185,7 +236,8 @@ pub(crate) fn apply_script_component_write(
 mod tests {
     use super::*;
     use engine_scene::components::{Camera, Light};
-    use engine_scene::{ComponentRegistry, World};
+    use engine_scene::registry::ScriptAccess;
+    use engine_scene::{ComponentRegistry, ComponentStorageDyn, World};
 
     fn world_with_core_registry() -> World {
         let mut registry = ComponentRegistry::new();
@@ -195,23 +247,154 @@ mod tests {
         world
     }
 
-    #[test]
-    fn curated_component_set_is_explicit_and_feature_gated() {
-        let types = script_component_types();
-        assert!(types.contains(&"engine.camera"));
-        assert!(types.contains(&"engine.light"));
-        #[cfg(feature = "runtime-subsystems")]
-        assert!(types.contains(&"engine.audio_source"));
-        #[cfg(feature = "gameplay")]
-        {
-            assert!(types.contains(&"engine.physics.rigid_body"));
-            assert!(types.contains(&"engine.physics.collider"));
-            assert!(types.contains(&"engine.gravity_source"));
+    struct QueryOnlyComponent;
+
+    impl engine_scene::Component for QueryOnlyComponent {
+        const TYPE_ID: &'static str = "test.query_only";
+    }
+
+    struct HooklessComponent;
+
+    impl engine_scene::Component for HooklessComponent {
+        const TYPE_ID: &'static str = "test.hookless";
+    }
+
+    struct DedicatedComponent;
+
+    impl engine_scene::Component for DedicatedComponent {
+        const TYPE_ID: &'static str = "test.dedicated";
+    }
+
+    fn serialize_empty(
+        _component: &dyn std::any::Any,
+    ) -> BTreeMap<String, engine_serialize::Value> {
+        BTreeMap::new()
+    }
+
+    fn deserialize_query_only(
+        _fields: &BTreeMap<String, engine_serialize::Value>,
+    ) -> Box<dyn std::any::Any> {
+        Box::new(QueryOnlyComponent)
+    }
+
+    fn deserialize_dedicated(
+        _fields: &BTreeMap<String, engine_serialize::Value>,
+    ) -> Box<dyn std::any::Any> {
+        Box::new(DedicatedComponent)
+    }
+
+    fn test_extension<T: engine_scene::Component + 'static>(
+        display_name: &'static str,
+        script_access: ScriptAccess,
+        serialize: Option<engine_scene::registry::SerializeFn>,
+        deserialize: Option<engine_scene::registry::DeserializeFn>,
+    ) -> engine_scene::ComponentExtension {
+        engine_scene::ComponentExtension {
+            meta: engine_scene::ComponentMeta {
+                type_id: T::TYPE_ID,
+                display_name,
+                schema_version: (0, 1, 0),
+                has_editor: false,
+                script_access,
+            },
+            storage_factory: || -> Box<dyn ComponentStorageDyn> {
+                Box::new(engine_scene::SparseSet::<T>::new())
+            },
+            serialize,
+            deserialize,
         }
-        // Transform and retained UI stay on their dedicated paths.
-        assert!(!types.contains(&"engine.transform"));
-        assert!(!types.contains(&"engine.canvas"));
-        assert!(!types.contains(&"engine.renderable"));
+    }
+
+    fn world_with_access_levels() -> World {
+        let mut registry = ComponentRegistry::new();
+        registry.register_core();
+        registry
+            .register(test_extension::<QueryOnlyComponent>(
+                "Query Only",
+                ScriptAccess::ReadOnly,
+                Some(serialize_empty),
+                Some(deserialize_query_only),
+            ))
+            .expect("register read-only component");
+        registry
+            .register(test_extension::<HooklessComponent>(
+                "Hookless",
+                ScriptAccess::ReadWrite,
+                None,
+                None,
+            ))
+            .expect("register hookless component");
+        registry
+            .register(test_extension::<DedicatedComponent>(
+                "Dedicated",
+                ScriptAccess::DedicatedApi,
+                Some(serialize_empty),
+                Some(deserialize_dedicated),
+            ))
+            .expect("register dedicated component");
+        let mut world = World::new();
+        world.set_component_registry(registry);
+        world
+    }
+
+    #[test]
+    fn resolution_is_registry_driven_for_every_access_level() {
+        let world = world_with_access_levels();
+        use ScriptComponentResolution as Resolution;
+
+        // ReadWrite + both hooks: queryable and writable.
+        assert_eq!(
+            resolve_script_component(&world, "engine.camera"),
+            Resolution::ReadWrite
+        );
+        assert_eq!(
+            resolve_script_component(&world, "engine.light"),
+            Resolution::ReadWrite
+        );
+        // ReadOnly + both hooks: queryable, writes rejected.
+        assert_eq!(
+            resolve_script_component(&world, "test.query_only"),
+            Resolution::ReadOnly
+        );
+        // ReadWrite without serde hooks is not bridge-accessible.
+        assert_eq!(
+            resolve_script_component(&world, "test.hookless"),
+            Resolution::Unsupported
+        );
+        // Dedicated APIs never enter the generic bridge.
+        assert_eq!(
+            resolve_script_component(&world, "test.dedicated"),
+            Resolution::Unsupported
+        );
+        assert_eq!(
+            resolve_script_component(&world, "engine.transform"),
+            Resolution::Unsupported
+        );
+        // Opted out and unknown keys are unsupported.
+        assert_eq!(
+            resolve_script_component(&world, "engine.name"),
+            Resolution::Unsupported
+        );
+        assert_eq!(
+            resolve_script_component(&world, "game.custom"),
+            Resolution::Unsupported
+        );
+    }
+
+    #[test]
+    fn supported_types_track_the_registry() {
+        let world = world_with_access_levels();
+        let supported = supported_script_component_types(&world);
+        assert!(supported.contains(&"engine.camera"));
+        assert!(supported.contains(&"engine.light"));
+        assert!(supported.contains(&"test.query_only"));
+        assert!(!supported.contains(&"engine.transform"));
+        assert!(!supported.contains(&"test.dedicated"));
+        assert!(!supported.contains(&"test.hookless"));
+        // The list is sorted for stable diagnostics.
+        let mut sorted = supported.clone();
+        sorted.sort_unstable();
+        assert_eq!(supported, sorted);
     }
 
     #[test]
@@ -273,6 +456,18 @@ mod tests {
     }
 
     #[test]
+    fn read_allows_read_only_components() {
+        let mut world = world_with_access_levels();
+        let entity = world.create_persistent_entity("probe-01").unwrap();
+        world.add_component(entity, QueryOnlyComponent);
+
+        assert!(matches!(
+            read_script_component(&world, "probe-01", "test.query_only"),
+            ScriptComponentRead::Snapshot(_)
+        ));
+    }
+
+    #[test]
     fn write_merges_fields_over_the_current_snapshot() {
         let mut world = world_with_core_registry();
         let entity = world.create_persistent_entity("light-01").unwrap();
@@ -320,6 +515,23 @@ mod tests {
         let camera = world.get::<Camera>(entity).expect("camera installed");
         assert_eq!(camera.fov_y, 1.2);
         assert_eq!(camera.near, Camera::default().near);
+    }
+
+    #[test]
+    fn write_rejects_read_only_components_without_touching_the_world() {
+        let mut world = world_with_access_levels();
+        let entity = world.create_persistent_entity("probe-01").unwrap();
+        world.add_component(entity, QueryOnlyComponent);
+
+        assert_eq!(
+            apply_script_component_write(
+                &mut world,
+                "probe-01",
+                "test.query_only",
+                &BTreeMap::from([("anything".to_string(), GameplayComponentValue::Bool(true))]),
+            ),
+            Err(ScriptComponentWriteError::ReadOnly)
+        );
     }
 
     #[test]

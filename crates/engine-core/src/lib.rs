@@ -2,6 +2,7 @@
 
 pub mod diagnostics;
 pub use diagnostics::*;
+pub mod component_audit;
 pub mod cooked_assets;
 pub use cooked_assets::*;
 pub mod asset_stream;
@@ -1591,7 +1592,23 @@ impl EngineRuntime {
                         ));
                         continue;
                     }
-                    if !script_components::is_script_component_type(&query.component_type) {
+                    // Registry-driven access check. `None` means no World is
+                    // active; the query is still queued and the executor
+                    // reports SCRIPT_WORLD_MISSING instead.
+                    let resolution = self.world_slot.with_world(|world| {
+                        (
+                            script_components::resolve_script_component(
+                                world,
+                                &query.component_type,
+                            ),
+                            script_components::supported_script_component_types(world),
+                        )
+                    });
+                    if let Some((
+                        script_components::ScriptComponentResolution::Unsupported,
+                        supported,
+                    )) = resolution
+                    {
                         diagnostics.push(script_component_diagnostic(
                             "SCRIPT_COMPONENT_UNKNOWN",
                             &entity_id,
@@ -1599,7 +1616,7 @@ impl EngineRuntime {
                                 "script entity '{entity_id}' queried component '{}' on entity '{}', but that type is not script-accessible; {}",
                                 query.component_type,
                                 query.entity_id,
-                                supported_script_component_description()
+                                supported_script_component_description(&supported)
                             ),
                         ));
                         continue;
@@ -1645,16 +1662,48 @@ impl EngineRuntime {
                         ));
                         continue;
                     }
-                    if !script_components::is_script_component_type(&component_type) {
-                        diagnostics.push(script_component_diagnostic(
-                            "SCRIPT_COMPONENT_UNKNOWN",
-                            &entity_id,
-                            format!(
-                                "script entity '{entity_id}' tried to write component '{component_type}' on entity '{target_id}', but that type is not script-accessible; {}",
-                                supported_script_component_description()
-                            ),
-                        ));
-                        continue;
+                    let resolution = self.world_slot.with_world(|world| {
+                        (
+                            script_components::resolve_script_component(world, &component_type),
+                            script_components::supported_script_component_types(world),
+                        )
+                    });
+                    match resolution {
+                        Some((script_components::ScriptComponentResolution::ReadWrite, _)) => {}
+                        Some((script_components::ScriptComponentResolution::ReadOnly, _)) => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_COMPONENT_READ_ONLY",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' tried to write component '{component_type}' on entity '{target_id}', but that component is read-only for scripts; query it with Components.Query instead"
+                                ),
+                            ));
+                            continue;
+                        }
+                        Some((
+                            script_components::ScriptComponentResolution::Unsupported,
+                            supported,
+                        )) => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_COMPONENT_UNKNOWN",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' tried to write component '{component_type}' on entity '{target_id}', but that type is not script-accessible; {}",
+                                    supported_script_component_description(&supported)
+                                ),
+                            ));
+                            continue;
+                        }
+                        None => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_WORLD_MISSING",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' component write for entity '{target_id}' could not be applied because no World is active"
+                                ),
+                            ));
+                            continue;
+                        }
                     }
                     let outcome = self.world_slot.with_world_mut(|world| {
                         script_components::apply_script_component_write(
@@ -1675,6 +1724,15 @@ impl EngineRuntime {
                                 ),
                             ));
                         }
+                        Some(Err(script_components::ScriptComponentWriteError::ReadOnly)) => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_COMPONENT_READ_ONLY",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' tried to write component '{component_type}' on entity '{target_id}', but that component is read-only for scripts; query it with Components.Query instead"
+                                ),
+                            ));
+                        }
                         Some(Err(
                             script_components::ScriptComponentWriteError::PayloadRejected {
                                 rejected,
@@ -1692,12 +1750,16 @@ impl EngineRuntime {
                             ));
                         }
                         Some(Err(script_components::ScriptComponentWriteError::Unsupported)) => {
+                            let supported = self
+                                .world_slot
+                                .with_world(script_components::supported_script_component_types)
+                                .unwrap_or_default();
                             diagnostics.push(script_component_diagnostic(
                                 "SCRIPT_COMPONENT_UNKNOWN",
                                 &entity_id,
                                 format!(
                                     "script entity '{entity_id}' tried to write component '{component_type}' on entity '{target_id}', but that type is not script-accessible; {}",
-                                    supported_script_component_description()
+                                    supported_script_component_description(&supported)
                                 ),
                             ));
                         }
@@ -1770,27 +1832,30 @@ impl EngineRuntime {
         > = std::collections::BTreeMap::new();
         for engine_script::OwnedGameplayComponentQuery { entity_id, query } in pending {
             let outcome = self.world_slot.with_world(|world| {
-                script_components::read_script_component(
-                    world,
-                    &query.entity_id,
-                    &query.component_type,
+                (
+                    script_components::read_script_component(
+                        world,
+                        &query.entity_id,
+                        &query.component_type,
+                    ),
+                    script_components::supported_script_component_types(world),
                 )
             });
             use engine_script::GameplayComponentQueryResult as QueryResult;
             use script_components::ScriptComponentRead as Read;
             let result = match outcome {
-                Some(Read::Snapshot(fields)) => QueryResult::Snapshot {
+                Some((Read::Snapshot(fields), _)) => QueryResult::Snapshot {
                     query_id: query.query_id,
                     entity_id: query.entity_id,
                     component_type: query.component_type,
                     fields,
                 },
-                Some(Read::Missing) => QueryResult::Missing {
+                Some((Read::Missing, _)) => QueryResult::Missing {
                     query_id: query.query_id,
                     entity_id: query.entity_id,
                     component_type: query.component_type,
                 },
-                Some(Read::Unsupported) => {
+                Some((Read::Unsupported, supported)) => {
                     diagnostics.push(script_component_diagnostic(
                         "SCRIPT_COMPONENT_UNKNOWN",
                         &entity_id,
@@ -1798,7 +1863,7 @@ impl EngineRuntime {
                             "script entity '{entity_id}' queried component '{}' on entity '{}', but that type is not script-accessible; {}",
                             query.component_type,
                             query.entity_id,
-                            supported_script_component_description()
+                            supported_script_component_description(&supported)
                         ),
                     ));
                     continue;
@@ -2609,11 +2674,11 @@ fn script_component_diagnostic(code: &str, entity_id: &str, message: String) -> 
 /// Human-readable list of the component type keys scripts may access, used
 /// by `SCRIPT_COMPONENT_UNKNOWN` diagnostics.
 #[cfg(feature = "subsystem-scripting-csharp")]
-fn supported_script_component_description() -> String {
-    format!(
-        "supported component types: {}",
-        script_components::script_component_types().join(", ")
-    )
+fn supported_script_component_description(supported: &[&'static str]) -> String {
+    if supported.is_empty() {
+        return "no component types are script-accessible in this build".to_string();
+    }
+    format!("supported component types: {}", supported.join(", "))
 }
 
 #[cfg(feature = "subsystem-scripting-csharp")]
@@ -3110,7 +3175,7 @@ mod tests {
                     display_name: "A Only",
                     schema_version: (0, 1, 0),
                     has_editor: false,
-                    has_script_binding: true,
+                    script_access: engine_scene::ScriptAccess::ReadWrite,
                 },
                 storage_factory: a_only_storage,
                 serialize: Some(serialize_a_only),
@@ -3127,7 +3192,7 @@ mod tests {
                     display_name: "B Only",
                     schema_version: (0, 1, 0),
                     has_editor: false,
-                    has_script_binding: true,
+                    script_access: engine_scene::ScriptAccess::ReadWrite,
                 },
                 storage_factory: b_only_storage,
                 serialize: Some(serialize_a_only),
@@ -5206,5 +5271,78 @@ mod tests {
         }));
         assert!(!runtime.has_world());
         assert!(runtime.scene_ref().is_none());
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn script_component_access_levels_drive_query_and_write_diagnostics() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::from_scene(&engine_scene::sample_scene()));
+
+        let commands = vec![
+            // ReadOnly component: the write is rejected with the distinct
+            // read-only diagnostic, never applied.
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::SetComponent {
+                    entity_id: "cube-01".into(),
+                    component_type: "engine.character_controller".into(),
+                    fields: std::collections::BTreeMap::from([(
+                        "move_speed".to_string(),
+                        engine_script::GameplayComponentValue::Float(9.0),
+                    )]),
+                },
+            },
+            // DedicatedApi component: same stable unknown-component
+            // diagnostic as unregistered keys.
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::SetComponent {
+                    entity_id: "cube-01".into(),
+                    component_type: "engine.transform".into(),
+                    fields: std::collections::BTreeMap::from([(
+                        "translation".to_string(),
+                        engine_script::GameplayComponentValue::Vec3([0.0; 3]),
+                    )]),
+                },
+            },
+            // ReadOnly component queries are accepted: no diagnostic.
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::ComponentQuery {
+                    query: engine_script::GameplayComponentQuery {
+                        query_id: 7,
+                        entity_id: "cube-01".into(),
+                        component_type: "engine.character_controller".into(),
+                    },
+                },
+            },
+        ];
+
+        let diagnostics = runtime.apply_script_gameplay_commands(commands);
+
+        let read_only = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "SCRIPT_COMPONENT_READ_ONLY")
+            .collect::<Vec<_>>();
+        assert_eq!(read_only.len(), 1, "{diagnostics:?}");
+        assert!(read_only[0].message.contains("engine.character_controller"));
+
+        let unknown = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "SCRIPT_COMPONENT_UNKNOWN")
+            .collect::<Vec<_>>();
+        assert_eq!(unknown.len(), 1, "{diagnostics:?}");
+        assert!(unknown[0].message.contains("engine.transform"));
+        // The supported list in the diagnostic is registry-driven and now
+        // includes the read-only character controller.
+        assert!(unknown[0].message.contains("engine.character_controller"));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "SCRIPT_COMPONENT_PAYLOAD_INVALID"),
+            "{diagnostics:?}"
+        );
     }
 }

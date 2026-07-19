@@ -37,7 +37,7 @@ pub use prefab_instance::{
 };
 pub use registry::{
     AssetTypeExtension, AssetTypeMeta, AssetTypeRegistry, ComponentExtension, ComponentMeta,
-    ComponentRegistry,
+    ComponentRegistry, ScriptAccess,
 };
 pub use scene::*;
 pub use validation::{

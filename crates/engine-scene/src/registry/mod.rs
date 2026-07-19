@@ -34,7 +34,7 @@ mod tests {
                 display_name,
                 schema_version: (0, 1, 0),
                 has_editor: false,
-                has_script_binding: false,
+                script_access: ScriptAccess::None,
             },
             storage_factory: dummy_storage_factory,
             serialize: None,
@@ -140,7 +140,7 @@ mod tests {
                 "{type_id} needs a deserialize hook"
             );
             assert!(
-                ext.meta.has_script_binding,
+                ext.meta.has_script_binding(),
                 "{type_id} opts into script binding"
             );
         }

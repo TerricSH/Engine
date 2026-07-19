@@ -67,6 +67,7 @@ tempfile = "3"
 bincode.workspace = true
 engine-audio = { path = "../engine-audio" }
 engine-nav = { path = "../engine-nav" }
+engine-ui = { path = "../engine-ui" }
 
 [build-dependencies]
 serde_json.workspace = true

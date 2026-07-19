@@ -773,7 +773,7 @@ mod tests {
                 display_name: "External",
                 schema_version: (0, 1, 0),
                 has_editor: false,
-                has_script_binding: false,
+                script_access: crate::registry::ScriptAccess::None,
             },
             storage_factory: external_storage,
             serialize: Some(serialize_external),
