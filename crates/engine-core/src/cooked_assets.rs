@@ -299,6 +299,38 @@ impl EngineRuntime {
             replaced_asset_ids,
         );
 
+        // Runtime mesh IDs are reserved while the mesh is live: neither a
+        // replace-mode swap (which would overwrite the registry entry and
+        // later unload it) nor an additive install may claim them. Additive
+        // payload-identity checks below only cover typed equality, so the
+        // reservation is enforced explicitly for both modes.
+        {
+            let runtime_id_conflicts = batch
+                .textures
+                .iter()
+                .map(|upload| (&upload.texture_id, "texture"))
+                .chain(
+                    batch
+                        .materials
+                        .iter()
+                        .map(|(_, upload)| (&upload.material_id, "material")),
+                )
+                .chain(batch.meshes.iter().map(|upload| (&upload.mesh_id, "mesh")))
+                .chain(
+                    batch
+                        .extensions
+                        .iter()
+                        .map(|asset| (&asset.id, asset.type_id.as_str())),
+                );
+            for (id, kind) in runtime_id_conflicts {
+                if self.is_runtime_mesh_asset_id(id) {
+                    diagnostics.push(crate::runtime_mesh::runtime_mesh_conflict_diagnostic(
+                        id, kind,
+                    ));
+                }
+            }
+        }
+
         let mut identical_ids = BTreeSet::new();
         if mode == CookedCommitMode::Additive {
             for upload in &batch.textures {

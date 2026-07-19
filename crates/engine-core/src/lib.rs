@@ -5,6 +5,8 @@ pub use diagnostics::*;
 pub mod component_audit;
 pub mod cooked_assets;
 pub use cooked_assets::*;
+pub mod runtime_mesh;
+pub use runtime_mesh::*;
 pub mod asset_stream;
 pub use asset_stream::*;
 pub mod cell_stream;
@@ -215,6 +217,11 @@ pub struct EngineRuntime {
     asset_registry: AssetRegistry,
     loaded_cooked_asset_ids: BTreeSet<AssetId>,
     loaded_extension_asset_ids: BTreeMap<String, BTreeSet<AssetId>>,
+    /// Handle table for runtime-registered dynamic meshes (ENG-20). The
+    /// meshes themselves live as typed `MeshUpload` assets in
+    /// `asset_registry`; the table owns handle generations, name lookup,
+    /// memory accounting, and deferred GPU removals.
+    runtime_mesh_table: runtime_mesh::RuntimeMeshTable,
     /// Lazily created background cooked-asset decoder; see
     /// [`EngineRuntime::enqueue_cooked_asset_stream`]. `None` until the first
     /// streamed enqueue so runtimes that never stream never spawn a thread.
@@ -308,6 +315,7 @@ impl EngineRuntime {
             asset_registry,
             loaded_cooked_asset_ids: BTreeSet::new(),
             loaded_extension_asset_ids: BTreeMap::new(),
+            runtime_mesh_table: runtime_mesh::RuntimeMeshTable::default(),
             stream_loader: None,
             stream_budget: asset_stream::DEFAULT_STREAM_COMMIT_BUDGET,
             scene: None,
@@ -623,6 +631,7 @@ impl EngineRuntime {
             collector: self.collector.clone(),
             reload_queue: None,
             frame_timing: self.frame_timing.summary(),
+            runtime_meshes: self.runtime_mesh_memory(),
             #[cfg(feature = "subsystem-scripting-csharp")]
             script_engine_state: format!(
                 "{} coroutines={}",
@@ -682,6 +691,9 @@ impl EngineRuntime {
         ui_batches: Vec<engine_renderer::UiBatch>,
         viewport: Option<RenderViewportContext>,
     ) -> Result<FrameStats, Vec<Diagnostic>> {
+        // Frames-in-flight boundary: release GPU resources of runtime meshes
+        // destroyed since the previous frame before recording a new one.
+        self.drain_deferred_runtime_mesh_removals();
         self.frame_timing.begin_stage("extraction");
         let extraction = self.world_slot.with_world(|world| match viewport {
             Some(viewport) => {
@@ -3134,7 +3146,7 @@ mod tests {
 
     static FFI_WORLD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn serial_ffi_world_test() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn serial_ffi_world_test() -> std::sync::MutexGuard<'static, ()> {
         FFI_WORLD_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

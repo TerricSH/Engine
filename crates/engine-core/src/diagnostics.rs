@@ -29,6 +29,8 @@ pub struct RuntimeDiagnostics {
     /// diagnostics; GPU fields are absent when the backend cannot provide
     /// timestamps.
     pub frame_timing: engine_renderer::FrameTimingSummary,
+    /// Memory accounting for live runtime-registered meshes (ENG-20).
+    pub runtime_meshes: crate::runtime_mesh::RuntimeMeshMemory,
     pub script_engine_state: String,
 }
 
@@ -368,6 +370,7 @@ mod tests {
             collector: DiagnosticsCollector::new(),
             reload_queue: None,
             frame_timing: engine_renderer::FrameTimingSummary::default(),
+            runtime_meshes: crate::runtime_mesh::RuntimeMeshMemory::default(),
             script_engine_state: "idle".to_string(),
         };
         assert_eq!(rd.script_engine_state, "idle");

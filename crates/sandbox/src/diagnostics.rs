@@ -156,6 +156,7 @@ mod tests {
             collector: engine_core::DiagnosticsCollector::new(),
             reload_queue: None,
             frame_timing: engine_renderer::FrameTimingSummary::default(),
+            runtime_meshes: engine_core::RuntimeMeshMemory::default(),
             script_engine_state: "idle".to_string(),
         };
         runtime_diags.frame_timing.window_frames = 7;
