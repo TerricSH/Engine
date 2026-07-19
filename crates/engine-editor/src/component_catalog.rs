@@ -20,6 +20,7 @@ pub const UI_CANVAS_COMPONENT: &str = "engine.canvas";
 pub const AUDIO_SOURCE_COMPONENT: &str = "engine.audio_source";
 pub const IK_TARGET_COMPONENT: &str = "engine.ik_target";
 pub const NAV_AGENT_COMPONENT: &str = "engine.nav_agent";
+pub const TERRAIN_VOLUME_COMPONENT: &str = "engine.terrain_volume";
 
 #[derive(Clone, Copy)]
 pub struct ComponentDescriptor {
@@ -297,7 +298,56 @@ fn nav_agent(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
     Ok(record(fields))
 }
 
-const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 15] = [
+fn terrain_volume(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
+    let terrain = engine_terrain::TerrainVolume::default();
+    Ok(record(BTreeMap::from([
+        ("enabled".into(), Value::Bool(terrain.enabled)),
+        ("seed".into(), Value::UInt(terrain.seed)),
+        ("chunk_size".into(), Value::Float32(terrain.chunk_size)),
+        (
+            "base_resolution".into(),
+            Value::UInt(u64::from(terrain.base_resolution)),
+        ),
+        ("height_scale".into(), Value::Float32(terrain.height_scale)),
+        ("frequency".into(), Value::Float32(terrain.frequency)),
+        ("octaves".into(), Value::UInt(u64::from(terrain.octaves))),
+        ("lacunarity".into(), Value::Float32(terrain.lacunarity)),
+        ("gain".into(), Value::Float32(terrain.gain)),
+        (
+            "domain_warp_amplitude".into(),
+            Value::Float32(terrain.domain_warp_amplitude),
+        ),
+        (
+            "domain_warp_frequency".into(),
+            Value::Float32(terrain.domain_warp_frequency),
+        ),
+        ("skirt_depth".into(), Value::Float32(terrain.skirt_depth)),
+        (
+            "collision_enabled".into(),
+            Value::Bool(terrain.collision_enabled),
+        ),
+        (
+            "material_asset".into(),
+            Value::Asset(AssetId::new("mat-default")),
+        ),
+        (
+            "lod_distances".into(),
+            Value::List(
+                terrain
+                    .lod_distances
+                    .into_iter()
+                    .map(Value::Float32)
+                    .collect(),
+            ),
+        ),
+        (
+            "lod_hysteresis".into(),
+            Value::Float32(terrain.lod_hysteresis),
+        ),
+    ])))
+}
+
+const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 16] = [
     ComponentDescriptor {
         type_id: TRANSFORM_COMPONENT,
         display_name: "Transform",
@@ -424,6 +474,14 @@ const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 15] = [
         required_components: &[TRANSFORM_COMPONENT, CHARACTER_CONTROLLER_COMPONENT],
         factory: nav_agent,
     },
+    ComponentDescriptor {
+        type_id: TERRAIN_VOLUME_COMPONENT,
+        display_name: "Terrain Volume",
+        category: "Terrain",
+        removable: true,
+        required_components: &[],
+        factory: terrain_volume,
+    },
 ];
 
 fn configure_unchanged(_: &mut EntityRecord) {}
@@ -472,12 +530,19 @@ fn configure_spot_light(entity: &mut EntityRecord) {
     );
 }
 
-const ENTITY_TEMPLATES: [EntityTemplate; 13] = [
+const ENTITY_TEMPLATES: [EntityTemplate; 14] = [
     EntityTemplate {
         id: "empty",
         display_name: "GameObject",
         category: "Core",
         component_types: &[TRANSFORM_COMPONENT],
+        configure: configure_unchanged,
+    },
+    EntityTemplate {
+        id: "terrain",
+        display_name: "Terrain",
+        category: "3D Object",
+        component_types: &[TERRAIN_VOLUME_COMPONENT],
         configure: configure_unchanged,
     },
     EntityTemplate {
@@ -710,6 +775,7 @@ mod tests {
             AUDIO_SOURCE_COMPONENT,
             IK_TARGET_COMPONENT,
             NAV_AGENT_COMPONENT,
+            TERRAIN_VOLUME_COMPONENT,
         ] {
             assert!(ComponentCatalog::descriptor(type_id).is_some(), "{type_id}");
         }
@@ -735,6 +801,7 @@ mod tests {
         engine_character::register_character_extensions(&mut components, None);
         engine_physics::register_physics_extensions(&mut components, None);
         engine_ui::register_ui_extensions(&mut components);
+        engine_terrain::register_terrain_extensions(&mut components);
 
         let mut assets = engine_scene::registry::AssetTypeRegistry::new();
         engine_audio::register_audio_extensions(&mut components, &mut assets);

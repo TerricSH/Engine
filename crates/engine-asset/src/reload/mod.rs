@@ -119,8 +119,8 @@ impl ReloadCoordinator {
             .map(WatchCoordinator::poll_events)
             .unwrap_or_default();
         if !events.is_empty() {
-            let batch = recook::incremental_recook(
-                &events,
+            let batch = recook::recook_assets(
+                recook::RecookTrigger::WatchEvents(&events),
                 &mut self.graph,
                 &self.source_dir,
                 &self.cooked_dir,
@@ -198,8 +198,8 @@ impl ReloadCoordinator {
     /// ID is absent or rejected by manifest validation. No filename, category,
     /// or string-only alias is accepted.
     pub fn request_reload(&mut self, asset_id: &AssetId) -> bool {
-        let batch = recook::recook_asset(
-            asset_id,
+        let batch = recook::recook_assets(
+            recook::RecookTrigger::Asset(asset_id),
             &mut self.graph,
             &self.source_dir,
             &self.cooked_dir,

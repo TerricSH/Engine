@@ -11,6 +11,10 @@ pub mod asset_stream;
 pub use asset_stream::*;
 pub mod cell_stream;
 pub use cell_stream::{CellStreamingConfig, CellStreamingDriver};
+#[cfg(feature = "terrain")]
+pub mod terrain;
+#[cfg(feature = "terrain")]
+pub use terrain::{TerrainBindingStats, TerrainSystem};
 
 use engine_asset::{AssetHandle, AssetRegistry};
 use engine_renderer::{
@@ -109,6 +113,8 @@ impl EngineRuntimeBuilder {
             &mut component_registry,
             Some(&mut debug_draw_registry),
         );
+        #[cfg(feature = "terrain")]
+        engine_terrain::register_terrain_extensions(&mut component_registry);
         #[cfg(feature = "gameplay")]
         engine_physics::register_physics_extensions(
             &mut component_registry,
@@ -1785,6 +1791,19 @@ impl EngineRuntime {
                                 ),
                             ));
                         }
+                        Some(Err(
+                            script_components::ScriptComponentWriteError::ValidationFailed {
+                                message,
+                            },
+                        )) => {
+                            diagnostics.push(script_component_diagnostic(
+                                "SCRIPT_COMPONENT_VALIDATION_FAILED",
+                                &entity_id,
+                                format!(
+                                    "script entity '{entity_id}' wrote invalid component '{component_type}' parameters on entity '{target_id}': {message}"
+                                ),
+                            ));
+                        }
                         Some(Err(script_components::ScriptComponentWriteError::Unsupported)) => {
                             let supported = self
                                 .world_slot
@@ -2905,6 +2924,16 @@ fn scene_load_diagnostic(diagnostic: SceneLoadDiagnostic) -> Diagnostic {
             entity_id,
             component_type_id,
         } => ("SC0033", entity_id, component_type_id, None),
+        SceneLoadDiagnostic::InvalidComponentFields {
+            entity_id,
+            component_type_id,
+            ..
+        } => ("SC0034", entity_id, component_type_id, None),
+        SceneLoadDiagnostic::DuplicateSingletonComponent {
+            entity_id,
+            component_type_id,
+            ..
+        } => ("SC0035", entity_id, component_type_id, None),
     };
 
     let mut mapped = Diagnostic::new(

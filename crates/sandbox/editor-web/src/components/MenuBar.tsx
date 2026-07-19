@@ -40,7 +40,7 @@ const menus: MenuDefinition[] = [
     { id: 'window.inspector', label: 'General / Inspector' }, { id: 'window.project', label: 'General / Project' },
     { id: 'window.console', label: 'General / Console', shortcut: 'Ctrl+Shift+C' }, { id: 'window.material', label: 'Shading / Material', separatorBefore: true },
     { id: 'window.animation', label: 'Animation / Animation' },
-    { id: 'window.profiler', label: 'Analysis / Profiler' }, { id: 'window.build', label: 'Build' }, { id: 'window.resetLayout', label: 'Layouts / Default', separatorBefore: true },
+    { id: 'window.profiler', label: 'Analysis / Profiler' }, { id: 'window.terrain', label: 'Analysis / Terrain' }, { id: 'window.build', label: 'Build' }, { id: 'window.resetLayout', label: 'Layouts / Default', separatorBefore: true },
   ] },
 ]
 

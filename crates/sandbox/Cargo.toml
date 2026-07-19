@@ -18,7 +18,9 @@ tooling-editor = [
     "dep:engine-editor-host",
     "subsystem-scripting-csharp",
     "runtime-subsystems",
+    "terrain",
 ]
+terrain = ["engine-core/terrain", "dep:engine-terrain"]
 target-desktop = [
     "engine-core/gameplay",
     "runtime-subsystems",
@@ -37,6 +39,7 @@ engine-animation = { path = "../engine-animation" }
 engine-asset = { path = "../engine-asset" }
 engine-character = { path = "../engine-character" }
 engine-core = { path = "../engine-core" }
+engine-terrain = { path = "../engine-terrain", optional = true }
 engine-ui = { path = "../engine-ui", optional = true }
 engine-gameplay = { path = "../engine-gameplay" }
 engine-physics = { path = "../engine-physics" }

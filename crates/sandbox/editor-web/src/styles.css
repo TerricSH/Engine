@@ -2614,3 +2614,8 @@ kbd {
   .profiler-summary { grid-template-columns: repeat(3, 1fr); }
   .profiler-content.live-only .profiler-summary { grid-template-columns: repeat(3, minmax(65px, 1fr)); }
 }
+.terrain-panel { overflow: auto; height: 100%; padding: 8px; }
+.terrain-runtime-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; }
+.terrain-runtime-grid h3, .terrain-runtime-grid .field-error { grid-column: 1 / -1; }
+.terrain-runtime-grid span { display: flex; justify-content: space-between; gap: 8px; color: var(--text-muted); }
+.terrain-runtime-grid strong { color: var(--text-primary); font-variant-numeric: tabular-nums; }

@@ -470,6 +470,9 @@ pub struct WorldOriginShift {
 pub struct GameLoop {
     pub runtime: EngineRuntime,
 
+    #[cfg(feature = "terrain")]
+    pub terrain: crate::TerrainSystem,
+
     /// Cumulative count and details of executed world-origin shifts.
     world_origin_shift_count: u64,
     last_world_origin_shift: Option<WorldOriginShift>,
@@ -526,6 +529,8 @@ impl GameLoop {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             runtime: EngineRuntime::new(config),
+            #[cfg(feature = "terrain")]
+            terrain: crate::TerrainSystem::default(),
             world_origin_shift_count: 0,
             last_world_origin_shift: None,
             #[cfg(feature = "gameplay")]
@@ -577,6 +582,8 @@ impl GameLoop {
             self.script_physics_query_results.clear();
         }
         self.runtime.load_scene(scene)?;
+        #[cfg(feature = "terrain")]
+        self.terrain.reset(&mut self.runtime);
         #[cfg(feature = "runtime-subsystems")]
         self.reset_runtime_ui_input();
         #[cfg(feature = "runtime-audio-output")]
@@ -903,6 +910,8 @@ impl GameLoop {
     }
 
     fn update_inner(&mut self, dt: f32) {
+        #[cfg(feature = "terrain")]
+        self.tick_terrain(None);
         // Tick physics (ECS → physics → ECS sync) — gameplay feature
         #[cfg(feature = "gameplay")]
         {
@@ -996,6 +1005,32 @@ impl GameLoop {
         self.update_runtime_animation(dt);
         #[cfg(feature = "runtime-audio-output")]
         self.update_runtime_audio(dt);
+    }
+
+    /// Tick the optional terrain component at the frame boundary. Normal
+    /// [`update`](Self::update) calls this with the active camera; editor and
+    /// server hosts may supply an absolute/logical focus explicitly.
+    #[cfg(feature = "terrain")]
+    pub fn tick_terrain(&mut self, focus_logical: Option<[f64; 3]>) {
+        self.runtime.frame_timing_begin_stage("terrain_stream");
+        let physics_changed = self.terrain.tick(&mut self.runtime, focus_logical);
+        if physics_changed {
+            self.resync_physics_from_world();
+        }
+        self.runtime.frame_timing_end_stage("terrain_stream");
+    }
+
+    /// Snapshot used by the ENG-70 editor panel and headless diagnostics.
+    #[cfg(feature = "terrain")]
+    pub fn terrain_debug_snapshot(&self) -> engine_terrain::TerrainDebugSnapshot {
+        self.terrain.debug_snapshot()
+    }
+
+    /// Regenerate resident and in-flight chunks without changing authored
+    /// terrain parameters.
+    #[cfg(feature = "terrain")]
+    pub fn terrain_force_regenerate(&mut self) {
+        self.terrain.force_regenerate();
     }
 
     #[cfg(feature = "gameplay")]

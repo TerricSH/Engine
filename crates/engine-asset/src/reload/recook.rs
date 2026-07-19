@@ -39,15 +39,24 @@ struct ManifestCatalog {
     diagnostics: Vec<Diagnostic>,
 }
 
-/// Recook manifest-declared assets affected by debounced filesystem events.
-pub(super) fn incremental_recook(
-    events: &[WatchEvent],
+/// The validated trigger for the one incremental recook implementation.
+pub(super) enum RecookTrigger<'a> {
+    WatchEvents(&'a [WatchEvent]),
+    Asset(&'a AssetId),
+}
+
+/// Recook manifest-declared assets selected by a filesystem or explicit-ID trigger.
+///
+/// Both trigger kinds deliberately share manifest scanning, exact [`AssetId`]
+/// resolution, reverse-dependency expansion, cooking, and result tracking.
+pub(super) fn recook_assets(
+    trigger: RecookTrigger<'_>,
     graph: &mut DependencyGraph,
     source_dir: &Path,
     cooked_dir: &Path,
     asset_type_registry: &AssetTypeRegistry,
 ) -> RecookBatch {
-    if events.is_empty() {
+    if matches!(trigger, RecookTrigger::WatchEvents(events) if events.is_empty()) {
         return RecookBatch::default();
     }
 
@@ -57,67 +66,46 @@ pub(super) fn incremental_recook(
         ..RecookBatch::default()
     };
     let mut directly_affected = BTreeSet::new();
-    for event in events {
-        let comparable = comparable_path(&event.path);
-        if let Some(asset_ids) = catalog.paths.get(&comparable) {
-            directly_affected.extend(asset_ids.iter().cloned());
-        } else {
-            let mut diagnostic = reload_diagnostic(
-                "RECOOK_EVENT_PATH_NOT_DECLARED",
-                DiagnosticSeverity::Warning,
-                format!(
-                    "changed path '{}' is not declared by a valid source manifest",
-                    event.path.display()
-                ),
-                None,
-            );
-            diagnostic.path = Some(event.path.display().to_string());
-            batch.diagnostics.push(diagnostic);
+    match trigger {
+        RecookTrigger::WatchEvents(events) => {
+            for event in events {
+                let comparable = comparable_path(&event.path);
+                if let Some(asset_ids) = catalog.paths.get(&comparable) {
+                    directly_affected.extend(asset_ids.iter().cloned());
+                } else {
+                    let mut diagnostic = reload_diagnostic(
+                        "RECOOK_EVENT_PATH_NOT_DECLARED",
+                        DiagnosticSeverity::Warning,
+                        format!(
+                            "changed path '{}' is not declared by a valid source manifest",
+                            event.path.display()
+                        ),
+                        None,
+                    );
+                    diagnostic.path = Some(event.path.display().to_string());
+                    batch.diagnostics.push(diagnostic);
+                }
+            }
+        }
+        RecookTrigger::Asset(asset_id) => {
+            if !catalog.entries.contains_key(asset_id) {
+                batch.diagnostics.push(reload_diagnostic(
+                    "RECOOK_ASSET_NOT_DECLARED",
+                    DiagnosticSeverity::Error,
+                    format!(
+                        "asset '{}' with logical path {:?} is not declared by a valid source manifest",
+                        asset_id.id, asset_id.logical_path
+                    ),
+                    Some(asset_id.clone()),
+                ));
+                return batch;
+            }
+            directly_affected.insert(asset_id.clone());
         }
     }
     batch.matched = !directly_affected.is_empty();
     recook_affected(
         directly_affected,
-        &catalog.entries,
-        graph,
-        source_dir,
-        cooked_dir,
-        asset_type_registry,
-        &mut batch,
-    );
-    batch
-}
-
-/// Recook one exact, manifest-declared [`AssetId`] and all transitive reverse
-/// dependencies. No filename, category, or string-only alias is accepted.
-pub(super) fn recook_asset(
-    asset_id: &AssetId,
-    graph: &mut DependencyGraph,
-    source_dir: &Path,
-    cooked_dir: &Path,
-    asset_type_registry: &AssetTypeRegistry,
-) -> RecookBatch {
-    let catalog = scan_manifests(source_dir);
-    let mut batch = RecookBatch {
-        diagnostics: catalog.diagnostics.clone(),
-        ..RecookBatch::default()
-    };
-    if !catalog.entries.contains_key(asset_id) {
-        batch.diagnostics.push(reload_diagnostic(
-            "RECOOK_ASSET_NOT_DECLARED",
-            DiagnosticSeverity::Error,
-            format!(
-                "asset '{}' with logical path {:?} is not declared by a valid source manifest",
-                asset_id.id, asset_id.logical_path
-            ),
-            Some(asset_id.clone()),
-        ));
-        return batch;
-    }
-
-    batch.matched = true;
-    recook_affected(
-        BTreeSet::from([asset_id.clone()]),
         &catalog.entries,
         graph,
         source_dir,
@@ -515,10 +503,10 @@ mod tests {
     }
 
     #[test]
-    fn incremental_recook_empty_events() {
+    fn empty_watch_trigger_is_a_noop() {
         let mut graph = DependencyGraph::new();
-        let batch = incremental_recook(
-            &[],
+        let batch = recook_assets(
+            RecookTrigger::WatchEvents(&[]),
             &mut graph,
             Path::new("unused"),
             Path::new("unused"),
@@ -548,11 +536,11 @@ mod tests {
         let registry = default_registry();
         let mut graph = DependencyGraph::new();
 
-        let watched = incremental_recook(
-            &[WatchEvent {
+        let watched = recook_assets(
+            RecookTrigger::WatchEvents(&[WatchEvent {
                 path: source_path.clone(),
                 kind: WatchEventKind::Modified,
-            }],
+            }]),
             &mut graph,
             &source_dir,
             &cooked_dir,
@@ -563,7 +551,13 @@ mod tests {
         assert!(watched.results[0].success);
 
         std::fs::write(&source_path, material_source(0.25)).unwrap();
-        let requested = recook_asset(&asset_id, &mut graph, &source_dir, &cooked_dir, &registry);
+        let requested = recook_assets(
+            RecookTrigger::Asset(&asset_id),
+            &mut graph,
+            &source_dir,
+            &cooked_dir,
+            &registry,
+        );
         assert!(requested.matched);
         assert!(requested.results[0].success);
         let artifact = read_cooked_artifact(&cooked_dir.join("sample-material.cooked")).unwrap();
@@ -595,11 +589,11 @@ mod tests {
         );
         let mut graph = DependencyGraph::new();
 
-        let batch = incremental_recook(
-            &[WatchEvent {
+        let batch = recook_assets(
+            RecookTrigger::WatchEvents(&[WatchEvent {
                 path: source_dir.join("assets.manifest"),
                 kind: WatchEventKind::Modified,
-            }],
+            }]),
             &mut graph,
             &source_dir,
             &cooked_dir,
@@ -631,13 +625,26 @@ mod tests {
         let registry = default_registry();
         let mut graph = DependencyGraph::new();
         assert!(
-            recook_asset(&asset_id, &mut graph, &source_dir, &cooked_dir, &registry).results[0]
+            recook_assets(
+                RecookTrigger::Asset(&asset_id),
+                &mut graph,
+                &source_dir,
+                &cooked_dir,
+                &registry,
+            )
+            .results[0]
                 .success
         );
         let prior = std::fs::read(cooked_dir.join("stable-material.cooked")).unwrap();
 
         std::fs::write(&source_path, b"not valid material json").unwrap();
-        let failed = recook_asset(&asset_id, &mut graph, &source_dir, &cooked_dir, &registry);
+        let failed = recook_assets(
+            RecookTrigger::Asset(&asset_id),
+            &mut graph,
+            &source_dir,
+            &cooked_dir,
+            &registry,
+        );
         assert!(!failed.results[0].success);
         assert_eq!(
             std::fs::read(cooked_dir.join("stable-material.cooked")).unwrap(),
@@ -664,8 +671,9 @@ mod tests {
             )],
         );
         let mut graph = DependencyGraph::new();
-        let batch = recook_asset(
-            &AssetId::new("material"),
+        let requested_id = AssetId::new("material");
+        let batch = recook_assets(
+            RecookTrigger::Asset(&requested_id),
             &mut graph,
             &source_dir,
             &root.path().join("cooked"),
@@ -723,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_recook_dispatches_every_registry_owned_asset_type() {
+    fn unified_recook_dispatches_every_registry_owned_asset_type() {
         let root = tempfile::tempdir().unwrap();
         let source_dir = root.path().join("source");
         let cooked_dir = root.path().join("cooked");
@@ -746,7 +754,13 @@ mod tests {
         let registry = complete_extension_registry();
         let mut graph = DependencyGraph::new();
         for entry in entries {
-            let batch = recook_asset(&entry.id, &mut graph, &source_dir, &cooked_dir, &registry);
+            let batch = recook_assets(
+                RecookTrigger::Asset(&entry.id),
+                &mut graph,
+                &source_dir,
+                &cooked_dir,
+                &registry,
+            );
             assert!(batch.matched);
             assert!(batch.results[0].success);
             let artifact =

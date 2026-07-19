@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use engine_serialize::Value;
 
@@ -87,6 +87,9 @@ pub type SerializeFn = fn(&dyn std::any::Any) -> BTreeMap<String, Value>;
 /// Deserialization hook: build a component from a `BTreeMap<String, Value>`.
 pub type DeserializeFn = fn(&BTreeMap<String, Value>) -> Box<dyn std::any::Any>;
 
+/// Optional semantic validation hook for the serialized field map.
+pub type ValidateFieldsFn = fn(&BTreeMap<String, Value>) -> Result<(), String>;
+
 // ---------------------------------------------------------------------------
 // ComponentExtension
 // ---------------------------------------------------------------------------
@@ -122,6 +125,8 @@ impl std::fmt::Debug for ComponentExtension {
 #[derive(Clone, Debug)]
 pub struct ComponentRegistry {
     extensions: BTreeMap<&'static str, ComponentExtension>,
+    field_validators: BTreeMap<&'static str, ValidateFieldsFn>,
+    singleton_types: BTreeSet<&'static str>,
     order: Vec<&'static str>,
 }
 
@@ -129,6 +134,8 @@ impl ComponentRegistry {
     pub fn new() -> Self {
         Self {
             extensions: BTreeMap::new(),
+            field_validators: BTreeMap::new(),
+            singleton_types: BTreeSet::new(),
             order: Vec::new(),
         }
     }
@@ -155,6 +162,44 @@ impl ComponentRegistry {
     /// Get extension metadata by type ID.
     pub fn get(&self, type_id: &str) -> Option<&ComponentExtension> {
         self.extensions.get(type_id)
+    }
+
+    /// Install semantic validation for a registered component's serialized
+    /// field map. Scene loading, editor authoring, and generic script writes
+    /// all consult this same hook before deserialization.
+    pub fn register_fields_validator(
+        &mut self,
+        type_id: &'static str,
+        validator: ValidateFieldsFn,
+    ) -> Result<(), &'static str> {
+        if !self.extensions.contains_key(type_id) || self.field_validators.contains_key(type_id) {
+            return Err(type_id);
+        }
+        self.field_validators.insert(type_id, validator);
+        Ok(())
+    }
+
+    /// Validate fields when the component registered a semantic validator.
+    pub fn validate_fields(
+        &self,
+        type_id: &str,
+        fields: &BTreeMap<String, Value>,
+    ) -> Result<(), String> {
+        self.field_validators
+            .get(type_id)
+            .map_or(Ok(()), |validator| validator(fields))
+    }
+
+    /// Mark a registered component type as scene-global singleton data.
+    pub fn register_singleton(&mut self, type_id: &'static str) -> Result<(), &'static str> {
+        if !self.extensions.contains_key(type_id) || !self.singleton_types.insert(type_id) {
+            return Err(type_id);
+        }
+        Ok(())
+    }
+
+    pub fn singleton_types(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.singleton_types.iter().copied()
     }
 
     /// Create storage for all registered types (used by `World` initialization).

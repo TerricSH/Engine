@@ -305,6 +305,21 @@ impl World {
         let mut world = Self::new();
         let mut diagnostics = Vec::new();
         if let Some(registry) = registry {
+            for component_type_id in registry.singleton_types() {
+                let mut owners = scene
+                    .entities
+                    .iter()
+                    .filter(|entity| entity.components.contains_key(component_type_id));
+                if let Some(first) = owners.next() {
+                    diagnostics.extend(owners.map(|duplicate| {
+                        SceneLoadDiagnostic::DuplicateSingletonComponent {
+                            entity_id: duplicate.persistent_id.clone(),
+                            first_entity_id: first.persistent_id.clone(),
+                            component_type_id: component_type_id.to_string(),
+                        }
+                    }));
+                }
+            }
             let storages = registry.create_storages();
             for (registered_type_id, storage) in &storages {
                 if storage.type_id() != *registered_type_id {
@@ -493,6 +508,13 @@ impl World {
                 component_type_id: comp_type_id.to_string(),
             });
         };
+        registry
+            .validate_fields(comp_type_id, fields)
+            .map_err(|message| SceneLoadDiagnostic::InvalidComponentFields {
+                entity_id: entity_id.clone(),
+                component_type_id: comp_type_id.to_string(),
+                message,
+            })?;
 
         let mut storage = (extension.storage_factory)();
         if storage.type_id() != extension.meta.type_id {
@@ -681,6 +703,13 @@ impl World {
                     component_type_id: comp_type_id.to_string(),
                 });
             };
+            registry
+                .validate_fields(comp_type_id, fields)
+                .map_err(|message| SceneLoadDiagnostic::InvalidComponentFields {
+                    entity_id: entity_id.clone(),
+                    component_type_id: comp_type_id.to_string(),
+                    message,
+                })?;
             (
                 extension.meta.type_id,
                 extension.storage_factory,

@@ -94,12 +94,18 @@ function Invoke-FeatureCheck {
         "-p",
         "engine-core",
         "--features",
-        "backend-vulkan,subsystem-scripting-csharp,gameplay"
+        "backend-vulkan,subsystem-scripting-csharp,gameplay,terrain"
     )
 }
 
 function Invoke-WorkspaceTests {
     Invoke-Native "cargo test --workspace" "cargo" @("test", "--workspace", "--locked")
+    Invoke-Native "engine-core terrain/gameplay feature tests" "cargo" @(
+        "test", "--locked", "-p", "engine-core", "--features", "terrain,gameplay"
+    )
+    Invoke-Native "engine-editor tooling/terrain feature tests" "cargo" @(
+        "test", "--locked", "-p", "engine-editor", "--features", "tooling-editor"
+    )
 }
 
 function Invoke-FixtureTest {
@@ -318,6 +324,18 @@ function Invoke-ManagedChecks {
         Invoke-EngineSampleSmoke $engineSample
         $sandbox = Get-ManagedAssembly $artifactsRoot "Sandbox"
         Invoke-DotnetAssembly "C# sandbox smoke" $sandbox
+        Invoke-Native "C# ProcGen golden-vector parity" "cargo" @(
+            "test",
+            "--locked",
+            "-p",
+            "sandbox",
+            "--test",
+            "procgen_parity",
+            "--features",
+            "subsystem-scripting-csharp",
+            "--",
+            "--nocapture"
+        )
     }
     finally {
         $env:CARGO_TARGET_DIR = $oldCargoTarget

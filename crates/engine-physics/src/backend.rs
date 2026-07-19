@@ -36,18 +36,54 @@ pub struct RaycastHit {
 
 // ── Helper: convert ColliderShape to Rapier SharedShape ─────────────────────
 
-pub(crate) fn to_rapier_shared_shape(shape: &ColliderShape) -> SharedShape {
-    match *shape {
-        ColliderShape::Cuboid { hx, hy, hz } => SharedShape::cuboid(hx, hy, hz),
-        ColliderShape::Ball { radius } => SharedShape::ball(radius),
+pub(crate) fn to_rapier_shared_shape(shape: &ColliderShape) -> Option<SharedShape> {
+    match shape {
+        ColliderShape::Cuboid { hx, hy, hz }
+            if [hx, hy, hz]
+                .into_iter()
+                .all(|value| value.is_finite() && *value > 0.0) =>
+        {
+            Some(SharedShape::cuboid(*hx, *hy, *hz))
+        }
+        ColliderShape::Ball { radius } if radius.is_finite() && *radius > 0.0 => {
+            Some(SharedShape::ball(*radius))
+        }
         ColliderShape::Capsule {
             half_height,
             radius,
-        } => {
-            let a = na::Point3::new(0.0, -half_height, 0.0);
-            let b = na::Point3::new(0.0, half_height, 0.0);
-            SharedShape::capsule(a, b, radius)
+        } if half_height.is_finite()
+            && *half_height >= 0.0
+            && radius.is_finite()
+            && *radius > 0.0 =>
+        {
+            let a = na::Point3::new(0.0, -*half_height, 0.0);
+            let b = na::Point3::new(0.0, *half_height, 0.0);
+            Some(SharedShape::capsule(a, b, *radius))
         }
+        ColliderShape::HeightField {
+            rows,
+            columns,
+            heights,
+            scale,
+        } => {
+            let valid = *rows >= 2
+                && *columns >= 2
+                && heights.len() == *rows as usize * *columns as usize
+                && heights.iter().all(|height| height.is_finite())
+                && scale.iter().all(|value| value.is_finite() && *value > 0.0);
+            if !valid {
+                // Collider data can arrive through generic script writes. A
+                // malformed payload must not reach Rapier's assert-heavy
+                // constructor or turn into a phantom fallback collider.
+                return None;
+            }
+            let matrix = na::DMatrix::from_row_slice(*rows as usize, *columns as usize, heights);
+            Some(SharedShape::heightfield(
+                matrix,
+                na::Vector3::new(scale[0], scale[1], scale[2]),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -514,7 +550,10 @@ impl RapierBackend {
             None => return,
         };
 
-        let shape = to_rapier_shared_shape(&collider.shape);
+        let Some(shape) = to_rapier_shared_shape(&collider.shape) else {
+            tracing::warn!(entity = ?entity, "ignored invalid collider shape");
+            return;
+        };
 
         let density = material.map_or(collider.density, |m| m.density);
         let friction = material.map_or(collider.friction, |m| m.friction);
@@ -929,7 +968,7 @@ impl RapierBackend {
     ) -> Option<RaycastHit> {
         use rapier3d::parry::query::ShapeCastOptions;
 
-        let rapier_shape = to_rapier_shared_shape(shape);
+        let rapier_shape = to_rapier_shared_shape(shape)?;
         let iso = Isometry::from_parts(
             na::Translation3::new(origin.x, origin.y, origin.z),
             na::UnitQuaternion::identity(),
@@ -982,7 +1021,9 @@ impl RapierBackend {
         pos: glam::Vec3,
         filter: &PhysicsQueryFilter,
     ) -> Vec<Entity> {
-        let rapier_shape = to_rapier_shared_shape(shape);
+        let Some(rapier_shape) = to_rapier_shared_shape(shape) else {
+            return Vec::new();
+        };
         let iso = Isometry::from_parts(
             na::Translation3::new(pos.x, pos.y, pos.z),
             na::UnitQuaternion::identity(),
@@ -1069,7 +1110,10 @@ impl RapierBackend {
 
         // ── 2. Overlaps ────────────────────────────────────────────────
         for q in &batcher.overlaps {
-            let shape = to_rapier_shared_shape(&q.shape);
+            let Some(shape) = to_rapier_shared_shape(&q.shape) else {
+                overlap_details.push(Vec::new());
+                continue;
+            };
             let pos = Isometry::from_parts(
                 na::Translation3::new(q.position.x, q.position.y, q.position.z),
                 na::UnitQuaternion::identity(),
@@ -1096,7 +1140,10 @@ impl RapierBackend {
 
         // ── 3. Sweeps (shape casts) ────────────────────────────────────
         for q in &batcher.sweeps {
-            let shape = to_rapier_shared_shape(&q.shape);
+            let Some(shape) = to_rapier_shared_shape(&q.shape) else {
+                sweep_details.push(Vec::new());
+                continue;
+            };
             let from_pos = Isometry::from_parts(
                 na::Translation3::new(q.from.x, q.from.y, q.from.z),
                 na::UnitQuaternion::identity(),

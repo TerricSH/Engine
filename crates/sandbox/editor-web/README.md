@@ -42,7 +42,7 @@ The shell sends JSON only through Wry's canonical `window.ipc.postMessage` trans
 
 ```json
 {
-  "protocol": "EngineEditorIpc-v1",
+  "protocol": "EngineEditorIpc-v2",
   "id": "request-id",
   "method": "document.save",
   "params": {},
@@ -51,7 +51,7 @@ The shell sends JSON only through Wry's canonical `window.ipc.postMessage` trans
 }
 ```
 
-The host replies only by calling `window.__ENGINE_EDITOR_RECEIVE__(envelope)`. Every envelope carries `EngineEditorIpc-v1`. Responses use `id`, `result` or `error`, plus the authoritative `sessionId` and `revision`. The three typed events are `project.changed` (a complete authoritative snapshot), `editor.telemetry` (complete replacements for the `performance`, `animation`, and `build` domains), and `ui.openPanel` (native-requested dock navigation). Telemetry is accepted only for the current snapshot revision, so a mutation response can never apply telemetry to stale React state. All events use monotonic `sequence` and `revision` counters. The complete typed contract lives in `src/bridge/protocol.ts`; the shell intentionally has no generic string-command or DOM-event compatibility path.
+The host replies only by calling `window.__ENGINE_EDITOR_RECEIVE__(envelope)`. Every envelope carries `EngineEditorIpc-v2`. Responses use `id`, `result` or `error`, plus the authoritative `sessionId` and `revision`. The three typed events are `project.changed` (a complete authoritative snapshot), `editor.telemetry` (complete replacements for the `performance`, `animation`, `build`, and `terrain` domains), and `ui.openPanel` (native-requested dock navigation). Telemetry is accepted only for the current snapshot revision, so a mutation response can never apply telemetry to stale React state. All events use monotonic `sequence` and `revision` counters. The complete typed contract lives in `src/bridge/protocol.ts`; the shell intentionally has no generic string-command or DOM-event compatibility path.
 
 `viewport.bounds` reports the active Scene or Game viewport rectangle in CSS pixels. `viewport.input` forwards pointer, wheel, focus, and keyboard input for that transparent region. The native host owns rendering and must keep using the normal `EngineRuntime -> Renderer -> SceneRenderer` pipeline.
 

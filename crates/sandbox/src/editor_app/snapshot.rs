@@ -46,6 +46,7 @@ pub struct EditorSnapshot {
     pub background_operations: Vec<BackgroundOperationDto>,
     pub settings: SettingsDto,
     pub performance: PerformanceDto,
+    pub terrain: TerrainDto,
     pub capabilities: CapabilitiesDto,
 }
 
@@ -58,6 +59,7 @@ pub struct EditorTelemetry {
     pub performance: PerformanceDto,
     pub animation: AnimationDto,
     pub build: BuildDto,
+    pub terrain: TerrainDto,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -406,6 +408,51 @@ pub struct PerformanceDto {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TerrainDto {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+    pub enabled: bool,
+    /// Decimal string preserves all u64 seed bits in the React shell.
+    pub seed: String,
+    pub chunk_size: f32,
+    pub base_resolution: u32,
+    pub height_scale: f32,
+    pub frequency: f32,
+    pub octaves: u32,
+    pub lacunarity: f32,
+    pub gain: f32,
+    pub domain_warp_amplitude: f32,
+    pub domain_warp_frequency: f32,
+    pub skirt_depth: f32,
+    pub collision_enabled: bool,
+    pub lod_distances: Vec<f32>,
+    pub lod_hysteresis: f32,
+    pub runtime: TerrainRuntimeStatsDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerrainRuntimeStatsDto {
+    pub queued: usize,
+    pub generating: usize,
+    pub ready_to_commit: usize,
+    pub resident: usize,
+    pub failed: usize,
+    pub resident_bytes: usize,
+    pub stale_results_discarded: u64,
+    pub cancelled: u64,
+    pub generated: u64,
+    pub committed: u64,
+    pub evicted: u64,
+    pub last_tick_committed_bytes: usize,
+    pub last_generation_micros: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FrameStatsDto {
     pub frame_time_ms: f32,
     pub draw_calls: u32,
@@ -538,6 +585,7 @@ impl EditorApp {
                     }),
             },
             performance: telemetry.performance,
+            terrain: self.terrain_snapshot(scene_records),
             capabilities: CapabilitiesDto {
                 editing,
                 has_selection: selected.is_some(),
@@ -555,6 +603,11 @@ impl EditorApp {
     }
 
     pub(super) fn editor_telemetry(&self) -> EditorTelemetry {
+        let scene_records = self
+            .editor_scene
+            .as_ref()
+            .map(|scene| scene.scene.entities.as_slice())
+            .unwrap_or_default();
         EditorTelemetry {
             performance: PerformanceDto {
                 current: frame_stats_snapshot(&self.performance.frame_stats),
@@ -574,6 +627,7 @@ impl EditorApp {
                 package_version: self.package_version.clone(),
                 package_output_root: self.package_output_root.clone(),
             },
+            terrain: self.terrain_snapshot(scene_records),
         }
     }
 
@@ -765,6 +819,110 @@ impl EditorApp {
                     name: event.name.clone(),
                 })
                 .collect(),
+        }
+    }
+
+    fn terrain_snapshot(&self, entities: &[EntityRecord]) -> TerrainDto {
+        let defaults = engine_terrain::TerrainVolume::default();
+        let authored = entities.iter().find_map(|entity| {
+            entity
+                .components
+                .get("engine.terrain_volume")
+                .map(|component| (entity.persistent_id.clone(), component))
+        });
+        let (runtime, last_error) = self.game_loop.as_ref().map_or_else(
+            || (TerrainRuntimeStatsDto::default(), None),
+            |game_loop| {
+                let stats = game_loop.terrain_debug_snapshot().stats;
+                (
+                    TerrainRuntimeStatsDto {
+                        queued: stats.queued,
+                        generating: stats.generating,
+                        ready_to_commit: stats.ready_to_commit,
+                        resident: stats.resident,
+                        failed: stats.failed,
+                        resident_bytes: stats.resident_bytes,
+                        stale_results_discarded: stats.stale_results_discarded,
+                        cancelled: stats.cancelled,
+                        generated: stats.generated,
+                        committed: stats.committed,
+                        evicted: stats.evicted,
+                        last_tick_committed_bytes: stats.last_tick_committed_bytes,
+                        last_generation_micros: stats.last_generation_micros,
+                    },
+                    game_loop.terrain.binding_stats().last_error.clone(),
+                )
+            },
+        );
+        let Some((entity_id, component)) = authored else {
+            return TerrainDto {
+                available: false,
+                entity_id: None,
+                enabled: defaults.enabled,
+                seed: defaults.seed.to_string(),
+                chunk_size: defaults.chunk_size,
+                base_resolution: defaults.base_resolution,
+                height_scale: defaults.height_scale,
+                frequency: defaults.frequency,
+                octaves: defaults.octaves,
+                lacunarity: defaults.lacunarity,
+                gain: defaults.gain,
+                domain_warp_amplitude: defaults.domain_warp_amplitude,
+                domain_warp_frequency: defaults.domain_warp_frequency,
+                skirt_depth: defaults.skirt_depth,
+                collision_enabled: defaults.collision_enabled,
+                lod_distances: defaults.lod_distances,
+                lod_hysteresis: defaults.lod_hysteresis,
+                runtime,
+                last_error,
+            };
+        };
+        let fields = &component.fields;
+        let float = |name: &str, fallback: f32| match fields.get(name) {
+            Some(Value::Float32(value)) => *value,
+            Some(Value::Float64(value)) => *value as f32,
+            _ => fallback,
+        };
+        let uint = |name: &str, fallback: u64| match fields.get(name) {
+            Some(Value::UInt(value)) => *value,
+            Some(Value::Int(value)) if *value >= 0 => *value as u64,
+            _ => fallback,
+        };
+        let boolean = |name: &str, fallback: bool| match fields.get(name) {
+            Some(Value::Bool(value)) => *value,
+            _ => fallback,
+        };
+        let lod_distances = match fields.get("lod_distances") {
+            Some(Value::List(values)) => values
+                .iter()
+                .filter_map(|value| match value {
+                    Value::Float32(value) => Some(*value),
+                    Value::Float64(value) => Some(*value as f32),
+                    _ => None,
+                })
+                .collect(),
+            _ => defaults.lod_distances,
+        };
+        TerrainDto {
+            available: true,
+            entity_id: Some(entity_id),
+            enabled: boolean("enabled", defaults.enabled),
+            seed: uint("seed", defaults.seed).to_string(),
+            chunk_size: float("chunk_size", defaults.chunk_size),
+            base_resolution: uint("base_resolution", u64::from(defaults.base_resolution)) as u32,
+            height_scale: float("height_scale", defaults.height_scale),
+            frequency: float("frequency", defaults.frequency),
+            octaves: uint("octaves", u64::from(defaults.octaves)) as u32,
+            lacunarity: float("lacunarity", defaults.lacunarity),
+            gain: float("gain", defaults.gain),
+            domain_warp_amplitude: float("domain_warp_amplitude", defaults.domain_warp_amplitude),
+            domain_warp_frequency: float("domain_warp_frequency", defaults.domain_warp_frequency),
+            skirt_depth: float("skirt_depth", defaults.skirt_depth),
+            collision_enabled: boolean("collision_enabled", defaults.collision_enabled),
+            lod_distances,
+            lod_hysteresis: float("lod_hysteresis", defaults.lod_hysteresis),
+            runtime,
+            last_error,
         }
     }
 }

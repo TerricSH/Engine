@@ -44,7 +44,7 @@ use protocol::{InputModifiers, ScreenRect};
 const BUILTIN_DEFAULT_MATERIAL_ID: &str = "mat-default";
 const EDITOR_CAMERA_ID_PREFIX: &str = "__engine_editor_camera";
 const EDITOR_LIGHT_ID_PREFIX: &str = "__engine_editor_light";
-const DEFAULT_REACT_LAYOUT: &str = r#"{"zones":{"left":{"panels":["hierarchy"],"active":"hierarchy","collapsed":false},"center":{"panels":["scene","game"],"active":"scene","collapsed":false},"right":{"panels":["inspector","settings"],"active":"inspector","collapsed":false},"bottom":{"panels":["project","console","material","animation","profiler","build"],"active":"project","collapsed":false}},"leftWidth":272,"rightWidth":326,"bottomHeight":260}"#;
+const DEFAULT_REACT_LAYOUT: &str = r#"{"zones":{"left":{"panels":["hierarchy"],"active":"hierarchy","collapsed":false},"center":{"panels":["scene","game"],"active":"scene","collapsed":false},"right":{"panels":["inspector","settings"],"active":"inspector","collapsed":false},"bottom":{"panels":["project","console","material","animation","profiler","terrain","build"],"active":"project","collapsed":false}},"leftWidth":272,"rightWidth":326,"bottomHeight":260}"#;
 
 static EDITOR_WEB_ASSETS: &[WebAsset] = &[
     WebAsset::new(

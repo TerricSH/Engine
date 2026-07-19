@@ -1,0 +1,15 @@
+[package]
+name = "engine-terrain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+engine-procgen = { path = "../engine-procgen" }
+engine-scene = { path = "../engine-scene" }
+engine-serialize = { path = "../engine-serialize" }
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true

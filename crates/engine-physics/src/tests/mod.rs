@@ -198,6 +198,19 @@ fn collider_shape_capsule_serde() {
     }
 }
 
+#[test]
+fn collider_shape_heightfield_serde() {
+    let shape = ColliderShape::HeightField {
+        rows: 2,
+        columns: 3,
+        heights: vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        scale: [8.0, 1.0, 4.0],
+    };
+    let json = serde_json::to_string(&shape).unwrap();
+    let back: ColliderShape = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, shape);
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Physics Step & Gravity Tests
 // ══════════════════════════════════════════════════════════════════════════════
@@ -310,6 +323,70 @@ fn raycast_hits_entity() {
         "unexpected hit point: {:?}",
         hit.point
     );
+}
+
+#[test]
+fn raycast_hits_heightfield_surface() {
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let transform = Transform::default();
+    let rb = RigidBody {
+        body_type: BodyType::Static,
+        ..RigidBody::default()
+    };
+    world.backend.create_body(entity(0), &rb, &transform);
+    world.backend.create_collider(
+        entity(0),
+        &Collider {
+            shape: ColliderShape::HeightField {
+                rows: 3,
+                columns: 3,
+                heights: vec![0.0; 9],
+                scale: [4.0, 1.0, 4.0],
+            },
+            ..Collider::default()
+        },
+        entity(0),
+        None,
+    );
+    world.backend.sync_query_pipeline();
+    let hit = world
+        .raycast(glam::Vec3::new(0.0, 5.0, 0.0), glam::Vec3::NEG_Y, 10.0)
+        .expect("ray should hit terrain heightfield");
+    assert!(
+        (hit.point.y).abs() < 0.01,
+        "unexpected heightfield hit: {hit:?}"
+    );
+}
+
+#[test]
+fn invalid_heightfield_is_rejected_without_a_phantom_collider() {
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let transform = Transform::default();
+    let rb = RigidBody {
+        body_type: BodyType::Static,
+        ..RigidBody::default()
+    };
+    world.backend.create_body(entity(0), &rb, &transform);
+    world.backend.create_collider(
+        entity(0),
+        &Collider {
+            shape: ColliderShape::HeightField {
+                rows: 3,
+                columns: 3,
+                heights: vec![0.0; 8],
+                scale: [4.0, 1.0, 4.0],
+            },
+            ..Collider::default()
+        },
+        entity(0),
+        None,
+    );
+    world.backend.sync_query_pipeline();
+
+    assert!(!world.backend.has_collider(entity(0)));
+    assert!(world
+        .raycast(glam::Vec3::new(0.0, 1.0, 0.0), glam::Vec3::NEG_Y, 2.0)
+        .is_none());
 }
 
 #[test]

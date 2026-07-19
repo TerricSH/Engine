@@ -9,6 +9,7 @@ import { HierarchyPanel } from '../panels/HierarchyPanel'
 import { InspectorPanel } from '../panels/InspectorPanel'
 import { MaterialPanel } from '../panels/MaterialPanel'
 import { ProfilerPanel } from '../panels/ProfilerPanel'
+import { TerrainPanel } from '../panels/TerrainPanel'
 import { ProjectPanel } from '../panels/ProjectPanel'
 import { SettingsPanel } from '../panels/SettingsPanel'
 import {
@@ -62,6 +63,7 @@ function PanelContent({ panelId, zoneId, controller, nativeViewportKey }: { pane
     case 'material': return <MaterialPanel controller={controller} />
     case 'animation': return <AnimationPanel controller={controller} />
     case 'profiler': return <ProfilerPanel controller={controller} />
+    case 'terrain': return <TerrainPanel controller={controller} />
     case 'build': return <BuildPanel controller={controller} />
     case 'settings': return <SettingsPanel controller={controller} />
     case 'scene':

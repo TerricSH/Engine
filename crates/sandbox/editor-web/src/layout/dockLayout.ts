@@ -29,6 +29,7 @@ export const PANEL_TITLES: Record<PanelId, string> = {
   material: 'Material',
   animation: 'Animation',
   profiler: 'Profiler',
+  terrain: 'Terrain',
   build: 'Build',
   settings: 'Settings',
 }
@@ -38,7 +39,7 @@ export const DEFAULT_DOCK_LAYOUT: DockLayoutState = {
     left: { panels: ['hierarchy'], active: 'hierarchy', collapsed: false },
     center: { panels: ['scene', 'game'], active: 'scene', collapsed: false },
     right: { panels: ['inspector', 'settings'], active: 'inspector', collapsed: false },
-    bottom: { panels: ['project', 'console', 'material', 'animation', 'profiler', 'build'], active: 'project', collapsed: false },
+    bottom: { panels: ['project', 'console', 'material', 'animation', 'profiler', 'terrain', 'build'], active: 'project', collapsed: false },
   },
   leftWidth: 272,
   rightWidth: 326,

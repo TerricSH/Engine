@@ -176,6 +176,22 @@ pub enum SceneLoadDiagnostic {
         entity_id: PersistentId,
         component_type_id: ComponentTypeId,
     },
+    #[error(
+        "component `{component_type_id}` on entity `{entity_id}` has invalid fields: {message}"
+    )]
+    InvalidComponentFields {
+        entity_id: PersistentId,
+        component_type_id: ComponentTypeId,
+        message: String,
+    },
+    #[error(
+        "singleton component `{component_type_id}` appears on both `{first_entity_id}` and `{entity_id}`"
+    )]
+    DuplicateSingletonComponent {
+        entity_id: PersistentId,
+        first_entity_id: PersistentId,
+        component_type_id: ComponentTypeId,
+    },
 }
 
 /// Non-failing scene load result. The partially restored world is retained,

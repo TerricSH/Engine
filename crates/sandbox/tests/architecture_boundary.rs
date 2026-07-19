@@ -200,6 +200,9 @@ fn retired_render_and_asset_compatibility_paths_cannot_reenter() {
         "engine-character-demo",
         "mesh_upload_from_data",
         "load_cooked_render_assets",
+        "apply_gizmo_drag",
+        "begin_gizmo_session",
+        "end_gizmo_session",
         "HotReload",
         "DebouncedWatcher",
     ];

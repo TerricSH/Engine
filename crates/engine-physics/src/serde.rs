@@ -125,6 +125,25 @@ pub(super) fn serialize_collider(component: &dyn std::any::Any) -> BTreeMap<Stri
             .into_iter()
             .collect(),
         ),
+        ColliderShape::HeightField {
+            rows,
+            columns,
+            heights,
+            scale,
+        } => (
+            "HeightField",
+            vec![
+                ("rows".into(), Value::UInt(u64::from(*rows))),
+                ("columns".into(), Value::UInt(u64::from(*columns))),
+                (
+                    "heights".into(),
+                    Value::List(heights.iter().copied().map(Value::Float32).collect()),
+                ),
+                ("scale".into(), Value::Vec3(*scale)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
     };
 
     // Serialize shape as a map with "kind" and "params".
@@ -168,6 +187,35 @@ pub(super) fn deserialize_collider(fields: &BTreeMap<String, Value>) -> Box<dyn 
                     half_height: float_field(params, "half_height").unwrap_or(0.5),
                     radius: float_field(params, "radius").unwrap_or(0.25),
                 },
+                "HeightField" => {
+                    let rows = uint_field(params, "rows")
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(0);
+                    let columns = uint_field(params, "columns")
+                        .and_then(|value| u32::try_from(value).ok())
+                        .unwrap_or(0);
+                    let heights = match params.get("heights") {
+                        Some(Value::List(values)) => values
+                            .iter()
+                            .filter_map(|value| match value {
+                                Value::Float32(value) => Some(*value),
+                                Value::Float64(value) => Some(*value as f32),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    let scale = match params.get("scale") {
+                        Some(Value::Vec3(value)) => *value,
+                        _ => [1.0; 3],
+                    };
+                    ColliderShape::HeightField {
+                        rows,
+                        columns,
+                        heights,
+                        scale,
+                    }
+                }
                 _ => ColliderShape::Cuboid {
                     hx: float_field(params, "hx").unwrap_or(0.5),
                     hy: float_field(params, "hy").unwrap_or(0.5),

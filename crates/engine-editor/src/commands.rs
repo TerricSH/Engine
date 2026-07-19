@@ -123,16 +123,14 @@ impl Command for CommandBatch {
 
     fn execute(&mut self, scene: &mut Scene) -> Result<(), EditorError> {
         let before = scene.clone();
-        let mut applied = 0;
         for index in 0..self.commands.len() {
             if let Err(error) = self.commands[index].execute(scene) {
-                for rollback in (0..applied).rev() {
+                for rollback in (0..index).rev() {
                     let _ = self.commands[rollback].undo(scene);
                 }
                 *scene = before;
                 return Err(error);
             }
-            applied += 1;
         }
         Ok(())
     }

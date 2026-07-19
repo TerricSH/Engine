@@ -18,6 +18,7 @@ const windowPanels: Partial<Record<string, { panel: PanelId; zone: DockZoneId }>
   'window.project': { panel: 'project', zone: 'bottom' }, 'window.console': { panel: 'console', zone: 'bottom' },
   'window.material': { panel: 'material', zone: 'bottom' },
   'window.animation': { panel: 'animation', zone: 'bottom' }, 'window.profiler': { panel: 'profiler', zone: 'bottom' },
+  'window.terrain': { panel: 'terrain', zone: 'bottom' },
   'window.build': { panel: 'build', zone: 'bottom' },
 }
 

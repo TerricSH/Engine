@@ -82,6 +82,25 @@ impl DebugDrawProvider for PhysicsDebugDraw {
                     buffer.sphere_wireframe(bottom, *radius, color);
                     buffer.line(top, bottom, color);
                 }
+                ColliderShape::HeightField { heights, scale, .. } => {
+                    let Some((&first, rest)) = heights.split_first() else {
+                        continue;
+                    };
+                    let (min, max) = rest
+                        .iter()
+                        .copied()
+                        .fold((first, first), |(min, max), height| {
+                            (min.min(height), max.max(height))
+                        });
+                    let half_height = ((max - min) * scale[1] * 0.5).max(0.01);
+                    let center = info.position
+                        + info.rotation * glam::Vec3::new(0.0, (max + min) * scale[1] * 0.5, 0.0);
+                    buffer.box_wireframe(
+                        center,
+                        glam::Vec3::new(scale[0] * 0.5, half_height, scale[2] * 0.5),
+                        color,
+                    );
+                }
             }
         }
     }

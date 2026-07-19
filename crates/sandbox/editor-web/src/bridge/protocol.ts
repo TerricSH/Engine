@@ -1,5 +1,5 @@
-export const EDITOR_PROTOCOL = 'EngineEditorIpc-v1' as const
-export const EDITOR_PROTOCOL_VERSION = 1 as const
+export const EDITOR_PROTOCOL = 'EngineEditorIpc-v2' as const
+export const EDITOR_PROTOCOL_VERSION = 2 as const
 
 export type EntityId = string
 export type AssetId = string
@@ -7,7 +7,7 @@ export interface SerializedAssetId { id: string; logical_path: string | null }
 export type RuntimeMode = 'edit' | 'play' | 'paused'
 export type TransformTool = 'move' | 'rotate' | 'scale'
 export type OrientationMode = 'global' | 'local'
-export type UiPanelId = 'hierarchy' | 'scene' | 'game' | 'inspector' | 'project' | 'console' | 'material' | 'animation' | 'profiler' | 'build' | 'settings'
+export type UiPanelId = 'hierarchy' | 'scene' | 'game' | 'inspector' | 'project' | 'console' | 'material' | 'animation' | 'profiler' | 'terrain' | 'build' | 'settings'
 export type UiDockZone = 'left' | 'center' | 'right' | 'bottom'
 
 export interface Vec3 { x: number; y: number; z: number }
@@ -227,6 +227,42 @@ export interface FrameStatsSnapshot {
   assetCount: number
 }
 export interface PerformanceSnapshot { current: FrameStatsSnapshot; history: FrameStatsSnapshot[] }
+export interface TerrainRuntimeStatsSnapshot {
+  queued: number
+  generating: number
+  readyToCommit: number
+  resident: number
+  failed: number
+  residentBytes: number
+  staleResultsDiscarded: number
+  cancelled: number
+  generated: number
+  committed: number
+  evicted: number
+  lastTickCommittedBytes: number
+  lastGenerationMicros: number
+}
+export interface TerrainSnapshot {
+  available: boolean
+  entityId?: EntityId
+  enabled: boolean
+  seed: string
+  chunkSize: number
+  baseResolution: number
+  heightScale: number
+  frequency: number
+  octaves: number
+  lacunarity: number
+  gain: number
+  domainWarpAmplitude: number
+  domainWarpFrequency: number
+  skirtDepth: number
+  collisionEnabled: boolean
+  lodDistances: number[]
+  lodHysteresis: number
+  runtime: TerrainRuntimeStatsSnapshot
+  lastError?: string
+}
 export interface CapabilitiesSnapshot {
   editing: boolean
   hasSelection: boolean
@@ -269,6 +305,7 @@ export interface ProjectSnapshot {
   backgroundOperations?: BackgroundOperationSnapshot[]
   settings: SettingsSnapshot
   performance: PerformanceSnapshot
+  terrain: TerrainSnapshot
   capabilities: CapabilitiesSnapshot
 }
 
@@ -353,6 +390,9 @@ export interface EditorCommandMap {
   'material.save': { request: Empty; response: Accepted }
   'material.assign': { request: Empty; response: Accepted }
   'animation.setState': { request: { skeleton?: string | null; clip?: string | null; playing?: boolean; looping?: boolean; speed?: number; time?: number }; response: Accepted }
+  'terrain.replaySeed': { request: { seed: string }; response: Accepted }
+  'terrain.regenerate': { request: Empty; response: Accepted }
+  'terrain.retryFailed': { request: Empty; response: Accepted }
   'console.clear': { request: Empty; response: Accepted }
   'console.export': { request: Empty; response: Accepted }
   'build.start': { request: { targetId?: string; operation?: 'validate' | 'cookAndCompile' | 'packageWindows'; runAfterBuild?: boolean; version?: string; outputRoot?: string }; response: Accepted }
@@ -400,6 +440,7 @@ export interface EditorTelemetry {
   performance: PerformanceSnapshot
   animation: AnimationSnapshot
   build: BuildSnapshot
+  terrain: TerrainSnapshot
 }
 export interface EditorTelemetryEvent {
   protocol: typeof EDITOR_PROTOCOL

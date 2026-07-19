@@ -1172,6 +1172,7 @@ dependencies = [
  "engine-scene",
  "engine-script",
  "engine-serialize",
+ "engine-terrain",
  "engine-ui",
  "glam",
  "raw-window-handle",
@@ -1193,6 +1194,7 @@ dependencies = [
  "engine-scene",
  "engine-script",
  "engine-serialize",
+ "engine-terrain",
  "engine-ui",
  "glam",
  "ron",
@@ -1375,6 +1377,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "engine-terrain"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "engine-procgen",
+ "engine-scene",
+ "engine-serialize",
+ "glam",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4204,6 +4219,7 @@ dependencies = [
  "engine-script",
  "engine-script-api",
  "engine-serialize",
+ "engine-terrain",
  "engine-ui",
  "glam",
  "gltf",

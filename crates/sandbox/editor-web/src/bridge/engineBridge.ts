@@ -61,14 +61,14 @@ function isSafeCounter(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
-const UI_PANEL_IDS = new Set<UiPanelId>(['hierarchy', 'scene', 'game', 'inspector', 'project', 'console', 'material', 'animation', 'profiler', 'build', 'settings'])
+const UI_PANEL_IDS = new Set<UiPanelId>(['hierarchy', 'scene', 'game', 'inspector', 'project', 'console', 'material', 'animation', 'profiler', 'terrain', 'build', 'settings'])
 const UI_DOCK_ZONES = new Set<UiDockZone>(['left', 'center', 'right', 'bottom'])
 
 const SNAPSHOT_KEYS: readonly (keyof ProjectSnapshot)[] = [
   'protocolVersion', 'sessionId', 'revision', 'projectName', 'projectPath',
   'activeSceneName', 'sceneDirty', 'runtimeMode', 'hierarchy', 'selection',
   'assets', 'console', 'buildTargets', 'document', 'workspace', 'viewport', 'catalog',
-  'assetBrowser', 'material', 'animation', 'build', 'settings', 'performance',
+  'assetBrowser', 'material', 'animation', 'build', 'settings', 'performance', 'terrain',
   'capabilities',
 ]
 

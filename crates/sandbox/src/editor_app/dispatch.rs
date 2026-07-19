@@ -1046,6 +1046,52 @@ impl EditorApp {
                 self.set_animation_state(params);
                 Ok(DispatchOutcome::accepted(true))
             }
+            EditorRequest::ReplayTerrainSeed(params) => {
+                self.require_editing()?;
+                let seed = params.seed.trim().parse::<u64>().map_err(|_| {
+                    BridgeError::new(
+                        EditorErrorCode::InvalidRequest,
+                        "Terrain seed must be a decimal integer in 0..=18446744073709551615",
+                    )
+                })?;
+                let entity_id = self
+                    .editor_scene
+                    .as_ref()
+                    .and_then(|scene| {
+                        scene.scene.entities.iter().find_map(|entity| {
+                            entity
+                                .components
+                                .contains_key("engine.terrain_volume")
+                                .then(|| entity.persistent_id.clone())
+                        })
+                    })
+                    .ok_or_else(|| not_found("component", "engine.terrain_volume"))?;
+                self.execute_command(Box::new(SetComponentField::new(
+                    entity_id,
+                    "engine.terrain_volume".to_string(),
+                    "seed".to_string(),
+                    Value::UInt(seed),
+                )))?;
+                if let Some(game_loop) = self.game_loop.as_mut() {
+                    game_loop.terrain_force_regenerate();
+                }
+                Ok(DispatchOutcome::accepted(true))
+            }
+            EditorRequest::RegenerateTerrain => {
+                self.game_loop
+                    .as_mut()
+                    .ok_or_else(runtime_unavailable)?
+                    .terrain_force_regenerate();
+                Ok(DispatchOutcome::accepted(true))
+            }
+            EditorRequest::RetryTerrain => {
+                self.game_loop
+                    .as_mut()
+                    .ok_or_else(runtime_unavailable)?
+                    .terrain
+                    .retry_failed();
+                Ok(DispatchOutcome::accepted(true))
+            }
             EditorRequest::ClearDiagnostics => {
                 self.editor_scene
                     .as_mut()
@@ -2079,7 +2125,7 @@ fn validation_error(error: impl Into<String>) -> BridgeError {
 fn validate_react_layout(serialized: &str) -> Result<(), BridgeError> {
     const MAX_LAYOUT_BYTES: usize = 128 * 1024;
     const ZONES: [&str; 4] = ["left", "center", "right", "bottom"];
-    const PANELS: [&str; 11] = [
+    const PANELS: [&str; 12] = [
         "hierarchy",
         "scene",
         "game",
@@ -2089,6 +2135,7 @@ fn validate_react_layout(serialized: &str) -> Result<(), BridgeError> {
         "material",
         "animation",
         "profiler",
+        "terrain",
         "build",
         "settings",
     ];

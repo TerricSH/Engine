@@ -27,7 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::noise::{gradient_noise_2d, gradient_noise_3d};
+use crate::noise::{gradient_noise_2d, gradient_noise_2d_wide, gradient_noise_3d};
 use crate::seed::{derive_seed, Seed};
 use crate::ProcGenError;
 
@@ -189,6 +189,31 @@ impl Fbm2D {
         }
     }
 
+    /// Sample using f64 logical coordinates and an extended i64 lattice.
+    ///
+    /// Intended for native floating-origin systems. This does not alter the
+    /// versioned f32/script sampling contract or its golden vectors.
+    pub fn sample_wide(&self, x: f64, y: f64) -> f32 {
+        let params = &self.params;
+        let mut sum = 0.0f32;
+        let mut amplitude = params.amplitude;
+        let mut total = 0.0f32;
+        let mut fx = (x + f64::from(params.offset[0])) * f64::from(params.frequency);
+        let mut fy = (y + f64::from(params.offset[1])) * f64::from(params.frequency);
+        for _ in 0..params.octaves {
+            sum += amplitude * gradient_noise_2d_wide(self.seed.0, fx, fy);
+            total += amplitude;
+            fx *= f64::from(params.lacunarity);
+            fy *= f64::from(params.lacunarity);
+            amplitude *= params.gain;
+        }
+        if params.normalize && total > 0.0 {
+            sum / total
+        } else {
+            sum
+        }
+    }
+
     /// Batch sampling; bit-identical to per-coordinate [`Self::sample`].
     /// Panics when the slices differ in length.
     pub fn sample_batch(&self, coords: &[[f32; 2]], out: &mut [f32]) {
@@ -286,6 +311,28 @@ impl WarpedFbm2D {
         let qy =
             y + self.warp.amplitude * gradient_noise_2d(derive_seed(seed, WARP_2D_Y_KEY).0, wx, wy);
         self.fbm.sample(qx, qy)
+    }
+
+    /// Wide-coordinate domain-warped sampling for native floating-origin
+    /// systems. The warp displacement remains f32 recipe data, while logical
+    /// position and lattice selection retain f64/i64 precision.
+    pub fn sample_wide(&self, x: f64, y: f64) -> f32 {
+        let seed = self.fbm.seed;
+        let wx = x * f64::from(self.warp.frequency);
+        let wy = y * f64::from(self.warp.frequency);
+        let qx = x + f64::from(self.warp.amplitude)
+            * f64::from(gradient_noise_2d_wide(
+                derive_seed(seed, WARP_2D_X_KEY).0,
+                wx,
+                wy,
+            ));
+        let qy = y + f64::from(self.warp.amplitude)
+            * f64::from(gradient_noise_2d_wide(
+                derive_seed(seed, WARP_2D_Y_KEY).0,
+                wx,
+                wy,
+            ));
+        self.fbm.sample_wide(qx, qy)
     }
 
     /// Batch sampling; bit-identical to per-coordinate [`Self::sample`].

@@ -74,6 +74,15 @@ pub enum ColliderShape {
     Ball { radius: f32 },
     /// Capsule (cylinder with hemispherical caps) aligned to local +Y.
     Capsule { half_height: f32, radius: f32 },
+    /// Static x-z heightfield. Heights are row-major (`row * columns + col`)
+    /// and `scale` is the full local extent consumed by Rapier. Intended for
+    /// streamed terrain collision; rows/columns must both be at least two.
+    HeightField {
+        rows: u32,
+        columns: u32,
+        heights: Vec<f32>,
+        scale: [f32; 3],
+    },
 }
 
 // ── Collider ────────────────────────────────────────────────────────────────

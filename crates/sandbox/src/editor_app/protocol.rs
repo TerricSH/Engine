@@ -10,8 +10,8 @@ use engine_serialize::{AssetId, Value};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-pub const EDITOR_PROTOCOL: &str = "EngineEditorIpc-v1";
-pub const EDITOR_PROTOCOL_VERSION: u32 = 1;
+pub const EDITOR_PROTOCOL: &str = "EngineEditorIpc-v2";
+pub const EDITOR_PROTOCOL_VERSION: u32 = 2;
 pub const PROJECT_CHANGED_EVENT: &str = "project.changed";
 pub const TELEMETRY_EVENT: &str = "editor.telemetry";
 pub const UI_OPEN_PANEL_EVENT: &str = "ui.openPanel";
@@ -67,6 +67,7 @@ pub enum UiPanel {
     Material,
     Animation,
     Profiler,
+    Terrain,
     Build,
     Settings,
 }
@@ -206,6 +207,9 @@ pub enum EditorRequest {
     SaveMaterial,
     AssignOpenMaterial,
     SetAnimation(AnimationParams),
+    ReplayTerrainSeed(TerrainSeedParams),
+    RegenerateTerrain,
+    RetryTerrain,
     ClearDiagnostics,
     ExportDiagnostics,
     StartBuild(BuildParams),
@@ -295,6 +299,9 @@ impl EditorRequest {
             "material.save" => Self::SaveMaterial,
             "material.assign" => Self::AssignOpenMaterial,
             "animation.setState" => Self::SetAnimation(params(request)?),
+            "terrain.replaySeed" => Self::ReplayTerrainSeed(params(request)?),
+            "terrain.regenerate" => Self::RegenerateTerrain,
+            "terrain.retryFailed" => Self::RetryTerrain,
             "console.clear" => Self::ClearDiagnostics,
             "console.export" => Self::ExportDiagnostics,
             "build.start" => Self::StartBuild(params(request)?),
@@ -810,6 +817,13 @@ pub struct AnimationParams {
     pub time: Option<f32>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerrainSeedParams {
+    /// Decimal u64 string avoids JavaScript's 53-bit integer limit.
+    pub seed: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BuildOperation {
@@ -1059,5 +1073,22 @@ mod tests {
                 "params": {"panel": "material", "preferredZone": "bottom"}
             })
         );
+    }
+
+    #[test]
+    fn terrain_debug_commands_preserve_full_u64_seed_text() {
+        let decoded = EditorRequest::decode(&request(
+            "terrain.replaySeed",
+            serde_json::json!({"seed": "18446744073709551615"}),
+        ))
+        .unwrap();
+        let EditorRequest::ReplayTerrainSeed(params) = decoded else {
+            panic!("wrong terrain request variant");
+        };
+        assert_eq!(params.seed, "18446744073709551615");
+        assert!(matches!(
+            EditorRequest::decode(&request("terrain.regenerate", serde_json::json!({}))).unwrap(),
+            EditorRequest::RegenerateTerrain
+        ));
     }
 }

@@ -90,6 +90,19 @@ pub(crate) fn coordinate_to_fixed(coordinate: f32) -> Option<i32> {
     Some(scaled as i32)
 }
 
+/// Snap a wide logical coordinate to a Q55.8 fixed-point lattice.
+///
+/// This native-only path is used by floating-origin engine systems such as
+/// terrain generation. The public/script `PROCGEN-NOISE-v1` f32 contract stays
+/// unchanged; wide coordinates retain sub-unit detail far beyond the f32
+/// mantissa instead of saturating at the Q24.8 boundary.
+pub(crate) fn coordinate_to_fixed_wide(coordinate: f64) -> Option<i64> {
+    if !coordinate.is_finite() {
+        return None;
+    }
+    Some((coordinate * FRAC_SCALE as f64).floor() as i64)
+}
+
 /// Hash one lattice corner: FNV-1a-style word mixing + splitmix64 finalizer.
 ///
 /// `dimension_tag` (2 or 3) keeps the 2D and 3D families independent.
@@ -101,6 +114,32 @@ pub(crate) fn lattice_hash(seed: u64, dimension_tag: u64, x: i32, y: i32, z: i32
     hash = (hash ^ u64::from(x as u32)).wrapping_mul(FNV1A64_PRIME);
     hash = (hash ^ u64::from(y as u32)).wrapping_mul(FNV1A64_PRIME);
     hash = (hash ^ u64::from(z as u32)).wrapping_mul(FNV1A64_PRIME);
+    splitmix64_finalize(hash)
+}
+
+fn mix_wide_coordinate(mut hash: u64, coordinate: i64) -> u64 {
+    let low = coordinate as u32;
+    hash = (hash ^ u64::from(low)).wrapping_mul(FNV1A64_PRIME);
+
+    // Preserve the exact v1 hash inside the i32 domain. Outside it, mix the
+    // significant high word as an extension so adjacent far-away lattice
+    // cells remain independent instead of aliasing every 2^32 cells.
+    let high = (coordinate >> 32) as i32;
+    let sign_extension = if low & 0x8000_0000 == 0 { 0 } else { -1 };
+    if high != sign_extension {
+        hash = (hash ^ u64::from(high as u32)).wrapping_mul(FNV1A64_PRIME);
+    }
+    hash
+}
+
+fn lattice_hash_wide(seed: u64, dimension_tag: u64, x: i64, y: i64) -> u64 {
+    let mut hash = FNV1A64_OFFSET;
+    hash = (hash ^ seed).wrapping_mul(FNV1A64_PRIME);
+    hash = (hash ^ dimension_tag).wrapping_mul(FNV1A64_PRIME);
+    hash = mix_wide_coordinate(hash, x);
+    hash = mix_wide_coordinate(hash, y);
+    // Match the existing 2D hash's explicit z=0 word.
+    hash = hash.wrapping_mul(FNV1A64_PRIME);
     splitmix64_finalize(hash)
 }
 
@@ -165,6 +204,40 @@ pub(crate) fn gradient_noise_2d(seed: u64, x: f32, y: f32) -> f32 {
     let fade_y = fade(frac_y);
     let value = lerp(lerp(d00, d10, fade_x), lerp(d01, d11, fade_x), fade_y);
     // |value| <= 512 < 2^24: the conversion and the 2^-9 scale are exact.
+    value as f32 * OUTPUT_SCALE
+}
+
+/// Wide-coordinate counterpart used by native floating-origin systems.
+pub(crate) fn gradient_noise_2d_wide(seed: u64, x: f64, y: f64) -> f32 {
+    let (Some(fixed_x), Some(fixed_y)) = (coordinate_to_fixed_wide(x), coordinate_to_fixed_wide(y))
+    else {
+        return 0.0;
+    };
+    let cell_x = fixed_x >> FRAC_BITS;
+    let cell_y = fixed_y >> FRAC_BITS;
+    let frac_x = fixed_x & (FRAC_SCALE - 1);
+    let frac_y = fixed_y & (FRAC_SCALE - 1);
+
+    let d00 = gradient_dot_2d(lattice_hash_wide(seed, 2, cell_x, cell_y), frac_x, frac_y);
+    let d10 = gradient_dot_2d(
+        lattice_hash_wide(seed, 2, cell_x + 1, cell_y),
+        frac_x - FRAC_SCALE,
+        frac_y,
+    );
+    let d01 = gradient_dot_2d(
+        lattice_hash_wide(seed, 2, cell_x, cell_y + 1),
+        frac_x,
+        frac_y - FRAC_SCALE,
+    );
+    let d11 = gradient_dot_2d(
+        lattice_hash_wide(seed, 2, cell_x + 1, cell_y + 1),
+        frac_x - FRAC_SCALE,
+        frac_y - FRAC_SCALE,
+    );
+
+    let fade_x = fade(frac_x);
+    let fade_y = fade(frac_y);
+    let value = lerp(lerp(d00, d10, fade_x), lerp(d01, d11, fade_x), fade_y);
     value as f32 * OUTPUT_SCALE
 }
 
@@ -288,6 +361,8 @@ impl GradientNoise3D {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -311,6 +386,31 @@ mod tests {
         assert_eq!(coordinate_to_fixed(f32::INFINITY), None);
         assert_eq!(coordinate_to_fixed(f32::NEG_INFINITY), None);
         assert_eq!(coordinate_to_fixed(f32::NAN), None);
+    }
+
+    #[test]
+    fn wide_coordinate_snap_retains_fractional_detail_far_beyond_f32() {
+        let base = 1_000_000_000_000.0f64;
+        assert_eq!(
+            coordinate_to_fixed_wide(base + 0.25)
+                .unwrap()
+                .saturating_sub(coordinate_to_fixed_wide(base).unwrap()),
+            64
+        );
+        assert_eq!(coordinate_to_fixed_wide(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn wide_noise_keeps_local_variation_at_large_logical_coordinates() {
+        let base = 1_000_000_000_000.0f64;
+        let samples = (0..16)
+            .map(|index| gradient_noise_2d_wide(9, base + f64::from(index) / 8.0, base))
+            .map(f32::to_bits)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            samples.len() > 1,
+            "far coordinates must not collapse to one sample"
+        );
     }
 
     #[test]

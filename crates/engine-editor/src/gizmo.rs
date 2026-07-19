@@ -3,27 +3,14 @@
 //! Provides translate, rotate, and scale gizmos with axis snapping,
 //! local/global space support, and screen-space hit testing.
 //!
-//! # Usage
-//!
-//! ```ignore
-//! let mut gizmo = GizmoSystem::new();
-//!
-//! // Each frame:
-//! let consumed = update_gizmo(
-//!     &mut gizmo, entity_pos, entity_rot,
-//!     &view, &proj, viewport_size, pointer_pos, pointer_down,
-//! );
-//!
-//! if consumed {
-//!     let delta = gizmo.take_delta();
-//!     apply_gizmo_drag(&gizmo, entity, &mut world, delta);
-//! }
-//! ```
+//! Viewport integrations feed interaction deltas into
+//! [`EditorScene::preview_transform_gizmo_drag`] and commit the complete
+//! gesture through editor command history.
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 
 use engine_scene::components::Transform;
-use engine_scene::{Entity, Scene, World};
+use engine_scene::Scene;
 use engine_serialize::{PersistentId, Value};
 
 use crate::commands::Command;
@@ -208,7 +195,7 @@ impl Default for GizmoSystem {
 ///
 /// When `true` is returned, call [`take_delta`](GizmoSystem::take_delta)
 /// to retrieve the per-frame drag delta, then pass it to
-/// [`apply_gizmo_drag`].
+/// [`EditorScene::preview_transform_gizmo_drag`].
 #[allow(clippy::too_many_arguments)]
 pub fn update_gizmo(
     system: &mut GizmoSystem,
@@ -406,14 +393,6 @@ impl ResolvedWorldTransform {
 }
 
 impl TransformFieldSnapshot {
-    fn from_transform(transform: &Transform) -> Self {
-        Self {
-            translation: Some(Value::Vec3(transform.translation.to_array())),
-            rotation: Some(Value::Quat(transform.rotation.to_array())),
-            scale: Some(Value::Vec3(transform.scale.to_array())),
-        }
-    }
-
     fn effective(&self) -> Option<EffectiveTransform> {
         let translation = match &self.translation {
             Some(Value::Vec3(value)) => Vec3::from_array(*value),
@@ -767,98 +746,6 @@ fn set_transform_field(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// apply_gizmo_drag
-// ---------------------------------------------------------------------------
-
-/// Apply a drag `delta` to the entity's [`Transform`] component.
-///
-/// The interpretation of `delta` depends on the current mode:
-/// - `Translate` – world-space translation offset.
-/// - `Rotate`    – rotation angle (radians) around the drag axis.
-/// - `Scale`     – multiplicative scale factor offset.
-///
-/// Note: this low-level World function bypasses scene command history. Editor
-/// integrations should prefer [`EditorScene::begin_transform_gizmo_drag`],
-/// [`EditorScene::preview_transform_gizmo_drag`], and
-/// [`EditorScene::commit_transform_gizmo_drag`].
-pub fn apply_gizmo_drag(system: &GizmoSystem, entity: Entity, world: &mut World, delta: Vec3) {
-    let transform = match world.get_mut::<Transform>(entity) {
-        Some(t) => t,
-        None => return,
-    };
-
-    match system.mode {
-        GizmoMode::Translate => {
-            transform.translation += delta;
-        }
-        GizmoMode::Rotate => {
-            if let Some(axis) = system.drag_axis {
-                let dir = if system.space == GizmoSpace::Local {
-                    transform.rotation * axis.direction()
-                } else {
-                    axis.direction()
-                };
-                let angle = match axis {
-                    GizmoAxis::X => delta.x,
-                    GizmoAxis::Y => delta.y,
-                    GizmoAxis::Z => delta.z,
-                };
-                let q = Quat::from_axis_angle(dir, angle);
-                transform.rotation = (q * transform.rotation).normalize();
-            }
-        }
-        GizmoMode::Scale => {
-            transform.scale *= Vec3::ONE + delta;
-            transform.scale = transform.scale.max(Vec3::splat(0.001));
-        }
-    }
-}
-
-/// Snapshot an entity's transform so that [`end_gizmo_session`] can produce
-/// an undoable command recording the full gesture delta.
-///
-/// Call this once when the gizmo drag *starts* (e.g. on pointer-down).
-pub fn begin_gizmo_session(entity: Entity, world: &World) -> Option<Transform> {
-    world.get::<Transform>(entity).cloned()
-}
-
-/// Finalise a low-level World gizmo drag as one scene-history command.
-///
-/// Call this once when the gizmo drag *ends* (e.g. on pointer-up).
-///
-/// Requires the `snapshot` from [`begin_gizmo_session`] and the current
-/// entity transform, plus a mutable reference to the editor's command
-/// history and scene so the transform delta is recorded for undo/redo.
-pub fn end_gizmo_session(
-    entity: Entity,
-    world: &World,
-    snapshot: &Transform,
-    history: &mut crate::commands::CommandHistory,
-    scene: &mut engine_scene::Scene,
-) {
-    let current = match world.get::<Transform>(entity) {
-        Some(t) => t,
-        None => return,
-    };
-    let Some(entity_id) = world.persistent_id(entity).map(str::to_owned) else {
-        return;
-    };
-    let before = TransformFieldSnapshot::from_transform(snapshot);
-    let after = TransformFieldSnapshot::from_transform(current);
-    if before == after {
-        return;
-    }
-    let _ = history.push(
-        Box::new(SetTransformGesture {
-            entity_id,
-            before,
-            after,
-        }),
-        scene,
-    );
-}
-
 // ===========================================================================
 // Internal helpers
 // ===========================================================================
@@ -1103,8 +990,7 @@ fn compute_translate_delta(
 /// Compute a rotation angle delta from a pointer movement.
 ///
 /// Returns a [`Vec3`] where only the component corresponding to the drag
-/// axis should be used (the caller or [`apply_gizmo_drag`] selects the
-/// correct component).
+/// axis should be used by the scene-level gizmo preview.
 fn compute_rotate_delta(
     pointer: Vec2,
     last_pointer: Vec2,
@@ -1182,7 +1068,6 @@ fn accumulate_gesture_amount(system: &mut GizmoSystem, raw_amount: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_scene::components::Transform;
     use engine_scene::ComponentRecord;
     use engine_serialize::SchemaVersion;
 
@@ -1307,88 +1192,6 @@ mod tests {
         assert_eq!(d, Vec3::new(1.0, 2.0, 3.0));
         // After take, delta is zero
         assert_eq!(g.take_delta(), Vec3::ZERO);
-    }
-
-    // ── apply_gizmo_drag ────────────────────────────────────────────
-
-    #[test]
-    fn apply_translate_drag() {
-        let mut world = engine_scene::World::new();
-        let entity = world.create_entity();
-        world.add_component(entity, Transform::default());
-
-        let g = GizmoSystem {
-            mode: GizmoMode::Translate,
-            dragging: true,
-            drag_axis: Some(GizmoAxis::X),
-            ..GizmoSystem::new()
-        };
-
-        apply_gizmo_drag(&g, entity, &mut world, Vec3::new(5.0, 0.0, 0.0));
-        let t = world.get::<Transform>(entity).unwrap();
-        assert!((t.translation.x - 5.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn apply_rotate_drag() {
-        let mut world = engine_scene::World::new();
-        let entity = world.create_entity();
-        world.add_component(entity, Transform::default());
-
-        let g = GizmoSystem {
-            mode: GizmoMode::Rotate,
-            dragging: true,
-            drag_axis: Some(GizmoAxis::Y),
-            ..GizmoSystem::new()
-        };
-
-        apply_gizmo_drag(
-            &g,
-            entity,
-            &mut world,
-            Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0),
-        );
-        let t = world.get::<Transform>(entity).unwrap();
-        let (_axis, angle) = t.rotation.to_axis_angle();
-        assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 0.001);
-    }
-
-    #[test]
-    fn apply_scale_drag() {
-        let mut world = engine_scene::World::new();
-        let entity = world.create_entity();
-        world.add_component(entity, Transform::default());
-
-        let g = GizmoSystem {
-            mode: GizmoMode::Scale,
-            dragging: true,
-            drag_axis: Some(GizmoAxis::X),
-            ..GizmoSystem::new()
-        };
-
-        apply_gizmo_drag(&g, entity, &mut world, Vec3::new(0.5, 0.0, 0.0));
-        let t = world.get::<Transform>(entity).unwrap();
-        assert!((t.scale.x - 1.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn apply_drag_no_entity_transform_no_crash() {
-        let mut world = engine_scene::World::new();
-        let entity = world.create_entity();
-        // Entity has no Transform component
-        let g = GizmoSystem::new();
-        apply_gizmo_drag(&g, entity, &mut world, Vec3::ZERO);
-        // Should not panic
-    }
-
-    #[test]
-    fn apply_drag_stale_entity_no_crash() {
-        let mut world = engine_scene::World::new();
-        let entity = world.create_entity();
-        world.destroy_entity(entity);
-        let g = GizmoSystem::new();
-        apply_gizmo_drag(&g, entity, &mut world, Vec3::ZERO);
-        // Should not panic
     }
 
     // ── update_gizmo (basic state machine) ──────────────────────────

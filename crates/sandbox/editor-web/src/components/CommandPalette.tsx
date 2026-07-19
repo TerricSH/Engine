@@ -39,6 +39,7 @@ const commands = [
   ['window.material', 'Show Material editor', 'Window'],
   ['window.animation', 'Show Animation', 'Window'],
   ['window.profiler', 'Show Profiler', 'Window'],
+  ['window.terrain', 'Show Terrain Debugger', 'Window'],
   ['window.build', 'Show Build', 'Window'],
   ['window.resetLayout', 'Restore default layout', 'Window'],
   ['viewport.focusSelection', 'Frame selected object', 'Scene'],

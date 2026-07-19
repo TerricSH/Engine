@@ -22,6 +22,7 @@ members = [
     "crates/engine-ui",
     "crates/engine-nav",
     "crates/engine-procgen",
+    "crates/engine-terrain",
     "crates/engine-character",
     "crates/engine-gameplay",
     "crates/engine-ffi",

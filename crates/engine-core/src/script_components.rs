@@ -161,6 +161,9 @@ pub(crate) enum ScriptComponentWriteError {
         rejected: Vec<String>,
         known: Vec<String>,
     },
+    /// The field types were accepted, but the component's semantic validator
+    /// rejected the resulting parameter set.
+    ValidationFailed { message: String },
     /// The validated component could not be committed to storage.
     ApplyFailed,
 }
@@ -210,6 +213,10 @@ pub(crate) fn apply_script_component_write(
     for (name, value) in fields {
         merged.insert(name.clone(), value.to_scene_value());
     }
+
+    registry
+        .validate_fields(component_type, &merged)
+        .map_err(|message| Error::ValidationFailed { message })?;
 
     let candidate = deserialize(&merged);
     let reserialized = serialize(candidate.as_ref());

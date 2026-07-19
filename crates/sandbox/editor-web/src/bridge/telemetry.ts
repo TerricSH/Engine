@@ -6,6 +6,7 @@ import type {
   FrameStatsSnapshot,
   PerformanceSnapshot,
   ProjectSnapshot,
+  TerrainSnapshot,
 } from './protocol'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -80,11 +81,40 @@ function isBuild(value: unknown): value is BuildSnapshot {
     && typeof value.packageOutputRoot === 'string'
 }
 
+function isTerrain(value: unknown): value is TerrainSnapshot {
+  if (!isRecord(value) || !hasOwn(value, [
+    'available', 'enabled', 'seed', 'chunkSize', 'baseResolution', 'heightScale',
+    'frequency', 'octaves', 'lacunarity', 'gain', 'domainWarpAmplitude',
+    'domainWarpFrequency', 'skirtDepth', 'collisionEnabled', 'lodDistances', 'lodHysteresis', 'runtime',
+  ])) return false
+  if (typeof value.available !== 'boolean' || typeof value.enabled !== 'boolean'
+    || typeof value.seed !== 'string' || typeof value.collisionEnabled !== 'boolean'
+    || !Array.isArray(value.lodDistances) || !value.lodDistances.every(isFiniteNonNegative)
+    || !isFiniteNonNegative(value.lodHysteresis)
+    || !isRecord(value.runtime)) return false
+  const finiteFields = [
+    'chunkSize', 'baseResolution', 'heightScale', 'frequency', 'octaves',
+    'lacunarity', 'gain', 'domainWarpAmplitude', 'domainWarpFrequency', 'skirtDepth',
+  ] as const
+  if (!finiteFields.every((field) => {
+    const fieldValue = value[field]
+    return typeof fieldValue === 'number' && Number.isFinite(fieldValue)
+  })) return false
+  if (!Number.isSafeInteger(value.baseResolution) || !Number.isSafeInteger(value.octaves)) return false
+  if (!/^(0|[1-9][0-9]*)$/.test(value.seed)) return false
+  return hasOwn(value.runtime, [
+    'queued', 'generating', 'readyToCommit', 'resident', 'failed', 'residentBytes',
+    'staleResultsDiscarded', 'cancelled', 'generated', 'committed', 'evicted',
+    'lastTickCommittedBytes', 'lastGenerationMicros',
+  ]) && Object.values(value.runtime).every(isFiniteNonNegative)
+}
+
 export function isCompleteEditorTelemetry(value: unknown): value is EditorTelemetry {
-  if (!isRecord(value) || !hasOwn(value, ['performance', 'animation', 'build'])) return false
+  if (!isRecord(value) || !hasOwn(value, ['performance', 'animation', 'build', 'terrain'])) return false
   return isPerformance(value.performance)
     && isAnimation(value.animation)
     && isBuild(value.build)
+    && isTerrain(value.terrain)
 }
 
 export function telemetryMatchesAuthoritativeSnapshot(
@@ -113,5 +143,6 @@ export function mergeProjectTelemetry(
     performance: event.params.performance,
     animation: event.params.animation,
     build: event.params.build,
+    terrain: event.params.terrain,
   }
 }

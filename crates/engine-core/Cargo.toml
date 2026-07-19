@@ -17,6 +17,7 @@ runtime-subsystems = [
     "dep:engine-ui",
 ]
 runtime-audio-output = ["runtime-subsystems", "engine-audio/subsystem-audio-cpal"]
+terrain = ["dep:engine-terrain"]
 
 [dependencies]
 engine-asset = { path = "../engine-asset" }
@@ -32,6 +33,7 @@ engine-nav = { path = "../engine-nav", optional = true }
 engine-physics = { path = "../engine-physics", optional = true }
 engine-gameplay = { path = "../engine-gameplay", optional = true }
 engine-ui = { path = "../engine-ui", optional = true }
+engine-terrain = { path = "../engine-terrain", optional = true }
 render-vulkan = { path = "../render-vulkan", optional = true }
 raw-window-handle = { workspace = true, optional = true }
 tracing.workspace = true

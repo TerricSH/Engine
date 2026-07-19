@@ -58,6 +58,13 @@ const EMPTY_PROJECT: ProjectSnapshot = {
     current: { frameTimeMs: 0, drawCalls: 0, triangles: 0, physicsBodies: 0, animationCount: 0, navAgents: 0, assetCount: 0 },
     history: [],
   },
+  terrain: {
+    available: false, enabled: true, seed: '0', chunkSize: 64, baseResolution: 65,
+    heightScale: 24, frequency: 0.008, octaves: 5, lacunarity: 2, gain: 0.5,
+    domainWarpAmplitude: 0, domainWarpFrequency: 0.01, skirtDepth: 4,
+    collisionEnabled: true, lodDistances: [160, 320, 640], lodHysteresis: 16,
+    runtime: { queued: 0, generating: 0, readyToCommit: 0, resident: 0, failed: 0, residentBytes: 0, staleResultsDiscarded: 0, cancelled: 0, generated: 0, committed: 0, evicted: 0, lastTickCommittedBytes: 0, lastGenerationMicros: 0 },
+  },
   capabilities: {
     editing: false, hasSelection: false, canUndo: false, canRedo: false,
     canSave: false, canStartPlay: false, canPause: false, canResume: false,
