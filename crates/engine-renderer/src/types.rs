@@ -591,4 +591,17 @@ pub struct FrameStats {
     pub draw_calls: u32,
     pub triangles: u64,
     pub gpu_frame_ms: f32,
+    /// GPU timestamp availability reported by the backend for this frame
+    /// (ENG-04). Backends without GPU timestamp support leave this at
+    /// [`GpuTimingStatus::Unavailable`](crate::frame_timing::GpuTimingStatus::Unavailable).
+    #[serde(default)]
+    pub gpu_timing: crate::frame_timing::GpuTimingStatus,
+    /// Frame the GPU pass samples below were recorded on. GPU read-back is
+    /// asynchronous (frames-in-flight delay), so this can be earlier than
+    /// the frame these statistics belong to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_pass_frame_index: Option<u64>,
+    /// Per-pass GPU times read back during this frame, when available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_pass_times: Vec<crate::frame_timing::GpuPassTime>,
 }

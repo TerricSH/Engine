@@ -12,12 +12,16 @@ use engine_serialize::{Diagnostic, DiagnosticSeverity};
 ///
 /// Collects and caches diagnostics from multiple sources each frame:
 /// - Frame-level render statistics (draw calls, culling, GPU time)
+/// - Rolling per-pass CPU/GPU frame timing (ENG-04)
 /// - Scene validation warnings
 /// - Asset reload status
 /// - Script lifecycle errors
 pub struct SandboxDiagnostics {
     /// Latest frame stats snapshot from the runtime collector.
     pub frame_snapshot: Option<FrameStatsSnapshot>,
+    /// Rolling per-pass CPU/GPU frame timing summary (read-only). GPU
+    /// aggregates are absent unless the backend reports timestamps.
+    pub frame_timing: engine_renderer::FrameTimingSummary,
     /// Scene validation diagnostics.
     pub scene_validation: Vec<Diagnostic>,
     /// Asset reload status diagnostics.
@@ -33,6 +37,7 @@ impl SandboxDiagnostics {
     pub fn new() -> Self {
         Self {
             frame_snapshot: None,
+            frame_timing: engine_renderer::FrameTimingSummary::default(),
             scene_validation: Vec::new(),
             reload_status: Vec::new(),
             script_diagnostics: Vec::new(),
@@ -52,6 +57,9 @@ impl SandboxDiagnostics {
 
         // Capture the most recent frame stats snapshot, if any.
         self.frame_snapshot = collector.frame_stats.last().cloned();
+
+        // Capture the rolling frame timing summary (ENG-04).
+        self.frame_timing = runtime_diags.frame_timing.clone();
 
         // Copy diagnostics from each category.
         self.scene_validation = collector.scene_diagnostics.clone();
@@ -133,5 +141,35 @@ impl SandboxDiagnostics {
 impl Default for SandboxDiagnostics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_copies_frame_timing_summary_from_runtime_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let coordinator = ReloadCoordinator::new(temp.path(), temp.path(), temp.path()).unwrap();
+        let mut runtime_diags = RuntimeDiagnostics {
+            collector: engine_core::DiagnosticsCollector::new(),
+            reload_queue: None,
+            frame_timing: engine_renderer::FrameTimingSummary::default(),
+            script_engine_state: "idle".to_string(),
+        };
+        runtime_diags.frame_timing.window_frames = 7;
+        runtime_diags.frame_timing.gpu_status = engine_renderer::GpuTimingStatus::Available;
+
+        let mut sandbox_diags = SandboxDiagnostics::new();
+        assert_eq!(sandbox_diags.frame_timing.window_frames, 0);
+
+        sandbox_diags.update(&runtime_diags, &coordinator);
+
+        assert_eq!(sandbox_diags.frame_timing.window_frames, 7);
+        assert_eq!(
+            sandbox_diags.frame_timing.gpu_status,
+            engine_renderer::GpuTimingStatus::Available
+        );
     }
 }

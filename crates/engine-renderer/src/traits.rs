@@ -154,6 +154,14 @@ pub trait BackendRenderer: Send {
             "surface resize",
         ))
     }
+
+    /// Enable or disable GPU timestamp profiling (ENG-04).
+    ///
+    /// Backends with timestamp support (Vulkan) honour this switch; other
+    /// backends keep reporting
+    /// [`GpuTimingStatus::Unavailable`](crate::frame_timing::GpuTimingStatus::Unavailable)
+    /// through their frame statistics. The default is a no-op.
+    fn set_gpu_timing_enabled(&mut self, _enabled: bool) {}
 }
 
 pub struct Renderer {

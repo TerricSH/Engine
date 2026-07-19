@@ -48,12 +48,18 @@ use script::{collect_scene_scripts, script_engine_state_summary};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EngineConfig {
     pub application_name: String,
+    /// Master switch for GPU timestamp profiling (ENG-04). When `true`
+    /// (default) a capable backend records per-pass GPU timestamps; when
+    /// `false` the backend reports GPU timing as disabled and measures
+    /// nothing. CPU stage timing is unaffected.
+    pub gpu_timestamps: bool,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             application_name: "engine".to_string(),
+            gpu_timestamps: true,
         }
     }
 }
@@ -216,6 +222,8 @@ pub struct EngineRuntime {
     stream_budget: usize,
     scene: Option<Scene>,
     world_slot: WorldSlot,
+    /// Per-pass CPU/GPU frame timing recorder and rolling statistics (ENG-04).
+    frame_timing: engine_renderer::FrameTimingTracker,
     component_registry: Arc<ComponentRegistry>,
     asset_type_registry: AssetTypeRegistry,
     render_extension_registry: RenderExtensionRegistry,
@@ -303,6 +311,7 @@ impl EngineRuntime {
             stream_budget: asset_stream::DEFAULT_STREAM_COMMIT_BUDGET,
             scene: None,
             world_slot: WorldSlot::new(),
+            frame_timing: engine_renderer::FrameTimingTracker::new(),
             component_registry,
             asset_type_registry,
             render_extension_registry,
@@ -515,7 +524,12 @@ impl EngineRuntime {
     }
 
     /// Install the backend used by the runtime's sole render pipeline.
-    pub fn set_renderer_backend(&mut self, backend: Box<dyn BackendRenderer>) {
+    ///
+    /// The runtime's [`EngineConfig::gpu_timestamps`] switch is forwarded to
+    /// the backend; capable backends (Vulkan) start or stop recording GPU
+    /// timestamps accordingly.
+    pub fn set_renderer_backend(&mut self, mut backend: Box<dyn BackendRenderer>) {
+        backend.set_gpu_timing_enabled(self.config.gpu_timestamps);
         self.renderer.set_backend(backend);
     }
 
@@ -607,6 +621,7 @@ impl EngineRuntime {
         RuntimeDiagnostics {
             collector: self.collector.clone(),
             reload_queue: None,
+            frame_timing: self.frame_timing.summary(),
             #[cfg(feature = "subsystem-scripting-csharp")]
             script_engine_state: format!(
                 "{} coroutines={}",
@@ -666,14 +681,25 @@ impl EngineRuntime {
         ui_batches: Vec<engine_renderer::UiBatch>,
         viewport: Option<RenderViewportContext>,
     ) -> Result<FrameStats, Vec<Diagnostic>> {
-        let mut input = if let Some(result) = self.world_slot.with_world(|world| match viewport {
+        self.frame_timing.begin_stage("extraction");
+        let extraction = self.world_slot.with_world(|world| match viewport {
             Some(viewport) => {
                 extract_renderer_input_from_world_with_viewport(world, frame_index, viewport)
             }
             None => extract_renderer_input_from_world(world, frame_index),
-        }) {
-            result?
+        });
+        let mut input = if let Some(result) = extraction {
+            match result {
+                Ok(input) => input,
+                Err(diagnostics) => {
+                    self.frame_timing.end_stage("extraction");
+                    self.frame_timing.discard_frame();
+                    return Err(diagnostics);
+                }
+            }
         } else if self.scene.is_some() {
+            self.frame_timing.end_stage("extraction");
+            self.frame_timing.discard_frame();
             return Err(vec![Diagnostic::new(
                 "SC0019",
                 DiagnosticSeverity::Error,
@@ -681,6 +707,8 @@ impl EngineRuntime {
                 "a scene snapshot exists without an active World; reload it through load_scene",
             )]);
         } else {
+            self.frame_timing.end_stage("extraction");
+            self.frame_timing.discard_frame();
             return Err(vec![Diagnostic::new(
                 "SC0018",
                 DiagnosticSeverity::Error,
@@ -692,15 +720,64 @@ impl EngineRuntime {
             .produce_all(&mut input, frame_index);
         input.ui_batches.extend(ui_batches);
         self.refresh_generated_ui_assets();
-        if let Err(diagnostics) = self.sync_render_assets(&input) {
+        self.frame_timing.end_stage("extraction");
+
+        self.frame_timing.begin_stage("sync_render_assets");
+        let sync_result = self.sync_render_assets(&input);
+        self.frame_timing.end_stage("sync_render_assets");
+        if let Err(diagnostics) = sync_result {
             self.collector.push_asset_diags(diagnostics.clone());
+            self.frame_timing.discard_frame();
             return Err(diagnostics);
         }
+
+        self.frame_timing.begin_stage("render_submit");
         let result = self.renderer.draw_scene(&input);
-        if let Ok(stats) = &result {
-            self.collector.record_frame(frame_index, stats);
+        self.frame_timing.end_stage("render_submit");
+        match result {
+            Ok(stats) => {
+                // GPU pass times reported by the backend were read back
+                // asynchronously; they belong to `stats.gpu_pass_frame_index`.
+                self.frame_timing.finish_frame(
+                    frame_index,
+                    stats.gpu_timing,
+                    stats.gpu_pass_frame_index,
+                    stats.gpu_pass_times.clone(),
+                );
+                self.collector.record_frame(frame_index, &stats);
+                Ok(stats)
+            }
+            Err(diagnostics) => {
+                self.frame_timing.discard_frame();
+                Err(diagnostics)
+            }
         }
-        result
+    }
+
+    /// Rolling per-pass CPU/GPU timing statistics (ENG-04).
+    ///
+    /// CPU stages cover `update`/`script_tick` (recorded by
+    /// [`GameLoop`](crate::game_loop::GameLoop)) and
+    /// `extraction`/`sync_render_assets`/`render_submit` (recorded here).
+    /// GPU pass times appear when the active backend supports timestamps;
+    /// see [`engine_renderer::GpuTimingStatus`] for the availability states.
+    pub fn frame_timing_summary(&self) -> engine_renderer::FrameTimingSummary {
+        self.frame_timing.summary()
+    }
+
+    /// The most recently completed frame's full timing breakdown.
+    pub fn last_frame_timings(&self) -> Option<&engine_renderer::FrameTimings> {
+        self.frame_timing.last_frame()
+    }
+
+    /// Begin a CPU timing stage on the current frame (engine-internal).
+    pub(crate) fn frame_timing_begin_stage(&mut self, name: &str) {
+        self.frame_timing.begin_stage(name);
+    }
+
+    /// End a CPU timing stage on the current frame (engine-internal).
+    pub(crate) fn frame_timing_end_stage(&mut self, name: &str) {
+        self.frame_timing.end_stage(name);
     }
 
     fn sync_render_assets(
@@ -3080,6 +3157,7 @@ mod tests {
         let b = EngineConfig::default();
         let c = EngineConfig {
             application_name: "custom".to_string(),
+            gpu_timestamps: true,
         };
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -3245,6 +3323,261 @@ mod tests {
         runtime.render_frame(17).expect("frame should render");
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    // ── Frame timing (ENG-04) ───────────────────────────────────────────
+
+    /// Backend that reports canned GPU pass timings, mimicking the async
+    /// read-back shape of the Vulkan backend.
+    struct GpuTimingBackend {
+        gpu_enabled: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl engine_renderer::BackendRenderer for GpuTimingBackend {
+        fn begin_frame(
+            &mut self,
+            _input: &engine_renderer::RenderFrameInput,
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn apply_pass_barriers(
+            &mut self,
+            _input: &engine_renderer::RenderFrameInput,
+            _pass: &engine_renderer::render_graph2::PassNode,
+            _barriers: &[engine_renderer::render_graph2::CompiledBarrier],
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn execute_pass(
+            &mut self,
+            _input: &engine_renderer::RenderFrameInput,
+            _pass: &engine_renderer::render_graph2::PassNode,
+            _frame_stats: &mut FrameStats,
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn end_frame(&mut self, stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
+            stats.gpu_timing = engine_renderer::GpuTimingStatus::Available;
+            // The samples belong to the frame recorded two frames ago.
+            stats.gpu_pass_frame_index = Some(0);
+            stats.gpu_pass_times = vec![
+                engine_renderer::GpuPassTime {
+                    name: "directional_shadow_pass".to_string(),
+                    ms: 0.5,
+                },
+                engine_renderer::GpuPassTime {
+                    name: "opaque_pbr_forward_pass".to_string(),
+                    ms: 1.5,
+                },
+            ];
+            Ok(())
+        }
+
+        fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn upload_mesh(
+            &mut self,
+            _upload: MeshUpload,
+        ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+            Ok(engine_renderer::UploadReceipt::new(1))
+        }
+
+        fn upload_texture(
+            &mut self,
+            _upload: TextureUpload,
+        ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+            Ok(engine_renderer::UploadReceipt::new(1))
+        }
+
+        fn upload_material(
+            &mut self,
+            _upload: MaterialUpload,
+        ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+            Ok(engine_renderer::UploadReceipt::new(1))
+        }
+
+        fn set_gpu_timing_enabled(&mut self, enabled: bool) {
+            *self
+                .gpu_enabled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(enabled);
+        }
+    }
+
+    fn recording_backend() -> RecordingBackend {
+        RecordingBackend {
+            uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            rendered_ui_batch_counts: None,
+        }
+    }
+
+    fn shared_gpu_flag() -> std::sync::Arc<std::sync::Mutex<Option<bool>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(None))
+    }
+
+    #[test]
+    fn render_frame_records_cpu_stage_timings() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_renderer_backend(Box::new(recording_backend()));
+        runtime
+            .load_scene(engine_scene::sample_scene())
+            .expect("sample scene should load");
+
+        for frame in 0..3 {
+            runtime.render_frame(frame).expect("frame should render");
+        }
+
+        let timings = runtime.last_frame_timings().expect("frame timings");
+        assert_eq!(timings.frame_index, 2);
+        assert_eq!(
+            timings.gpu_status,
+            engine_renderer::GpuTimingStatus::Unavailable
+        );
+        assert!(timings.gpu_frame_index.is_none());
+        for stage in ["extraction", "sync_render_assets", "render_submit"] {
+            let pass = timings
+                .passes
+                .iter()
+                .find(|pass| pass.name == stage)
+                .unwrap_or_else(|| panic!("missing CPU stage '{stage}'"));
+            assert!(pass.cpu_ms.is_some(), "stage '{stage}' needs cpu_ms");
+            assert!(pass.gpu_ms.is_none());
+        }
+        let stage_sum: f32 = timings.passes.iter().filter_map(|pass| pass.cpu_ms).sum();
+        assert!(
+            (stage_sum - timings.total_cpu_ms).abs() < f32::EPSILON,
+            "stage sum must equal total_cpu_ms"
+        );
+
+        let summary = runtime.frame_timing_summary();
+        assert_eq!(summary.window_frames, 3);
+        assert_eq!(
+            summary.gpu_status,
+            engine_renderer::GpuTimingStatus::Unavailable
+        );
+        let submit = summary
+            .passes
+            .iter()
+            .find(|pass| pass.name == "render_submit")
+            .expect("render_submit stats");
+        let cpu = submit.cpu.expect("cpu aggregate");
+        assert_eq!(cpu.samples, 3);
+        assert!(cpu.avg_ms <= cpu.p95_ms && cpu.p95_ms <= cpu.max_ms);
+        assert!(submit.gpu.is_none());
+        assert!(summary.total_cpu.is_some());
+        assert!(summary.total_gpu.is_none());
+    }
+
+    #[test]
+    fn backend_gpu_pass_times_flow_into_frame_timings() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_renderer_backend(Box::new(GpuTimingBackend {
+            gpu_enabled: shared_gpu_flag(),
+        }));
+        runtime
+            .load_scene(engine_scene::sample_scene())
+            .expect("sample scene should load");
+
+        runtime.render_frame(2).expect("frame should render");
+
+        let timings = runtime.last_frame_timings().expect("frame timings");
+        assert_eq!(
+            timings.gpu_status,
+            engine_renderer::GpuTimingStatus::Available
+        );
+        assert_eq!(timings.gpu_frame_index, Some(0));
+        assert_eq!(timings.total_gpu_ms, Some(2.0));
+        let forward = timings
+            .passes
+            .iter()
+            .find(|pass| pass.name == "opaque_pbr_forward_pass")
+            .expect("GPU pass sample");
+        assert_eq!(forward.gpu_ms, Some(1.5));
+        assert_eq!(forward.cpu_ms, None);
+
+        let summary = runtime.frame_timing_summary();
+        assert_eq!(
+            summary.gpu_status,
+            engine_renderer::GpuTimingStatus::Available
+        );
+        let shadow = summary
+            .passes
+            .iter()
+            .find(|pass| pass.name == "directional_shadow_pass")
+            .expect("shadow stats");
+        assert_eq!(shadow.gpu.unwrap().samples, 1);
+        assert_eq!(summary.total_gpu.unwrap().samples, 1);
+
+        let diagnostics = runtime.runtime_diagnostics();
+        assert_eq!(
+            diagnostics.frame_timing.gpu_status,
+            engine_renderer::GpuTimingStatus::Available
+        );
+    }
+
+    #[test]
+    fn gpu_timing_config_is_forwarded_to_the_backend() {
+        let _guard = serial_ffi_world_test();
+        let disabled_flag = shared_gpu_flag();
+        let mut runtime = EngineRuntime::new(EngineConfig {
+            application_name: "timing-test".to_string(),
+            gpu_timestamps: false,
+        });
+        runtime.set_renderer_backend(Box::new(GpuTimingBackend {
+            gpu_enabled: std::sync::Arc::clone(&disabled_flag),
+        }));
+        assert_eq!(
+            *disabled_flag
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(false)
+        );
+
+        let enabled_flag = shared_gpu_flag();
+        let mut enabled_runtime = EngineRuntime::new(EngineConfig::default());
+        enabled_runtime.set_renderer_backend(Box::new(GpuTimingBackend {
+            gpu_enabled: std::sync::Arc::clone(&enabled_flag),
+        }));
+        assert_eq!(
+            *enabled_flag
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn failed_render_discards_partial_frame_timing() {
+        let _guard = serial_ffi_world_test();
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        // No backend installed: draw_scene fails after extraction/sync stages.
+        runtime
+            .load_scene(engine_scene::sample_scene())
+            .expect("sample scene should load");
+        assert!(runtime.render_frame(0).is_err());
+        assert!(runtime.last_frame_timings().is_none());
+        assert_eq!(runtime.frame_timing_summary().window_frames, 0);
+
+        // A subsequent healthy frame starts from a clean recorder.
+        runtime.set_renderer_backend(Box::new(recording_backend()));
+        runtime.render_frame(1).expect("frame should render");
+        let timings = runtime.last_frame_timings().expect("frame timings");
+        assert_eq!(timings.frame_index, 1);
+        assert_eq!(
+            timings
+                .passes
+                .iter()
+                .filter(|pass| pass.cpu_ms.is_some())
+                .count(),
+            3
+        );
     }
 
     #[test]

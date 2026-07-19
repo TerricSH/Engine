@@ -895,6 +895,14 @@ impl GameLoop {
     /// 2. Call `update(dt)` for physics + character + scripts
     /// 3. Call `render(frame_idx)` for extraction + draw
     pub fn update(&mut self, dt: f32) {
+        // Frame-time attribution (ENG-04): the whole simulation step is the
+        // `update` stage; script ticking nests inside it as `script_tick`.
+        self.runtime.frame_timing_begin_stage("update");
+        self.update_inner(dt);
+        self.runtime.frame_timing_end_stage("update");
+    }
+
+    fn update_inner(&mut self, dt: f32) {
         // Tick physics (ECS → physics → ECS sync) — gameplay feature
         #[cfg(feature = "gameplay")]
         {
@@ -947,6 +955,7 @@ impl GameLoop {
         // by the player/editor GameLoop.
         #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
         {
+            self.runtime.frame_timing_begin_stage("script_tick");
             let input_actions = self.resolved_script_input_actions();
             let input_transitions = self.resolved_script_input_transitions(&input_actions);
             let physics_events = self.resolved_script_physics_events();
@@ -965,9 +974,11 @@ impl GameLoop {
             // stepped physics world; scripts observe the results with the
             // next frame snapshot.
             self.execute_script_physics_queries();
+            self.runtime.frame_timing_end_stage("script_tick");
         }
         #[cfg(all(feature = "subsystem-scripting-csharp", not(feature = "gameplay")))]
         {
+            self.runtime.frame_timing_begin_stage("script_tick");
             self.runtime.tick_scripts_with_frame_input_and_ui(
                 dt,
                 &std::collections::BTreeMap::new(),
@@ -978,6 +989,7 @@ impl GameLoop {
             // Without a physics world no query can be answered; drop drained
             // queries so the runtime queue cannot accumulate.
             let _ = self.runtime.take_pending_physics_queries();
+            self.runtime.frame_timing_end_stage("script_tick");
         }
 
         #[cfg(feature = "runtime-subsystems")]
@@ -1018,6 +1030,15 @@ impl GameLoop {
                 || matches!(&action.current_value, InputValue::Float(value) if *value > 0.5)
         });
         (direction, wish_jump)
+    }
+
+    /// Rolling per-pass CPU/GPU frame timing statistics (ENG-04).
+    ///
+    /// CPU stages: `update` (whole simulation step, with `script_tick`
+    /// nested), `extraction`, `sync_render_assets`, `render_submit`. GPU pass
+    /// times appear only when the active backend supports timestamps.
+    pub fn frame_timing_summary(&self) -> engine_renderer::FrameTimingSummary {
+        self.runtime.frame_timing_summary()
     }
 
     /// Produce a single rendered frame.
@@ -4083,5 +4104,123 @@ mod world_origin_tests {
         );
         let listener = frame.listener.as_ref().unwrap();
         assert!(listener.position.length() < 1e-4, "{listener:?}");
+    }
+}
+
+#[cfg(test)]
+mod frame_timing_tests {
+    use super::*;
+
+    /// Minimal no-op backend so a GameLoop can drive full frames in-process.
+    struct NoopBackend;
+
+    impl engine_renderer::BackendRenderer for NoopBackend {
+        fn begin_frame(
+            &mut self,
+            _input: &engine_renderer::RenderFrameInput,
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn apply_pass_barriers(
+            &mut self,
+            _input: &engine_renderer::RenderFrameInput,
+            _pass: &engine_renderer::render_graph2::PassNode,
+            _barriers: &[engine_renderer::render_graph2::CompiledBarrier],
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn execute_pass(
+            &mut self,
+            _input: &engine_renderer::RenderFrameInput,
+            _pass: &engine_renderer::render_graph2::PassNode,
+            _frame_stats: &mut FrameStats,
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn upload_mesh(
+            &mut self,
+            _upload: engine_renderer::MeshUpload,
+        ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+            Ok(engine_renderer::UploadReceipt::new(1))
+        }
+
+        fn upload_texture(
+            &mut self,
+            _upload: engine_renderer::TextureUpload,
+        ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+            Ok(engine_renderer::UploadReceipt::new(1))
+        }
+
+        fn upload_material(
+            &mut self,
+            _upload: engine_renderer::MaterialUpload,
+        ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+            Ok(engine_renderer::UploadReceipt::new(1))
+        }
+    }
+
+    #[test]
+    fn game_loop_attributes_update_and_render_stages_to_one_frame() {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop
+            .runtime
+            .set_renderer_backend(Box::new(NoopBackend));
+        game_loop
+            .load_scene(engine_scene::sample_scene())
+            .expect("sample scene should load");
+
+        for frame in 0..5 {
+            game_loop.update(1.0 / 60.0);
+            game_loop.render(frame).expect("frame should render");
+        }
+
+        let timings = game_loop
+            .runtime
+            .last_frame_timings()
+            .expect("frame timings after five frames");
+        for stage in [
+            "update",
+            "extraction",
+            "sync_render_assets",
+            "render_submit",
+        ] {
+            assert!(
+                timings
+                    .passes
+                    .iter()
+                    .any(|pass| pass.name == stage && pass.cpu_ms.is_some()),
+                "missing CPU stage '{stage}' in {timings:?}"
+            );
+        }
+        let stage_sum: f32 = timings.passes.iter().filter_map(|pass| pass.cpu_ms).sum();
+        assert!(
+            (stage_sum - timings.total_cpu_ms).abs() < f32::EPSILON,
+            "CPU stage attribution must sum to the frame total"
+        );
+
+        let summary = game_loop.frame_timing_summary();
+        assert_eq!(summary.window_frames, 5);
+        let update = summary
+            .passes
+            .iter()
+            .find(|pass| pass.name == "update")
+            .expect("update stats");
+        assert_eq!(update.cpu.expect("cpu aggregate").samples, 5);
+        assert_eq!(
+            summary.gpu_status,
+            engine_renderer::GpuTimingStatus::Unavailable,
+            "a no-op backend reports GPU timing as unavailable"
+        );
     }
 }

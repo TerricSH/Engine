@@ -17,6 +17,10 @@
 
 所有 `BackendRenderer` 现在都强制执行 Render Graph 生命周期；`LegacySinglePass` 和整帧 `render_frame()` 后端兼容入口已经删除。
 
+## 帧时间剖析（ENG-04）
+
+`GameLoop::update` 与 `EngineRuntime::render_frame_submission` 按命名阶段记录 CPU 时间（`update`、`script_tick`、`extraction`、`sync_render_assets`、`render_submit`）；Vulkan 后端用时间戳查询按 Render Graph Pass 记录 GPU 时间，按 in-flight 帧数延迟异步回读，不支持时降级为 `unavailable`。滚动统计（最近 120 帧，avg/p95/max）经 `EngineRuntime::frame_timing_summary()` 暴露，并写入无头运行报告的 `frame_timing` 段。详见 [PROFILING.md](./PROFILING.md)。
+
 ## 相机相对渲染（Camera-Relative Rendering，ENG-01）
 
 场景设置 `SceneSettings::camera_relative_rendering`（默认 `false`，旧场景文件反序列化时自动取默认值）控制是否在提取阶段启用相机相对渲染。变换在引擎中始终是 f32：距离世界原点 100 km 时，存储位置被量化到约 8 mm 的网格上，而 `proj * view * model` 矩阵链的浮点舍入会按坐标量级放大误差，实测在最坏取向下会给 2 m 的相机相对偏移带来约 1.1e-2 m 的视空间误差（相对误差约 5.5e-3）和约 7.8e-3 的 NDC 误差（像素级可见抖动）。

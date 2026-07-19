@@ -378,6 +378,7 @@ fn checked_cook_material_bytes(
     let mut graph = DependencyGraph::new();
     let runtime_builder = EngineRuntime::builder(EngineConfig {
         application_name: format!("{}-material-cook", project.manifest.name),
+        gpu_timestamps: true,
     });
     let report = cook_orchestrate_checked_with_registry(
         &project.asset_source,
@@ -3864,6 +3865,7 @@ impl EditorApp {
 
         let mut game_loop = GameLoop::new(EngineConfig {
             application_name: format!("{} Editor", self.project.manifest.name),
+            gpu_timestamps: true,
         });
         #[cfg(feature = "target-desktop")]
         {

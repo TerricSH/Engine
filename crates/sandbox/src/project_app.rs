@@ -81,6 +81,7 @@ fn create_game_loop(
     let input_map = super::project_input::load_project_input_map(project)?;
     let mut game_loop = GameLoop::new(EngineConfig {
         application_name: project.manifest.name.clone(),
+        gpu_timestamps: true,
     });
     #[cfg(any(feature = "target-desktop", feature = "subsystem-scripting-csharp"))]
     {
@@ -484,6 +485,9 @@ fn run_headless(
         "cell_streaming": cell_streaming_report,
         "world_origin": game_loop.world_origin(),
         "world_origin_shifts": game_loop.world_origin_shift_count(),
+        // ENG-04: rolling per-pass CPU timing summary. The headless QA
+        // backend reports GPU timing as unavailable; GPU fields are absent.
+        "frame_timing": game_loop.runtime.frame_timing_summary(),
         "script_errors": 0,
         "passed": true
     }))
@@ -1052,6 +1056,44 @@ mod tests {
         // No origin shifting configured: the report shows the zero origin.
         assert_eq!(report["world_origin"], serde_json::json!([0.0, 0.0, 0.0]));
         assert_eq!(report["world_origin_shifts"], 0);
+    }
+
+    #[test]
+    fn headless_run_report_includes_frame_timing_section() {
+        let (_temp, project) = scene_project_fixture();
+        let scene = Scene::load_from_file(project.startup_scene_path()).unwrap();
+        let report_path = project.root.join("build/run-report.json");
+        run_headless(project, scene, 3, Some(&report_path), false).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(report["passed"], true);
+
+        let frame_timing = &report["frame_timing"];
+        assert_eq!(frame_timing["window_frames"], 3);
+        // The headless QA backend cannot provide GPU timestamps: the section
+        // reports "unavailable" and carries CPU-only aggregates.
+        assert_eq!(frame_timing["gpu_status"], "unavailable");
+        assert!(frame_timing.get("total_gpu").is_none());
+        assert!(frame_timing["total_cpu"]["avg_ms"].is_number());
+
+        let passes = frame_timing["passes"].as_array().unwrap();
+        for stage in [
+            "update",
+            "extraction",
+            "sync_render_assets",
+            "render_submit",
+        ] {
+            let pass = passes
+                .iter()
+                .find(|pass| pass["name"] == stage)
+                .unwrap_or_else(|| panic!("missing stage '{stage}' in {passes:?}"));
+            assert_eq!(pass["cpu"]["samples"], 3);
+            assert!(pass["cpu"]["avg_ms"].is_number());
+            assert!(pass["cpu"]["p95_ms"].is_number());
+            assert!(pass["cpu"]["max_ms"].is_number());
+            assert!(pass.get("gpu").is_none());
+        }
     }
 
     #[test]

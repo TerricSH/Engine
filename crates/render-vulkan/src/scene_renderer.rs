@@ -768,6 +768,17 @@ pub struct SceneRenderer {
     /// buffer would race the other frame slot while the GPU is reading it.
     ui_vbs: [Option<BufferHandle>; 2],
     ui_vb_capacities: [u64; 2],
+
+    /// Per-pass GPU timestamp state machine (ENG-04). Async read-back lands
+    /// frames-in-flight frames after recording; unavailable/disabled states
+    /// degrade to status reporting only.
+    gpu_timestamps: crate::timestamps::GpuTimestampProfiler,
+    /// Lazily created timestamp query pools (one per frame-in-flight slot).
+    timestamp_pools: crate::timestamps::TimestampQueryPools,
+    /// Engine configuration switch for GPU timestamps.
+    gpu_timing_enabled: bool,
+    /// Whether device timestamp support was already evaluated.
+    gpu_timing_configured: bool,
 }
 
 impl SceneRenderer {
@@ -802,6 +813,10 @@ impl SceneRenderer {
             width: width.max(1),
             height: height.max(1),
             pass_registry: PassRegistry::new(),
+            gpu_timestamps: crate::timestamps::GpuTimestampProfiler::new(),
+            timestamp_pools: crate::timestamps::TimestampQueryPools::new(),
+            gpu_timing_enabled: true,
+            gpu_timing_configured: false,
         }
     }
 
@@ -3181,6 +3196,78 @@ impl SceneRenderer {
         Ok(())
     }
 
+    // ------------------------------------------------------------------
+    // Per-pass GPU timestamps (ENG-04)
+    // ------------------------------------------------------------------
+
+    /// Evaluate device support once and configure the profiler.
+    fn configure_gpu_timestamps(&mut self) {
+        if self.gpu_timing_configured {
+            return;
+        }
+        self.gpu_timing_configured = true;
+        if !self.gpu_timing_enabled {
+            self.gpu_timestamps
+                .configure(crate::timestamps::TimestampSupport::Disabled, 0);
+            return;
+        }
+        let limits = &self.device.adapter.properties.limits;
+        let support = crate::timestamps::evaluate_support(
+            true,
+            limits.timestamp_compute_and_graphics == vk::TRUE,
+            limits.timestamp_period,
+        );
+        let slots = self.device.frame_sync.len().max(1);
+        self.gpu_timestamps.configure(support, slots);
+    }
+
+    /// Read back the slot's previous frame (its fence was just waited inside
+    /// the device `begin_frame`), then reset the pool and start recording.
+    fn gpu_timestamps_begin_frame(&mut self, frame_index: u64) {
+        self.configure_gpu_timestamps();
+        let fi = self.device.current_frame;
+        let device = self.device.logical_device.device.clone();
+        if self.gpu_timestamps.readback_len(fi).is_some() {
+            let ticks = self.timestamp_pools.read(&device, fi);
+            self.gpu_timestamps.deliver_readback(fi, ticks.as_deref());
+        }
+        let Some(_) = self.gpu_timestamps.begin_recording(fi, frame_index) else {
+            return;
+        };
+        if self.timestamp_pools.ensure_created(&device).is_err() {
+            self.gpu_timestamps
+                .degrade("timestamp query pool creation failed");
+            return;
+        }
+        let cmd = self.device.frame_sync[fi].command_buffer;
+        self.timestamp_pools.cmd_reset(&device, cmd, fi);
+    }
+
+    /// Record the start timestamp for `pass_name`; returns the query to write.
+    fn gpu_timestamp_pass_start(&mut self, pass_name: &str) -> Option<(u32, usize)> {
+        let fi = self.device.current_frame;
+        self.gpu_timestamps
+            .stamp_start(pass_name)
+            .map(|query| (query, fi))
+    }
+
+    /// Record the end timestamp paired with the most recent start.
+    fn gpu_timestamp_pass_end(&mut self) -> Option<(u32, usize)> {
+        let fi = self.device.current_frame;
+        self.gpu_timestamps.stamp_end().map(|query| (query, fi))
+    }
+
+    /// Close the frame's recording after submission and publish backend GPU
+    /// timing into the frame statistics.
+    fn gpu_timestamps_end_frame(&mut self, stats: &mut FrameStats) {
+        self.gpu_timestamps.finish_recording();
+        stats.gpu_timing = self.gpu_timestamps.status();
+        if let Some(batch) = self.gpu_timestamps.take_latest() {
+            stats.gpu_pass_frame_index = Some(batch.frame_index);
+            stats.gpu_pass_times = batch.passes;
+        }
+    }
+
     fn recover_failed_device_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
         self.device
             .abort_current_frame_recording()
@@ -3265,6 +3352,10 @@ impl BackendRenderer for SceneRenderer {
         self.cur_sc = Some(sc_h);
         self.cur_ii = Some(ii);
         self.cur_enc = Some(enc);
+        // The device begin-frame already waited for this slot's in-flight
+        // fence, so the previous frame recorded on the slot can be read back
+        // without stalling; then the slot's pool is reset for this frame.
+        self.gpu_timestamps_begin_frame(input.frame_index);
         Ok(())
     }
 
@@ -3288,18 +3379,28 @@ impl BackendRenderer for SceneRenderer {
         // render-pass transition from UNDEFINED to PRESENT_SRC_KHR for the
         // acquired swapchain image. Custom passes continue to use the
         // pluggable registry.
-        match pass.kind {
+        //
+        // Every pass is bracketed by GPU timestamp writes (start at
+        // TOP_OF_PIPE, end at BOTTOM_OF_PIPE) into the current slot's pool.
+        let stamp_device = self.device.logical_device.device.clone();
+        let stamp_cmd = self.device.frame_sync[self.device.current_frame].command_buffer;
+        if let Some((query, slot)) = self.gpu_timestamp_pass_start(pass.name) {
+            self.timestamp_pools.cmd_write(
+                &stamp_device,
+                stamp_cmd,
+                query,
+                slot,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            );
+        }
+        let pass_result = match pass.kind {
             render_graph2::PassKind::OpaquePbrForward => {
-                self.execute_hdr_forward_pass(input, stats)?;
+                self.execute_hdr_forward_pass(input, stats)
             }
-            render_graph2::PassKind::DirectionalShadow => {
-                self.execute_shadow_pass(input, stats)?;
-            }
-            render_graph2::PassKind::ToneMap => {
-                self.execute_tonemap_pass(input, stats)?;
-            }
+            render_graph2::PassKind::DirectionalShadow => self.execute_shadow_pass(input, stats),
+            render_graph2::PassKind::ToneMap => self.execute_tonemap_pass(input, stats),
             render_graph2::PassKind::Present => {
-                self.execute_ui_overlay_pass(&input.ui_batches, stats)?;
+                self.execute_ui_overlay_pass(&input.ui_batches, stats)
             }
             render_graph2::PassKind::Custom(name) => {
                 let enc = self.cur_enc.as_mut().expect("encoder checked above");
@@ -3309,11 +3410,19 @@ impl BackendRenderer for SceneRenderer {
                     input,
                     &mut **enc,
                     stats,
-                )?;
+                )
             }
+        };
+        if let Some((query, slot)) = self.gpu_timestamp_pass_end() {
+            self.timestamp_pools.cmd_write(
+                &stamp_device,
+                stamp_cmd,
+                query,
+                slot,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            );
         }
-
-        Ok(())
+        pass_result
     }
 
     fn end_frame(&mut self, stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
@@ -3325,6 +3434,7 @@ impl BackendRenderer for SceneRenderer {
                 let s = match self.device.end_frame(sc_h, enc, ii) {
                     Ok(stats) => stats,
                     Err(error) => {
+                        self.gpu_timestamps.abort_slot(self.device.current_frame);
                         let mut diagnostics = vec![Diagnostic::new(
                             "RV0209",
                             DiagnosticSeverity::Error,
@@ -3337,6 +3447,10 @@ impl BackendRenderer for SceneRenderer {
                         return Err(diagnostics);
                     }
                 };
+                // The frame was submitted: its timestamp queries are now
+                // pending asynchronous read-back. Publish whatever batch the
+                // begin-frame read-back produced into the statistics.
+                self.gpu_timestamps_end_frame(stats);
                 // Built-in Vulkan passes issue several draws directly because
                 // they need backend-specific descriptor and render-pass state.
                 // The generic encoder only accounts for the draws recorded
@@ -3863,6 +3977,9 @@ impl BackendRenderer for SceneRenderer {
         self.cur_enc.take();
         self.cur_sc.take();
         self.cur_ii.take();
+        // The aborted frame's command buffer is reset without submission, so
+        // its timestamp queries can never be read back; drop the slot state.
+        self.gpu_timestamps.abort_slot(self.device.current_frame);
         self.recover_failed_device_frame()
     }
 
@@ -3897,6 +4014,24 @@ impl BackendRenderer for SceneRenderer {
         self.height = height;
         self.device.resize(width, height);
         Ok(())
+    }
+
+    fn set_gpu_timing_enabled(&mut self, enabled: bool) {
+        self.gpu_timing_enabled = enabled;
+        // Re-evaluate device support on the next frame so a runtime toggle
+        // takes effect without recreating the renderer.
+        self.gpu_timing_configured = false;
+    }
+}
+
+impl Drop for SceneRenderer {
+    fn drop(&mut self) {
+        // Query pools are device-owned objects; wait for in-flight work so
+        // pools are never destroyed while queries are still being written,
+        // then destroy them before the logical device goes away.
+        self.device.wait_idle();
+        self.timestamp_pools
+            .destroy(&self.device.logical_device.device);
     }
 }
 

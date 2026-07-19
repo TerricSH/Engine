@@ -25,6 +25,10 @@ pub struct ReloadQueueSnapshot {
 pub struct RuntimeDiagnostics {
     pub collector: DiagnosticsCollector,
     pub reload_queue: Option<ReloadQueueSnapshot>,
+    /// Rolling per-pass CPU/GPU frame timing statistics (ENG-04). Read-only
+    /// diagnostics; GPU fields are absent when the backend cannot provide
+    /// timestamps.
+    pub frame_timing: engine_renderer::FrameTimingSummary,
     pub script_engine_state: String,
 }
 
@@ -163,6 +167,7 @@ mod tests {
             draw_calls,
             triangles,
             gpu_frame_ms: gpu_ms,
+            ..FrameStats::default()
         }
     }
 
@@ -362,10 +367,12 @@ mod tests {
         let rd = RuntimeDiagnostics {
             collector: DiagnosticsCollector::new(),
             reload_queue: None,
+            frame_timing: engine_renderer::FrameTimingSummary::default(),
             script_engine_state: "idle".to_string(),
         };
         assert_eq!(rd.script_engine_state, "idle");
         assert!(rd.reload_queue.is_none());
         assert!(rd.collector.all().is_empty());
+        assert_eq!(rd.frame_timing.window_frames, 0);
     }
 }

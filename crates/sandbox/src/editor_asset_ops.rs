@@ -1031,6 +1031,7 @@ fn cook_staged_asset(
     let mut graph = DependencyGraph::new();
     let runtime_builder = engine_core::EngineRuntime::builder(engine_core::EngineConfig {
         application_name: format!("{}-editor-asset-op", project.manifest.name),
+        gpu_timestamps: true,
     });
     let report = cook_orchestrate_checked_with_registry(
         &staging.source_root,

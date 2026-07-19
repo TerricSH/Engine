@@ -1794,6 +1794,7 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
     let mut script_components = 0usize;
     let mut strict_runtime = engine_core::EngineRuntime::new(engine_core::EngineConfig {
         application_name: format!("{}-project-check", project.manifest.name),
+        gpu_timestamps: true,
     });
     for (scene_id, scene_path) in project.scenes() {
         let scene = Scene::load_from_file(&scene_path).map_err(|error| {
@@ -2317,6 +2318,7 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
     let mut graph = DependencyGraph::new();
     let runtime_builder = engine_core::EngineRuntime::builder(engine_core::EngineConfig {
         application_name: format!("{}-asset-import", project.manifest.name),
+        gpu_timestamps: true,
     });
     let cook_report = cook_orchestrate_checked_with_registry(
         &project.asset_source,
@@ -2880,6 +2882,7 @@ pub(crate) fn cook_project(path: &Path) -> Result<(), String> {
     let mut graph = DependencyGraph::new();
     let runtime_builder = engine_core::EngineRuntime::builder(engine_core::EngineConfig {
         application_name: format!("{}-asset-cook", project.manifest.name),
+        gpu_timestamps: true,
     });
     let report = cook_orchestrate_checked_with_registry(
         &project.asset_source,
