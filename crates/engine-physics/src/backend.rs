@@ -11,7 +11,8 @@ use crate::events::{
 };
 use crate::joints::{JointDescriptor, JointHandle, JointType};
 use crate::queries::{
-    OverlapHitResult, QueryBatcher, QueryResults, RaycastHitResult, SweepHitResult,
+    OverlapHitResult, PhysicsQueryFilter, QueryBatcher, QueryResults, RaycastHitResult,
+    SweepHitResult,
 };
 use crate::Entity;
 use crate::Transform;
@@ -837,6 +838,33 @@ impl RapierBackend {
 
     // ── Queries ─────────────────────────────────────────────────────────
 
+    /// Build the rapier-side [`QueryFilter`] for a [`PhysicsQueryFilter`].
+    ///
+    /// Layer filtering maps the script-visible mask onto the collider's
+    /// `collision_group` membership bits: a collider is a candidate iff
+    /// `(collision_group & layer_mask) != 0`. Colliders whose own
+    /// `collision_mask` is zero never collide with anything — including
+    /// queries — so they are never candidates either.
+    fn rapier_query_filter(&self, filter: &PhysicsQueryFilter) -> QueryFilter<'static> {
+        let mut rapier_filter = if filter.include_sensors {
+            QueryFilter::default()
+        } else {
+            QueryFilter::default().exclude_sensors()
+        };
+        if let Some(layer_mask) = filter.layer_mask {
+            rapier_filter.groups = Some(InteractionGroups::new(
+                Group::ALL,
+                Group::from_bits_truncate(layer_mask),
+            ));
+        }
+        if let Some(excluded) = filter.exclude_entity {
+            if let Some(&(handle, _)) = self.collider_map.get(&excluded) {
+                rapier_filter.exclude_collider = Some(handle);
+            }
+        }
+        rapier_filter
+    }
+
     /// Cast a ray against all colliders and return the closest hit.
     pub fn raycast(
         &self,
@@ -844,11 +872,22 @@ impl RapierBackend {
         dir: glam::Vec3,
         max_dist: f32,
     ) -> Option<RaycastHit> {
+        self.raycast_filtered(origin, dir, max_dist, &PhysicsQueryFilter::default())
+    }
+
+    /// Cast a ray with a candidate filter and return the closest hit.
+    pub fn raycast_filtered(
+        &self,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+        max_dist: f32,
+        filter: &PhysicsQueryFilter,
+    ) -> Option<RaycastHit> {
         let ray = Ray::new(
             na::Point3::new(origin.x, origin.y, origin.z),
             na::Vector3::new(dir.x, dir.y, dir.z),
         );
-        let filter = QueryFilter::default().exclude_sensors();
+        let filter = self.rapier_query_filter(filter);
 
         let (collider_handle, intersection) = self.query_pipeline.cast_ray_and_get_normal(
             &self.bodies,
@@ -873,14 +912,82 @@ impl RapierBackend {
         })
     }
 
+    /// Sweep a shape along a direction and return the closest hit.
+    ///
+    /// The returned [`RaycastHit`] reuses the raycast payload: `point` is the
+    /// world-space contact point on the hit collider, `normal` its outward
+    /// surface normal, and `distance` the travel distance of the sweep.
+    /// When the shape starts in penetration the hit reports a zero distance
+    /// and the contact geometry is only a conservative approximation.
+    pub fn cast_shape_filtered(
+        &self,
+        shape: &ColliderShape,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+        max_dist: f32,
+        filter: &PhysicsQueryFilter,
+    ) -> Option<RaycastHit> {
+        use rapier3d::parry::query::ShapeCastOptions;
+
+        let rapier_shape = to_rapier_shared_shape(shape);
+        let iso = Isometry::from_parts(
+            na::Translation3::new(origin.x, origin.y, origin.z),
+            na::UnitQuaternion::identity(),
+        );
+        let rapier_dir = na::Vector3::new(dir.x, dir.y, dir.z);
+        let options = ShapeCastOptions {
+            max_time_of_impact: max_dist,
+            target_distance: 0.0,
+            stop_at_penetration: true,
+            compute_impact_geometry_on_penetration: false,
+        };
+        let filter = self.rapier_query_filter(filter);
+
+        let (collider_handle, hit) = self.query_pipeline.cast_shape(
+            &self.bodies,
+            &self.colliders,
+            &iso,
+            &rapier_dir,
+            &*rapier_shape,
+            options,
+            filter,
+        )?;
+
+        let entity = self
+            .collider_map
+            .iter()
+            .find(|(_, &(handle, _))| handle == collider_handle)
+            .map(|(&entity, _)| entity)?;
+
+        // `normal1`/`witness1` refer to the hit world collider in world
+        // space (rapier swaps the composite-shape side for shape casts).
+        Some(RaycastHit {
+            entity,
+            point: glam::Vec3::new(hit.witness1.x, hit.witness1.y, hit.witness1.z),
+            normal: glam::Vec3::new(hit.normal1.x, hit.normal1.y, hit.normal1.z),
+            distance: hit.time_of_impact,
+        })
+    }
+
     /// Find all entities whose colliders overlap with the given shape.
     pub fn query_proximity(&self, shape: &ColliderShape, pos: glam::Vec3) -> Vec<Entity> {
+        self.query_proximity_filtered(shape, pos, &PhysicsQueryFilter::default())
+    }
+
+    /// Find all entities whose colliders overlap with the given shape,
+    /// honouring a candidate filter.
+    pub fn query_proximity_filtered(
+        &self,
+        shape: &ColliderShape,
+        pos: glam::Vec3,
+        filter: &PhysicsQueryFilter,
+    ) -> Vec<Entity> {
         let rapier_shape = to_rapier_shared_shape(shape);
         let iso = Isometry::from_parts(
             na::Translation3::new(pos.x, pos.y, pos.z),
             na::UnitQuaternion::identity(),
         );
-        let filter = QueryFilter::default().exclude_sensors();
+        let filter = self.rapier_query_filter(filter);
         let mut entities = Vec::new();
 
         self.query_pipeline.intersections_with_shape(

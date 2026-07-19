@@ -9,7 +9,9 @@ use crate::debug::{ColliderDebugInfo, PhysicsDebugDraw};
 use crate::events::{CollisionEvent, PhysicsEvents, TriggerEvent};
 use crate::gravity::{sum_source_gravity, GravitySource};
 use crate::joints::{JointDescriptor, JointHandle};
-use crate::queries::{OverlapQuery, QueryBatcher, QueryResults, RaycastQuery, SweepQuery};
+use crate::queries::{
+    OverlapQuery, PhysicsQueryFilter, QueryBatcher, QueryResults, RaycastQuery, SweepQuery,
+};
 use crate::{BodyType, Collider, Entity, PhysicsMaterial, Transform};
 
 // ── PhysicsCommand ──────────────────────────────────────────────────────────
@@ -497,6 +499,18 @@ impl PhysicsWorld {
         self.backend.raycast(origin, direction, max_distance)
     }
 
+    /// Cast a ray with a candidate filter and return the closest hit.
+    pub fn raycast_filtered(
+        &self,
+        origin: glam::Vec3,
+        direction: glam::Vec3,
+        max_distance: f32,
+        filter: &PhysicsQueryFilter,
+    ) -> Option<RaycastHit> {
+        self.backend
+            .raycast_filtered(origin, direction, max_distance, filter)
+    }
+
     /// Alias for `raycast`, used by engine-character.
     pub fn cast_ray(
         &self,
@@ -507,9 +521,37 @@ impl PhysicsWorld {
         self.backend.raycast(origin, direction, max_distance)
     }
 
+    /// Sweep a shape along a direction and return the closest hit.
+    ///
+    /// Reuses the [`RaycastHit`] payload: contact point and outward normal
+    /// on the hit collider, plus the sweep travel distance.
+    pub fn cast_shape(
+        &self,
+        shape: &ColliderShape,
+        origin: glam::Vec3,
+        direction: glam::Vec3,
+        max_distance: f32,
+        filter: &PhysicsQueryFilter,
+    ) -> Option<RaycastHit> {
+        self.backend
+            .cast_shape_filtered(shape, origin, direction, max_distance, filter)
+    }
+
     /// Find all entities whose colliders overlap with the given shape.
     pub fn query_proximity(&self, shape: &ColliderShape, position: glam::Vec3) -> Vec<Entity> {
         self.backend.query_proximity(shape, position)
+    }
+
+    /// Find all entities whose colliders overlap with the given shape,
+    /// honouring a candidate filter.
+    pub fn query_proximity_filtered(
+        &self,
+        shape: &ColliderShape,
+        position: glam::Vec3,
+        filter: &PhysicsQueryFilter,
+    ) -> Vec<Entity> {
+        self.backend
+            .query_proximity_filtered(shape, position, filter)
     }
 
     // ── Batched queries ──────────────────────────────────────────────

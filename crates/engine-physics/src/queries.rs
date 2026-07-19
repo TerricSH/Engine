@@ -2,6 +2,24 @@ use crate::components::ColliderShape;
 use crate::Entity;
 use glam::Vec3;
 
+/// Optional filter applied to physics world queries (raycast, shape cast,
+/// overlap).
+///
+/// The default filter reproduces the long-standing behaviour: every
+/// collision layer matches, sensor (trigger) colliders are skipped, and no
+/// entity is excluded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhysicsQueryFilter {
+    /// Only colliders whose `collision_group` shares at least one bit with
+    /// this mask are candidates. `None` matches every layer.
+    pub layer_mask: Option<u32>,
+    /// Include sensor (trigger) colliders in the query. Defaults to `false`.
+    pub include_sensors: bool,
+    /// Ignore every collider owned by this entity (for example
+    /// self-exclusion for character casts).
+    pub exclude_entity: Option<Entity>,
+}
+
 /// A raycast query that can be performed against the physics world.
 ///
 /// Safe to hold across frames — does not reference backend state.

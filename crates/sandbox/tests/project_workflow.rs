@@ -1156,6 +1156,9 @@ public sealed class PhysicsProbeBehaviour : EngineBehaviour
     private PhysicsQuery _hitQuery;
     private PhysicsQuery _missQuery;
     private PhysicsQuery _overlapQuery;
+    private PhysicsQuery _sweepHitQuery;
+    private PhysicsQuery _sweepMissQuery;
+    private PhysicsQuery _selfExcludedQuery;
     public int UpdateCount = 0;
 
     public void OnCreate()
@@ -1174,6 +1177,33 @@ public sealed class PhysicsProbeBehaviour : EngineBehaviour
             // Query handles never resolve on the frame that issued them.
             if (Physics.TryGetRaycastHit(_hitQuery, out _))
                 throw new InvalidOperationException("query resolved on its issuing frame");
+
+            // Filter validation rejects degenerate masks and ids up front.
+            try
+            {
+                Physics.Raycast(
+                    new Vector3(0.0f, 5.0f, 0.0f),
+                    new Vector3(0.0f, -1.0f, 0.0f),
+                    10.0f,
+                    new PhysicsQueryFilter { LayerMask = 0u });
+                throw new InvalidOperationException("zero layer mask was not rejected");
+            }
+            catch (ArgumentException)
+            {
+            }
+            try
+            {
+                Physics.SphereCast(
+                    new Vector3(0.0f, 5.0f, 0.0f),
+                    0.0f,
+                    new Vector3(0.0f, -1.0f, 0.0f),
+                    10.0f);
+                throw new InvalidOperationException("zero sweep radius was not rejected");
+            }
+            catch (ArgumentException)
+            {
+            }
+
             _hitQuery = Physics.Raycast(
                 new Vector3(0.0f, 5.0f, 0.0f),
                 new Vector3(0.0f, -1.0f, 0.0f),
@@ -1183,6 +1213,23 @@ public sealed class PhysicsProbeBehaviour : EngineBehaviour
                 new Vector3(0.0f, 1.0f, 0.0f),
                 10.0f);
             _overlapQuery = Physics.OverlapSphere(new Vector3(0.0f, 0.0f, 0.0f), 1.0f);
+            _sweepHitQuery = Physics.SphereCast(
+                new Vector3(0.0f, 5.0f, 0.0f),
+                0.5f,
+                new Vector3(0.0f, -1.0f, 0.0f),
+                10.0f);
+            _sweepMissQuery = Physics.SphereCast(
+                new Vector3(0.0f, 5.0f, 0.0f),
+                0.5f,
+                new Vector3(0.0f, 1.0f, 0.0f),
+                10.0f);
+            // Self-exclusion turns the ground probe into a miss; a layer mask
+            // matching the default collision group still hits.
+            _selfExcludedQuery = Physics.Raycast(
+                new Vector3(0.0f, 5.0f, 0.0f),
+                new Vector3(0.0f, -1.0f, 0.0f),
+                10.0f,
+                new PhysicsQueryFilter { ExcludeEntityId = "cube-01" });
             return;
         }
         if (UpdateCount == 2)
@@ -1200,6 +1247,52 @@ public sealed class PhysicsProbeBehaviour : EngineBehaviour
             if (!Physics.TryGetOverlapResult(_overlapQuery, out var entityIds) ||
                 !entityIds.Contains("cube-01"))
                 throw new InvalidOperationException("overlap sphere missed cube-01");
+
+            // Sphere casts deliver the same hit payload as raycasts.
+            if (!Physics.TryGetSphereCastHit(_sweepHitQuery, out var sweepHit))
+                throw new InvalidOperationException("sphere cast hit missing on the next frame");
+            if (sweepHit.EntityId != "cube-01")
+                throw new InvalidOperationException("sphere cast hit the wrong entity");
+            // The sphere surface touches the top face after 4.0 units of
+            // travel; the contact point and normal match the raycast's.
+            if (Math.Abs(sweepHit.Distance - 4.0f) > 1e-3f)
+                throw new InvalidOperationException(
+                    $"unexpected sphere cast distance {sweepHit.Distance}");
+            if (Math.Abs(sweepHit.Point.Y - 0.5f) > 5e-3f ||
+                Math.Abs(sweepHit.Normal.Y - 1.0f) > 1e-3f)
+                throw new InvalidOperationException("sphere cast hit geometry mismatch");
+            if (Physics.TryGetSphereCastHit(_sweepMissQuery, out _))
+                throw new InvalidOperationException("miss sphere cast resolved as a hit");
+
+            // The self-excluded ray found nothing to hit.
+            if (Physics.TryGetRaycastHit(_selfExcludedQuery, out _))
+                throw new InvalidOperationException("self-excluded raycast resolved as a hit");
+
+            // One call drains the whole batch, ordered by query id, and
+            // consumes the drained results.
+            var drained = Physics.DrainAll();
+            if (drained.Count != 6)
+                throw new InvalidOperationException($"expected 6 drained results, got {drained.Count}");
+            for (var index = 0; index < drained.Count; index += 1)
+            {
+                if (drained[index].Query.Id != (uint)(index + 1))
+                    throw new InvalidOperationException("drained results are not ordered by query id");
+            }
+            if (drained[0].Kind != PhysicsQueryResultKind.RaycastHit || drained[0].Hit is null)
+                throw new InvalidOperationException("drained raycast hit payload mismatch");
+            if (drained[1].Kind != PhysicsQueryResultKind.RaycastMiss)
+                throw new InvalidOperationException("drained raycast miss kind mismatch");
+            if (drained[2].Kind != PhysicsQueryResultKind.OverlapSphere ||
+                drained[2].EntityIds is null || !drained[2].EntityIds.Contains("cube-01"))
+                throw new InvalidOperationException("drained overlap payload mismatch");
+            if (drained[3].Kind != PhysicsQueryResultKind.SphereCastHit || drained[3].Hit is null)
+                throw new InvalidOperationException("drained sphere cast hit payload mismatch");
+            if (drained[4].Kind != PhysicsQueryResultKind.SphereCastMiss)
+                throw new InvalidOperationException("drained sphere cast miss kind mismatch");
+            if (drained[5].Kind != PhysicsQueryResultKind.RaycastMiss)
+                throw new InvalidOperationException("drained self-excluded miss kind mismatch");
+            if (Physics.TryGetRaycastHit(_hitQuery, out _) || Physics.DrainAll().Count != 0)
+                throw new InvalidOperationException("drained results must be consumed");
         }
         if (UpdateCount >= 3)
         {

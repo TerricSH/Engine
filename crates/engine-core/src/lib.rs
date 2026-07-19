@@ -1555,6 +1555,30 @@ impl EngineRuntime {
                         diagnostics.push(diagnostic);
                         continue;
                     }
+                    // `GameplayPhysicsQuery::validate` cannot know the world;
+                    // reject exclusion targets that name no existing entity.
+                    if let Some(excluded) = query
+                        .filter()
+                        .and_then(|filter| filter.exclude_entity.as_deref())
+                    {
+                        let excluded_exists = self
+                            .world_slot
+                            .with_world(|world| world.entity_by_persistent_id(excluded).is_some())
+                            .unwrap_or(false);
+                        if !excluded_exists {
+                            let mut diagnostic = Diagnostic::new(
+                                "SCRIPT_PHYSICS_QUERY_INVALID",
+                                DiagnosticSeverity::Error,
+                                "script",
+                                format!(
+                                    "script entity '{entity_id}' produced an invalid physics query: unknown exclude_entity id '{excluded}'"
+                                ),
+                            );
+                            diagnostic.entity = Some(entity_id);
+                            diagnostics.push(diagnostic);
+                            continue;
+                        }
+                    }
                     if self.pending_physics_queries.len()
                         >= engine_script::MAX_PENDING_PHYSICS_QUERIES
                     {

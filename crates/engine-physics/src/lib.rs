@@ -24,8 +24,8 @@ pub use gravity::{
 };
 pub use joints::{JointDescriptor, JointHandle, JointLimits, JointMotor, JointType};
 pub use queries::{
-    OverlapHitResult, OverlapQuery, QueryBatcher, QueryResults, RaycastHitResult, RaycastQuery,
-    SweepHitResult, SweepQuery,
+    OverlapHitResult, OverlapQuery, PhysicsQueryFilter, QueryBatcher, QueryResults,
+    RaycastHitResult, RaycastQuery, SweepHitResult, SweepQuery,
 };
 pub use world::{PhysicsCommand, PhysicsWorld};
 

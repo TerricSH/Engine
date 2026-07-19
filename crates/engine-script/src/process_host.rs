@@ -759,7 +759,8 @@ mod tests {
             "inst-0001",
             r#"[
                 {"type":"physics_query","query":{"kind":"raycast","query_id":7,"origin":[0,5,0],"direction":[0,-1,0],"max_distance":10}},
-                {"type":"physics_query","query":{"kind":"overlap_sphere","query_id":8,"center":[0,0,0],"radius":2.5}}
+                {"type":"physics_query","query":{"kind":"overlap_sphere","query_id":8,"center":[0,0,0],"radius":2.5}},
+                {"type":"physics_query","query":{"kind":"sphere_cast","query_id":9,"origin":[0,5,0],"radius":0.5,"direction":[0,-1,0],"max_distance":10,"filter":{"layer_mask":2,"include_sensors":true,"exclude_entity":"player-01"}}}
             ]"#,
         )
         .unwrap();
@@ -771,6 +772,7 @@ mod tests {
                     origin: [0.0, 5.0, 0.0],
                     direction: [0.0, -1.0, 0.0],
                     max_distance: 10.0,
+                    filter: None,
                 }
             }
         );
@@ -781,6 +783,24 @@ mod tests {
                     query_id: 8,
                     center: [0.0, 0.0, 0.0],
                     radius: 2.5,
+                    filter: None,
+                }
+            }
+        );
+        assert_eq!(
+            commands[2],
+            GameplayCommand::PhysicsQuery {
+                query: crate::GameplayPhysicsQuery::SphereCast {
+                    query_id: 9,
+                    origin: [0.0, 5.0, 0.0],
+                    radius: 0.5,
+                    direction: [0.0, -1.0, 0.0],
+                    max_distance: 10.0,
+                    filter: Some(crate::GameplayPhysicsQueryFilter {
+                        layer_mask: Some(2),
+                        include_sensors: true,
+                        exclude_entity: Some("player-01".into()),
+                    }),
                 }
             }
         );
@@ -795,6 +815,10 @@ mod tests {
             r#"[{"type":"physics_query","query":{"kind":"raycast","query_id":7,"origin":[0,5,0],"direction":[0,-1,0],"max_distance":0}}]"#,
             // Non-positive radius.
             r#"[{"type":"physics_query","query":{"kind":"overlap_sphere","query_id":8,"center":[0,0,0],"radius":-1}}]"#,
+            // Non-positive swept-sphere radius.
+            r#"[{"type":"physics_query","query":{"kind":"sphere_cast","query_id":9,"origin":[0,5,0],"radius":0,"direction":[0,-1,0],"max_distance":10}}]"#,
+            // A zero layer mask matches nothing and is never intentional.
+            r#"[{"type":"physics_query","query":{"kind":"raycast","query_id":7,"origin":[0,5,0],"direction":[0,-1,0],"max_distance":10,"filter":{"layer_mask":0}}}]"#,
         ] {
             let error = decode_gameplay_commands("inst-0001", json).unwrap_err();
             let message = error.to_string();

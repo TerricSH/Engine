@@ -93,6 +93,47 @@ pub const MAX_PHYSICS_OVERLAP_RESULTS: usize = 64;
 /// drain. Queries beyond the cap are rejected with a script diagnostic.
 pub const MAX_PENDING_PHYSICS_QUERIES: usize = 256;
 
+/// Optional filter applied to a script physics query.
+///
+/// All fields are optional; an absent filter (or an all-default filter)
+/// reproduces the original query behaviour: every collision layer matches,
+/// sensor (trigger) colliders are skipped, and no entity is excluded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameplayPhysicsQueryFilter {
+    /// Only colliders whose `collision_group` shares at least one bit with
+    /// this mask are candidates. `None` matches every layer. A zero mask
+    /// matches nothing and is rejected as a validation error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_mask: Option<u32>,
+    /// Include sensor (trigger) colliders in the query. Defaults to `false`,
+    /// preserving the long-standing sensor-excluding behaviour.
+    #[serde(default)]
+    pub include_sensors: bool,
+    /// Persistent id of an entity whose colliders the query ignores, for
+    /// example self-exclusion for character casts. The id must be a valid
+    /// entity id and — enforced by the runtime, which owns the world — must
+    /// name an existing entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_entity: Option<String>,
+}
+
+impl GameplayPhysicsQueryFilter {
+    /// Validate untrusted filter data received from a script host.
+    ///
+    /// This checks the self-contained invariants (non-zero mask, well-formed
+    /// entity id); the runtime separately rejects `exclude_entity` ids that
+    /// do not name an existing entity.
+    pub fn validate(&self) -> Result<(), String> {
+        if matches!(self.layer_mask, Some(0)) {
+            return Err("physics query layer_mask must be non-zero".into());
+        }
+        if let Some(exclude_entity) = &self.exclude_entity {
+            validate_entity_id(exclude_entity)?;
+        }
+        Ok(())
+    }
+}
+
 /// Active physics query requested by a script through the gameplay bridge.
 ///
 /// Queries travel as deferred gameplay commands: the engine validates and
@@ -115,6 +156,26 @@ pub enum GameplayPhysicsQuery {
         direction: [f32; 3],
         /// Maximum travel distance, clamped to [`MAX_PHYSICS_QUERY_DISTANCE`].
         max_distance: f32,
+        /// Optional candidate filter (layer mask, sensors, self-exclusion).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<GameplayPhysicsQueryFilter>,
+    },
+    /// Sweep a sphere along a direction and report the closest hit, if any.
+    SphereCast {
+        /// Script-chosen correlator echoed back with the result.
+        query_id: u32,
+        /// World-space centre of the sphere at the start of the sweep.
+        origin: [f32; 3],
+        /// Sphere radius, clamped to [`MAX_PHYSICS_QUERY_DISTANCE`].
+        radius: f32,
+        /// Sweep direction. Does not need to be normalised; the engine
+        /// normalises before querying. Must not be zero length.
+        direction: [f32; 3],
+        /// Maximum travel distance, clamped to [`MAX_PHYSICS_QUERY_DISTANCE`].
+        max_distance: f32,
+        /// Optional candidate filter (layer mask, sensors, self-exclusion).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<GameplayPhysicsQueryFilter>,
     },
     /// Find every collider overlapping a world-space sphere.
     OverlapSphere {
@@ -124,6 +185,9 @@ pub enum GameplayPhysicsQuery {
         center: [f32; 3],
         /// Sphere radius, clamped to [`MAX_PHYSICS_QUERY_DISTANCE`].
         radius: f32,
+        /// Optional candidate filter (layer mask, sensors, self-exclusion).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<GameplayPhysicsQueryFilter>,
     },
 }
 
@@ -131,12 +195,26 @@ impl GameplayPhysicsQuery {
     /// The script-chosen correlator carried by this query.
     pub fn query_id(&self) -> u32 {
         match self {
-            Self::Raycast { query_id, .. } | Self::OverlapSphere { query_id, .. } => *query_id,
+            Self::Raycast { query_id, .. }
+            | Self::SphereCast { query_id, .. }
+            | Self::OverlapSphere { query_id, .. } => *query_id,
+        }
+    }
+
+    /// The optional candidate filter carried by this query.
+    pub fn filter(&self) -> Option<&GameplayPhysicsQueryFilter> {
+        match self {
+            Self::Raycast { filter, .. }
+            | Self::SphereCast { filter, .. }
+            | Self::OverlapSphere { filter, .. } => filter.as_ref(),
         }
     }
 
     /// Validate untrusted query data received from a script host.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(filter) = self.filter() {
+            filter.validate()?;
+        }
         match self {
             Self::Raycast {
                 origin,
@@ -147,14 +225,30 @@ impl GameplayPhysicsQuery {
                 if !origin.iter().all(|value| value.is_finite()) {
                     return Err("raycast origin must contain only finite values".into());
                 }
-                if !direction.iter().all(|value| value.is_finite()) {
-                    return Err("raycast direction must contain only finite values".into());
-                }
-                if direction.iter().map(|value| value * value).sum::<f32>() <= f32::EPSILON {
-                    return Err("raycast direction must not be zero length".into());
-                }
+                validate_sweep_direction(direction, "raycast")?;
                 if !max_distance.is_finite() || *max_distance <= 0.0 {
                     return Err("raycast max_distance must be finite and greater than zero".into());
+                }
+                Ok(())
+            }
+            Self::SphereCast {
+                origin,
+                radius,
+                direction,
+                max_distance,
+                ..
+            } => {
+                if !origin.iter().all(|value| value.is_finite()) {
+                    return Err("sphere cast origin must contain only finite values".into());
+                }
+                if !radius.is_finite() || *radius <= 0.0 {
+                    return Err("sphere cast radius must be finite and greater than zero".into());
+                }
+                validate_sweep_direction(direction, "sphere cast")?;
+                if !max_distance.is_finite() || *max_distance <= 0.0 {
+                    return Err(
+                        "sphere cast max_distance must be finite and greater than zero".into(),
+                    );
                 }
                 Ok(())
             }
@@ -169,6 +263,19 @@ impl GameplayPhysicsQuery {
             }
         }
     }
+}
+
+/// Shared validation for raycast / sphere-cast sweep directions.
+fn validate_sweep_direction(direction: &[f32; 3], query_kind: &str) -> Result<(), String> {
+    if !direction.iter().all(|value| value.is_finite()) {
+        return Err(format!(
+            "{query_kind} direction must contain only finite values"
+        ));
+    }
+    if direction.iter().map(|value| value * value).sum::<f32>() <= f32::EPSILON {
+        return Err(format!("{query_kind} direction must not be zero length"));
+    }
+    Ok(())
 }
 
 /// Outcome of a script physics query, delivered with the next frame
@@ -194,6 +301,27 @@ pub enum GameplayPhysicsQueryResult {
     },
     /// A raycast found no collider within range.
     RaycastMiss {
+        /// Correlator from the issuing query.
+        query_id: u32,
+    },
+    /// A sphere cast found a collider attached to the given persistent
+    /// entity. Carries the same payload as [`Self::RaycastHit`]: the
+    /// world-space contact point on the hit collider, its outward normal,
+    /// and the sweep travel distance.
+    SphereCastHit {
+        /// Correlator from the issuing query.
+        query_id: u32,
+        /// Persistent entity id of the closest hit — never a raw ECS handle.
+        entity_id: String,
+        /// World-space contact point on the hit collider.
+        point: [f32; 3],
+        /// World-space outward surface normal of the hit collider.
+        normal: [f32; 3],
+        /// Travel distance from the sweep origin to the impact.
+        distance: f32,
+    },
+    /// A sphere cast found no collider within range.
+    SphereCastMiss {
         /// Correlator from the issuing query.
         query_id: u32,
     },
@@ -1657,6 +1785,7 @@ mod tests {
                 origin: [0.0, 5.0, 0.0],
                 direction: [0.0, -1.0, 0.0],
                 max_distance: 10.0,
+                filter: None,
             },
         };
         assert_eq!(
@@ -1675,6 +1804,7 @@ mod tests {
                 query_id: 8,
                 center: [1.0, 2.0, 3.0],
                 radius: 2.5,
+                filter: None,
             },
         };
         assert_eq!(
@@ -1683,10 +1813,124 @@ mod tests {
         );
         assert!(overlap.validate().is_ok());
 
+        let sphere_cast = GameplayCommand::PhysicsQuery {
+            query: GameplayPhysicsQuery::SphereCast {
+                query_id: 9,
+                origin: [0.0, 5.0, 0.0],
+                radius: 0.5,
+                direction: [0.0, -1.0, 0.0],
+                max_distance: 10.0,
+                filter: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&sphere_cast).unwrap(),
+            r#"{"type":"physics_query","query":{"kind":"sphere_cast","query_id":9,"origin":[0.0,5.0,0.0],"radius":0.5,"direction":[0.0,-1.0,0.0],"max_distance":10.0}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(&serde_json::to_string(&sphere_cast).unwrap())
+                .unwrap(),
+            sphere_cast
+        );
+        assert!(sphere_cast.validate().is_ok());
+
         let GameplayCommand::PhysicsQuery { query } = &raycast else {
             panic!("expected physics query command");
         };
         assert_eq!(query.query_id(), 7);
+        assert_eq!(query.filter(), None);
+    }
+
+    #[test]
+    fn physics_query_filters_have_a_stable_validated_contract() {
+        let filter = GameplayPhysicsQueryFilter {
+            layer_mask: Some(0b0100),
+            include_sensors: true,
+            exclude_entity: Some("player-01".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&filter).unwrap(),
+            r#"{"layer_mask":4,"include_sensors":true,"exclude_entity":"player-01"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsQueryFilter>(
+                r#"{"layer_mask":4,"include_sensors":true,"exclude_entity":"player-01"}"#
+            )
+            .unwrap(),
+            filter
+        );
+        // Older hosts send no filter at all; a partial filter defaults the
+        // remaining fields.
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsQueryFilter>(r#"{"layer_mask":4}"#).unwrap(),
+            GameplayPhysicsQueryFilter {
+                layer_mask: Some(4),
+                include_sensors: false,
+                exclude_entity: None,
+            }
+        );
+
+        let filtered_raycast = GameplayPhysicsQuery::Raycast {
+            query_id: 3,
+            origin: [0.0; 3],
+            direction: [0.0, -1.0, 0.0],
+            max_distance: 10.0,
+            filter: Some(filter.clone()),
+        };
+        assert_eq!(
+            serde_json::to_string(&filtered_raycast).unwrap(),
+            r#"{"kind":"raycast","query_id":3,"origin":[0.0,0.0,0.0],"direction":[0.0,-1.0,0.0],"max_distance":10.0,"filter":{"layer_mask":4,"include_sensors":true,"exclude_entity":"player-01"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsQuery>(
+                &serde_json::to_string(&filtered_raycast).unwrap()
+            )
+            .unwrap(),
+            filtered_raycast
+        );
+        assert_eq!(filtered_raycast.filter(), Some(&filter));
+        assert!(filtered_raycast.validate().is_ok());
+        // A filter on a pre-0.6.0 query simply deserialises to `None`.
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsQuery>(
+                r#"{"kind":"raycast","query_id":3,"origin":[0,0,0],"direction":[0,-1,0],"max_distance":10}"#
+            )
+            .unwrap()
+            .filter(),
+            None
+        );
+    }
+
+    #[test]
+    fn untrusted_physics_query_filters_reject_degenerate_values() {
+        let zero_mask = GameplayPhysicsQuery::OverlapSphere {
+            query_id: 1,
+            center: [0.0; 3],
+            radius: 1.0,
+            filter: Some(GameplayPhysicsQueryFilter {
+                layer_mask: Some(0),
+                include_sensors: false,
+                exclude_entity: None,
+            }),
+        };
+        assert!(zero_mask.validate().unwrap_err().contains("non-zero"));
+
+        let bad_exclude = GameplayPhysicsQuery::SphereCast {
+            query_id: 1,
+            origin: [0.0; 3],
+            radius: 0.5,
+            direction: [0.0, -1.0, 0.0],
+            max_distance: 10.0,
+            filter: Some(GameplayPhysicsQueryFilter {
+                layer_mask: None,
+                include_sensors: false,
+                exclude_entity: Some("not/an id".into()),
+            }),
+        };
+        assert!(bad_exclude
+            .validate()
+            .unwrap_err()
+            .contains("invalid entity id"));
     }
 
     #[test]
@@ -1716,6 +1960,38 @@ mod tests {
             r#"{"kind":"raycast_miss","query_id":4}"#
         );
 
+        let sphere_hit = GameplayPhysicsQueryResult::SphereCastHit {
+            query_id: 6,
+            entity_id: "cube-01".into(),
+            point: [0.0, 0.5, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            distance: 4.0,
+        };
+        assert_eq!(
+            serde_json::to_string(&sphere_hit).unwrap(),
+            r#"{"kind":"sphere_cast_hit","query_id":6,"entity_id":"cube-01","point":[0.0,0.5,0.0],"normal":[0.0,1.0,0.0],"distance":4.0}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsQueryResult>(
+                &serde_json::to_string(&sphere_hit).unwrap()
+            )
+            .unwrap(),
+            sphere_hit
+        );
+
+        let sphere_miss = GameplayPhysicsQueryResult::SphereCastMiss { query_id: 7 };
+        assert_eq!(
+            serde_json::to_string(&sphere_miss).unwrap(),
+            r#"{"kind":"sphere_cast_miss","query_id":7}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsQueryResult>(
+                r#"{"kind":"sphere_cast_miss","query_id":7}"#
+            )
+            .unwrap(),
+            sphere_miss
+        );
+
         let overlap = GameplayPhysicsQueryResult::OverlapSphere {
             query_id: 5,
             entity_ids: vec!["cube-01".into(), "physics-peer".into()],
@@ -1740,6 +2016,7 @@ mod tests {
             origin: [f32::NAN, 0.0, 0.0],
             direction: [0.0, -1.0, 0.0],
             max_distance: 10.0,
+            filter: None,
         };
         assert!(nan_origin.validate().unwrap_err().contains("finite"));
 
@@ -1748,6 +2025,7 @@ mod tests {
             origin: [0.0; 3],
             direction: [f32::INFINITY, 0.0, 0.0],
             max_distance: 10.0,
+            filter: None,
         };
         assert!(infinite_direction
             .validate()
@@ -1759,8 +2037,22 @@ mod tests {
             origin: [0.0; 3],
             direction: [0.0; 3],
             max_distance: 10.0,
+            filter: None,
         };
         assert!(zero_direction
+            .validate()
+            .unwrap_err()
+            .contains("zero length"));
+
+        let zero_cast_direction = GameplayPhysicsQuery::SphereCast {
+            query_id: 1,
+            origin: [0.0; 3],
+            radius: 0.5,
+            direction: [0.0; 3],
+            max_distance: 10.0,
+            filter: None,
+        };
+        assert!(zero_cast_direction
             .validate()
             .unwrap_err()
             .contains("zero length"));
@@ -1772,6 +2064,7 @@ mod tests {
                     origin: [0.0; 3],
                     direction: [0.0, -1.0, 0.0],
                     max_distance: 0.0,
+                    filter: None,
                 },
             },
             GameplayCommand::PhysicsQuery {
@@ -1780,6 +2073,27 @@ mod tests {
                     origin: [0.0; 3],
                     direction: [0.0, -1.0, 0.0],
                     max_distance: f32::INFINITY,
+                    filter: None,
+                },
+            },
+            GameplayCommand::PhysicsQuery {
+                query: GameplayPhysicsQuery::SphereCast {
+                    query_id: 1,
+                    origin: [0.0; 3],
+                    radius: 0.0,
+                    direction: [0.0, -1.0, 0.0],
+                    max_distance: 10.0,
+                    filter: None,
+                },
+            },
+            GameplayCommand::PhysicsQuery {
+                query: GameplayPhysicsQuery::SphereCast {
+                    query_id: 1,
+                    origin: [0.0, f32::NAN, 0.0],
+                    radius: 0.5,
+                    direction: [0.0, -1.0, 0.0],
+                    max_distance: 10.0,
+                    filter: None,
                 },
             },
             GameplayCommand::PhysicsQuery {
@@ -1787,6 +2101,7 @@ mod tests {
                     query_id: 2,
                     center: [0.0, f32::NAN, 0.0],
                     radius: 1.0,
+                    filter: None,
                 },
             },
             GameplayCommand::PhysicsQuery {
@@ -1794,6 +2109,7 @@ mod tests {
                     query_id: 2,
                     center: [0.0; 3],
                     radius: -1.0,
+                    filter: None,
                 },
             },
         ] {

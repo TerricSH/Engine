@@ -40,9 +40,9 @@ const SCRIPT_SDK_PROJECT: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
     <Nullable>enable</Nullable>
     <AssemblyName>EngineGameplay</AssemblyName>
     <RootNamespace>Engine</RootNamespace>
-    <Version>0.5.0</Version>
-    <AssemblyVersion>0.5.0.0</AssemblyVersion>
-    <FileVersion>0.5.0.0</FileVersion>
+    <Version>0.6.0</Version>
+    <AssemblyVersion>0.6.0.0</AssemblyVersion>
+    <FileVersion>0.6.0.0</FileVersion>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
@@ -86,14 +86,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.5.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.6.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.5.0";
+    public const string Version = "0.6.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
@@ -831,8 +831,31 @@ public sealed class PhysicsEvent
 
 // Correlates a deferred physics query with its result. Queries execute at
 // the next frame boundary; the handle is frame-local and only meaningful to
-// TryGetRaycastHit/TryGetOverlapResult on the frame after it was issued.
+// TryGetRaycastHit/TryGetSphereCastHit/TryGetOverlapResult on the frame
+// after it was issued.
 public readonly record struct PhysicsQuery(uint Id);
+
+// Optional candidate filter shared by every physics query kind. LayerMask
+// matches a collider when it shares at least one bit with the collider's
+// collision_group (colliders default to every layer bit set); IncludeSensors
+// opts sensor (trigger) colliders into the query (default false, preserving
+// the original sensor-excluding behaviour); ExcludeEntityId skips every
+// collider owned by that persistent entity (for example self-exclusion for
+// character casts) and must name an existing entity.
+public sealed class PhysicsQueryFilter
+{
+    public uint? LayerMask { get; set; }
+    public bool IncludeSensors { get; set; }
+    public string? ExcludeEntityId { get; set; }
+
+    internal void Validate(string parameterName)
+    {
+        if (LayerMask is 0u)
+            throw new ArgumentException("Layer mask must be non-zero", parameterName);
+        if (ExcludeEntityId is not null)
+            UIValidation.EntityId(ExcludeEntityId, parameterName);
+    }
+}
 
 public sealed class RaycastHit
 {
@@ -860,6 +883,45 @@ public sealed class RaycastHit
     public Entity? Entity => _scene.FindEntity(EntityId);
 }
 
+// The outcome of one physics query, as returned by ScriptPhysics.DrainAll.
+// Hit carries the contact payload for hit kinds; EntityIds carries the
+// overlap payload for the overlap kind.
+public enum PhysicsQueryResultKind
+{
+    RaycastHit,
+    RaycastMiss,
+    SphereCastHit,
+    SphereCastMiss,
+    OverlapSphere,
+}
+
+public sealed class PhysicsQueryResult
+{
+    internal PhysicsQueryResult(PhysicsQuery query, PhysicsQueryResultState state, ScriptScene scene)
+    {
+        Query = query;
+        Kind = state.Kind switch
+        {
+            "raycast_hit" => PhysicsQueryResultKind.RaycastHit,
+            "raycast_miss" => PhysicsQueryResultKind.RaycastMiss,
+            "sphere_cast_hit" => PhysicsQueryResultKind.SphereCastHit,
+            "sphere_cast_miss" => PhysicsQueryResultKind.SphereCastMiss,
+            _ => PhysicsQueryResultKind.OverlapSphere,
+        };
+        Hit = state.Kind is "raycast_hit" or "sphere_cast_hit"
+            ? new RaycastHit(state, scene)
+            : null;
+        EntityIds = state.Kind == "overlap_sphere"
+            ? state.EntityIds ?? (IReadOnlyList<string>)Array.Empty<string>()
+            : null;
+    }
+
+    public PhysicsQuery Query { get; }
+    public PhysicsQueryResultKind Kind { get; }
+    public RaycastHit? Hit { get; }
+    public IReadOnlyList<string>? EntityIds { get; }
+}
+
 public sealed class ScriptPhysics
 {
     // Mirrors the native query bounds: ray distance and sphere radius are
@@ -885,44 +947,83 @@ public sealed class ScriptPhysics
     // the physics world at the frame boundary and delivers results with the
     // next frame's context. Invalid arguments throw before anything is
     // queued, surfacing as a script error for this frame.
-    public PhysicsQuery Raycast(Vector3 origin, Vector3 direction, float maxDistance)
+    public PhysicsQuery Raycast(
+        Vector3 origin,
+        Vector3 direction,
+        float maxDistance,
+        PhysicsQueryFilter? filter = null)
     {
-        UIValidation.Finite(origin.X, nameof(origin));
-        UIValidation.Finite(origin.Y, nameof(origin));
-        UIValidation.Finite(origin.Z, nameof(origin));
-        UIValidation.Finite(direction.X, nameof(direction));
-        UIValidation.Finite(direction.Y, nameof(direction));
-        UIValidation.Finite(direction.Z, nameof(direction));
-        if (direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z
-            <= MinDirectionLengthSquared)
-            throw new ArgumentException("Raycast direction must be non-zero", nameof(direction));
+        Finite(origin, nameof(origin));
+        ValidateDirection(direction, "Raycast");
         UIValidation.Positive(maxDistance, nameof(maxDistance));
+        filter?.Validate(nameof(filter));
         var query = AllocateQuery();
         _pendingQueries.Add(PhysicsQueryState.Raycast(
             query.Id,
             origin,
             direction,
-            Math.Min(maxDistance, MaxQueryDistance)));
+            Math.Min(maxDistance, MaxQueryDistance),
+            PhysicsQueryFilterState.From(filter)));
         return query;
     }
 
-    public PhysicsQuery OverlapSphere(Vector3 center, float radius)
+    // Sweeps a sphere along a direction and reports the closest hit. The hit
+    // payload mirrors a raycast: contact point and outward normal on the hit
+    // collider plus the sweep travel distance.
+    public PhysicsQuery SphereCast(
+        Vector3 origin,
+        float radius,
+        Vector3 direction,
+        float maxDistance,
+        PhysicsQueryFilter? filter = null)
     {
-        UIValidation.Finite(center.X, nameof(center));
-        UIValidation.Finite(center.Y, nameof(center));
-        UIValidation.Finite(center.Z, nameof(center));
+        Finite(origin, nameof(origin));
         UIValidation.Positive(radius, nameof(radius));
+        ValidateDirection(direction, "SphereCast");
+        UIValidation.Positive(maxDistance, nameof(maxDistance));
+        filter?.Validate(nameof(filter));
+        var query = AllocateQuery();
+        _pendingQueries.Add(PhysicsQueryState.SphereCast(
+            query.Id,
+            origin,
+            Math.Min(radius, MaxQueryDistance),
+            direction,
+            Math.Min(maxDistance, MaxQueryDistance),
+            PhysicsQueryFilterState.From(filter)));
+        return query;
+    }
+
+    public PhysicsQuery OverlapSphere(
+        Vector3 center,
+        float radius,
+        PhysicsQueryFilter? filter = null)
+    {
+        Finite(center, nameof(center));
+        UIValidation.Positive(radius, nameof(radius));
+        filter?.Validate(nameof(filter));
         var query = AllocateQuery();
         _pendingQueries.Add(PhysicsQueryState.OverlapSphere(
             query.Id,
             center,
-            Math.Min(radius, MaxQueryDistance)));
+            Math.Min(radius, MaxQueryDistance),
+            PhysicsQueryFilterState.From(filter)));
         return query;
     }
 
     public bool TryGetRaycastHit(PhysicsQuery query, out RaycastHit hit)
     {
         if (_queryResults.TryGetValue(query.Id, out var state) && state.Kind == "raycast_hit")
+        {
+            hit = new RaycastHit(state, _scene);
+            return true;
+        }
+        hit = null!;
+        return false;
+    }
+
+    public bool TryGetSphereCastHit(PhysicsQuery query, out RaycastHit hit)
+    {
+        if (_queryResults.TryGetValue(query.Id, out var state) && state.Kind == "sphere_cast_hit")
         {
             hit = new RaycastHit(state, _scene);
             return true;
@@ -942,6 +1043,20 @@ public sealed class ScriptPhysics
         return false;
     }
 
+    // Drains every result for this frame in one call, ordered by query id —
+    // the batch counterpart to the per-handle TryGet methods. Drained
+    // results are consumed: TryGetRaycastHit/TryGetSphereCastHit/
+    // TryGetOverlapResult no longer resolve them afterwards.
+    public List<PhysicsQueryResult> DrainAll()
+    {
+        var drained = _queryResults
+            .OrderBy(pair => pair.Key)
+            .Select(pair => new PhysicsQueryResult(new PhysicsQuery(pair.Key), pair.Value, _scene))
+            .ToList();
+        _queryResults.Clear();
+        return drained;
+    }
+
     internal void Replace(
         IReadOnlyList<PhysicsEventState> events,
         IReadOnlyList<PhysicsQueryResultState> queryResults)
@@ -956,6 +1071,21 @@ public sealed class ScriptPhysics
     {
         commands.AddRange(_pendingQueries.Select(GameplayCommandState.PhysicsQuery));
         _pendingQueries.Clear();
+    }
+
+    private static void Finite(Vector3 value, string parameterName)
+    {
+        UIValidation.Finite(value.X, parameterName);
+        UIValidation.Finite(value.Y, parameterName);
+        UIValidation.Finite(value.Z, parameterName);
+    }
+
+    private static void ValidateDirection(Vector3 direction, string queryKind)
+    {
+        Finite(direction, nameof(direction));
+        if (direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z
+            <= MinDirectionLengthSquared)
+            throw new ArgumentException($"{queryKind} direction must be non-zero", nameof(direction));
     }
 
     private PhysicsQuery AllocateQuery()
@@ -1790,6 +1920,30 @@ internal sealed class PhysicsQueryResultState
     public float? Distance { get; set; }
 }
 
+internal sealed class PhysicsQueryFilterState
+{
+    [JsonPropertyName("layer_mask")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public uint? LayerMask { get; init; }
+
+    [JsonPropertyName("include_sensors")]
+    public bool IncludeSensors { get; init; }
+
+    [JsonPropertyName("exclude_entity")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ExcludeEntityId { get; init; }
+
+    internal static PhysicsQueryFilterState? From(PhysicsQueryFilter? filter) =>
+        filter is null
+            ? null
+            : new PhysicsQueryFilterState
+            {
+                LayerMask = filter.LayerMask,
+                IncludeSensors = filter.IncludeSensors,
+                ExcludeEntityId = filter.ExcludeEntityId
+            };
+}
+
 internal sealed class PhysicsQueryState
 {
     [JsonPropertyName("kind")]
@@ -1801,6 +1955,10 @@ internal sealed class PhysicsQueryState
     [JsonPropertyName("origin")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public float[]? Origin { get; init; }
+
+    [JsonPropertyName("radius")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? Radius { get; init; }
 
     [JsonPropertyName("direction")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -1814,31 +1972,56 @@ internal sealed class PhysicsQueryState
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public float[]? Center { get; init; }
 
-    [JsonPropertyName("radius")]
+    [JsonPropertyName("filter")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public float? Radius { get; init; }
+    public PhysicsQueryFilterState? Filter { get; init; }
 
     public static PhysicsQueryState Raycast(
         uint queryId,
         Vector3 origin,
         Vector3 direction,
-        float maxDistance) =>
+        float maxDistance,
+        PhysicsQueryFilterState? filter) =>
         new()
         {
             Kind = "raycast",
             QueryId = queryId,
             Origin = new[] { origin.X, origin.Y, origin.Z },
             Direction = new[] { direction.X, direction.Y, direction.Z },
-            MaxDistance = maxDistance
+            MaxDistance = maxDistance,
+            Filter = filter
         };
 
-    public static PhysicsQueryState OverlapSphere(uint queryId, Vector3 center, float radius) =>
+    public static PhysicsQueryState SphereCast(
+        uint queryId,
+        Vector3 origin,
+        float radius,
+        Vector3 direction,
+        float maxDistance,
+        PhysicsQueryFilterState? filter) =>
+        new()
+        {
+            Kind = "sphere_cast",
+            QueryId = queryId,
+            Origin = new[] { origin.X, origin.Y, origin.Z },
+            Radius = radius,
+            Direction = new[] { direction.X, direction.Y, direction.Z },
+            MaxDistance = maxDistance,
+            Filter = filter
+        };
+
+    public static PhysicsQueryState OverlapSphere(
+        uint queryId,
+        Vector3 center,
+        float radius,
+        PhysicsQueryFilterState? filter) =>
         new()
         {
             Kind = "overlap_sphere",
             QueryId = queryId,
             Center = new[] { center.X, center.Y, center.Z },
-            Radius = radius
+            Radius = radius,
+            Filter = filter
         };
 }
 
@@ -2869,7 +3052,7 @@ pub(crate) fn inspect_project_scripts(
                 .into(),
         ),
         (None, Some(_)) => {
-            return Err("script_assembly is configured without an authoring script_project".into())
+            return Err("script_assembly is configured without an authoring script_project".into());
         }
     };
 
@@ -2883,18 +3066,18 @@ pub(crate) fn inspect_project_scripts(
             Some(Value::Str(value)) if !value.trim().is_empty() => value,
             _ => {
                 return Err(format!(
-                "entity '{}' has an engine.script component without a non-empty string assembly_id",
-                entity.persistent_id
-            ))
+                    "entity '{}' has an engine.script component without a non-empty string assembly_id",
+                    entity.persistent_id
+                ));
             }
         };
         let class_name = match component.fields.get("class_name") {
             Some(Value::Str(value)) if !value.trim().is_empty() => value,
             _ => {
                 return Err(format!(
-                "entity '{}' has an engine.script component without a non-empty string class_name",
-                entity.persistent_id
-            ))
+                    "entity '{}' has an engine.script component without a non-empty string class_name",
+                    entity.persistent_id
+                ));
             }
         };
         let Some(expected) = configured.as_deref() else {
@@ -2940,7 +3123,7 @@ pub(crate) fn validate_runtime_script_references(
                 return Err(format!(
                     "entity '{}' has an invalid engine.script assembly_id",
                     entity.persistent_id
-                ))
+                ));
             }
         };
         match component.fields.get("class_name") {
@@ -2949,7 +3132,7 @@ pub(crate) fn validate_runtime_script_references(
                 return Err(format!(
                     "entity '{}' has an invalid engine.script class_name",
                     entity.persistent_id
-                ))
+                ));
             }
         }
         let Some(expected) = expected.as_deref() else {
@@ -3688,10 +3871,20 @@ mod tests {
         assert!(STARTER_SCRIPT_API_SOURCE
             .contains("public readonly record struct PhysicsQuery(uint Id)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class RaycastHit"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class PhysicsQueryFilter"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public uint? LayerMask { get; set; }"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool IncludeSensors { get; set; }"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public string? ExcludeEntityId { get; set; }"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery Raycast("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery SphereCast("));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery OverlapSphere("));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetRaycastHit("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetSphereCastHit("));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetOverlapResult("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public enum PhysicsQueryResultKind"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class PhysicsQueryResult"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public List<PhysicsQueryResult> DrainAll()"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Kind = \"sphere_cast\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"physics_query\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"physics_query_results\")]"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Physics.DrainTo(commands)"));
