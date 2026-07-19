@@ -52,6 +52,44 @@ jobs:
         run: ./.github/scripts/ci.ps1 -Task ProjectWorkflow
       - name: Headless scene and game-project QA
         run: ./.github/scripts/ci.ps1 -Task Qa
+      - name: Archive soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report-windows
+          path: target/soak/soak-report.json
+          if-no-files-found: ignore
+
+  rust-quality-linux:
+    name: Linux core tests (non-GPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Format
+        run: cargo fmt --all -- --check
+      # The full workspace builds headlessly on Linux except
+      # engine-editor-host, which requires wry/tao + webkit2gtk (editor UI)
+      # and stays Windows-only. Vulkan device tests, DX12, and the editor
+      # feature set remain covered by the Windows gates.
+      - name: Clippy (core crates, warnings are errors)
+        run: cargo clippy --workspace --exclude engine-editor-host --all-targets --locked -- -D warnings
+      - name: Core workspace tests
+        run: cargo test --workspace --exclude engine-editor-host --locked
+      - name: Archive soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report-linux
+          path: target/soak/soak-report.json
+          if-no-files-found: ignore
 
   managed-interop:
     name: C# Release build and native ABI smoke
