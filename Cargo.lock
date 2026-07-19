@@ -4212,6 +4212,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "windows 0.58.0",
 ]
 
 [[package]]

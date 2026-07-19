@@ -5,6 +5,8 @@ use engine_asset::cook::{read_cooked_artifact, AssetType, SourceManifest};
 use engine_asset::project::GameProject;
 use engine_scene::Scene;
 
+mod common;
+
 fn sandbox() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sandbox"))
 }
@@ -508,6 +510,9 @@ fn imports_texture_and_rolls_back_every_rejected_or_failed_import() {
 #[cfg(feature = "subsystem-scripting-csharp")]
 #[test]
 fn csharp_scene_load_transitions_to_catalog_scene() {
+    if !common::require_tool("dotnet") {
+        return;
+    }
     let root = unique_project_root();
     let run_report = root.join("build/csharp-scene-load-run.json");
 
@@ -571,6 +576,9 @@ fn csharp_scene_load_transitions_to_catalog_scene() {
 #[cfg(feature = "subsystem-scripting-csharp")]
 #[test]
 fn csharp_script_api_sync_restores_engine_owned_contract() {
+    if !common::require_tool("dotnet") {
+        return;
+    }
     let root = unique_project_root();
     let output = run(&[
         "project",
@@ -628,6 +636,9 @@ fn csharp_script_api_sync_restores_engine_owned_contract() {
 #[cfg(feature = "subsystem-scripting-csharp")]
 #[test]
 fn csharp_project_builds_and_runs_managed_lifecycle() {
+    if !common::require_tool("dotnet") {
+        return;
+    }
     let root = unique_project_root();
     let run_report = root.join("build/csharp-run.json");
 
@@ -1072,6 +1083,9 @@ fn install_prefab_spawn_fixture(root: &Path) {
 #[cfg(feature = "subsystem-scripting-csharp")]
 #[test]
 fn csharp_scene_spawn_instantiates_cooked_prefabs_at_frame_boundaries() {
+    if !common::require_tool("dotnet") {
+        return;
+    }
     let root = unique_project_root();
     let run_report = root.join("build/csharp-spawn-run.json");
 
@@ -1311,6 +1325,9 @@ public sealed class PhysicsProbeBehaviour : EngineBehaviour
 #[cfg(feature = "subsystem-scripting-csharp")]
 #[test]
 fn csharp_physics_queries_round_trip_through_the_process_host() {
+    if !common::require_tool("dotnet") {
+        return;
+    }
     let root = unique_project_root();
     let output = run(&[
         "project",
@@ -1553,6 +1570,9 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
 #[cfg(feature = "subsystem-scripting-csharp")]
 #[test]
 fn csharp_component_access_round_trips_through_the_process_host() {
+    if !common::require_tool("dotnet") {
+        return;
+    }
     let root = unique_project_root();
     let output = run(&[
         "project",

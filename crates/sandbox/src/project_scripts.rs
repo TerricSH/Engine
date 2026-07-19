@@ -4088,6 +4088,12 @@ mod tests {
         use engine_scene::ComponentRecord;
         use engine_serialize::{SchemaVersion, Value};
 
+        // Environment-coupled test: it drives the real dotnet toolchain.
+        // Without the SDK this is a capability skip, not a failure (ENG-71).
+        if !crate::test_capability::require_tool("dotnet") {
+            return;
+        }
+
         let temporary = tempfile::tempdir().expect("temporary script project");
         let root = temporary.path();
         std::fs::create_dir_all(root.join("assets/source")).expect("asset source directory");

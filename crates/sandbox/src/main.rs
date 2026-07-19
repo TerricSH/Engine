@@ -15,6 +15,13 @@ mod project_scripts;
 mod qa;
 mod release_diagnostics;
 
+/// Environment-capability probes shared with the integration tests. The
+/// single source of truth lives in `tests/common/mod.rs` so unit tests and
+/// integration tests use the exact same capability-skip mechanism (ENG-71).
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_capability;
+
 #[cfg(feature = "backend-vulkan")]
 fn log_renderer_diagnostics(operation: &str, diagnostics: &[engine_renderer::Diagnostic]) {
     for diagnostic in diagnostics {

@@ -69,6 +69,14 @@ engine-audio = { path = "../engine-audio" }
 engine-nav = { path = "../engine-nav" }
 engine-ui = { path = "../engine-ui" }
 
+# Soak harness working-set sampling (ENG-71): process memory counters for the
+# memory-plateau assertion. Windows-only, test-only.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 [build-dependencies]
 serde_json.workspace = true
 sha2.workspace = true

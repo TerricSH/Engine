@@ -1494,28 +1494,38 @@ mod tests {
         assert!(display.contains("clean worktree"));
     }
 
+    /// Marker line the child-process helper prints so the parent test can
+    /// confirm stdout capture flows through the background-task machinery.
+    const CHILD_HELPER_STDOUT_MARKER: &str = "editor-build-task-test";
+
+    /// Child-process entry point spawned by
+    /// `background_task_exposes_output_completion_and_finished_cancellation`.
+    ///
+    /// Ignored during normal test runs: the parent test re-invokes this test
+    /// binary with `--exact`/`--ignored` so the child prints a marker line
+    /// and exits successfully. Spawning the current test executable keeps the
+    /// background-task test hermetic — it no longer depends on PowerShell,
+    /// `/bin/sh`, or any other system tool being installed (ENG-71).
+    #[test]
+    #[ignore = "child-process helper for the background-task test"]
+    fn child_process_helper_prints_marker_and_exits() {
+        println!("{CHILD_HELPER_STDOUT_MARKER}");
+    }
+
     #[test]
     fn background_task_exposes_output_completion_and_finished_cancellation() {
         let (_directory, manifest_path) = project_fixture();
-        #[cfg(windows)]
-        let (executable, arguments) = (
-            PathBuf::from("powershell.exe"),
-            vec![
-                OsString::from("-NoLogo"),
-                OsString::from("-NoProfile"),
-                OsString::from("-NonInteractive"),
-                OsString::from("-Command"),
-                OsString::from("Write-Output editor-build-task-test"),
-            ],
-        );
-        #[cfg(not(windows))]
-        let (executable, arguments) = (
-            PathBuf::from("/bin/sh"),
-            vec![
-                OsString::from("-c"),
-                OsString::from("printf editor-build-task-test"),
-            ],
-        );
+        // Spawn the current test executable in its helper mode: the binary
+        // always exists on every platform and needs no system shell, so the
+        // test exercises the spawn/output/cancellation machinery without
+        // conflating code correctness with environment contents.
+        let executable = std::env::current_exe().expect("current test executable");
+        let arguments = vec![
+            OsString::from("--exact"),
+            OsString::from("editor_build_ops::tests::child_process_helper_prints_marker_and_exits"),
+            OsString::from("--ignored"),
+            OsString::from("--nocapture"),
+        ];
         let plan = ProcessPlan {
             kind: EditorBuildOperationKind::CookAndCompile,
             executable,
@@ -1525,7 +1535,7 @@ mod tests {
         };
         let mut task = EditorBuildTask::spawn(plan).unwrap();
         assert_eq!(task.operation(), EditorBuildOperationKind::CookAndCompile);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let result = loop {
             if let Some(result) = task.try_complete() {
                 break result.unwrap();
@@ -1540,7 +1550,7 @@ mod tests {
         assert!(task
             .output_snapshot()
             .stdout
-            .contains("editor-build-task-test"));
+            .contains(CHILD_HELPER_STDOUT_MARKER));
         assert!(!task.cancel().unwrap());
     }
 
