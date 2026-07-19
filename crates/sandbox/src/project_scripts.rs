@@ -40,9 +40,9 @@ const SCRIPT_SDK_PROJECT: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
     <Nullable>enable</Nullable>
     <AssemblyName>EngineGameplay</AssemblyName>
     <RootNamespace>Engine</RootNamespace>
-    <Version>0.6.0</Version>
-    <AssemblyVersion>0.6.0.0</AssemblyVersion>
-    <FileVersion>0.6.0.0</FileVersion>
+    <Version>0.7.0</Version>
+    <AssemblyVersion>0.7.0.0</AssemblyVersion>
+    <FileVersion>0.7.0.0</FileVersion>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
@@ -86,14 +86,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.6.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.7.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.6.0";
+    public const string Version = "0.7.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
@@ -106,6 +106,324 @@ public readonly record struct Quaternion(float X, float Y, float Z, float W);
 // keep working in origin-relative coordinates; the origin itself is read-only
 // and advances only when the engine re-centres the world.
 public readonly record struct ScriptWorldOrigin(double X, double Y, double Z);
+
+// ── Procedural generation (PROCGEN-v1) ───────────────────────────────────
+// Synchronous, bit-exact port of the native `engine-procgen` crate. The
+// frame-context/command protocol is unchanged: these are pure functions
+// evaluated locally in the script process, which avoids the latency and
+// protocol churn of a deferred query and matches chunk-generation
+// throughput needs. Parity is enforced by the checked-in golden vectors
+// (crates/engine-procgen/tests/golden_vectors.json): the managed parity
+// harness (scripts/csharp/ProcGenParity) checks this port against the same
+// expected bit patterns as the Rust tests.
+//
+// Port rules (must mirror the Rust implementation exactly):
+// - all integer arithmetic is unchecked and wrapping (ulong/long);
+// - every float operation is a single IEEE-754 binary32 +, -, *, or /
+//   (deterministic on .NET Core 3.0+), with no FMA contraction and no
+//   transcendental functions (no MathF.Sin/Pow/Sqrt/...);
+// - coordinates snap to a Q24.8 fixed-point lattice (1/256 unit
+//   resolution, |c| < 2^23 world units); larger finite magnitudes saturate
+//   deterministically and non-finite inputs sample as exactly 0.0f.
+public readonly record struct ProcGenFbmParams(
+    int Octaves,
+    float Frequency,
+    float Amplitude,
+    float Lacunarity,
+    float Gain,
+    float OffsetX,
+    float OffsetY,
+    float OffsetZ,
+    bool Normalize)
+{
+    public static ProcGenFbmParams Default => new(4, 1.0f, 1.0f, 2.0f, 0.5f, 0.0f, 0.0f, 0.0f, true);
+
+    public void Validate()
+    {
+        if (Octaves < 1 || Octaves > 32)
+            throw new ArgumentOutOfRangeException(nameof(Octaves), "octaves must be in 1..=32");
+        if (!float.IsFinite(Frequency) || Frequency <= 0.0f || Frequency > 65536.0f)
+            throw new ArgumentOutOfRangeException(
+                nameof(Frequency), "frequency must be finite and in (0, 65536]");
+        if (!float.IsFinite(Amplitude) || Amplitude < 0.0f || Amplitude > 65536.0f)
+            throw new ArgumentOutOfRangeException(
+                nameof(Amplitude), "amplitude must be finite and in [0, 65536]");
+        if (!float.IsFinite(Lacunarity) || Lacunarity <= 0.0f || Lacunarity > 16.0f)
+            throw new ArgumentOutOfRangeException(
+                nameof(Lacunarity), "lacunarity must be finite and in (0, 16]");
+        if (!float.IsFinite(Gain) || Gain < 0.0f || Gain > 1.0f)
+            throw new ArgumentOutOfRangeException(nameof(Gain), "gain must be finite and in [0, 1]");
+        if (!float.IsFinite(OffsetX) || !float.IsFinite(OffsetY) || !float.IsFinite(OffsetZ))
+            throw new ArgumentOutOfRangeException(nameof(OffsetX), "offset components must be finite");
+    }
+}
+
+public readonly record struct ProcGenWarpParams(float Amplitude, float Frequency)
+{
+    public static ProcGenWarpParams Default => new(1.0f, 1.0f);
+
+    public void Validate()
+    {
+        if (!float.IsFinite(Amplitude) || Amplitude < 0.0f || Amplitude > 65536.0f)
+            throw new ArgumentOutOfRangeException(
+                nameof(Amplitude), "warp amplitude must be finite and in [0, 65536]");
+        if (!float.IsFinite(Frequency) || Frequency <= 0.0f || Frequency > 65536.0f)
+            throw new ArgumentOutOfRangeException(
+                nameof(Frequency), "warp frequency must be finite and in (0, 65536]");
+    }
+}
+
+public static class ProcGen
+{
+    // Version tag of the ported algorithm family; matches
+    // engine_procgen::PROCGEN_SCHEMA. Bump together with the Rust crate.
+    public const string Schema = "PROCGEN-v1";
+
+    private const ulong Fnv1A64Offset = 0xcbf29ce484222325UL;
+    private const ulong Fnv1A64Prime = 0x00000100000001b3UL;
+    private const int FracScale = 256;
+    private const float OutputScale = 1.0f / 512.0f;
+
+    private static readonly sbyte[,] Gradients2D = new sbyte[,]
+    {
+        { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+        { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 }
+    };
+
+    private static readonly sbyte[,] Gradients3D = new sbyte[,]
+    {
+        { 1, 1, 0 }, { -1, 1, 0 }, { 1, -1, 0 }, { -1, -1, 0 },
+        { 1, 0, 1 }, { -1, 0, 1 }, { 1, 0, -1 }, { -1, 0, -1 },
+        { 0, 1, 1 }, { 0, -1, 1 }, { 0, 1, -1 }, { 0, -1, -1 },
+        { 1, 1, 0 }, { -1, 1, 0 }, { 1, -1, 0 }, { -1, -1, 0 }
+    };
+
+    // PROCGEN-SEED-v1: byte-wise FNV-1a 64 over
+    //   parent (8 bytes, little-endian) || "PROCGEN-SEED-v1\0" || key (UTF-8)
+    // followed by a splitmix64 finalizer. Little-endian parent bytes are
+    // emitted with explicit shifts so the result is endianness-independent.
+    public static ulong DeriveSeed(ulong parent, string key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ulong hash = Fnv1A64Offset;
+        for (int i = 0; i < 8; i++)
+            hash = unchecked((hash ^ (byte)(parent >> (8 * i))) * Fnv1A64Prime);
+        foreach (byte value in System.Text.Encoding.UTF8.GetBytes("PROCGEN-SEED-v1\0"))
+            hash = unchecked((hash ^ value) * Fnv1A64Prime);
+        foreach (byte value in System.Text.Encoding.UTF8.GetBytes(key))
+            hash = unchecked((hash ^ value) * Fnv1A64Prime);
+        return SplitMix64Finalize(hash);
+    }
+
+    // PROCGEN-NOISE-v1: Perlin-style gradient noise on a fixed-point
+    // lattice, output in [-1, 1].
+    public static float Noise2D(ulong seed, float x, float y)
+    {
+        if (!TryCoordinateToFixed(x, out int fixedX) || !TryCoordinateToFixed(y, out int fixedY))
+            return 0.0f;
+        int cellX = fixedX >> 8;
+        int cellY = fixedY >> 8;
+        long fracX = fixedX & 255;
+        long fracY = fixedY & 255;
+        long d00 = GradientDot2(LatticeHash(seed, 2UL, cellX, cellY, 0), fracX, fracY);
+        long d10 = GradientDot2(
+            LatticeHash(seed, 2UL, cellX + 1, cellY, 0), fracX - FracScale, fracY);
+        long d01 = GradientDot2(
+            LatticeHash(seed, 2UL, cellX, cellY + 1, 0), fracX, fracY - FracScale);
+        long d11 = GradientDot2(
+            LatticeHash(seed, 2UL, cellX + 1, cellY + 1, 0), fracX - FracScale, fracY - FracScale);
+        long fadeX = Fade(fracX);
+        long fadeY = Fade(fracY);
+        long value = Lerp(Lerp(d00, d10, fadeX), Lerp(d01, d11, fadeX), fadeY);
+        // |value| <= 512 < 2^24: the long->float conversion and the 2^-9
+        // scale are both exact.
+        return value * OutputScale;
+    }
+
+    public static float Noise3D(ulong seed, float x, float y, float z)
+    {
+        if (!TryCoordinateToFixed(x, out int fixedX) ||
+            !TryCoordinateToFixed(y, out int fixedY) ||
+            !TryCoordinateToFixed(z, out int fixedZ))
+            return 0.0f;
+        int cellX = fixedX >> 8;
+        int cellY = fixedY >> 8;
+        int cellZ = fixedZ >> 8;
+        long fracX = fixedX & 255;
+        long fracY = fixedY & 255;
+        long fracZ = fixedZ & 255;
+        var corners = new long[8];
+        for (int index = 0; index < 8; index++)
+        {
+            long dx = index & 1;
+            long dy = (index >> 1) & 1;
+            long dz = (index >> 2) & 1;
+            corners[index] = GradientDot3(
+                LatticeHash(
+                    seed, 3UL, cellX + (int)dx, cellY + (int)dy, cellZ + (int)dz),
+                fracX - dx * FracScale,
+                fracY - dy * FracScale,
+                fracZ - dz * FracScale);
+        }
+        long fadeX = Fade(fracX);
+        long fadeY = Fade(fracY);
+        long fadeZ = Fade(fracZ);
+        long x00 = Lerp(corners[0], corners[1], fadeX);
+        long x10 = Lerp(corners[2], corners[3], fadeX);
+        long x01 = Lerp(corners[4], corners[5], fadeX);
+        long x11 = Lerp(corners[6], corners[7], fadeX);
+        long y0 = Lerp(x00, x10, fadeY);
+        long y1 = Lerp(x01, x11, fadeY);
+        long value = Lerp(y0, y1, fadeZ);
+        return value * OutputScale;
+    }
+
+    // PROCGEN-FBM-v1: octave sum over the gradient field with a fixed
+    // accumulation order; optionally normalized by the total amplitude.
+    public static float Fbm2D(ulong seed, float x, float y, ProcGenFbmParams p)
+    {
+        p.Validate();
+        float sum = 0.0f;
+        float amplitude = p.Amplitude;
+        float total = 0.0f;
+        float fx = (x + p.OffsetX) * p.Frequency;
+        float fy = (y + p.OffsetY) * p.Frequency;
+        for (int octave = 0; octave < p.Octaves; octave++)
+        {
+            sum += amplitude * Noise2D(seed, fx, fy);
+            total += amplitude;
+            fx *= p.Lacunarity;
+            fy *= p.Lacunarity;
+            amplitude *= p.Gain;
+        }
+        return p.Normalize && total > 0.0f ? sum / total : sum;
+    }
+
+    public static float Fbm3D(ulong seed, float x, float y, float z, ProcGenFbmParams p)
+    {
+        p.Validate();
+        float sum = 0.0f;
+        float amplitude = p.Amplitude;
+        float total = 0.0f;
+        float fx = (x + p.OffsetX) * p.Frequency;
+        float fy = (y + p.OffsetY) * p.Frequency;
+        float fz = (z + p.OffsetZ) * p.Frequency;
+        for (int octave = 0; octave < p.Octaves; octave++)
+        {
+            sum += amplitude * Noise3D(seed, fx, fy, fz);
+            total += amplitude;
+            fx *= p.Lacunarity;
+            fy *= p.Lacunarity;
+            fz *= p.Lacunarity;
+            amplitude *= p.Gain;
+        }
+        return p.Normalize && total > 0.0f ? sum / total : sum;
+    }
+
+    // PROCGEN-WARP-v1: displace the fBm input by independent gradient
+    // channels whose seeds are derived from the base seed with versioned
+    // keys, then evaluate the fBm at the warped position.
+    public static float WarpedFbm2D(
+        ulong seed, float x, float y, ProcGenFbmParams fbm, ProcGenWarpParams warp)
+    {
+        warp.Validate();
+        float wx = x * warp.Frequency;
+        float wy = y * warp.Frequency;
+        float qx = x + warp.Amplitude * Noise2D(DeriveSeed(seed, "procgen/warp/2d/x"), wx, wy);
+        float qy = y + warp.Amplitude * Noise2D(DeriveSeed(seed, "procgen/warp/2d/y"), wx, wy);
+        return Fbm2D(seed, qx, qy, fbm);
+    }
+
+    public static float WarpedFbm3D(
+        ulong seed, float x, float y, float z, ProcGenFbmParams fbm, ProcGenWarpParams warp)
+    {
+        warp.Validate();
+        float wx = x * warp.Frequency;
+        float wy = y * warp.Frequency;
+        float wz = z * warp.Frequency;
+        float qx = x + warp.Amplitude * Noise3D(DeriveSeed(seed, "procgen/warp/3d/x"), wx, wy, wz);
+        float qy = y + warp.Amplitude * Noise3D(DeriveSeed(seed, "procgen/warp/3d/y"), wx, wy, wz);
+        float qz = z + warp.Amplitude * Noise3D(DeriveSeed(seed, "procgen/warp/3d/z"), wx, wy, wz);
+        return Fbm3D(seed, qx, qy, qz, fbm);
+    }
+
+    private static ulong SplitMix64Finalize(ulong value)
+    {
+        unchecked
+        {
+            value ^= value >> 30;
+            value *= 0xbf58476d1ce4e5b9UL;
+            value ^= value >> 27;
+            value *= 0x94d049bb133111ebUL;
+            value ^= value >> 31;
+            return value;
+        }
+    }
+
+    // FNV-1a-style wrapping mixing of seed, dimension tag, and the
+    // two's-complement cell coordinates, with a splitmix64 finalizer.
+    private static ulong LatticeHash(ulong seed, ulong dimensionTag, int x, int y, int z)
+    {
+        unchecked
+        {
+            ulong hash = Fnv1A64Offset;
+            hash = (hash ^ seed) * Fnv1A64Prime;
+            hash = (hash ^ dimensionTag) * Fnv1A64Prime;
+            hash = (hash ^ (uint)x) * Fnv1A64Prime;
+            hash = (hash ^ (uint)y) * Fnv1A64Prime;
+            hash = (hash ^ (uint)z) * Fnv1A64Prime;
+            return SplitMix64Finalize(hash);
+        }
+    }
+
+    // Snap a coordinate to the Q24.8 fixed-point lattice. Returns false for
+    // non-finite inputs (the sample then yields exactly 0.0f); huge finite
+    // magnitudes saturate to the fixed-point extremes deterministically.
+    private static bool TryCoordinateToFixed(float coordinate, out int result)
+    {
+        result = 0;
+        if (!float.IsFinite(coordinate))
+            return false;
+        // Multiplication by 2^8 and Floor are both exact IEEE-754 operations.
+        float scaled = MathF.Floor(coordinate * 256.0f);
+        if (!(scaled > -2147483648.0f && scaled < 2147483648.0f))
+        {
+            result = scaled >= 0.0f ? int.MaxValue : int.MinValue;
+            return true;
+        }
+        // scaled is integral and strictly inside the int range: exact cast.
+        result = (int)scaled;
+        return true;
+    }
+
+    // Quintic fade 6t^5 - 15t^4 + 10t^3 on a Q8 input, Q8 output; every
+    // intermediate is a non-negative long, so the shift is an exact floor.
+    private static long Fade(long t)
+    {
+        long cubic = t * t * t;
+        long inner = t * (6L * t - 15L * FracScale) + 10L * FracScale * FracScale;
+        return (cubic * inner) >> 32;
+    }
+
+    // The arithmetic shift on the (possibly negative) product is an exact
+    // floor, matching the Rust implementation bit for bit.
+    private static long Lerp(long a, long b, long fadeFraction) =>
+        a + ((b - a) * fadeFraction >> 8);
+
+    private static long GradientDot2(ulong hash, long offsetX, long offsetY)
+    {
+        int g = (int)(hash & 7UL);
+        return Gradients2D[g, 0] * offsetX + Gradients2D[g, 1] * offsetY;
+    }
+
+    private static long GradientDot3(ulong hash, long offsetX, long offsetY, long offsetZ)
+    {
+        int g = (int)(hash & 15UL);
+        return Gradients3D[g, 0] * offsetX + Gradients3D[g, 1] * offsetY +
+            Gradients3D[g, 2] * offsetZ;
+    }
+}
+
 
 public sealed class ScriptTransform
 {
@@ -3969,6 +4287,31 @@ mod tests {
             .contains("public ScriptWorldOrigin WorldOrigin { get; private set; }"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"world_origin\")]"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("context.WorldOrigin is { Length: 3 }"));
+        // ProcGen (ENG-10): a synchronous, bit-exact C# port of the native
+        // engine-procgen primitives — no protocol churn, golden-vector parity.
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public static class ProcGen"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public const string Schema = \"PROCGEN-v1\""));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public static ulong DeriveSeed(ulong parent, string key)"));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public static float Noise2D(ulong seed, float x, float y)"));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public static float Noise3D(ulong seed, float x, float y, float z)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains(
+            "public static float Fbm2D(ulong seed, float x, float y, ProcGenFbmParams p)"
+        ));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains(
+            "public static float Fbm3D(ulong seed, float x, float y, float z, ProcGenFbmParams p)"
+        ));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public static float WarpedFbm2D("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public static float WarpedFbm3D("));
+        assert!(
+            STARTER_SCRIPT_API_SOURCE.contains("public readonly record struct ProcGenFbmParams(")
+        );
+        assert!(STARTER_SCRIPT_API_SOURCE.contains(
+            "public readonly record struct ProcGenWarpParams(float Amplitude, float Frequency)"
+        ));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("procgen/warp/2d/x"));
     }
 
     #[test]

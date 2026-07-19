@@ -21,6 +21,7 @@ members = [
     "crates/engine-audio",
     "crates/engine-ui",
     "crates/engine-nav",
+    "crates/engine-procgen",
     "crates/engine-character",
     "crates/engine-gameplay",
     "crates/engine-ffi",

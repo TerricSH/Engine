@@ -1313,6 +1313,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-procgen"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "engine-renderer"
 version = "0.1.0"
 dependencies = [
