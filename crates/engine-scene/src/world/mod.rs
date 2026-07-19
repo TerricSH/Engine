@@ -72,6 +72,15 @@ pub struct World {
     pub(crate) diagnostics_policy: DiagnosticsPolicy,
     /// Optional registry for serialize/deserialize hooks of external components.
     pub(crate) component_registry: Option<Arc<ComponentRegistry>>,
+    /// Runtime world origin for periodic origin shifting (ENG-01 Phase 2).
+    ///
+    /// `Transform.translation` values (and every other f32 world-space runtime
+    /// state) are stored **relative** to this origin: the logical position of
+    /// an entity is `world_origin + translation`. The origin starts at zero,
+    /// is advanced only by [`World::shift_world_origin`], and is intentionally
+    /// *not* serialised — scene files store origin-relative coordinates, so a
+    /// freshly loaded world always starts at a zero origin.
+    pub(crate) world_origin: [f64; 3],
 }
 
 impl World {
@@ -93,6 +102,7 @@ impl World {
             scene_dependencies: Vec::new(),
             diagnostics_policy: DiagnosticsPolicy::Strict,
             component_registry: None,
+            world_origin: [0.0; 3],
         }
     }
 
@@ -131,6 +141,64 @@ impl World {
     /// written back to the scene file the world was loaded from.
     pub fn scene_settings_mut(&mut self) -> &mut SceneSettings {
         &mut self.scene_settings
+    }
+
+    // ── World origin (ENG-01 Phase 2) ──────────────────────────────────
+
+    /// Current runtime world origin.
+    ///
+    /// Every `Transform.translation` is stored **relative** to this origin;
+    /// the logical position of an entity is `world_origin + translation`
+    /// (resolved through its parent chain). The origin starts at zero and
+    /// advances only through [`Self::shift_world_origin`]. It is runtime-only
+    /// state: scene serialisation stores origin-relative coordinates, so
+    /// loading a scene always starts at a zero origin.
+    pub fn world_origin(&self) -> [f64; 3] {
+        self.world_origin
+    }
+
+    /// Shift the world origin by `delta`, preserving logical positions.
+    ///
+    /// `delta` is subtracted from the translation of every root `Transform`
+    /// (an entity whose parent chain carries no `Transform` above it —
+    /// children follow their roots through the hierarchy) and added to
+    /// [`Self::world_origin`], so the logical position
+    /// `world_origin + world_position` of every entity is unchanged. Disabled
+    /// entities are shifted too: their stored transforms are world-space
+    /// state like any other.
+    ///
+    /// Only the ECS transforms and the origin are touched here. The host
+    /// (e.g. `GameLoop`) is responsible for sweeping the remaining f32
+    /// world-space runtime state — physics bodies, character controllers,
+    /// navigation agents, and point gravity sources — in the same frame
+    /// boundary so the shift is observed atomically.
+    ///
+    /// Returns the number of root transforms that were translated.
+    pub fn shift_world_origin(&mut self, delta: [f64; 3]) -> usize {
+        let offset = glam::Vec3::new(delta[0] as f32, delta[1] as f32, delta[2] as f32);
+        // A root is an entity whose nearest ancestor chain carries no
+        // Transform: either it has no parent at all, or its parent entity
+        // has no Transform (treated as an identity root by extraction).
+        let roots: Vec<Entity> = self
+            .query_all::<Transform>()
+            .filter_map(|(entity, transform)| match transform.parent {
+                Some(parent) => (!self.has::<Transform>(parent)).then_some(entity),
+                None => Some(entity),
+            })
+            .collect();
+        let mut shifted = 0;
+        for entity in roots {
+            if let Some(transform) = self.get_mut::<Transform>(entity) {
+                transform.translation -= offset;
+                shifted += 1;
+            }
+        }
+        self.world_origin = [
+            self.world_origin[0] + delta[0],
+            self.world_origin[1] + delta[1],
+            self.world_origin[2] + delta[2],
+        ];
+        shifted
     }
 
     // ── Entity management ─────────────────────────────────────────────
@@ -667,6 +735,7 @@ impl World {
         self.scene_name = "ECS World".to_string();
         self.scene_dependencies.clear();
         self.diagnostics_policy = DiagnosticsPolicy::Strict;
+        self.world_origin = [0.0; 3];
     }
 }
 
@@ -1061,5 +1130,110 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["cube-01"]
         );
+    }
+
+    #[test]
+    fn world_origin_shift_preserves_logical_positions_across_hierarchies() {
+        let mut world = World::new();
+        let root = world.create_entity();
+        let child = world.create_entity();
+        let grandchild = world.create_entity();
+        world.add_component(
+            root,
+            Transform {
+                translation: glam::Vec3::new(9000.0, 10.0, -500.0),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            child,
+            Transform {
+                translation: glam::Vec3::new(1.0, 2.0, 3.0),
+                parent: Some(root),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            grandchild,
+            Transform {
+                translation: glam::Vec3::new(-4.0, 0.5, 8.0),
+                parent: Some(child),
+                ..Default::default()
+            },
+        );
+        // A disabled entity is world-space state too and must shift.
+        let disabled = world.create_entity();
+        world.add_component(
+            disabled,
+            Transform {
+                translation: glam::Vec3::new(8500.0, 0.0, 0.0),
+                ..Default::default()
+            },
+        );
+        world.set_enabled(disabled, false);
+
+        let delta = [9000.0, 10.0, -500.0];
+        let shifted = world.shift_world_origin(delta);
+        assert_eq!(shifted, 2);
+        assert_eq!(world.world_origin(), delta);
+
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().translation,
+            glam::Vec3::ZERO
+        );
+        // Local translations below a root are untouched: children follow
+        // their root through the hierarchy.
+        assert_eq!(
+            world.get::<Transform>(child).unwrap().translation,
+            glam::Vec3::new(1.0, 2.0, 3.0)
+        );
+        assert_eq!(
+            world.get::<Transform>(grandchild).unwrap().translation,
+            glam::Vec3::new(-4.0, 0.5, 8.0)
+        );
+        assert_eq!(
+            world.get::<Transform>(disabled).unwrap().translation,
+            glam::Vec3::new(-500.0, -10.0, 500.0)
+        );
+    }
+
+    #[test]
+    fn world_origin_shift_treats_transformless_parent_as_identity_root() {
+        let mut world = World::new();
+        let folder = world.create_entity();
+        let entity = world.create_entity();
+        world.add_component(
+            entity,
+            Transform {
+                translation: glam::Vec3::new(100.0, 0.0, 0.0),
+                parent: Some(folder),
+                ..Default::default()
+            },
+        );
+
+        let shifted = world.shift_world_origin([100.0, 0.0, 0.0]);
+        assert_eq!(shifted, 1);
+        assert_eq!(
+            world.get::<Transform>(entity).unwrap().translation,
+            glam::Vec3::ZERO
+        );
+    }
+
+    #[test]
+    fn world_origin_accumulates_and_clear_resets_it() {
+        let mut world = World::new();
+        let entity = world.create_entity();
+        world.add_component(entity, Transform::default());
+
+        world.shift_world_origin([1000.0, 0.0, 0.0]);
+        world.shift_world_origin([0.0, -250.0, 500.0]);
+        assert_eq!(world.world_origin(), [1000.0, -250.0, 500.0]);
+        assert_eq!(
+            world.get::<Transform>(entity).unwrap().translation,
+            glam::Vec3::new(-1000.0, 250.0, -500.0)
+        );
+
+        world.clear();
+        assert_eq!(world.world_origin(), [0.0; 3]);
     }
 }

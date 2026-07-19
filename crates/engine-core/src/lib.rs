@@ -1130,6 +1130,10 @@ impl EngineRuntime {
             .collect::<std::collections::BTreeSet<_>>();
 
         let entities = self.script_gameplay_entity_snapshots();
+        let world_origin = self
+            .world_slot
+            .with_world(|world| world.world_origin())
+            .unwrap_or([0.0; 3]);
 
         entity_ids
             .into_iter()
@@ -1140,6 +1144,7 @@ impl EngineRuntime {
                         .get(&entity_id)
                         .and_then(|snapshot| snapshot.transform.clone()),
                     entity_id: entity_id.clone(),
+                    world_origin,
                     input_actions: input_actions.clone(),
                     input_transitions: input_transitions.clone(),
                     physics_events: physics_events.get(&entity_id).cloned().unwrap_or_default(),

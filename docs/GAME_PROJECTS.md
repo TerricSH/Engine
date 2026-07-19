@@ -521,3 +521,110 @@ built-in components. Unlike `engine.physics.rigid_body` writes, gravity
 source writes are re-read by the physics step and therefore take effect on
 the next fixed step — a script can, for example, move `center` every frame to
 track a flying planet or toggle `enabled` to switch the field off.
+
+## World origin shifting
+
+Large worlds eventually exceed the range where f32 coordinates stay precise
+(visible jitter starts a few kilometres from the origin). Periodic world-origin
+shifting re-centres the world's f32 storage on the viewer at runtime while
+keeping every **logical** position unchanged:
+
+```text
+logical_position(entity) = world_origin + Transform.translation
+```
+
+The world origin is a double-precision `[f64; 3]` value held by the runtime
+`World` (`World::world_origin`); every `Transform.translation` — and every
+other f32 world-space runtime value — is stored **relative** to it. A shift by
+`delta` advances the origin by `delta` and translates all of that state by
+`-delta`, so logical positions are bit-identical before and after.
+
+### Configuration
+
+Origin shifting is opt-in per scene via `scene_settings.origin_shift`
+(disabled by default, so existing scenes simulate unchanged):
+
+```ron
+scene_settings: (
+    // ... other settings ...
+    origin_shift: (
+        enabled: true,
+        threshold: 8000.0,          // metres; default when omitted
+        reference_entity: None,      // None = watch the active camera
+    ),
+)
+```
+
+- `enabled` (default `false`) — master switch.
+- `threshold` (default `8000.0`) — distance in metres beyond which a shift
+  triggers. Non-finite or non-positive values defensively disable the trigger.
+- `reference_entity` (default `None`) — persistent ID of the entity watched
+  for threshold crossing; when unset the active camera's world position is
+  used. When the reference's distance from the origin exceeds `threshold`, the
+  runtime shifts by the full reference position, landing the reference back on
+  the relative origin.
+
+### Frame-boundary execution
+
+The trigger is evaluated at most once per frame, at the existing frame
+boundary — after `update()` and scene-transition processing, in the same seam
+as cell-streaming commits, before `render()`. Both sandbox players (headless
+and windowed) call `GameLoop::tick_world_origin_shift()` there; `update()`
+itself never shifts, so a shift is never observed mid-frame. At most one shift
+runs per frame boundary, and because the reference lands on the relative
+origin it cannot immediately retrigger.
+
+### Atomic consistency sweep
+
+One shift moves all of the following by `-delta` in the same boundary:
+
+- every root `Transform` in the ECS (children follow through the hierarchy;
+  disabled entities included),
+- every physics body, teleported **in place** (`set_position` without waking)
+  rather than rebuilt — velocities, forces, joints, and sleep state are
+  preserved, collider positions are propagated, and the query pipeline is
+  refreshed so raycasts and overlaps observe the shifted world immediately,
+- every `CharacterController` position, including the primary mirror used by
+  `update_character`,
+- every navigation agent's target and in-progress path
+  (`runtime-subsystems`),
+- every point `engine.gravity_source` centre (`gameplay`).
+
+Audio needs no sweep: emitter and listener snapshots are rebuilt from ECS
+transforms every frame, and both move together, so relative audio geometry is
+seamless. Camera-relative rendering composes unchanged — extraction already
+subtracts the current camera translation, which is exactly what the shift
+rebased. Cell streaming is origin-aware: bounds tests run in logical
+(authored) space, and freshly merged cell hierarchy roots are rebased by
+`-origin`.
+
+### Observability
+
+Headless run reports expose `world_origin` (final `[x, y, z]`) and
+`world_origin_shifts` (cumulative shift count). `GameLoop` also surfaces
+`world_origin()`, `world_origin_shift_count()`, and
+`last_world_origin_shift()` (per-sweep counts of transforms, physics bodies,
+character controllers, nav agents, and gravity sources moved). C# scripts see
+a read-only `ScriptWorldOrigin WorldOrigin` on `EngineBehaviour`
+(double precision); all script-visible positions stay origin-relative, so game
+code never needs to add the origin itself.
+
+### Current limitations
+
+- **f32 storage still bounds local scale.** Shifting keeps the *viewer* near
+  the origin; content more than ~threshold metres from the reference still
+  loses f32 precision. Size cells and streaming radii accordingly.
+- **Save/load stores relative coordinates.** Scenes serialize
+  origin-relative transforms, and the world origin is runtime-only state in
+  this version: it always starts at zero on load and is not persisted into
+  save data. A save captured mid-session therefore reloads at the same
+  logical positions with a zero origin — consistent, but the origin counter
+  itself is not restored.
+- **Cell scenes keep non-Transform world-space data un-rebased.** When a cell
+  merges under a non-zero origin, only hierarchy-root `Transform`s are rebased
+  by `-origin`; other world-space component data authored inside the cell
+  (e.g. an `engine.nav_agent` target or an `engine.gravity_source` centre) is
+  not rebased in this version. Author such components in the startup scene, or
+  keep cells to plain geometry.
+- The editor does not shift origins (it edits authored scenes directly); the
+  shift is a player-runtime behaviour and tooling builds are unaffected.

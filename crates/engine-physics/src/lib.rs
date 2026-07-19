@@ -19,8 +19,8 @@ pub use events::{
     CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind,
 };
 pub use gravity::{
-    resolve_effective_gravity, sum_source_gravity, GravityFalloff, GravityMode, GravitySource,
-    GRAVITY_SOURCE_MIN_DISTANCE,
+    resolve_effective_gravity, shift_gravity_source_centers, sum_source_gravity, GravityFalloff,
+    GravityMode, GravitySource, GRAVITY_SOURCE_MIN_DISTANCE,
 };
 pub use joints::{JointDescriptor, JointHandle, JointLimits, JointMotor, JointType};
 pub use queries::{

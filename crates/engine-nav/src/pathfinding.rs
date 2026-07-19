@@ -56,6 +56,18 @@ impl Path {
     pub fn last(&self) -> Option<&PathPoint> {
         self.waypoints.last()
     }
+
+    /// Translate every waypoint position by `offset`.
+    ///
+    /// Polygon indices are untouched: the path's topology is unchanged, only
+    /// the frame it is expressed in moves. World-origin shifts use this to
+    /// rebase a path computed in navmesh (authored/logical) space into the
+    /// origin-relative frame the agent tracks.
+    pub fn translate(&mut self, offset: Vec3) {
+        for waypoint in &mut self.waypoints {
+            waypoint.position += offset;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

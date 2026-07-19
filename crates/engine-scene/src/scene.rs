@@ -62,6 +62,51 @@ pub struct SceneSettings {
     /// Defaults to `false` so existing scenes render unchanged.
     #[serde(default)]
     pub camera_relative_rendering: bool,
+    /// Opt-in periodic world-origin shifting (ENG-01 Phase 2). Disabled by
+    /// default so existing scenes simulate unchanged.
+    #[serde(default)]
+    pub origin_shift: OriginShiftSettings,
+}
+
+/// Periodic world-origin shift trigger configuration (ENG-01 Phase 2).
+///
+/// When `enabled`, the runtime evaluates the reference position once per
+/// frame at the frame boundary (between the update and the render, alongside
+/// scene-transition processing); when its distance from the origin exceeds
+/// `threshold` metres, every f32 world-space runtime value is translated by
+/// `-reference` and the world origin advances by `reference`, keeping logical
+/// positions unchanged while re-centring f32 storage on the viewer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OriginShiftSettings {
+    /// Whether periodic origin shifting runs. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Distance in metres beyond which a shift triggers. Values that are
+    /// non-finite or `<= 0` disable the trigger defensively.
+    /// Defaults to 8000 (roughly the onset of visible f32 jitter).
+    #[serde(default = "default_origin_shift_threshold")]
+    pub threshold: f32,
+    /// Persistent ID of the entity watched for threshold crossing. `None`
+    /// watches the active camera (same selection as renderer extraction).
+    #[serde(default)]
+    pub reference_entity: Option<PersistentId>,
+}
+
+/// Default origin-shift trigger distance: 8 km.
+pub const DEFAULT_ORIGIN_SHIFT_THRESHOLD: f32 = 8000.0;
+
+fn default_origin_shift_threshold() -> f32 {
+    DEFAULT_ORIGIN_SHIFT_THRESHOLD
+}
+
+impl Default for OriginShiftSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: DEFAULT_ORIGIN_SHIFT_THRESHOLD,
+            reference_entity: None,
+        }
+    }
 }
 
 impl Default for SceneSettings {
@@ -76,6 +121,7 @@ impl Default for SceneSettings {
             tone_mapping: ToneMapping::Aces,
             pass_graph_config: PassGraphConfig::default(),
             camera_relative_rendering: false,
+            origin_shift: OriginShiftSettings::default(),
         }
     }
 }

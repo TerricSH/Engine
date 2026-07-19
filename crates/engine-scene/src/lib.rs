@@ -21,7 +21,7 @@ pub use component::{Component, ComponentStorageDyn, SparseSet};
 pub use entity::{Entity, EntityManager};
 pub use extraction::{
     aabb_in_frustum, active_camera_world_position, camera_relative_render_origin,
-    extract_frustum_planes, extract_renderer_input_from_world,
+    entity_world_position, extract_frustum_planes, extract_renderer_input_from_world,
     extract_renderer_input_from_world_with_viewport, RenderViewportContext,
 };
 pub use pool::{ObjectPool, ObjectPoolError};

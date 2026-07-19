@@ -260,3 +260,22 @@ pub fn resolve_effective_gravity<'a>(
 ) -> glam::Vec3 {
     sum_source_gravity(sources, body_position).unwrap_or(global_gravity)
 }
+
+/// Translate every [`GravitySource::center`] in the world by `offset`.
+///
+/// `center` is stored in the same origin-relative f32 world space as
+/// `Transform::translation`, so world-origin shifts must move it by the same
+/// `-delta` to keep logical source positions unchanged. Directional sources
+/// ignore `center`, but shifting it unconditionally keeps the sweep simple
+/// and the stored data consistent. Disabled entities are included: their
+/// stored centers are world-space state like any other.
+///
+/// Returns the number of sources shifted.
+pub fn shift_gravity_source_centers(world: &mut engine_scene::World, offset: glam::Vec3) -> usize {
+    let mut shifted = 0;
+    for (_, source) in world.query_all_mut::<GravitySource>() {
+        source.center += offset;
+        shifted += 1;
+    }
+    shifted
+}

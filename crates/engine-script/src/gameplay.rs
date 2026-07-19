@@ -695,6 +695,15 @@ pub struct GameplayContext {
     pub script_api: String,
     pub entity_id: String,
     pub transform: Option<ScriptTransform>,
+    /// Current runtime world origin (ENG-01 Phase 2).
+    ///
+    /// Every `ScriptTransform` a script sees is **relative** to this origin:
+    /// the logical position of an entity is `world_origin + translation`.
+    /// Read-only for scripts; the origin changes only through the periodic
+    /// world-origin shift at the frame boundary. `default` keeps contexts
+    /// produced before origin shifting existed compatible (zero origin).
+    #[serde(default)]
+    pub world_origin: [f64; 3],
     pub input_actions: BTreeMap<String, GameplayInputValue>,
     #[serde(default)]
     pub input_transitions: GameplayInputTransitions,
@@ -1209,6 +1218,7 @@ mod tests {
                 rotation: [0.0, 0.0, 0.0, 1.0],
                 scale: [1.0, 1.0, 1.0],
             }),
+            world_origin: [8000.0, 0.0, -4000.0],
             input_actions: BTreeMap::from([
                 ("jump".into(), GameplayInputValue::Bool(true)),
                 ("move".into(), GameplayInputValue::Vec2([0.25, -0.5])),
@@ -1271,6 +1281,7 @@ mod tests {
 
         let json = serde_json::to_string(&context).unwrap();
         assert!(json.contains(r#""script_api":"ScriptAPI-v0""#));
+        assert!(json.contains(r#""world_origin":[8000.0,0.0,-4000.0]"#));
         assert!(json.contains(r#""jump":{"type":"Bool","value":true}"#));
         assert!(json.contains(r#""pressed":["jump"]"#));
         assert!(json.contains(r#""kind":"collision_entered""#));
@@ -1296,6 +1307,8 @@ mod tests {
                 .unwrap();
         assert!(context.entities.is_empty());
         assert_eq!(context.script_api, GAMEPLAY_SCRIPT_API_SCHEMA);
+        // Older runtimes predate origin shifting: scripts see a zero origin.
+        assert_eq!(context.world_origin, [0.0; 3]);
         assert!(context.physics_events.is_empty());
         assert!(context.physics_query_results.is_empty());
         assert!(context.component_query_results.is_empty());

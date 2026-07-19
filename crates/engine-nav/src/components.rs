@@ -119,6 +119,25 @@ impl Default for AiAgent {
     }
 }
 
+impl AiAgent {
+    /// Translate every stored world-space position by `offset`.
+    ///
+    /// World-origin shifts apply this with `-delta`: `target`,
+    /// `last_target`, and the internal path-follower state are all kept in
+    /// the same origin-relative f32 world space as `Transform::translation`,
+    /// so they move together and the agent keeps walking toward the same
+    /// logical destination.
+    pub fn shift_world_positions(&mut self, offset: Vec3) {
+        if let Some(target) = self.target.as_mut() {
+            *target += offset;
+        }
+        if let Some(last_target) = self.last_target.as_mut() {
+            *last_target += offset;
+        }
+        self.nav_agent.translate(offset);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Serialization hooks (for ComponentRegistry)
 // ---------------------------------------------------------------------------
@@ -284,6 +303,24 @@ pub fn update_ai_agent(
     navmesh: &NavMesh,
     dt: f32,
 ) {
+    update_ai_agent_with_world_origin(agent, character, navmesh, dt, Vec3::ZERO);
+}
+
+/// [`update_ai_agent`] variant for a shifted world origin.
+///
+/// The navmesh asset is baked in authored (logical) coordinates and is not
+/// shifted at runtime, so path queries run in logical space: the character's
+/// origin-relative position and the agent's origin-relative target are
+/// lifted by `world_origin` for the query, and the resulting path is rebased
+/// by `-world_origin` before the agent follows it in the origin-relative
+/// frame. With a zero origin this is exactly [`update_ai_agent`].
+pub fn update_ai_agent_with_world_origin(
+    agent: &mut AiAgent,
+    character: &mut CharacterController,
+    navmesh: &NavMesh,
+    dt: f32,
+    world_origin: Vec3,
+) {
     // Sync the NavAgent's position with the character's actual position.
     agent.nav_agent.set_position(character.position());
     agent.nav_agent.set_speed(agent.speed);
@@ -313,8 +350,14 @@ pub fn update_ai_agent(
         if agent.nav_agent.is_path_finished() || target_changed {
             agent.last_target = Some(target);
             let pathfinder = Pathfinder::new();
-            match pathfinder.find_path(navmesh, character.position(), target) {
-                Ok(path) => {
+            // The navmesh is authored in logical coordinates: lift the
+            // origin-relative query into logical space and rebase the
+            // resulting path back into the origin-relative frame.
+            let logical_start = character.position() + world_origin;
+            let logical_target = target + world_origin;
+            match pathfinder.find_path(navmesh, logical_start, logical_target) {
+                Ok(mut path) => {
+                    path.translate(-world_origin);
                     agent.nav_agent.set_path(path);
                 }
                 Err(_) => {
@@ -442,5 +485,139 @@ mod tests {
         assert!((restored.stopping_distance - 0.5).abs() < 1e-6);
         assert!(restored.target.is_none());
         assert_eq!(restored.controller_entity_id, 0);
+    }
+
+    // ── World-origin shift support ──────────────────────────────────────
+
+    use crate::navmesh::PolygonIndex;
+    use crate::pathfinding::{Path, PathPoint};
+
+    #[test]
+    fn path_translate_shifts_waypoints_only() {
+        let mut path = Path::new(vec![
+            PathPoint {
+                position: Vec3::new(8000.0, 1.0, -100.0),
+                polygon: PolygonIndex(0),
+            },
+            PathPoint {
+                position: Vec3::new(8010.0, 1.0, -90.0),
+                polygon: PolygonIndex(2),
+            },
+        ]);
+        path.translate(Vec3::new(-8000.0, 0.0, 0.0));
+        assert_eq!(path.waypoints()[0].position, Vec3::new(0.0, 1.0, -100.0));
+        assert_eq!(path.waypoints()[1].position, Vec3::new(10.0, 1.0, -90.0));
+        // Polygon topology is untouched.
+        assert_eq!(path.waypoints()[0].polygon, PolygonIndex(0));
+        assert_eq!(path.waypoints()[1].polygon, PolygonIndex(2));
+    }
+
+    #[test]
+    fn shift_world_positions_moves_target_and_followed_path() {
+        let mut agent = AiAgent::new();
+        agent.target = Some(Vec3::new(9000.0, 0.0, 100.0));
+        agent.last_target = agent.target;
+        agent.nav_agent.set_position(Vec3::new(8000.0, 0.0, 0.0));
+        agent.nav_agent.set_path(Path::new(vec![
+            PathPoint {
+                position: Vec3::new(8000.0, 0.0, 0.0),
+                polygon: PolygonIndex(0),
+            },
+            PathPoint {
+                position: Vec3::new(9000.0, 0.0, 100.0),
+                polygon: PolygonIndex(1),
+            },
+        ]));
+
+        agent.shift_world_positions(Vec3::new(-8000.0, 0.0, 0.0));
+
+        assert_eq!(agent.target, Some(Vec3::new(1000.0, 0.0, 100.0)));
+        assert_eq!(agent.last_target, Some(Vec3::new(1000.0, 0.0, 100.0)));
+        assert_eq!(agent.nav_agent.position(), Vec3::ZERO);
+        let path = agent.nav_agent.path().expect("path survives the shift");
+        assert_eq!(path.waypoints()[0].position, Vec3::ZERO);
+        assert_eq!(path.waypoints()[1].position, Vec3::new(1000.0, 0.0, 100.0));
+    }
+
+    /// Two-quad strip along +X, authored at `x_offset` (logical space).
+    fn strip_navmesh(x_offset: f32) -> NavMesh {
+        let mut mesh = NavMesh::new();
+        let v0 = mesh.add_vertex(Vec3::new(x_offset, 0.0, 0.0));
+        let v1 = mesh.add_vertex(Vec3::new(x_offset + 5.0, 0.0, 0.0));
+        let v2 = mesh.add_vertex(Vec3::new(x_offset + 5.0, 0.0, 2.0));
+        let v3 = mesh.add_vertex(Vec3::new(x_offset, 0.0, 2.0));
+        mesh.add_polygon(&[v0, v1, v2, v3], 1.0);
+        let v4 = mesh.add_vertex(Vec3::new(x_offset + 10.0, 0.0, 0.0));
+        let v5 = mesh.add_vertex(Vec3::new(x_offset + 10.0, 0.0, 2.0));
+        mesh.add_polygon(&[v1, v4, v5, v2], 1.0);
+        mesh.rebuild_bvh();
+        mesh
+    }
+
+    fn driven_intent_direction(
+        agent: &mut AiAgent,
+        controller: &mut CharacterController,
+        navmesh: &NavMesh,
+        world_origin: Vec3,
+    ) -> Vec3 {
+        update_ai_agent_with_world_origin(agent, controller, navmesh, 1.0 / 60.0, world_origin);
+        let command = controller
+            .pending_commands
+            .last()
+            .expect("agent pushes a movement command");
+        command.direction
+    }
+
+    #[test]
+    fn update_ai_agent_with_world_origin_paths_in_logical_space() {
+        // Reference run at a zero origin on a strip authored around x ∈ [0, 10].
+        let near_mesh = strip_navmesh(0.0);
+        let mut reference_agent = AiAgent::new();
+        reference_agent.target = Some(Vec3::new(9.0, 0.0, 1.0));
+        let mut reference_controller = CharacterController::new();
+        reference_controller.set_position(Vec3::new(1.0, 0.0, 1.0));
+        let reference_direction = driven_intent_direction(
+            &mut reference_agent,
+            &mut reference_controller,
+            &near_mesh,
+            Vec3::ZERO,
+        );
+
+        // Same scene after an origin shift: the strip is still authored in
+        // logical coordinates (x ∈ [8000, 8010]) while the controller and
+        // target keep their origin-relative values.
+        let origin = Vec3::new(8000.0, 0.0, 0.0);
+        let far_mesh = strip_navmesh(8000.0);
+        let mut shifted_agent = AiAgent::new();
+        shifted_agent.target = Some(Vec3::new(9.0, 0.0, 1.0));
+        let mut shifted_controller = CharacterController::new();
+        shifted_controller.set_position(Vec3::new(1.0, 0.0, 1.0));
+        let shifted_direction = driven_intent_direction(
+            &mut shifted_agent,
+            &mut shifted_controller,
+            &far_mesh,
+            origin,
+        );
+
+        assert!(
+            reference_direction.length_squared() > 0.0,
+            "reference run produces movement"
+        );
+        assert_eq!(
+            reference_direction, shifted_direction,
+            "origin-shifted run follows the same logical path"
+        );
+        // The followed path is rebased into the origin-relative frame.
+        let path = shifted_agent
+            .nav_agent
+            .path()
+            .expect("shifted run follows a path");
+        assert!(
+            path.waypoints()
+                .iter()
+                .all(|waypoint| waypoint.position.x.abs() <= 10.0),
+            "waypoints stay in the origin-relative frame: {:?}",
+            path.waypoints()
+        );
     }
 }

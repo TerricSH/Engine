@@ -862,6 +862,131 @@ fn set_body_position_command() {
     assert!((pos.0.z - 30.0).abs() < 1e-6, "z should be 30: {}", pos.0.z);
 }
 
+#[test]
+fn translate_bodies_teleports_positions_and_preserves_velocity() {
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+
+    let transform = Transform::default();
+    let rb = RigidBody::default();
+    world.backend.create_body(entity(0), &rb, &transform);
+    world
+        .backend
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
+    world.backend.sync_query_pipeline();
+
+    // Give the body a steady horizontal velocity.
+    world
+        .backend
+        .apply_impulse(entity(0), glam::Vec3::new(2.0, 0.0, 0.0));
+    for _ in 0..3 {
+        world.backend.step();
+    }
+    let velocity_before = *world.backend.bodies[world.backend.body_map[&entity(0)]].linvel();
+    let position_before = world.backend.sync_body_transform(entity(0)).unwrap().0;
+
+    // World-origin shift: every body teleports by -delta.
+    let delta = glam::Vec3::new(8000.0, 12.0, -4000.0);
+    assert_eq!(world.translate_bodies(-delta), 1);
+
+    let position_after = world.backend.sync_body_transform(entity(0)).unwrap().0;
+    let velocity_after = *world.backend.bodies[world.backend.body_map[&entity(0)]].linvel();
+    assert_eq!(position_after, position_before - delta);
+    assert_eq!(
+        velocity_after, velocity_before,
+        "teleport must not disturb linear velocity"
+    );
+
+    // The body keeps moving seamlessly from its shifted position.
+    for _ in 0..3 {
+        world.backend.step();
+    }
+    let position_later = world.backend.sync_body_transform(entity(0)).unwrap().0;
+    assert!(
+        position_later.x > position_after.x,
+        "moving body continues seamlessly: after={} later={}",
+        position_after.x,
+        position_later.x
+    );
+}
+
+#[test]
+fn translate_bodies_preserves_sleep_state_and_queries() {
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+
+    let transform = Transform::default();
+    let rb = RigidBody::default();
+    world.backend.create_body(entity(0), &rb, &transform);
+    world
+        .backend
+        .create_collider(entity(0), &Collider::default(), entity(0), None);
+    world.backend.sync_query_pipeline();
+
+    // Let the body fall asleep: no gravity, no motion, rapier's sleep timer.
+    for _ in 0..240 {
+        world.backend.step();
+    }
+    let handle = world.backend.body_map[&entity(0)];
+    assert!(
+        world.backend.bodies[handle].is_sleeping(),
+        "idle body should be asleep before the shift"
+    );
+
+    let offset = glam::Vec3::new(-5000.0, 0.0, 2500.0);
+    assert_eq!(world.translate_bodies(offset), 1);
+    assert!(
+        world.backend.bodies[handle].is_sleeping(),
+        "origin-shift teleport must not wake sleeping bodies"
+    );
+
+    // Queries observe the shifted position immediately (no step in between).
+    let expected = world.backend.sync_body_transform(entity(0)).unwrap().0;
+    let hit = world.raycast(
+        expected + glam::Vec3::new(0.0, 10.0, 0.0),
+        glam::Vec3::new(0.0, -1.0, 0.0),
+        100.0,
+    );
+    assert!(hit.is_some(), "raycast finds the teleported body");
+}
+
+#[test]
+fn shift_gravity_source_centers_moves_point_sources() {
+    use crate::{shift_gravity_source_centers, GravitySource};
+
+    let mut ecs = World::new();
+    let planet = ecs.create_entity();
+    ecs.add_component(
+        planet,
+        GravitySource::point(glam::Vec3::new(9000.0, 0.0, 0.0), 12.0),
+    );
+    let directional = ecs.create_entity();
+    ecs.add_component(
+        directional,
+        GravitySource::directional(glam::Vec3::new(0.0, -1.0, 0.0), 9.81),
+    );
+    // Disabled entities are world-space state too and must shift.
+    let disabled = ecs.create_entity();
+    ecs.add_component(
+        disabled,
+        GravitySource::point(glam::Vec3::new(100.0, 50.0, 0.0), 1.0),
+    );
+    ecs.set_enabled(disabled, false);
+
+    let offset = glam::Vec3::new(-9000.0, 0.0, 0.0);
+    assert_eq!(shift_gravity_source_centers(&mut ecs, offset), 3);
+    assert_eq!(
+        ecs.get::<GravitySource>(planet).unwrap().center,
+        glam::Vec3::ZERO
+    );
+    assert_eq!(
+        ecs.get::<GravitySource>(directional).unwrap().center,
+        glam::Vec3::new(-9000.0, 0.0, 0.0)
+    );
+    assert_eq!(
+        ecs.get::<GravitySource>(disabled).unwrap().center,
+        glam::Vec3::new(-8900.0, 50.0, 0.0)
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // ECS Synchronisation Tests
 // ══════════════════════════════════════════════════════════════════════════════

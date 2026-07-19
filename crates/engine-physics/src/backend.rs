@@ -765,6 +765,37 @@ impl RapierBackend {
         }
     }
 
+    /// Translate a body by `offset` without disturbing its simulation state.
+    ///
+    /// Used by world-origin shifts: the body's rotation, linear/angular
+    /// velocities, forces, and sleep state are all preserved — only its
+    /// position moves. `wake_up = false` keeps sleeping bodies asleep and
+    /// leaves awake bodies awake. Returns `false` when no body is registered
+    /// for `entity`.
+    pub fn translate_body(&mut self, entity: Entity, offset: glam::Vec3) -> bool {
+        let Some(&handle) = self.body_map.get(&entity) else {
+            return false;
+        };
+        let Some(body) = self.bodies.get_mut(handle) else {
+            return false;
+        };
+        let mut position = *body.position();
+        position.translation.vector += to_rapier_vec(offset);
+        body.set_position(position, false);
+        self.query_pipeline_dirty = true;
+        true
+    }
+
+    /// Push modified body positions into their attached colliders.
+    ///
+    /// `RigidBody::set_position` only updates the body; collider poses (and
+    /// therefore the query pipeline) observe the move after this
+    /// propagation, which the physics step normally performs.
+    pub(crate) fn propagate_body_positions_to_colliders(&mut self) {
+        self.bodies
+            .propagate_modified_body_positions_to_colliders(&mut self.colliders);
+    }
+
     // ── Force / impulse ─────────────────────────────────────────────────
 
     /// Set the gravity scale of a registered body without waking it.

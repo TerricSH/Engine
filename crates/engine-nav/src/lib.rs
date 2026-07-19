@@ -11,7 +11,9 @@ mod pathfinding;
 
 pub use agent::{AgentUpdate, MovementIntent, NavAgent};
 pub use behavior::{AiBehavior, AiState, BehaviorAsset};
-pub use components::{register_nav_extensions, update_ai_agent, AiAgent};
+pub use components::{
+    register_nav_extensions, update_ai_agent, update_ai_agent_with_world_origin, AiAgent,
+};
 pub use cooker::NavMeshCooker;
 pub use debug::NavMeshDebugDraw;
 pub use navmesh::{NavError, NavMesh, PolygonIndex, VertexIndex};

@@ -72,6 +72,13 @@ Define which system owns which transforms at each stage of the frame, preventing
 - **Command-based interaction**. Scripts do not directly write transforms. They submit movement commands (`MoveCharacter(direction, speed)`, `Jump()`) and query state (`IsGrounded()`, `GetMoveState()`, `GetVelocity()`).
 - **Animation control**: Scripts can set `AnimStateMachineInstance` parameters (e.g., trigger a "hurt" state). They cannot write `Pose` directly.
 
+### 6. World Origin Shifting (ENG-01 Phase 2)
+- **The GameLoop owns the world origin** (`World::world_origin`, f64) and is the *only* writer of it, via `shift_world_origin` / `tick_world_origin_shift` at the frame boundary (after `update()` and scene-transition processing, alongside cell-streaming commits, before `render()`). Nothing shifts mid-frame.
+- **Invariant**: `logical_position = world_origin + Transform.translation`. A shift translates every f32 world-space value by `-delta` and advances the origin by `delta`; logical positions never change.
+- **The sweep is atomic and exclusive**: in the same boundary the GameLoop moves every root ECS `Transform` (children follow through the hierarchy), teleports every physics body in place (velocities, sleep state, and joints preserved — never a physics-world rebuild), translates every character controller (including the primary mirror), every nav agent's target/path, and every point `gravity_source` centre. No other system may apply origin offsets on its own.
+- **Readers stay origin-relative**: scripts, physics, AI, and gameplay code keep working in origin-relative coordinates and never add the origin themselves. Only streaming bounds tests and navmesh queries cross into logical/authored space, at their boundary. Scripts may read the origin as a read-only value (`EngineBehaviour.WorldOrigin` / `GameplayContext.world_origin`).
+- **Audio and rendering need no sweep**: audio snapshots rebuild from ECS transforms each frame (emitter and listener shift together), and camera-relative extraction already subtracts the current camera translation.
+
 ## Pipeline Sequence (per frame)
 
 ```

@@ -629,6 +629,20 @@ pub fn camera_relative_render_origin(world: &World) -> Option<glam::Vec3> {
     active_camera_world_position(world)
 }
 
+/// World-space position of one entity, resolved through its `Transform`
+/// parent chain.
+///
+/// Returns `None` when the entity has no `Transform` component or its chain
+/// is invalid (non-finite TRS or a parent cycle), mirroring extraction's
+/// tolerance. The position is **origin-relative**: add
+/// [`World::world_origin`] for the logical position.
+pub fn entity_world_position(world: &World, entity: crate::Entity) -> Option<glam::Vec3> {
+    let world_matrices = resolve_world_transforms(world).ok()?;
+    world_matrices
+        .get(&entity)
+        .map(|matrix| matrix.transform_point3(glam::Vec3::ZERO))
+}
+
 /// World-space position of the base-view camera, independent of any render
 /// option flags.
 ///
@@ -2742,5 +2756,50 @@ mod tests {
             view.w_axis.truncate().length() <= 1.0e-6,
             "default camera at origin is translation-free in both modes"
         );
+    }
+
+    #[test]
+    fn origin_shift_is_disabled_by_default_and_serde_compatible() {
+        use crate::scene::{OriginShiftSettings, SceneSettings, DEFAULT_ORIGIN_SHIFT_THRESHOLD};
+
+        let defaults = SceneSettings::default();
+        assert!(!defaults.origin_shift.enabled);
+        assert_eq!(
+            defaults.origin_shift.threshold,
+            DEFAULT_ORIGIN_SHIFT_THRESHOLD
+        );
+        assert_eq!(defaults.origin_shift.reference_entity, None);
+        assert_eq!(OriginShiftSettings::default(), defaults.origin_shift);
+
+        // Scenes authored before the setting existed deserialize disabled
+        // (the whole block is serde-defaulted).
+        let legacy: SceneSettings = ron::from_str(
+            "(active_camera: None, default_render_layer: \"Default\", \
+             fixed_timestep_seconds: 0.016, gravity: None, \
+             ambient: (0.0, 0.0, 0.0, 1.0), environment_map: None, \
+             tone_mapping: Aces, \
+             pass_graph_config: (passes: [], enabled: true, output_mode: HdrThenToneMap), \
+             camera_relative_rendering: false)",
+        )
+        .expect("legacy scene settings deserialize");
+        assert_eq!(legacy.origin_shift, OriginShiftSettings::default());
+
+        // A partially authored block fills in the documented defaults.
+        let partial: SceneSettings = ron::from_str(
+            "(active_camera: None, default_render_layer: \"Default\", \
+             fixed_timestep_seconds: 0.016, gravity: None, \
+             ambient: (0.0, 0.0, 0.0, 1.0), environment_map: None, \
+             tone_mapping: Aces, \
+             pass_graph_config: (passes: [], enabled: true, output_mode: HdrThenToneMap), \
+             camera_relative_rendering: false, \
+             origin_shift: (enabled: true))",
+        )
+        .expect("partial origin shift settings deserialize");
+        assert!(partial.origin_shift.enabled);
+        assert_eq!(
+            partial.origin_shift.threshold,
+            DEFAULT_ORIGIN_SHIFT_THRESHOLD
+        );
+        assert_eq!(partial.origin_shift.reference_entity, None);
     }
 }

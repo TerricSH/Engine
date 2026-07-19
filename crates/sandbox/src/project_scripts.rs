@@ -40,9 +40,9 @@ const SCRIPT_SDK_PROJECT: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
     <Nullable>enable</Nullable>
     <AssemblyName>EngineGameplay</AssemblyName>
     <RootNamespace>Engine</RootNamespace>
-    <Version>0.4.0</Version>
-    <AssemblyVersion>0.4.0.0</AssemblyVersion>
-    <FileVersion>0.4.0.0</FileVersion>
+    <Version>0.5.0</Version>
+    <AssemblyVersion>0.5.0.0</AssemblyVersion>
+    <FileVersion>0.5.0.0</FileVersion>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
@@ -86,19 +86,26 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.4.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.5.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.4.0";
+    public const string Version = "0.5.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
 public readonly record struct Vector3(float X, float Y, float Z);
 public readonly record struct Quaternion(float X, float Y, float Z, float W);
+
+// Double-precision world origin (ENG-01): entity Transforms and every other
+// script-visible position are stored relative to this origin, so the logical
+// position of an entity is `WorldOrigin + Transform.Translation`. Scripts
+// keep working in origin-relative coordinates; the origin itself is read-only
+// and advances only when the engine re-centres the world.
+public readonly record struct ScriptWorldOrigin(double X, double Y, double Z);
 
 public sealed class ScriptTransform
 {
@@ -1642,6 +1649,7 @@ public abstract class EngineBehaviour
     public ScriptScene Scene { get; } = new();
     public ScriptPhysics Physics { get; }
     public ScriptComponents Components => Scene.Components;
+    public ScriptWorldOrigin WorldOrigin { get; private set; }
     public ScriptTransform Transform => _transform ?? throw new InvalidOperationException(
         $"Script entity '{EntityId}' has no Transform component");
 
@@ -1661,6 +1669,9 @@ public abstract class EngineBehaviour
         UI.Replace(context.UiEvents);
         Physics.Replace(context.PhysicsEvents, context.PhysicsQueryResults);
         Components.Replace(context.ComponentQueryResults);
+        WorldOrigin = context.WorldOrigin is { Length: 3 } origin
+            ? new ScriptWorldOrigin(origin[0], origin[1], origin[2])
+            : new ScriptWorldOrigin(0.0, 0.0, 0.0);
         _transform = context.Transform == null
             ? null
             : new ScriptTransform(context.Transform, () => _transformDirty = true);
@@ -1716,6 +1727,11 @@ internal sealed class GameplayContextState
 
     [JsonPropertyName("entities")]
     public Dictionary<string, EntitySnapshotState> Entities { get; set; } = new();
+
+    // Optional: older engine runtimes never emitted this field, so it stays
+    // at the zero origin when absent from the context JSON.
+    [JsonPropertyName("world_origin")]
+    public double[] WorldOrigin { get; set; } = new double[] { 0.0, 0.0, 0.0 };
 }
 
 internal sealed class InputTransitionState
@@ -3743,6 +3759,15 @@ mod tests {
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"add_element\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"set_text\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("UI.DrainTo(commands)"));
+        // World origin (ENG-01): scripts read the double-precision origin;
+        // every script-visible position stays origin-relative.
+        assert!(STARTER_SCRIPT_API_SOURCE.contains(
+            "public readonly record struct ScriptWorldOrigin(double X, double Y, double Z)"
+        ));
+        assert!(STARTER_SCRIPT_API_SOURCE
+            .contains("public ScriptWorldOrigin WorldOrigin { get; private set; }"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"world_origin\")]"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("context.WorldOrigin is { Length: 3 }"));
     }
 
     #[test]

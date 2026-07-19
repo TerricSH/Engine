@@ -417,6 +417,7 @@ fn run_headless(
     let mut current_scene_id = project.startup_scene_id().to_string();
     let mut scene_transitions =
         process_pending_scene_transitions(&mut game_loop, &project, &mut current_scene_id)?;
+    game_loop.tick_world_origin_shift();
     tick_cell_streaming(&mut game_loop, &mut cell_streaming, scene_transitions);
     for frame in 0..frames {
         game_loop.update(1.0 / 60.0);
@@ -424,6 +425,7 @@ fn run_headless(
         let frame_transitions =
             process_pending_scene_transitions(&mut game_loop, &project, &mut current_scene_id)?;
         scene_transitions += frame_transitions;
+        game_loop.tick_world_origin_shift();
         tick_cell_streaming(&mut game_loop, &mut cell_streaming, frame_transitions);
         let stats = game_loop.render(frame).map_err(format_diagnostics)?;
         total_draw_calls += u64::from(stats.draw_calls);
@@ -480,6 +482,8 @@ fn run_headless(
         "script_update_count": script_update_count,
         "script_entity_translations": script_entity_translations,
         "cell_streaming": cell_streaming_report,
+        "world_origin": game_loop.world_origin(),
+        "world_origin_shifts": game_loop.world_origin_shift_count(),
         "script_errors": 0,
         "passed": true
     }))
@@ -615,6 +619,7 @@ fn run_windowed(
                             return;
                         }
                     };
+                    game_loop.tick_world_origin_shift();
                     tick_cell_streaming(
                         &mut game_loop,
                         &mut self.cell_streaming,
@@ -669,6 +674,7 @@ fn run_windowed(
                         Ok(transitions) => transitions,
                         Err(error) => return self.fail(error),
                     };
+                    game_loop.tick_world_origin_shift();
                     tick_cell_streaming(game_loop, &mut self.cell_streaming, frame_transitions);
                     if let Err(diagnostics) = game_loop.render(self.frame) {
                         return self.fail(format_diagnostics(diagnostics));
@@ -899,6 +905,54 @@ mod tests {
         });
     }
 
+    /// Project whose startup scene opts into origin shifting: threshold 100,
+    /// camera at x = 150 (past the threshold), and a visible cube five metres
+    /// in front of the camera so draw calls keep flowing after the shift.
+    fn origin_shift_project_fixture() -> (tempfile::TempDir, GameProject) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let scene_dir = root.join("assets/scenes");
+        let source = root.join("assets/source");
+        let cooked = root.join("build/cooked");
+        std::fs::create_dir_all(&scene_dir).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&cooked).unwrap();
+
+        let mut main = engine_scene::sample_scene();
+        main.scene_id = "main".into();
+        main.entities
+            .iter_mut()
+            .find(|entity| entity.persistent_id == "camera-main")
+            .expect("sample scene camera")
+            .components
+            .insert(
+                "engine.transform".into(),
+                transform_record([150.0, 0.0, 0.0]),
+            );
+        main.entities
+            .iter_mut()
+            .find(|entity| entity.persistent_id == "cube-01")
+            .expect("sample scene cube")
+            .components
+            .insert(
+                "engine.transform".into(),
+                transform_record([150.0, 0.0, -5.0]),
+            );
+        main.scene_settings.origin_shift.enabled = true;
+        main.scene_settings.origin_shift.threshold = 100.0;
+        main.save_to_file(&scene_dir.join("main.scene.ron"))
+            .unwrap();
+
+        let mut manifest = ProjectManifest::new("Origin Shift Test");
+        manifest.startup_scene = PathBuf::from("main");
+        manifest.input_actions = None;
+        manifest.scenes =
+            BTreeMap::from([("main".into(), PathBuf::from("assets/scenes/main.scene.ron"))]);
+        manifest.write_to_root(&root).unwrap();
+        let project = GameProject::load(&root).unwrap();
+        (temp, project)
+    }
+
     fn has_persistent_entity(game_loop: &GameLoop, id: &str) -> bool {
         game_loop
             .runtime
@@ -995,6 +1049,30 @@ mod tests {
             report["cell_streaming"]["cell_states"]["cell_two"],
             "Loaded"
         );
+        // No origin shifting configured: the report shows the zero origin.
+        assert_eq!(report["world_origin"], serde_json::json!([0.0, 0.0, 0.0]));
+        assert_eq!(report["world_origin_shifts"], 0);
+    }
+
+    #[test]
+    fn headless_run_shifts_world_origin_past_threshold() {
+        let (_temp, project) = origin_shift_project_fixture();
+        let scene = Scene::load_from_file(project.startup_scene_path()).unwrap();
+        let report_path = project.root.join("build/run-report.json");
+        run_headless(project, scene, 3, Some(&report_path), false).unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(report["passed"], true);
+        assert!(report["total_draw_calls"].as_u64().unwrap() > 0);
+        // The camera starts at x = 150 with threshold 100: exactly one shift
+        // runs at the first frame boundary and the camera lands back on the
+        // relative origin, so no further shift triggers.
+        assert_eq!(report["world_origin_shifts"], 1);
+        let origin = report["world_origin"].as_array().unwrap();
+        assert_eq!(origin[0].as_f64().unwrap(), 150.0);
+        assert_eq!(origin[1].as_f64().unwrap(), 0.0);
+        assert_eq!(origin[2].as_f64().unwrap(), 0.0);
     }
 
     #[test]

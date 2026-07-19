@@ -432,6 +432,32 @@ struct RuntimeAudioOutput {
     initialization_failed: bool,
 }
 
+/// Record of one executed world-origin shift (ENG-01 Phase 2).
+///
+/// Emitted by [`GameLoop::shift_world_origin`] and surfaced through
+/// [`GameLoop::last_world_origin_shift`] and the headless run report. All
+/// counts describe how much world-space state moved by `-delta` in the
+/// atomic sweep.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldOriginShift {
+    /// The applied origin delta. Logical positions are unchanged:
+    /// `new_origin = old_origin + delta` and every stored world-space value
+    /// moved by `-delta`.
+    pub delta: [f64; 3],
+    /// World origin after the shift.
+    pub origin: [f64; 3],
+    /// Root `Transform`s translated (children follow via the hierarchy).
+    pub transforms: usize,
+    /// Physics bodies teleported with simulation state preserved.
+    pub physics_bodies: usize,
+    /// Character controllers translated (components and the primary mirror).
+    pub character_controllers: usize,
+    /// Navigation agents whose target and path were translated.
+    pub nav_agents: usize,
+    /// Point gravity source centers translated.
+    pub gravity_sources: usize,
+}
+
 /// Standard game loop that wires together all engine subsystems.
 ///
 /// ```text
@@ -443,6 +469,10 @@ struct RuntimeAudioOutput {
 /// renderer (SceneRenderer / BackendRenderer).
 pub struct GameLoop {
     pub runtime: EngineRuntime,
+
+    /// Cumulative count and details of executed world-origin shifts.
+    world_origin_shift_count: u64,
+    last_world_origin_shift: Option<WorldOriginShift>,
 
     #[cfg(feature = "gameplay")]
     pub physics: Option<PhysicsWorld>,
@@ -496,6 +526,8 @@ impl GameLoop {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             runtime: EngineRuntime::new(config),
+            world_origin_shift_count: 0,
+            last_world_origin_shift: None,
             #[cfg(feature = "gameplay")]
             physics: None,
             #[cfg(feature = "gameplay")]
@@ -635,6 +667,173 @@ impl GameLoop {
             self.runtime
                 .with_world(|world| physics.sync_from_ecs(world));
         }
+    }
+
+    // ── World origin shifting (ENG-01 Phase 2) ──────────────────────────
+
+    /// Current runtime world origin.
+    ///
+    /// Every `Transform.translation` (and every other f32 world-space
+    /// runtime value) is stored **relative** to this origin; the logical
+    /// position of an entity is `world_origin + world_position`. Zero until
+    /// the first [`shift_world_origin`](Self::shift_world_origin) and reset
+    /// by every scene load.
+    pub fn world_origin(&self) -> [f64; 3] {
+        self.runtime
+            .with_world(|world| world.world_origin())
+            .unwrap_or([0.0; 3])
+    }
+
+    /// Number of world-origin shifts performed since this loop was created.
+    pub fn world_origin_shift_count(&self) -> u64 {
+        self.world_origin_shift_count
+    }
+
+    /// Details of the most recent world-origin shift, if any.
+    pub fn last_world_origin_shift(&self) -> Option<WorldOriginShift> {
+        self.last_world_origin_shift
+    }
+
+    /// Evaluate the origin-shift trigger once and shift at most once.
+    ///
+    /// Intended call site: the frame boundary, after `update()` and
+    /// scene-transition processing, alongside cell-streaming commits and
+    /// before `render()` — never mid-frame. With
+    /// [`SceneSettings::origin_shift`] disabled (the default) or without an
+    /// active world this is a no-op.
+    ///
+    /// The reference position is the configured
+    /// `reference_entity`'s world position, or the active camera's world
+    /// position when unset. When its distance from the origin exceeds
+    /// `threshold`, exactly one shift by the full reference position runs, so
+    /// the reference lands back at the (relative) origin.
+    pub fn tick_world_origin_shift(&mut self) -> Option<WorldOriginShift> {
+        let settings = self
+            .runtime
+            .with_world(|world| world.scene_settings().origin_shift.clone())?;
+        if !settings.enabled || !settings.threshold.is_finite() || settings.threshold <= 0.0 {
+            return None;
+        }
+        let reference = self
+            .runtime
+            .with_world(|world| match settings.reference_entity.as_deref() {
+                Some(id) => world
+                    .entity_by_persistent_id(id)
+                    .and_then(|entity| engine_scene::entity_world_position(world, entity)),
+                None => engine_scene::active_camera_world_position(world),
+            })
+            .flatten()?;
+        if !reference.is_finite() {
+            return None;
+        }
+        if (reference.length() as f64) <= f64::from(settings.threshold) {
+            return None;
+        }
+        self.shift_world_origin([
+            f64::from(reference.x),
+            f64::from(reference.y),
+            f64::from(reference.z),
+        ])
+    }
+
+    /// Shift the world origin by `delta`, preserving logical positions.
+    ///
+    /// This is the atomic consistency sweep behind
+    /// [`tick_world_origin_shift`](Self::tick_world_origin_shift); hosts may
+    /// also call it directly (e.g. from tests or a debug console) at a frame
+    /// boundary. Every f32 world-space runtime value moves by `-delta` and
+    /// [`World::world_origin`] advances by `delta`:
+    ///
+    /// - every root `Transform` in the ECS (children follow via the
+    ///   hierarchy; disabled entities included),
+    /// - every physics body, teleported in place with velocities, forces,
+    ///   joints, and sleep state preserved (`gameplay` feature),
+    /// - every `CharacterController` position, including the primary mirror
+    ///   used by [`update_character`](Self::update_character),
+    /// - every navigation agent's target and in-progress path
+    ///   (`runtime-subsystems` feature),
+    /// - every point `GravitySource` center (`gameplay` feature).
+    ///
+    /// Audio needs no sweep: emitter/listener snapshots are rebuilt from ECS
+    /// transforms every `update()`, and emitters and listener shift together
+    /// so relative audio geometry is seamless. Camera-relative rendering
+    /// composes unchanged: extraction subtracts the *current* camera
+    /// translation each frame, which is exactly what the shift rebased.
+    ///
+    /// Returns `None` when no world is active.
+    pub fn shift_world_origin(&mut self, delta: [f64; 3]) -> Option<WorldOriginShift> {
+        let offset = Vec3::new(delta[0] as f32, delta[1] as f32, delta[2] as f32);
+        let (transforms, character_controllers, nav_agents, gravity_sources) =
+            self.runtime.with_world_mut(|world| {
+                let transforms = world.shift_world_origin(delta);
+
+                let mut characters = 0usize;
+                for (_, controller) in world.query_all_mut::<CharacterController>() {
+                    let position = controller.position();
+                    controller.set_position(position - offset);
+                    characters += 1;
+                }
+
+                #[cfg(feature = "runtime-subsystems")]
+                let nav_agents = {
+                    let mut count = 0usize;
+                    for (_, agent) in world.query_all_mut::<engine_nav::AiAgent>() {
+                        agent.shift_world_positions(-offset);
+                        count += 1;
+                    }
+                    count
+                };
+                #[cfg(not(feature = "runtime-subsystems"))]
+                let nav_agents = 0usize;
+
+                #[cfg(feature = "gameplay")]
+                let gravity_sources = engine_physics::shift_gravity_source_centers(world, -offset);
+                #[cfg(not(feature = "gameplay"))]
+                let gravity_sources = 0usize;
+
+                (transforms, characters, nav_agents, gravity_sources)
+            })?;
+
+        #[cfg(feature = "gameplay")]
+        let physics_bodies = self
+            .physics
+            .as_mut()
+            .map(|physics| physics.translate_bodies(-offset))
+            .unwrap_or(0);
+        #[cfg(not(feature = "gameplay"))]
+        let physics_bodies = 0usize;
+
+        // The primary character mirror is a clone of the component refreshed
+        // every frame; keep it consistent between the shift and the next
+        // update so a same-frame read cannot observe the pre-shift position.
+        if let Some(controller) = self.character.as_mut() {
+            let position = controller.position();
+            controller.set_position(position - offset);
+        }
+
+        let shift = WorldOriginShift {
+            delta,
+            origin: self.world_origin(),
+            transforms,
+            physics_bodies,
+            character_controllers,
+            nav_agents,
+            gravity_sources,
+        };
+        self.world_origin_shift_count += 1;
+        self.last_world_origin_shift = Some(shift);
+        tracing::info!(
+            delta = ?shift.delta,
+            origin = ?shift.origin,
+            transforms = shift.transforms,
+            physics_bodies = shift.physics_bodies,
+            character_controllers = shift.character_controllers,
+            nav_agents = shift.nav_agents,
+            gravity_sources = shift.gravity_sources,
+            count = self.world_origin_shift_count,
+            "world origin shifted"
+        );
+        Some(shift)
     }
 
     /// Take the most recent physics event snapshot, leaving it empty.
@@ -1334,6 +1533,12 @@ impl GameLoop {
         let updated_primary = self
             .runtime
             .with_world_mut(|world| {
+                // Path queries run in the navmesh's authored (logical)
+                // space; agent and controller state stays origin-relative.
+                let origin = {
+                    let origin = world.world_origin();
+                    Vec3::new(origin[0] as f32, origin[1] as f32, origin[2] as f32)
+                };
                 let entities = world
                     .query::<engine_nav::AiAgent>()
                     .map(|(entity, _)| entity)
@@ -1359,7 +1564,13 @@ impl GameLoop {
                     else {
                         continue;
                     };
-                    engine_nav::update_ai_agent(&mut agent, &mut controller, navmesh, dt);
+                    engine_nav::update_ai_agent_with_world_origin(
+                        &mut agent,
+                        &mut controller,
+                        navmesh,
+                        dt,
+                        origin,
+                    );
                     if let Some(component) = world.get_mut::<engine_nav::AiAgent>(entity) {
                         *component = agent;
                     }
@@ -3533,5 +3744,344 @@ mod gameplay_script_bridge_tests {
                 result,
                 GameplayPhysicsQueryResult::RaycastHit { query_id: 1, .. }
             ))));
+    }
+}
+
+#[cfg(test)]
+mod world_origin_tests {
+    use engine_scene::components::Transform;
+
+    use super::*;
+
+    /// Load the sample scene with the origin-shift trigger enabled and give
+    /// the camera and cube explicit root transforms.
+    fn shiftable_game_loop(threshold: f32) -> GameLoop {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                world.scene_settings_mut().origin_shift.enabled = true;
+                world.scene_settings_mut().origin_shift.threshold = threshold;
+                let camera = world.entity_by_persistent_id("camera-main").unwrap();
+                world.add_component(camera, Transform::default());
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(cube, Transform::default());
+            })
+            .unwrap();
+        game_loop
+    }
+
+    fn set_translation(game_loop: &GameLoop, persistent_id: &str, translation: Vec3) {
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let entity = world.entity_by_persistent_id(persistent_id).unwrap();
+                world.get_mut::<Transform>(entity).unwrap().translation = translation;
+            })
+            .unwrap();
+    }
+
+    fn translation_of(game_loop: &GameLoop, persistent_id: &str) -> Vec3 {
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let entity = world.entity_by_persistent_id(persistent_id).unwrap();
+                world.get::<Transform>(entity).unwrap().translation
+            })
+            .unwrap()
+    }
+
+    /// Logical position: `world_origin + world_position`. This is the
+    /// invariant every origin shift must preserve.
+    fn logical_position(game_loop: &GameLoop, persistent_id: &str) -> [f64; 3] {
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let entity = world.entity_by_persistent_id(persistent_id).unwrap();
+                let position = engine_scene::entity_world_position(world, entity).unwrap();
+                let origin = world.world_origin();
+                [
+                    origin[0] + f64::from(position.x),
+                    origin[1] + f64::from(position.y),
+                    origin[2] + f64::from(position.z),
+                ]
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn origin_shift_is_disabled_by_default() {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let camera = world.entity_by_persistent_id("camera-main").unwrap();
+                world.add_component(camera, Transform::default());
+            })
+            .unwrap();
+        // Past the default 8 km threshold, but the opt-in flag stays off.
+        set_translation(&game_loop, "camera-main", Vec3::new(9000.0, 0.0, 0.0));
+
+        assert!(game_loop.tick_world_origin_shift().is_none());
+        assert_eq!(game_loop.world_origin(), [0.0; 3]);
+        assert_eq!(game_loop.world_origin_shift_count(), 0);
+        assert_eq!(game_loop.last_world_origin_shift(), None);
+        assert_eq!(
+            translation_of(&game_loop, "camera-main"),
+            Vec3::new(9000.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn origin_shift_triggers_past_threshold_and_preserves_logical_positions() {
+        let mut game_loop = shiftable_game_loop(100.0);
+        set_translation(&game_loop, "camera-main", Vec3::new(150.0, 0.0, 0.0));
+        set_translation(&game_loop, "cube-01", Vec3::new(160.0, 5.0, -20.0));
+        let cube_logical_before = logical_position(&game_loop, "cube-01");
+
+        let shift = game_loop.tick_world_origin_shift().expect("shift runs");
+
+        assert_eq!(shift.delta, [150.0, 0.0, 0.0]);
+        assert_eq!(shift.origin, [150.0, 0.0, 0.0]);
+        assert_eq!(shift.transforms, 2);
+        assert_eq!(game_loop.world_origin(), [150.0, 0.0, 0.0]);
+        assert_eq!(game_loop.world_origin_shift_count(), 1);
+        assert_eq!(game_loop.last_world_origin_shift(), Some(shift));
+        // The reference camera lands back on the relative origin and every
+        // logical position is unchanged.
+        assert!(translation_of(&game_loop, "camera-main").length() < 1e-4);
+        assert_eq!(logical_position(&game_loop, "cube-01"), cube_logical_before);
+        assert_eq!(
+            logical_position(&game_loop, "camera-main"),
+            [150.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn origin_shift_stays_put_below_threshold() {
+        let mut game_loop = shiftable_game_loop(100.0);
+        set_translation(&game_loop, "camera-main", Vec3::new(50.0, 0.0, 0.0));
+
+        assert!(game_loop.tick_world_origin_shift().is_none());
+        assert_eq!(game_loop.world_origin(), [0.0; 3]);
+        assert_eq!(game_loop.world_origin_shift_count(), 0);
+        assert_eq!(
+            translation_of(&game_loop, "camera-main"),
+            Vec3::new(50.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn origin_shift_runs_at_most_once_per_tick() {
+        let mut game_loop = shiftable_game_loop(100.0);
+        set_translation(&game_loop, "camera-main", Vec3::new(150.0, 0.0, 0.0));
+
+        assert!(game_loop.tick_world_origin_shift().is_some());
+        // After the shift the reference sits at the relative origin, so a
+        // second evaluation in the same frame must not shift again.
+        assert!(game_loop.tick_world_origin_shift().is_none());
+        assert_eq!(game_loop.world_origin_shift_count(), 1);
+    }
+
+    #[test]
+    fn origin_shift_watches_the_configured_reference_entity() {
+        let mut game_loop = shiftable_game_loop(100.0);
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                world.scene_settings_mut().origin_shift.reference_entity =
+                    Some("cube-01".to_string());
+            })
+            .unwrap();
+        set_translation(&game_loop, "camera-main", Vec3::new(10.0, 0.0, 0.0));
+        set_translation(&game_loop, "cube-01", Vec3::new(220.0, 0.0, 30.0));
+
+        let shift = game_loop.tick_world_origin_shift().expect("shift runs");
+
+        assert_eq!(shift.delta, [220.0, 0.0, 30.0]);
+        // The reference entity lands on the relative origin while the camera
+        // keeps its logical position.
+        assert!(translation_of(&game_loop, "cube-01").length() < 1e-4);
+        assert_eq!(
+            logical_position(&game_loop, "camera-main"),
+            [10.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn origin_shift_waits_for_the_frame_boundary() {
+        let mut game_loop = shiftable_game_loop(100.0);
+        set_translation(&game_loop, "camera-main", Vec3::new(150.0, 0.0, 0.0));
+
+        // `update()` never triggers a shift mid-frame; the host calls
+        // `tick_world_origin_shift` at the frame boundary.
+        game_loop.update(0.1);
+        assert_eq!(game_loop.world_origin(), [0.0; 3]);
+        assert_eq!(game_loop.world_origin_shift_count(), 0);
+
+        assert!(game_loop.tick_world_origin_shift().is_some());
+        assert_eq!(game_loop.world_origin_shift_count(), 1);
+    }
+
+    #[test]
+    fn origin_shift_moves_character_controllers_and_the_primary_mirror() {
+        let mut game_loop = shiftable_game_loop(100.0);
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                let mut controller = CharacterController::new();
+                controller.set_position(Vec3::new(200.0, 1.0, 0.0));
+                world.add_component(cube, controller);
+            })
+            .unwrap();
+        let mut mirror = CharacterController::new();
+        mirror.set_position(Vec3::new(200.0, 1.0, 0.0));
+        game_loop.character = Some(mirror);
+        set_translation(&game_loop, "camera-main", Vec3::new(150.0, 0.0, 0.0));
+
+        let shift = game_loop.tick_world_origin_shift().expect("shift runs");
+
+        assert_eq!(shift.character_controllers, 1);
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                assert_eq!(
+                    world.get::<CharacterController>(cube).unwrap().position(),
+                    Vec3::new(50.0, 1.0, 0.0)
+                );
+            })
+            .unwrap();
+        // The primary mirror moves with the component so a same-frame read
+        // cannot observe the pre-shift position.
+        assert_eq!(
+            game_loop.character.as_ref().unwrap().position(),
+            Vec3::new(50.0, 1.0, 0.0)
+        );
+    }
+
+    #[cfg(feature = "gameplay")]
+    #[test]
+    fn origin_shift_teleports_physics_bodies_and_sweeps_gravity_sources() {
+        use engine_physics::{Collider, GravityMode, GravitySource, RigidBody};
+
+        let mut game_loop = shiftable_game_loop(100.0);
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(cube, RigidBody::default());
+                world.add_component(cube, Collider::default());
+                world.add_component(
+                    cube,
+                    GravitySource {
+                        mode: GravityMode::Point,
+                        center: Vec3::new(400.0, 0.0, 0.0),
+                        ..GravitySource::default()
+                    },
+                );
+            })
+            .unwrap();
+        set_translation(&game_loop, "cube-01", Vec3::new(300.0, 0.0, 0.0));
+        game_loop.init_physics();
+        set_translation(&game_loop, "camera-main", Vec3::new(150.0, 0.0, 0.0));
+
+        let shift = game_loop.tick_world_origin_shift().expect("shift runs");
+
+        assert_eq!(shift.physics_bodies, 1);
+        assert_eq!(shift.gravity_sources, 1);
+        // The point gravity centre moved by -delta.
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                assert_eq!(
+                    world.get::<GravitySource>(cube).unwrap().center,
+                    Vec3::new(250.0, 0.0, 0.0)
+                );
+            })
+            .unwrap();
+        // Queries observe the teleported body immediately: a ray over the
+        // shifted position hits, a ray over the stale position misses.
+        let physics = game_loop.physics.as_ref().unwrap();
+        assert!(physics
+            .raycast(Vec3::new(150.0, 10.0, 0.0), Vec3::NEG_Y, 100.0)
+            .is_some());
+        assert!(physics
+            .raycast(Vec3::new(300.0, 10.0, 0.0), Vec3::NEG_Y, 100.0)
+            .is_none());
+
+        // A subsequent frame keeps the entity at its logical position: the
+        // physics -> ECS resync must not yank the body back to pre-shift
+        // coordinates.
+        game_loop.update(0.0);
+        let cube_x = translation_of(&game_loop, "cube-01").x;
+        assert!((cube_x - 150.0).abs() < 1e-3, "{cube_x}");
+        assert_eq!(logical_position(&game_loop, "cube-01")[0], 300.0);
+    }
+
+    #[cfg(feature = "runtime-subsystems")]
+    #[test]
+    fn origin_shift_moves_nav_agent_targets() {
+        let mut game_loop = shiftable_game_loop(100.0);
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                let mut agent = engine_nav::AiAgent::new();
+                agent.target = Some(Vec3::new(500.0, 0.0, -100.0));
+                world.add_component(cube, agent);
+            })
+            .unwrap();
+        set_translation(&game_loop, "camera-main", Vec3::new(150.0, 0.0, 0.0));
+
+        let shift = game_loop.tick_world_origin_shift().expect("shift runs");
+
+        assert_eq!(shift.nav_agents, 1);
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                assert_eq!(
+                    world.get::<engine_nav::AiAgent>(cube).unwrap().target,
+                    Some(Vec3::new(350.0, 0.0, -100.0))
+                );
+            })
+            .unwrap();
+    }
+
+    #[cfg(feature = "runtime-audio-output")]
+    #[test]
+    fn origin_shift_moves_audio_snapshot_positions() {
+        let mut game_loop = shiftable_game_loop(100.0);
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                let mut source = engine_audio::AudioSourceComponent::default();
+                source.spatial = true;
+                world.add_component(cube, source);
+                let camera = world.entity_by_persistent_id("camera-main").unwrap();
+                world.add_component(camera, engine_audio::AudioListenerComponent::default());
+            })
+            .unwrap();
+        set_translation(&game_loop, "camera-main", Vec3::new(150.0, 0.0, 0.0));
+        set_translation(&game_loop, "cube-01", Vec3::new(300.0, 0.0, 0.0));
+
+        game_loop.tick_world_origin_shift().expect("shift runs");
+
+        // Audio state is rebuilt from ECS transforms every frame, so the
+        // next snapshot already observes the shifted positions.
+        let frame = game_loop.runtime_audio_frame();
+        assert_eq!(frame.sources.len(), 1);
+        assert_eq!(
+            frame.sources[0].emitter.as_ref().unwrap().position,
+            Vec3::new(150.0, 0.0, 0.0)
+        );
+        let listener = frame.listener.as_ref().unwrap();
+        assert!(listener.position.length() < 1e-4, "{listener:?}");
     }
 }

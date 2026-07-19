@@ -334,6 +334,35 @@ impl PhysicsWorld {
         self.sync_to_ecs_internal(world);
     }
 
+    /// Teleport every registered body by `offset`, preserving simulation
+    /// state.
+    ///
+    /// World-origin shifts use this instead of rebuilding the physics world:
+    /// each body's rotation, velocities, accumulated forces, joints, and
+    /// sleep state survive the teleport exactly, so a moving body continues
+    /// seamlessly and a sleeping body stays asleep. The query pipeline is
+    /// refreshed immediately so raycasts and overlap queries issued before
+    /// the next [`step`](Self::step) observe the shifted positions.
+    ///
+    /// Returns the number of bodies teleported.
+    pub fn translate_bodies(&mut self, offset: glam::Vec3) -> usize {
+        let entities: Vec<Entity> = self.backend.body_map.keys().copied().collect();
+        let mut teleported = 0;
+        for entity in entities {
+            if self.backend.translate_body(entity, offset) {
+                teleported += 1;
+            }
+        }
+        if teleported > 0 {
+            // Bodies were teleported outside a step: propagate their poses to
+            // the attached colliders, then refresh the query pipeline so
+            // raycasts/overlaps observe the shift before the next step.
+            self.backend.propagate_body_positions_to_colliders();
+            self.backend.sync_query_pipeline();
+        }
+        teleported
+    }
+
     fn sync_to_ecs_internal(&mut self, world: &mut crate::World) {
         let body_entities: Vec<Entity> = self.backend.body_map.keys().copied().collect();
 

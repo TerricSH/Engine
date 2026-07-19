@@ -102,6 +102,11 @@ impl NavAgent {
         self.path = Some(path);
     }
 
+    /// The path the agent is currently following, if any.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_ref()
+    }
+
     /// Set movement speed (metres per second).
     pub fn set_speed(&mut self, speed: f32) {
         self.speed = speed;
@@ -115,6 +120,19 @@ impl NavAgent {
     /// Current world position.
     pub fn position(&self) -> Vec3 {
         self.position
+    }
+
+    /// Translate the agent's tracked position and current path by `offset`.
+    ///
+    /// World-origin shifts apply this with `-delta` so the path the agent is
+    /// actively following stays glued to the same logical route while the
+    /// origin-relative frame moves. Waypoint progress (`next_waypoint`) and
+    /// speed are unaffected.
+    pub fn translate(&mut self, offset: Vec3) {
+        self.position += offset;
+        if let Some(path) = self.path.as_mut() {
+            path.translate(offset);
+        }
     }
 
     /// Advance the agent along its path by `dt` seconds.

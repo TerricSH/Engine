@@ -49,6 +49,15 @@
 //! bodies, unloaded entities lose theirs, and every other body keeps its
 //! simulation state.
 //!
+//! World-origin shifts (ENG-01 Phase 2) compose with streaming: partition
+//! bounds and cell scene data are authored in logical coordinates, so the
+//! driver lifts origin-relative world positions by
+//! [`World::world_origin`] for every bounds test and rebases merged
+//! hierarchy roots by `-origin`. World-space component data other than
+//! `Transform` inside cell scenes (for example `engine.nav_agent` targets
+//! or `engine.gravity_source` centers) is **not** rebased on merge in this
+//! version.
+//!
 //! v1 limitations (documented in `docs/GAME_PROJECTS.md`):
 //!
 //! - Shared cooked assets are never unloaded; there is no per-cell asset
@@ -65,6 +74,7 @@ use std::path::PathBuf;
 
 use engine_asset::partition::{CellBounds, WorldPartition};
 use engine_asset::project::GameProject;
+use engine_scene::components::Transform;
 use engine_scene::{
     active_camera_world_position, validate_scene, Entity, Scene, World, SCENE_ONLY_COMPONENT_TYPES,
 };
@@ -72,6 +82,15 @@ use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, PersistentId};
 use glam::Vec3;
 
 use crate::EngineRuntime;
+
+/// The f32 origin-relative offset corresponding to a world origin.
+///
+/// Streaming decisions run in logical (authored) space, so origin-relative
+/// positions from the world are lifted by this offset before they are
+/// compared against partition bounds.
+fn origin_offset(origin: [f64; 3]) -> Vec3 {
+    Vec3::new(origin[0] as f32, origin[1] as f32, origin[2] as f32)
+}
 
 /// Default enter factor: the camera must be inside `bounds * 1.0`.
 pub const DEFAULT_ENTER_FACTOR: f32 = 1.0;
@@ -578,7 +597,15 @@ impl CellStreamingDriver {
         // in-flight cells progress and their assets commit additively.
         runtime.drain_cooked_asset_stream();
 
-        let camera = runtime.with_world(active_camera_world_position).flatten();
+        let camera = runtime
+            .with_world(|world| {
+                // Streaming decisions run in logical space: partition bounds
+                // are authored logical coordinates, while world positions are
+                // origin-relative after a world-origin shift (ENG-01).
+                active_camera_world_position(world)
+                    .map(|camera| camera + origin_offset(world.world_origin()))
+            })
+            .flatten();
         let Some(camera) = camera else {
             return report;
         };
@@ -679,6 +706,7 @@ impl CellStreamingDriver {
     /// merged cell entities that moved out of their authoring cell bounds.
     fn update_residency(&mut self, runtime: &EngineRuntime, report: &mut CellStreamTickReport) {
         let Some((new_ids, moved_out)) = runtime.with_world(|world| {
+            let origin = origin_offset(world.world_origin());
             let world_ids: Vec<PersistentId> = world
                 .persistent_entities()
                 .map(|(id, _)| id.to_owned())
@@ -704,6 +732,10 @@ impl CellStreamingDriver {
                     let Some(position) = positions.position(world, entity) else {
                         continue;
                     };
+                    // Compare in logical space: bounds are authored logical
+                    // coordinates, positions from the world are
+                    // origin-relative after a world-origin shift.
+                    let position = position + origin;
                     if !Self::inside_bounds(&record.bounds, self.config.exit_factor, position) {
                         moved_out.push(id.clone());
                     }
@@ -941,6 +973,7 @@ impl CellStreamingDriver {
         let merged = runtime.with_world_mut(|world| world.merge_scene(&scene));
         match merged {
             Some(Ok(_)) => {
+                Self::rebase_merged_roots(runtime, &scene);
                 let record = self.cells.get_mut(cell_id).expect("cell exists");
                 record.merged_ids = scene
                     .entities
@@ -971,6 +1004,38 @@ impl CellStreamingDriver {
                 );
             }
         }
+    }
+
+    /// Rebase freshly merged cell content into the world's origin-relative
+    /// frame.
+    ///
+    /// Cell scenes are authored in logical coordinates, so while the world
+    /// origin is non-zero (ENG-01 Phase 2) the merged hierarchy roots must be
+    /// translated by `-origin` to land on their authored logical positions.
+    /// Entities parented onto already-live residents keep their authored
+    /// local translation: their parent's world position already accounts for
+    /// the origin.
+    fn rebase_merged_roots(runtime: &EngineRuntime, scene: &Scene) {
+        let Some(origin) = runtime.with_world(|world| world.world_origin()) else {
+            return;
+        };
+        if origin == [0.0; 3] {
+            return;
+        }
+        let offset = origin_offset(origin);
+        runtime.with_world_mut(|world| {
+            for record in &scene.entities {
+                let Some(entity) = world.entity_by_persistent_id(&record.persistent_id) else {
+                    continue;
+                };
+                let Some(transform) = world.get_mut::<Transform>(entity) else {
+                    continue;
+                };
+                if transform.parent.is_none() {
+                    transform.translation -= offset;
+                }
+            }
+        });
     }
 
     /// Move a cell into the terminal failed state and surface a diagnostic.
@@ -2050,5 +2115,92 @@ mod tests {
         assert!(report.world_changed());
         game_loop.resync_physics_from_world();
         assert_eq!(game_loop.physics.as_ref().expect("physics").body_count(), 0);
+    }
+
+    // ── World-origin shifts (ENG-01 Phase 2) ───────────────────────────────
+
+    /// Fixture with a far-field cell: authored bounds x ∈ [8000, 8020] and a
+    /// cube authored at logical x = 8005.
+    fn far_cell_fixture(name: &str) -> StreamFixture {
+        stream_fixture(
+            name,
+            vec![
+                startup_scene(),
+                cell_scene(
+                    "level-a",
+                    vec![cube_record(
+                        "cube-a",
+                        None,
+                        [8005.0, 0.0, 0.0],
+                        "mat-default",
+                    )],
+                ),
+            ],
+            vec![(
+                "cell-a",
+                "level-a",
+                bounds([8010.0, 0.0, 0.0], [10.0, 10.0, 10.0]),
+            )],
+        )
+    }
+
+    /// Move the camera to logical x = 8010, then shift the world origin by
+    /// 8 km: the camera lands at relative x = 10 with its logical position
+    /// unchanged.
+    fn shift_origin_to_camera(runtime: &EngineRuntime) {
+        set_camera_position(runtime, Vec3::new(8010.0, 0.0, 0.0));
+        runtime.with_world_mut(|world| {
+            world.shift_world_origin([8000.0, 0.0, 0.0]);
+        });
+    }
+
+    #[test]
+    fn streaming_decisions_use_logical_positions_with_a_non_zero_origin() {
+        let fixture = far_cell_fixture("origin-logical");
+        let (mut runtime, mut driver) = running_driver(&fixture, CellStreamingConfig::default());
+        shift_origin_to_camera(&runtime);
+
+        // Logical camera position 8010 is inside the cell bounds even though
+        // the stored (relative) camera position is only 10.
+        let report = driver.tick(&mut runtime);
+        assert_eq!(report.merged_cells, vec!["cell-a".to_string()]);
+        assert_eq!(driver.cell_state("cell-a"), Some(&CellState::Loaded));
+        assert!(has_entity(&runtime, "cube-a"));
+
+        // Moving the relative camera to 100 lifts the logical position to
+        // 8100 — outside the exit band — so the cell unloads.
+        set_camera_position(&runtime, Vec3::new(100.0, 0.0, 0.0));
+        let report = driver.tick(&mut runtime);
+        assert_eq!(report.unloaded_cells, vec!["cell-a".to_string()]);
+        assert!(!has_entity(&runtime, "cube-a"));
+    }
+
+    #[test]
+    fn merged_cell_roots_are_rebased_into_origin_relative_space() {
+        let fixture = far_cell_fixture("origin-rebase");
+        let (mut runtime, mut driver) = running_driver(&fixture, CellStreamingConfig::default());
+        shift_origin_to_camera(&runtime);
+
+        let report = driver.tick(&mut runtime);
+        assert_eq!(report.merged_cells, vec!["cell-a".to_string()]);
+
+        // The cube was authored at logical x = 8005; after the merge its
+        // stored transform must be rebased by -origin, i.e. relative x ≈ 5,
+        // so `world_origin + translation` still equals 8005.
+        let translation = runtime
+            .with_world(|world| {
+                let cube = world.entity_by_persistent_id("cube-a")?;
+                Some(world.get::<Transform>(cube)?.translation)
+            })
+            .flatten()
+            .expect("merged cube transform");
+        assert!(
+            (translation.x - 5.0).abs() < 1e-3,
+            "expected relative x ≈ 5, got {translation:?}"
+        );
+        let origin = runtime
+            .with_world(|world| world.world_origin())
+            .expect("world");
+        assert_eq!(origin, [8000.0, 0.0, 0.0]);
     }
 }
