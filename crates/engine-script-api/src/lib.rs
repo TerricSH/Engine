@@ -10,13 +10,16 @@
 pub const GAMEPLAY_SCRIPT_API_SCHEMA: &str = "ScriptAPI-v0";
 
 /// Concrete SDK contract emitted for newly created game projects.
-pub const GAMEPLAY_SCRIPT_API_VERSION: &str = "0.9.0";
+pub const GAMEPLAY_SCRIPT_API_VERSION: &str = "0.10.0";
 
 /// Managed SDK assembly referenced by game-authored C# projects.
 pub const MANAGED_SDK_ASSEMBLY_NAME: &str = "EngineGameplay";
 
 /// Engine-owned generated C# source compiled into the managed SDK assembly.
 pub const GENERATED_CSHARP_API_FILE: &str = "EngineGameplay.cs";
+
+/// Tactical-game toolkit compiled alongside the core managed API.
+pub const GENERATED_CSHARP_TACTICS_FILE: &str = "EngineTactics.cs";
 
 /// Sidecar that records ownership, version, and the canonical source hash.
 pub const GENERATED_CONTRACT_FILE: &str = "EngineGameplay.contract.json";
@@ -31,6 +34,7 @@ pub struct GameplayScriptApiContract {
     pub version: &'static str,
     pub managed_sdk_assembly: &'static str,
     pub generated_csharp_file: &'static str,
+    pub generated_csharp_tactics_file: &'static str,
     pub generated_contract_file: &'static str,
     pub generated_msbuild_targets_file: &'static str,
 }
@@ -40,6 +44,7 @@ pub const GAMEPLAY_SCRIPT_API: GameplayScriptApiContract = GameplayScriptApiCont
     version: GAMEPLAY_SCRIPT_API_VERSION,
     managed_sdk_assembly: MANAGED_SDK_ASSEMBLY_NAME,
     generated_csharp_file: GENERATED_CSHARP_API_FILE,
+    generated_csharp_tactics_file: GENERATED_CSHARP_TACTICS_FILE,
     generated_contract_file: GENERATED_CONTRACT_FILE,
     generated_msbuild_targets_file: GENERATED_MSBUILD_TARGETS_FILE,
 };
@@ -51,9 +56,12 @@ mod tests {
     #[test]
     fn gameplay_contract_is_explicit_and_versioned() {
         assert_eq!(GAMEPLAY_SCRIPT_API.schema, "ScriptAPI-v0");
-        assert_eq!(GAMEPLAY_SCRIPT_API.version, "0.9.0");
+        assert_eq!(GAMEPLAY_SCRIPT_API.version, "0.10.0");
         assert_eq!(GAMEPLAY_SCRIPT_API.managed_sdk_assembly, "EngineGameplay");
         assert!(GAMEPLAY_SCRIPT_API.generated_csharp_file.ends_with(".cs"));
+        assert!(GAMEPLAY_SCRIPT_API
+            .generated_csharp_tactics_file
+            .ends_with(".cs"));
         assert!(GAMEPLAY_SCRIPT_API
             .generated_contract_file
             .ends_with(".json"));

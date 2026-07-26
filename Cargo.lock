@@ -1179,6 +1179,7 @@ dependencies = [
  "raw-window-handle",
  "render-vulkan",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 1.0.69",
  "tracing",

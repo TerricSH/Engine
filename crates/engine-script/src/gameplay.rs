@@ -50,6 +50,74 @@ pub struct GameplayInputTransitions {
     pub released: BTreeSet<String>,
 }
 
+/// Frame-local pointing-device state for selection and tactical targeting.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GameplayPointerSnapshot {
+    pub position: [f32; 2],
+    pub delta: [f32; 2],
+    pub scroll: [f32; 2],
+    pub viewport: [f32; 2],
+    pub primary_down: bool,
+    pub primary_pressed: bool,
+    pub primary_released: bool,
+    pub secondary_down: bool,
+    pub middle_down: bool,
+    pub focused: bool,
+    pub inside_viewport: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ray_origin: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ray_direction: Option<[f32; 3]>,
+}
+
+/// Active renderer camera snapshot paired with [`GameplayPointerSnapshot`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GameplayCameraSnapshot {
+    pub entity_id: Option<String>,
+    pub perspective: bool,
+    pub position: [f32; 3],
+    pub forward: [f32; 3],
+    pub right: [f32; 3],
+    pub up: [f32; 3],
+    pub viewport: [f32; 4],
+    pub view_projection: [f32; 16],
+    pub inverse_view_projection: [f32; 16],
+}
+
+pub const MAX_SCRIPT_SAVE_STATE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PENDING_SAVE_REQUESTS: usize = 8;
+pub const MAX_PENDING_LOGIC_ASSET_QUERIES: usize = 256;
+pub const MAX_SCRIPT_LOGIC_ASSET_JSON_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameplaySaveEventKind {
+    Saved,
+    Loaded,
+    Failed,
+}
+
+/// Completion of a deferred save-slot request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameplaySaveEvent {
+    pub slot: String,
+    pub kind: GameplaySaveEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameplayLogicAssetResult {
+    pub query_id: u32,
+    pub asset_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 impl GameplayInputTransitions {
     pub fn was_pressed(&self, action: &str) -> bool {
         self.pressed.contains(action)
@@ -1122,6 +1190,18 @@ pub struct GameplayContext {
     pub input_actions: BTreeMap<String, GameplayInputValue>,
     #[serde(default)]
     pub input_transitions: GameplayInputTransitions,
+    /// Pointing-device state and the current cursor ray.
+    #[serde(default)]
+    pub pointer: GameplayPointerSnapshot,
+    /// Renderer-consistent active camera data.
+    #[serde(default)]
+    pub camera: Option<GameplayCameraSnapshot>,
+    /// Results of save/load requests issued by this script instance.
+    #[serde(default)]
+    pub save_events: Vec<GameplaySaveEvent>,
+    /// Deferred data-driven logic graph query results.
+    #[serde(default)]
+    pub logic_asset_results: Vec<GameplayLogicAssetResult>,
     /// Collision and trigger events involving the owning entity this frame.
     #[serde(default)]
     pub physics_events: Vec<GameplayPhysicsEvent>,
@@ -1288,6 +1368,20 @@ pub enum GameplayCommand {
         component_type: String,
         fields: BTreeMap<String, GameplayComponentValue>,
     },
+    /// Capture the live engine state plus one project-owned JSON document.
+    SaveCheckpoint {
+        slot: String,
+        state_json: String,
+    },
+    /// Restore a checkpoint from a configured save slot.
+    LoadCheckpoint {
+        slot: String,
+    },
+    /// Query a cooked behavior/state/skill/quest logic asset by ID.
+    QueryLogicAsset {
+        query_id: u32,
+        asset_id: String,
+    },
 }
 
 impl GameplayCommand {
@@ -1416,7 +1510,38 @@ impl GameplayCommand {
                 validate_component_type_key(component_type)?;
                 validate_component_fields(fields)
             }
+            Self::SaveCheckpoint { slot, state_json } => {
+                validate_save_slot(slot)?;
+                if state_json.len() > MAX_SCRIPT_SAVE_STATE_BYTES {
+                    return Err(format!(
+                        "save state JSON exceeds the {MAX_SCRIPT_SAVE_STATE_BYTES}-byte limit"
+                    ));
+                }
+                serde_json::from_str::<serde_json::Value>(state_json)
+                    .map(|_| ())
+                    .map_err(|error| format!("save state must be valid JSON: {error}"))
+            }
+            Self::LoadCheckpoint { slot } => validate_save_slot(slot),
+            Self::QueryLogicAsset { asset_id, .. } => validate_entity_id(asset_id),
         }
+    }
+}
+
+pub fn validate_save_slot(slot: &str) -> Result<(), String> {
+    let valid = !slot.is_empty()
+        && slot.len() <= 64
+        && slot != "."
+        && slot != ".."
+        && slot
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(
+            "save slots must contain 1 to 64 ASCII letters, digits, underscores, hyphens, or dots"
+                .into(),
+        )
     }
 }
 
@@ -1775,6 +1900,19 @@ pub struct OwnedGameplayRagdollRequest {
     pub impulse: [f32; 3],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GameplaySaveOperation {
+    Save { state_json: String },
+    Load,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedGameplaySaveRequest {
+    pub owner_entity_id: String,
+    pub slot: String,
+    pub operation: GameplaySaveOperation,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1798,6 +1936,35 @@ mod tests {
                 pressed: BTreeSet::from(["jump".into()]),
                 released: BTreeSet::new(),
             },
+            pointer: GameplayPointerSnapshot {
+                position: [640.0, 360.0],
+                viewport: [1280.0, 720.0],
+                focused: true,
+                inside_viewport: true,
+                ray_origin: Some([0.0, 10.0, 0.0]),
+                ray_direction: Some([0.0, -1.0, 0.0]),
+                ..GameplayPointerSnapshot::default()
+            },
+            camera: Some(GameplayCameraSnapshot {
+                entity_id: Some("camera".into()),
+                perspective: true,
+                position: [0.0, 10.0, 0.0],
+                forward: [0.0, -1.0, 0.0],
+                viewport: [0.0, 0.0, 1280.0, 720.0],
+                ..GameplayCameraSnapshot::default()
+            }),
+            save_events: vec![GameplaySaveEvent {
+                slot: "autosave".into(),
+                kind: GameplaySaveEventKind::Saved,
+                state_json: None,
+                error: None,
+            }],
+            logic_asset_results: vec![GameplayLogicAssetResult {
+                query_id: 11,
+                asset_id: "soldier-abilities".into(),
+                json: Some("{\"nodes\":[]}".into()),
+                error: None,
+            }],
             physics_events: vec![GameplayPhysicsEvent {
                 kind: GameplayPhysicsEventKind::CollisionEntered,
                 other_entity_id: "floor".into(),
@@ -3056,5 +3223,39 @@ mod tests {
                 .collect(),
         };
         assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn checkpoint_and_logic_asset_commands_are_bounded_and_path_safe() {
+        let save = GameplayCommand::SaveCheckpoint {
+            slot: "ironman-01".into(),
+            state_json: r#"{"round":4,"selected":"unit-2"}"#.into(),
+        };
+        assert!(save.validate().is_ok());
+        assert_eq!(
+            serde_json::to_string(&save).unwrap(),
+            r#"{"type":"save_checkpoint","slot":"ironman-01","state_json":"{\"round\":4,\"selected\":\"unit-2\"}"}"#
+        );
+        assert!(GameplayCommand::LoadCheckpoint {
+            slot: "../outside".into()
+        }
+        .validate()
+        .is_err());
+        assert!(GameplayCommand::SaveCheckpoint {
+            slot: "slot".into(),
+            state_json: "{broken".into(),
+        }
+        .validate()
+        .is_err());
+
+        let query = GameplayCommand::QueryLogicAsset {
+            query_id: 9,
+            asset_id: "soldier-abilities".into(),
+        };
+        assert!(query.validate().is_ok());
+        assert_eq!(
+            serde_json::to_string(&query).unwrap(),
+            r#"{"type":"query_logic_asset","query_id":9,"asset_id":"soldier-abilities"}"#
+        );
     }
 }

@@ -79,7 +79,7 @@ impl DecodedBatch {
         self.discovered_assets
     }
 
-    /// Artifacts intentionally skipped (shader, scene, logic, …).
+    /// Artifacts intentionally skipped (shader, scene, pipeline, script, …).
     pub fn skipped_assets(&self) -> &[String] {
         &self.skipped_assets
     }
@@ -200,8 +200,9 @@ impl EngineRuntime {
     /// Meshes, RGBA8 textures, portable opaque materials, and assets owned by
     /// registered runtime extensions are installed transactionally. A corrupt
     /// or unsupported artifact leaves the previous successful batch intact.
-    /// Shader, scene, logic, pipeline, and script artifacts are reported as
-    /// skipped because their dedicated consumers do not use this cache.
+    /// Shader, scene, pipeline, and script artifacts are reported as skipped
+    /// because their dedicated consumers do not use this cache. Logic graphs
+    /// install through the registered `logic` runtime loader.
     ///
     /// This is the staged pipeline
     /// ([`decode_cooked_batch`] → [`validate_cooked_batch`](Self::validate_cooked_batch)
@@ -699,7 +700,8 @@ fn decode_cooked_asset(
         | AssetType::Animation
         | AssetType::Skeleton
         | AssetType::NavMesh
-        | AssetType::Prefab) => {
+        | AssetType::Prefab
+        | AssetType::Logic) => {
             let type_id = registered_asset_type_id(&kind)
                 .expect("extension-owned asset types have a stable registry mapping");
             let extension = asset_type_registry.get(type_id).ok_or_else(|| {
@@ -721,11 +723,9 @@ fn decode_cooked_asset(
         AssetType::Font => {
             Err("cooked Font assets have no registered runtime loader mapping".into())
         }
-        kind @ (AssetType::Shader
-        | AssetType::Scene
-        | AssetType::Pipeline
-        | AssetType::Script
-        | AssetType::Logic) => Ok(DecodedCookedAsset::Skipped(kind)),
+        kind @ (AssetType::Shader | AssetType::Scene | AssetType::Pipeline | AssetType::Script) => {
+            Ok(DecodedCookedAsset::Skipped(kind))
+        }
         AssetType::Unknown => unreachable!("unknown kind was rejected above"),
     }
 }
@@ -1734,15 +1734,30 @@ pub(crate) mod tests {
             AssetType::NavMesh,
             &bincode::serialize(&navmesh).unwrap(),
         );
+        write_registered_extension_source(
+            &runtime,
+            &dir,
+            "logic.real",
+            AssetType::Logic,
+            br#"{
+                "schema_version":{"major":0,"minor":1,"patch":0},
+                "asset_id":"logic.real",
+                "kind":"SkillGraph",
+                "nodes":[{"id":"root","node_type":"ability","label":null,"transitions":[],"properties":{},"children":[]}],
+                "parameters":{},
+                "metadata":{"author":null,"description":null,"tags":["test"],"version":"1.0.0"}
+            }"#,
+        );
 
         let report = runtime.load_cooked_assets(&dir).unwrap();
 
-        assert_eq!(report.discovered_assets, 4);
-        assert_eq!(report.loaded_extension_assets(), 4);
+        assert_eq!(report.discovered_assets, 5);
+        assert_eq!(report.loaded_extension_assets(), 5);
         assert_eq!(runtime.extension_asset_count("audio_clip"), 1);
         assert_eq!(runtime.extension_asset_count("skeleton"), 1);
         assert_eq!(runtime.extension_asset_count("animation_clip"), 1);
         assert_eq!(runtime.extension_asset_count("navmesh"), 1);
+        assert_eq!(runtime.extension_asset_count("logic"), 1);
         assert_eq!(
             runtime
                 .extension_asset::<engine_audio::AudioClip>(
@@ -1775,6 +1790,9 @@ pub(crate) mod tests {
         );
         assert!(runtime
             .extension_asset::<NavMesh>("navmesh", &AssetId::new("navmesh.real"))
+            .is_some());
+        assert!(runtime
+            .extension_asset::<engine_asset::cook::LogicAsset>("logic", &AssetId::new("logic.real"))
             .is_some());
 
         engine_asset::cook::write_cooked_artifact(

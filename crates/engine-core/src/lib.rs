@@ -47,9 +47,10 @@ pub mod script;
 mod script_components;
 #[cfg(feature = "subsystem-scripting-csharp")]
 use engine_script::{
-    GameplayCommand, GameplayContext, GameplayDamageEvent, GameplayEntitySnapshot,
-    GameplayInputTransitions, GameplayInputValue, GameplayPhysicsEvent, GameplayRagdollEvent,
-    GameplayUiEvent, ScriptEngine, ScriptError, ScriptHost, ScriptTransform,
+    GameplayCameraSnapshot, GameplayCommand, GameplayContext, GameplayDamageEvent,
+    GameplayEntitySnapshot, GameplayInputTransitions, GameplayInputValue, GameplayPhysicsEvent,
+    GameplayPointerSnapshot, GameplayRagdollEvent, GameplaySaveEvent, GameplayUiEvent,
+    ScriptEngine, ScriptError, ScriptHost, ScriptTransform,
 };
 #[cfg(feature = "subsystem-scripting-csharp")]
 use script::{collect_scene_scripts, script_engine_state_summary};
@@ -113,6 +114,7 @@ impl EngineRuntimeBuilder {
         let mut debug_draw_registry = DebugDrawRegistry::new();
         component_registry.register_core();
         engine_scene::register_prefab_asset_type(&mut asset_type_registry);
+        engine_asset::cook::register_logic_asset_type(&mut asset_type_registry);
         engine_character::register_character_extensions(
             &mut component_registry,
             Some(&mut debug_draw_registry),
@@ -260,6 +262,17 @@ pub struct EngineRuntime {
     #[cfg(feature = "subsystem-scripting-csharp")]
     script_input_actions: std::collections::BTreeMap<String, GameplayInputValue>,
     #[cfg(feature = "subsystem-scripting-csharp")]
+    script_pointer: GameplayPointerSnapshot,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    script_camera: Option<GameplayCameraSnapshot>,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pending_save_requests: Vec<engine_script::OwnedGameplaySaveRequest>,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    script_save_events: std::collections::BTreeMap<String, Vec<GameplaySaveEvent>>,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    script_logic_asset_results:
+        std::collections::BTreeMap<String, Vec<engine_script::GameplayLogicAssetResult>>,
+    #[cfg(feature = "subsystem-scripting-csharp")]
     pending_scene_request: Option<SceneLoadRequest>,
     /// Validated physics queries drained from scripts during the current
     /// update. The owning [`crate::game_loop::GameLoop`] executes them
@@ -359,6 +372,16 @@ impl EngineRuntime {
             script_host_name: "dotnet".to_string(),
             #[cfg(feature = "subsystem-scripting-csharp")]
             script_input_actions: std::collections::BTreeMap::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_pointer: GameplayPointerSnapshot::default(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_camera: None,
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            pending_save_requests: Vec::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_save_events: std::collections::BTreeMap::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_logic_asset_results: std::collections::BTreeMap::new(),
             #[cfg(feature = "subsystem-scripting-csharp")]
             pending_scene_request: None,
             #[cfg(feature = "subsystem-scripting-csharp")]
@@ -500,6 +523,9 @@ impl EngineRuntime {
             self.script_ragdoll_events.clear();
             self.pending_component_queries.clear();
             self.script_component_query_results.clear();
+            self.pending_save_requests.clear();
+            self.script_save_events.clear();
+            self.script_logic_asset_results.clear();
             self.attach_scene_scripts(&scene);
         }
 
@@ -550,6 +576,9 @@ impl EngineRuntime {
             self.script_ragdoll_events.clear();
             self.pending_component_queries.clear();
             self.script_component_query_results.clear();
+            self.pending_save_requests.clear();
+            self.script_save_events.clear();
+            self.script_logic_asset_results.clear();
             self.attach_scene_scripts(&scene);
         }
 
@@ -1010,6 +1039,9 @@ impl EngineRuntime {
         self.script_ragdoll_events.clear();
         self.pending_component_queries.clear();
         self.script_component_query_results.clear();
+        self.pending_save_requests.clear();
+        self.script_save_events.clear();
+        self.script_logic_asset_results.clear();
         Ok(())
     }
 
@@ -1028,6 +1060,18 @@ impl EngineRuntime {
         input_actions: std::collections::BTreeMap<String, GameplayInputValue>,
     ) {
         self.script_input_actions = input_actions;
+    }
+
+    /// Set renderer-consistent pointer and camera data for the next script
+    /// lifecycle call.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn set_script_view_context(
+        &mut self,
+        pointer: GameplayPointerSnapshot,
+        camera: Option<GameplayCameraSnapshot>,
+    ) {
+        self.script_pointer = pointer;
+        self.script_camera = camera;
     }
 
     /// Take the next deferred script scene-load request, if scripting is
@@ -1088,6 +1132,19 @@ impl EngineRuntime {
         &mut self,
     ) -> Vec<engine_script::OwnedGameplayRagdollRequest> {
         std::mem::take(&mut self.pending_ragdoll_requests)
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn take_pending_save_requests(&mut self) -> Vec<engine_script::OwnedGameplaySaveRequest> {
+        std::mem::take(&mut self.pending_save_requests)
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub(crate) fn push_script_save_event(&mut self, entity_id: String, event: GameplaySaveEvent) {
+        self.script_save_events
+            .entry(entity_id)
+            .or_default()
+            .push(event);
     }
 
     #[cfg(feature = "subsystem-scripting-csharp")]
@@ -1223,6 +1280,8 @@ impl EngineRuntime {
         let mut diagnostics = self.script_engine.set_gameplay_contexts(&contexts);
         self.script_damage_events.clear();
         self.script_ragdoll_events.clear();
+        self.script_save_events.clear();
+        self.script_logic_asset_results.clear();
         diagnostics.extend(self.script_engine.update(dt));
         let (commands, command_diagnostics) = self.script_engine.drain_gameplay_commands();
         diagnostics.extend(command_diagnostics);
@@ -1342,6 +1401,18 @@ impl EngineRuntime {
                     world_origin,
                     input_actions: input_actions.clone(),
                     input_transitions: input_transitions.clone(),
+                    pointer: self.script_pointer.clone(),
+                    camera: self.script_camera.clone(),
+                    save_events: self
+                        .script_save_events
+                        .get(&entity_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    logic_asset_results: self
+                        .script_logic_asset_results
+                        .get(&entity_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     physics_events: physics_events.get(&entity_id).cloned().unwrap_or_default(),
                     damage_events: self
                         .script_damage_events
@@ -2205,6 +2276,164 @@ impl EngineRuntime {
                             ));
                         }
                     }
+                }
+                GameplayCommand::SaveCheckpoint { slot, state_json } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "save a checkpoint",
+                        ));
+                        continue;
+                    }
+                    let command = GameplayCommand::SaveCheckpoint {
+                        slot: slot.clone(),
+                        state_json: state_json.clone(),
+                    };
+                    if let Err(reason) = command.validate() {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_SAVE_INVALID",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' produced an invalid save request: {reason}"
+                            ),
+                        ));
+                        continue;
+                    }
+                    if self.pending_save_requests.len() >= engine_script::MAX_PENDING_SAVE_REQUESTS
+                    {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_SAVE_OVERFLOW",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' exceeded the pending save request budget of {} per frame",
+                                engine_script::MAX_PENDING_SAVE_REQUESTS
+                            ),
+                        ));
+                        continue;
+                    }
+                    self.pending_save_requests
+                        .push(engine_script::OwnedGameplaySaveRequest {
+                            owner_entity_id: entity_id,
+                            slot,
+                            operation: engine_script::GameplaySaveOperation::Save { state_json },
+                        });
+                }
+                GameplayCommand::LoadCheckpoint { slot } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "load a checkpoint",
+                        ));
+                        continue;
+                    }
+                    if let Err(reason) = engine_script::validate_save_slot(&slot) {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_SAVE_INVALID",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' produced an invalid load request: {reason}"
+                            ),
+                        ));
+                        continue;
+                    }
+                    if self.pending_save_requests.len() >= engine_script::MAX_PENDING_SAVE_REQUESTS
+                    {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_SAVE_OVERFLOW",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' exceeded the pending save request budget of {} per frame",
+                                engine_script::MAX_PENDING_SAVE_REQUESTS
+                            ),
+                        ));
+                        continue;
+                    }
+                    self.pending_save_requests
+                        .push(engine_script::OwnedGameplaySaveRequest {
+                            owner_entity_id: entity_id,
+                            slot,
+                            operation: engine_script::GameplaySaveOperation::Load,
+                        });
+                }
+                GameplayCommand::QueryLogicAsset { query_id, asset_id } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "query a logic asset",
+                        ));
+                        continue;
+                    }
+                    let query_count = self
+                        .script_logic_asset_results
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>();
+                    if query_count >= engine_script::MAX_PENDING_LOGIC_ASSET_QUERIES {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_LOGIC_ASSET_QUERY_OVERFLOW",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' exceeded the logic asset query budget of {} per frame",
+                                engine_script::MAX_PENDING_LOGIC_ASSET_QUERIES
+                            ),
+                        ));
+                        continue;
+                    }
+                    let result = if let Err(error) = engine_script::validate_entity_id(&asset_id) {
+                        engine_script::GameplayLogicAssetResult {
+                            query_id,
+                            asset_id,
+                            json: None,
+                            error: Some(error),
+                        }
+                    } else {
+                        let id = AssetId::new(asset_id.clone());
+                        match self
+                            .asset_registry
+                            .get::<engine_asset::cook::LogicAsset>(&id)
+                        {
+                            Some(asset) => match serde_json::to_string(asset.get()) {
+                                Ok(json)
+                                    if json.len()
+                                        <= engine_script::MAX_SCRIPT_LOGIC_ASSET_JSON_BYTES =>
+                                {
+                                    engine_script::GameplayLogicAssetResult {
+                                        query_id,
+                                        asset_id,
+                                        json: Some(json),
+                                        error: None,
+                                    }
+                                }
+                                Ok(_) => engine_script::GameplayLogicAssetResult {
+                                    query_id,
+                                    asset_id,
+                                    json: None,
+                                    error: Some(format!(
+                                        "logic asset JSON exceeds the {}-byte script limit",
+                                        engine_script::MAX_SCRIPT_LOGIC_ASSET_JSON_BYTES
+                                    )),
+                                },
+                                Err(error) => engine_script::GameplayLogicAssetResult {
+                                    query_id,
+                                    asset_id,
+                                    json: None,
+                                    error: Some(format!(
+                                        "logic asset could not be serialized: {error}"
+                                    )),
+                                },
+                            },
+                            None => engine_script::GameplayLogicAssetResult {
+                                query_id,
+                                asset_id,
+                                json: None,
+                                error: Some("logic asset is not loaded".into()),
+                            },
+                        }
+                    };
+                    self.script_logic_asset_results
+                        .entry(entity_id)
+                        .or_default()
+                        .push(result);
                 }
             }
         }

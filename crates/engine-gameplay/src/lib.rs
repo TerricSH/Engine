@@ -21,10 +21,12 @@ pub mod event_bus;
 pub mod input;
 pub mod platform;
 pub mod state;
+pub mod tactics;
 pub mod telemetry;
 
 pub use event_bus::{EventBus, EventHistory, GameplayEvent, SubscriptionId};
 pub use input::*;
 pub use platform::{DesktopPlatform, MockPlatform, PlatformCapabilities, PlatformFacade};
 pub use state::{GameState, GameStateManager, StateTransitionRule};
+pub use tactics::*;
 pub use telemetry::{clear, export_json, record, TelemetryCollector, TelemetryEvent};

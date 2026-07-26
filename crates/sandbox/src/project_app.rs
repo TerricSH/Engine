@@ -42,12 +42,19 @@ fn route_project_player_ui_event(
 ) -> bool {
     match event {
         platform::PlatformEvent::MouseMoved { x, y } => {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            game_loop.script_pointer_move(*x as f32, *y as f32);
             game_loop.ui_pointer_move(*x as f32, *y as f32);
             true
         }
         platform::PlatformEvent::MousePressed { button, x, y }
             if *button == platform::MouseButton::Left =>
         {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            {
+                game_loop.script_pointer_move(*x as f32, *y as f32);
+                game_loop.script_pointer_primary(true);
+            }
             game_loop.ui_pointer_move(*x as f32, *y as f32);
             game_loop.ui_pointer_left_press();
             true
@@ -55,11 +62,57 @@ fn route_project_player_ui_event(
         platform::PlatformEvent::MouseReleased { button, x, y }
             if *button == platform::MouseButton::Left =>
         {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            {
+                game_loop.script_pointer_move(*x as f32, *y as f32);
+                game_loop.script_pointer_primary(false);
+            }
             game_loop.ui_pointer_move(*x as f32, *y as f32);
             game_loop.ui_pointer_left_release();
             true
         }
+        platform::PlatformEvent::MousePressed { button, x, y } => {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            {
+                game_loop.script_pointer_move(*x as f32, *y as f32);
+                match button {
+                    platform::MouseButton::Right => game_loop.script_pointer_secondary(true),
+                    platform::MouseButton::Middle => game_loop.script_pointer_middle(true),
+                    _ => {}
+                }
+            }
+            true
+        }
+        platform::PlatformEvent::MouseReleased { button, x, y } => {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            {
+                game_loop.script_pointer_move(*x as f32, *y as f32);
+                match button {
+                    platform::MouseButton::Right => game_loop.script_pointer_secondary(false),
+                    platform::MouseButton::Middle => game_loop.script_pointer_middle(false),
+                    _ => {}
+                }
+            }
+            true
+        }
+        platform::PlatformEvent::MouseWheelScrolled { delta } => {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            game_loop.script_pointer_scroll(delta.0, delta.1);
+            true
+        }
+        platform::PlatformEvent::Resized { width, height } => {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            game_loop.set_script_viewport_size(*width, *height);
+            true
+        }
+        platform::PlatformEvent::Focused(true) | platform::PlatformEvent::Resumed => {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            game_loop.script_pointer_focus(true);
+            true
+        }
         platform::PlatformEvent::Focused(false) | platform::PlatformEvent::Suspended => {
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            game_loop.script_pointer_focus(false);
             game_loop.cancel_ui_pointer();
             true
         }
@@ -83,6 +136,18 @@ fn create_game_loop(
         application_name: project.manifest.name.clone(),
         gpu_timestamps: true,
     });
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    game_loop.set_script_viewport_size(
+        project.manifest.window.width,
+        project.manifest.window.height,
+    );
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    game_loop.set_script_save_directory(project.root.join("savegames"));
+    #[cfg(feature = "runtime-subsystems")]
+    game_loop.set_ui_viewport_size(
+        project.manifest.window.width,
+        project.manifest.window.height,
+    );
     #[cfg(any(feature = "target-desktop", feature = "subsystem-scripting-csharp"))]
     {
         game_loop.input_map = input_map;

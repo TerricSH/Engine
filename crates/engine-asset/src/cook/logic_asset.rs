@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use super::error::CookError;
 use super::{write_cooked_artifact, AssetType, CookResult};
 
+pub const LOGIC_ASSET_TYPE_ID: &str = "logic";
+
 // ── Top-level container ───────────────────────────────────────────────────
 
 /// Top-level logic asset container.
@@ -279,6 +281,53 @@ impl LogicAsset {
             LogicCondition::Always | LogicCondition::Never => {}
         }
     }
+}
+
+/// Registry cooker used by tooling that routes source bytes through the
+/// extension pipeline.
+pub fn logic_asset_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
+    let asset: LogicAsset = serde_json::from_slice(source)
+        .map_err(|error| format!("LogicAsset JSON is invalid: {error}"))?;
+    let errors = asset.validate();
+    if !errors.is_empty() {
+        return Err(format!(
+            "LogicAsset validation failed: {}",
+            errors.join("; ")
+        ));
+    }
+    output.extend(
+        bincode::serialize(&asset)
+            .map_err(|error| format!("LogicAsset serialization failed: {error}"))?,
+    );
+    Ok(())
+}
+
+/// Runtime loader for cooked logic graphs.
+pub fn logic_asset_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String> {
+    let asset: LogicAsset =
+        bincode::deserialize(cooked).map_err(|error| format!("LogicAsset load failed: {error}"))?;
+    let errors = asset.validate();
+    if !errors.is_empty() {
+        return Err(format!(
+            "LogicAsset validation failed: {}",
+            errors.join("; ")
+        ));
+    }
+    Ok(Box::new(asset))
+}
+
+pub fn register_logic_asset_type(registry: &mut engine_scene::registry::AssetTypeRegistry) {
+    use engine_scene::registry::{AssetTypeExtension, AssetTypeMeta};
+
+    let _ = registry.register(AssetTypeExtension {
+        meta: AssetTypeMeta {
+            type_id: LOGIC_ASSET_TYPE_ID,
+            source_extensions: vec!["logic.json"],
+            display_name: "Logic Graph",
+        },
+        cooker: Some(logic_asset_cooker),
+        loader: Some(logic_asset_loader),
+    });
 }
 
 // ── Cook entry point ─────────────────────────────────────────────────────
@@ -732,5 +781,21 @@ mod tests {
             let json2 = serde_json::to_string(&restored).unwrap();
             assert_eq!(json, json2, "LogicValue roundtrip mismatch");
         }
+    }
+
+    #[test]
+    fn registered_logic_loader_roundtrips_validated_runtime_asset() {
+        let source = serde_json::to_vec(&sample_behavior_tree()).unwrap();
+        let mut cooked = Vec::new();
+        logic_asset_cooker(&source, &mut cooked).unwrap();
+        let loaded = logic_asset_loader(&cooked).unwrap();
+        let loaded = loaded.downcast_ref::<LogicAsset>().unwrap();
+        assert_eq!(loaded.asset_id, "bt_enemy_patrol");
+
+        let mut registry = engine_scene::registry::AssetTypeRegistry::new();
+        register_logic_asset_type(&mut registry);
+        let extension = registry.get(LOGIC_ASSET_TYPE_ID).unwrap();
+        assert!(extension.loader.is_some());
+        assert!(extension.cooker.is_some());
     }
 }

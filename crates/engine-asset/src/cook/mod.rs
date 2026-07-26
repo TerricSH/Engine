@@ -31,7 +31,10 @@ pub use cooked_shader::{
 };
 pub use dependency::{CookState, DependencyGraph, DependencyNode};
 pub use error::CookError;
-pub use logic_asset::{cook_logic_asset, LogicAsset};
+pub use logic_asset::{
+    cook_logic_asset, logic_asset_cooker, logic_asset_loader, register_logic_asset_type,
+    LogicAsset, LOGIC_ASSET_TYPE_ID,
+};
 pub use manifest::{AssetType, CookRules, SourceAssetEntry, SourceManifest};
 pub use material::{
     cook_material, decode_cooked_material, CookedMaterial, MaterialSource, MaterialTransparency,
@@ -728,6 +731,7 @@ pub fn registered_asset_type_id(asset_type: &AssetType) -> Option<&'static str> 
         AssetType::Skeleton => Some("skeleton"),
         AssetType::NavMesh => Some("navmesh"),
         AssetType::Prefab => Some("prefab"),
+        AssetType::Logic => Some(LOGIC_ASSET_TYPE_ID),
         _ => None,
     }
 }

@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-subsystem-scripting-csharp = ["dep:engine-script"]
+subsystem-scripting-csharp = ["dep:engine-script", "dep:serde_json"]
 gameplay = ["dep:engine-physics", "dep:engine-gameplay"]
 backend-vulkan = ["dep:render-vulkan", "dep:raw-window-handle"]
 runtime-subsystems = [
@@ -41,6 +41,7 @@ tracing.workspace = true
 glam.workspace = true
 bincode.workspace = true
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 sha2.workspace = true
 thiserror.workspace = true
 

@@ -22,6 +22,58 @@ pub struct RenderViewportContext {
     output_rect: Rect,
 }
 
+/// Read-only description of the renderer's base camera for gameplay tools.
+///
+/// It uses the same camera ordering, hierarchy resolution, viewport
+/// composition and projection functions as renderer extraction, preventing
+/// picking code from drifting away from what the player sees.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveCameraView {
+    pub entity_id: Option<PersistentId>,
+    pub perspective: bool,
+    pub position: glam::Vec3,
+    pub forward: glam::Vec3,
+    pub right: glam::Vec3,
+    pub up: glam::Vec3,
+    pub viewport_pixels: [f32; 4],
+    pub view_projection: glam::Mat4,
+    pub inverse_view_projection: glam::Mat4,
+}
+
+impl ActiveCameraView {
+    /// Build a world-space ray for a top-left-origin surface pixel.
+    pub fn screen_ray(&self, point: [f32; 2]) -> Option<(glam::Vec3, glam::Vec3)> {
+        let [x, y, width, height] = self.viewport_pixels;
+        if width <= 0.0
+            || height <= 0.0
+            || point[0] < x
+            || point[1] < y
+            || point[0] > x + width
+            || point[1] > y + height
+        {
+            return None;
+        }
+        let ndc_x = ((point[0] - x) / width) * 2.0 - 1.0;
+        let ndc_y = 1.0 - ((point[1] - y) / height) * 2.0;
+        let near = self
+            .inverse_view_projection
+            .project_point3(glam::Vec3::new(ndc_x, ndc_y, 0.0));
+        let far = self
+            .inverse_view_projection
+            .project_point3(glam::Vec3::new(ndc_x, ndc_y, 1.0));
+        if !near.is_finite() || !far.is_finite() {
+            return None;
+        }
+        let origin = if self.perspective {
+            self.position
+        } else {
+            near
+        };
+        let direction = (far - origin).normalize_or_zero();
+        (direction.length_squared() > 0.0).then_some((origin, direction))
+    }
+}
+
 impl RenderViewportContext {
     pub fn new(surface_width: u32, surface_height: u32, output_rect: Rect) -> Option<Self> {
         (surface_width > 0 && surface_height > 0 && output_rect.is_valid_normalized()).then_some(
@@ -683,6 +735,60 @@ pub fn active_camera_world_position(world: &World) -> Option<glam::Vec3> {
         .copied()
         .unwrap_or(glam::Mat4::IDENTITY);
     Some(world_matrix.transform_point3(glam::Vec3::ZERO))
+}
+
+/// Resolve the renderer's base camera and its exact surface projection.
+pub fn active_camera_view(
+    world: &World,
+    viewport_context: RenderViewportContext,
+) -> Option<ActiveCameraView> {
+    let world_matrices = resolve_world_transforms(world).ok()?;
+    let active_camera = world.scene_settings().active_camera.as_deref();
+    let mut cameras = world
+        .query::<components::Camera>()
+        .map(|(entity, camera)| {
+            (
+                camera.priority,
+                world.persistent_id(entity).map(str::to_owned),
+                entity,
+                camera.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    cameras.sort_by(|left, right| {
+        compare_camera_order(active_camera, left.0, &left.1, right.0, &right.1)
+    });
+    let (_, entity_id, entity, camera) = cameras.into_iter().next()?;
+    let world_matrix = world_matrices.get(&entity).copied()?;
+    let viewport = effective_camera_viewport(&camera, viewport_context);
+    let surface = viewport_context.surface_size();
+    let viewport_pixels = [
+        viewport.min[0] * surface[0] as f32,
+        viewport.min[1] * surface[1] as f32,
+        viewport.width() * surface[0] as f32,
+        viewport.height() * surface[1] as f32,
+    ];
+    let projection =
+        compute_projection_matrix(&camera, effective_camera_aspect(&camera, viewport_context));
+    let view_projection = projection * compute_view_matrix(world_matrix);
+    let inverse_view_projection = view_projection.inverse();
+    if !view_projection.is_finite() || !inverse_view_projection.is_finite() {
+        return None;
+    }
+    let right = world_matrix.x_axis.truncate().normalize_or_zero();
+    let up = world_matrix.y_axis.truncate().normalize_or_zero();
+    let forward = -world_matrix.z_axis.truncate().normalize_or_zero();
+    Some(ActiveCameraView {
+        entity_id,
+        perspective: matches!(camera.projection, components::CameraProjection::Perspective),
+        position: world_matrix.transform_point3(glam::Vec3::ZERO),
+        forward,
+        right,
+        up,
+        viewport_pixels,
+        view_projection,
+        inverse_view_projection,
+    })
 }
 
 /// Translate every position carried by debug primitives. Pure translation:
@@ -2584,6 +2690,27 @@ mod tests {
             active_camera_world_position(&world),
             Some(glam::Vec3::new(101.0, 2.0, 3.0))
         );
+    }
+
+    #[test]
+    fn active_camera_view_builds_renderer_consistent_center_ray() {
+        let mut world = World::new();
+        let camera = world.create_persistent_entity("camera-main").unwrap();
+        world.add_component(camera, components::Camera::default());
+        world.add_component(
+            camera,
+            components::Transform {
+                translation: glam::Vec3::new(2.0, 3.0, 4.0),
+                ..Default::default()
+            },
+        );
+        let viewport = RenderViewportContext::new(1280, 720, engine_renderer::Rect::FULL).unwrap();
+        let view = active_camera_view(&world, viewport).unwrap();
+        let (origin, direction) = view.screen_ray([640.0, 360.0]).unwrap();
+        assert_eq!(view.entity_id.as_deref(), Some("camera-main"));
+        assert!(origin.abs_diff_eq(glam::Vec3::new(2.0, 3.0, 4.0), 1.0e-5));
+        assert!(direction.abs_diff_eq(glam::Vec3::NEG_Z, 1.0e-4));
+        assert!(view.screen_ray([-1.0, 360.0]).is_none());
     }
 
     #[test]

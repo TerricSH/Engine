@@ -499,6 +499,11 @@ pub struct GameLoop {
     previous_script_input_actions:
         std::collections::BTreeMap<String, engine_script::GameplayInputValue>,
 
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    script_pointer: engine_script::GameplayPointerSnapshot,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    script_save_directory: Option<std::path::PathBuf>,
+
     /// Physics query results computed after the previous update's script
     /// drain. They are delivered to scripts with exactly one frame snapshot
     /// and then discarded, mirroring the frame-local physics events.
@@ -547,6 +552,13 @@ impl GameLoop {
             input_map: InputActionMap::new("player".to_string(), "gameplay".to_string()),
             #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
             previous_script_input_actions: std::collections::BTreeMap::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_pointer: engine_script::GameplayPointerSnapshot {
+                focused: true,
+                ..engine_script::GameplayPointerSnapshot::default()
+            },
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_save_directory: None,
             #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
             script_physics_query_results: std::collections::BTreeMap::new(),
             character: None,
@@ -1231,6 +1243,9 @@ impl GameLoop {
             }
         };
 
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        self.refresh_script_view_context();
+
         // Tick scripts (OnUpdate) with the same resolved input snapshot used
         // by the player/editor GameLoop.
         #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
@@ -1283,7 +1298,11 @@ impl GameLoop {
             self.runtime.frame_timing_end_stage("script_tick");
         }
         #[cfg(feature = "subsystem-scripting-csharp")]
+        self.process_script_save_requests();
+        #[cfg(feature = "subsystem-scripting-csharp")]
         self.refresh_primary_character_from_world();
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        self.finish_script_pointer_frame();
 
         #[cfg(feature = "runtime-subsystems")]
         {
@@ -1366,6 +1385,204 @@ impl GameLoop {
     /// times appear only when the active backend supports timestamps.
     pub fn frame_timing_summary(&self) -> engine_renderer::FrameTimingSummary {
         self.runtime.frame_timing_summary()
+    }
+
+    /// Set the pixel extent used by script pointer and camera projection data.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn set_script_viewport_size(&mut self, width: u32, height: u32) {
+        self.script_pointer.viewport = [width.max(1) as f32, height.max(1) as f32];
+        self.update_script_pointer_inside();
+    }
+
+    /// Configure the trusted directory used by script save slots.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn set_script_save_directory(&mut self, directory: impl Into<std::path::PathBuf>) {
+        self.script_save_directory = Some(directory.into());
+    }
+
+    /// Update the gameplay pointer without coupling game input to retained UI.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn script_pointer_move(&mut self, x: f32, y: f32) {
+        if !x.is_finite() || !y.is_finite() {
+            self.script_pointer_focus(false);
+            return;
+        }
+        self.script_pointer.delta[0] += x - self.script_pointer.position[0];
+        self.script_pointer.delta[1] += y - self.script_pointer.position[1];
+        self.script_pointer.position = [x, y];
+        self.update_script_pointer_inside();
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn script_pointer_primary(&mut self, down: bool) {
+        if down && !self.script_pointer.primary_down {
+            self.script_pointer.primary_pressed = true;
+        } else if !down && self.script_pointer.primary_down {
+            self.script_pointer.primary_released = true;
+        }
+        self.script_pointer.primary_down = down;
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn script_pointer_secondary(&mut self, down: bool) {
+        self.script_pointer.secondary_down = down;
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn script_pointer_middle(&mut self, down: bool) {
+        self.script_pointer.middle_down = down;
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn script_pointer_scroll(&mut self, x: f32, y: f32) {
+        if x.is_finite() && y.is_finite() {
+            self.script_pointer.scroll[0] += x;
+            self.script_pointer.scroll[1] += y;
+        }
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn script_pointer_focus(&mut self, focused: bool) {
+        self.script_pointer.focused = focused;
+        if !focused {
+            self.script_pointer.primary_released |= self.script_pointer.primary_down;
+            self.script_pointer.primary_down = false;
+            self.script_pointer.secondary_down = false;
+            self.script_pointer.middle_down = false;
+            self.script_pointer.inside_viewport = false;
+        } else {
+            self.update_script_pointer_inside();
+        }
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn update_script_pointer_inside(&mut self) {
+        let [width, height] = self.script_pointer.viewport;
+        let [x, y] = self.script_pointer.position;
+        self.script_pointer.inside_viewport = self.script_pointer.focused
+            && width > 0.0
+            && height > 0.0
+            && x >= 0.0
+            && y >= 0.0
+            && x <= width
+            && y <= height;
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn refresh_script_view_context(&mut self) {
+        let [width, height] = self.script_pointer.viewport;
+        let viewport = if width > 0.0 && height > 0.0 {
+            engine_scene::RenderViewportContext::new(
+                width.round() as u32,
+                height.round() as u32,
+                engine_renderer::Rect::FULL,
+            )
+            .unwrap_or_default()
+        } else {
+            engine_scene::RenderViewportContext::default()
+        };
+        let camera = self
+            .runtime
+            .with_world(|world| engine_scene::active_camera_view(world, viewport))
+            .flatten();
+        self.script_pointer.ray_origin = None;
+        self.script_pointer.ray_direction = None;
+        if self.script_pointer.inside_viewport {
+            if let Some((origin, direction)) = camera
+                .as_ref()
+                .and_then(|camera| camera.screen_ray(self.script_pointer.position))
+            {
+                self.script_pointer.ray_origin = Some(origin.to_array());
+                self.script_pointer.ray_direction = Some(direction.to_array());
+            }
+        }
+        let camera = camera.map(|camera| engine_script::GameplayCameraSnapshot {
+            entity_id: camera.entity_id,
+            perspective: camera.perspective,
+            position: camera.position.to_array(),
+            forward: camera.forward.to_array(),
+            right: camera.right.to_array(),
+            up: camera.up.to_array(),
+            viewport: camera.viewport_pixels,
+            view_projection: camera.view_projection.to_cols_array(),
+            inverse_view_projection: camera.inverse_view_projection.to_cols_array(),
+        });
+        self.runtime
+            .set_script_view_context(self.script_pointer.clone(), camera);
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn finish_script_pointer_frame(&mut self) {
+        self.script_pointer.delta = [0.0; 2];
+        self.script_pointer.scroll = [0.0; 2];
+        self.script_pointer.primary_pressed = false;
+        self.script_pointer.primary_released = false;
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn process_script_save_requests(&mut self) {
+        const SCRIPT_STATE_KEY: &str = "script_state_json";
+        let requests = self.runtime.take_pending_save_requests();
+        for (index, request) in requests.into_iter().enumerate() {
+            let engine_script::OwnedGameplaySaveRequest {
+                owner_entity_id,
+                slot,
+                operation,
+            } = request;
+            let outcome = if index > 0 {
+                Err("only one save or load operation may execute per frame".to_string())
+            } else if let Some(directory) = self.script_save_directory.clone() {
+                let path = directory.join(format!("{slot}.save"));
+                match operation {
+                    engine_script::GameplaySaveOperation::Save { state_json } => self
+                        .capture_save_game(std::collections::BTreeMap::from([(
+                            SCRIPT_STATE_KEY.to_string(),
+                            engine_serialize::Value::Str(state_json),
+                        )]))
+                        .and_then(|snapshot| crate::write_save_game(path, &snapshot))
+                        .map(|_| (engine_script::GameplaySaveEventKind::Saved, None))
+                        .map_err(|error| error.to_string()),
+                    engine_script::GameplaySaveOperation::Load => crate::read_save_game(path)
+                        .and_then(|snapshot| self.restore_save_game(snapshot))
+                        .and_then(|report| {
+                            let state_json = report
+                                .custom_state
+                                .get(SCRIPT_STATE_KEY)
+                                .and_then(|value| match value {
+                                    engine_serialize::Value::Str(value) => Some(value.clone()),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    crate::SaveGameError::InvalidSnapshot(
+                                        "checkpoint does not contain script state JSON".into(),
+                                    )
+                                })?;
+                            Ok((
+                                engine_script::GameplaySaveEventKind::Loaded,
+                                Some(state_json),
+                            ))
+                        })
+                        .map_err(|error| error.to_string()),
+                }
+            } else {
+                Err("the runtime host did not configure a script save directory".to_string())
+            };
+            let event = match outcome {
+                Ok((kind, state_json)) => engine_script::GameplaySaveEvent {
+                    slot,
+                    kind,
+                    state_json,
+                    error: None,
+                },
+                Err(error) => engine_script::GameplaySaveEvent {
+                    slot,
+                    kind: engine_script::GameplaySaveEventKind::Failed,
+                    state_json: None,
+                    error: Some(error),
+                },
+            };
+            self.runtime.push_script_save_event(owner_entity_id, event);
+        }
     }
 
     /// Produce a single rendered frame.

@@ -45,6 +45,10 @@ physics queries plus validated linear/angular force commands and persistent
 pushable props, hinges, sliders, and gravity-gun-style interaction.
 Frame-accurate input edges are available to managed gameplay scripts through
 `Input.WasPressed(...)` and `Input.WasReleased(...)`.
+Turn-based tactical games additionally get a deterministic grid/cover/visibility
+domain, turn command queues, combat and utility-AI strategies, renderer-consistent
+pointer rays, data-driven Logic assets, and script checkpoint slots. See
+[`docs/TACTICAL_GAME_PLATFORM.md`](docs/TACTICAL_GAME_PLATFORM.md).
 
 The desktop/editor/scripting feature sets also enable the registered runtime
 UI, audio, animation, and navigation component and asset extensions. The normal
@@ -93,6 +97,7 @@ See [`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md),
 [`docs/MATERIAL_SURFACES.md`](docs/MATERIAL_SURFACES.md),
 [`docs/VFX.md`](docs/VFX.md),
 [`docs/INTERACTION.md`](docs/INTERACTION.md),
+[`docs/TACTICAL_GAME_PLATFORM.md`](docs/TACTICAL_GAME_PLATFORM.md),
 [`docs/HL2_READINESS.md`](docs/HL2_READINESS.md),
 [`docs/CI_RELEASE_GATES.md`](docs/CI_RELEASE_GATES.md), and
 [`docs/RELEASE_PACKAGING.md`](docs/RELEASE_PACKAGING.md) for details.
