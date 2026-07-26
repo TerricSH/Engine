@@ -33,8 +33,14 @@ pub(crate) struct MaterialTemplate {
     pub metallic: f32,
     pub roughness: f32,
     pub ambient_occlusion: f32,
+    pub emissive: [f32; 3],
     pub base_color_texture: Option<String>,
+    pub normal_texture: Option<String>,
+    pub metallic_roughness_texture: Option<String>,
+    pub occlusion_texture: Option<String>,
+    pub emissive_texture: Option<String>,
     pub transparency: String,
+    pub alpha_cutoff: f32,
     pub double_sided: bool,
 }
 
@@ -45,8 +51,14 @@ impl Default for MaterialTemplate {
             metallic: 0.0,
             roughness: 0.5,
             ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
             base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
             transparency: "Opaque".into(),
+            alpha_cutoff: 0.5,
             double_sided: false,
         }
     }
@@ -317,8 +329,14 @@ fn create_material_asset_impl(
         metallic: template.metallic,
         roughness: template.roughness,
         ambient_occlusion: template.ambient_occlusion,
+        emissive: template.emissive,
         base_color_texture: template.base_color_texture.clone(),
+        normal_texture: template.normal_texture.clone(),
+        metallic_roughness_texture: template.metallic_roughness_texture.clone(),
+        occlusion_texture: template.occlusion_texture.clone(),
+        emissive_texture: template.emissive_texture.clone(),
         transparency: template.transparency.clone(),
+        alpha_cutoff: template.alpha_cutoff,
         double_sided: template.double_sided,
     };
     let mut source_json = serde_json::to_string_pretty(&material)
@@ -1376,7 +1394,16 @@ fn source_asset_dependencies(
                     path.display()
                 )
             })?;
-            if let Some(texture) = material.base_color_texture {
+            for texture in [
+                material.base_color_texture,
+                material.normal_texture,
+                material.metallic_roughness_texture,
+                material.occlusion_texture,
+                material.emissive_texture,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 dependencies.insert(AssetId::new(texture));
             }
         }
@@ -2578,8 +2605,14 @@ mod tests {
             metallic: 0.0,
             roughness: 0.5,
             ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
             base_color_texture: Some("material-texture".into()),
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
             transparency: "Opaque".into(),
+            alpha_cutoff: 0.5,
             double_sided: false,
         };
         let material = fixture.declare_asset(
@@ -2680,8 +2713,14 @@ mod tests {
             metallic: 0.0,
             roughness: 0.5,
             ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
             base_color_texture: Some(target.asset_id.id.clone()),
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
             transparency: "Opaque".into(),
+            alpha_cutoff: 0.5,
             double_sided: false,
         };
         fixture.declare_asset(

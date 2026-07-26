@@ -9,7 +9,7 @@ use glam::Vec3;
 
 use crate::clip::AudioClip;
 use crate::{
-    AudioCommand, AudioListener, MixerGroup, _compute_stereo_pan, _distance_attenuation,
+    _compute_stereo_pan, _distance_attenuation, AudioCommand, AudioListener, MixerGroup,
     _MAX_VOICES, _VOLUME_RAMP_SECS,
 };
 

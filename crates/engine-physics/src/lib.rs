@@ -4,6 +4,7 @@ mod backend;
 pub mod components;
 mod convert;
 mod debug;
+pub mod destruction;
 pub mod events;
 pub mod gravity;
 pub mod joints;
@@ -15,19 +16,23 @@ pub use backend::{RapierBackend, RaycastHit};
 pub use components::{BodyType, Collider, ColliderShape, PhysicsMaterial, RigidBody};
 pub use convert::{from_rapier_vec, to_rapier_vec};
 pub use debug::{ColliderDebugInfo, PhysicsDebugDraw};
+pub use destruction::{
+    apply_damage, DamageError, DamageKind, DamageRequest, Destructible, DestructibleDamageEvent,
+};
 pub use events::{
-    CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind,
+    CollisionEvent, CollisionEventKind, JointBreakEvent, PhysicsEvents, TriggerEvent,
+    TriggerEventKind,
 };
 pub use gravity::{
     resolve_effective_gravity, shift_gravity_source_centers, sum_source_gravity, GravityFalloff,
     GravityMode, GravitySource, GRAVITY_SOURCE_MIN_DISTANCE,
 };
-pub use joints::{JointDescriptor, JointHandle, JointLimits, JointMotor, JointType};
+pub use joints::{JointDescriptor, JointHandle, JointLimits, JointMotor, JointType, PhysicsJoint};
 pub use queries::{
     OverlapHitResult, OverlapQuery, PhysicsQueryFilter, QueryBatcher, QueryResults,
     RaycastHitResult, RaycastQuery, SweepHitResult, SweepQuery,
 };
-pub use world::{PhysicsCommand, PhysicsWorld};
+pub use world::{PhysicsCommand, PhysicsWorld, RigidBodyRuntimeState};
 
 // Re-export key types from engine-scene for convenience
 pub use engine_scene::components::Transform;
@@ -35,6 +40,14 @@ pub use engine_scene::{Component, ComponentStorageDyn, Entity, SparseSet, World}
 
 use engine_renderer::debug_draw::DebugDrawRegistry;
 use engine_scene::registry::ComponentRegistry;
+
+/// Canonical scene field map for editor and tooling creation of a
+/// [`Destructible`] component.
+pub fn serialize_destructible_fields(
+    destructible: &Destructible,
+) -> std::collections::BTreeMap<String, engine_serialize::Value> {
+    serde::serialize_destructible(destructible)
+}
 
 /// Register physics extensions with Gate 9 extension surfaces.
 ///
@@ -63,6 +76,41 @@ pub fn register_physics_extensions(
             },
             serialize: Some(serde::serialize_rigid_body),
             deserialize: Some(serde::deserialize_rigid_body),
+        })
+        .ok();
+
+    // ── Destructible prop ────────────────────────────────────────────────
+    component_registry
+        .register(ComponentExtension {
+            meta: ComponentMeta {
+                type_id: Destructible::TYPE_ID,
+                display_name: "Destructible",
+                schema_version: (0, 1, 0),
+                has_editor: true,
+                script_access: engine_scene::registry::ScriptAccess::DedicatedApi,
+            },
+            storage_factory: || -> Box<dyn ComponentStorageDyn> {
+                Box::new(SparseSet::<Destructible>::new())
+            },
+            serialize: Some(serde::serialize_destructible),
+            deserialize: Some(serde::deserialize_destructible),
+        })
+        .ok();
+
+    component_registry
+        .register(ComponentExtension {
+            meta: ComponentMeta {
+                type_id: PhysicsJoint::TYPE_ID,
+                display_name: "Physics Joint",
+                schema_version: (0, 1, 0),
+                has_editor: true,
+                script_access: engine_scene::registry::ScriptAccess::DedicatedApi,
+            },
+            storage_factory: || -> Box<dyn ComponentStorageDyn> {
+                Box::new(SparseSet::<PhysicsJoint>::new())
+            },
+            serialize: Some(serde::serialize_physics_joint),
+            deserialize: Some(serde::deserialize_physics_joint),
         })
         .ok();
 

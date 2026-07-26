@@ -1,6 +1,6 @@
 use crate::{
     BonePaletteLayout, Diagnostic, DiagnosticSeverity, LightKind, PassGraphOutputMode,
-    RenderFrameInput, ShadowMode, ToneMapping, ViewCompose,
+    RenderFrameInput, ShadowMode, ToneMapping, Transparency, ViewCompose,
 };
 use std::collections::BTreeSet;
 
@@ -129,6 +129,23 @@ pub fn validate_frame_input(input: &RenderFrameInput) -> Vec<Diagnostic> {
                 .contract("RendererInput-v0", input.contract_version.clone())
                 .path(format!("skinned_items[{item_index}].bone_palette")),
             );
+        }
+    }
+
+    for (material_index, material) in input.materials.iter().enumerate() {
+        if let Transparency::Masked { cutoff } = &material.transparency {
+            if !cutoff.is_finite() || !(0.0..=1.0).contains(cutoff) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "RV0024",
+                        DiagnosticSeverity::Error,
+                        "engine-renderer",
+                        "masked material cutoff must be finite and in [0, 1]",
+                    )
+                    .contract("RendererInput-v0", input.contract_version.clone())
+                    .path(format!("materials[{material_index}].transparency.cutoff")),
+                );
+            }
         }
     }
 

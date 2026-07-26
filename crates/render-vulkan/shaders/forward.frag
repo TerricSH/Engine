@@ -46,10 +46,16 @@ layout(set = 2, binding = 0) uniform MaterialUBO {
     float metallic;
     float roughness;
     float ao;
+    float alpha_cutoff;
+    vec4 emissive;
 } material;
 
 // Base color texture (set=2, binding=1) — optional.
 layout(set = 2, binding = 1) uniform sampler2D u_base_color_texture;
+layout(set = 2, binding = 3) uniform sampler2D u_normal_texture;
+layout(set = 2, binding = 4) uniform sampler2D u_metallic_roughness_texture;
+layout(set = 2, binding = 5) uniform sampler2D u_occlusion_texture;
+layout(set = 2, binding = 6) uniform sampler2D u_emissive_texture;
 
 const float PI = 3.14159265359;
 const float MAX_REFLECTION_LOD = 4.0;
@@ -79,6 +85,19 @@ float geometry_smith(vec3 N, vec3 V, vec3 L, float roughness) {
 // Fresnel-Schlick approximation
 vec3 fresnel_schlick(float cos_theta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+mat3 cotangent_frame(vec3 N, vec3 position, vec2 uv) {
+    vec3 dp1 = dFdx(position);
+    vec3 dp2 = dFdy(position);
+    vec2 duv1 = dFdx(uv);
+    vec2 duv2 = dFdy(uv);
+    vec3 dp2_perp = cross(dp2, N);
+    vec3 dp1_perp = cross(N, dp1);
+    vec3 T = dp2_perp * duv1.x + dp1_perp * duv2.x;
+    vec3 B = dp2_perp * duv1.y + dp1_perp * duv2.y;
+    float scale = inversesqrt(max(max(dot(T, T), dot(B, B)), 1e-8));
+    return mat3(T * scale, B * scale, N);
 }
 
 /// Sample the CSM shadow map at the given light-space position and cascade layer.
@@ -133,14 +152,42 @@ vec3 compute_light_contribution(
 
 void main() {
     vec3 N = normalize(v_normal);
+    if (!gl_FrontFacing) {
+        N = -N;
+    }
+    uint texture_flags = uint(material.emissive.a + 0.5);
+    if ((texture_flags & 2u) != 0u) {
+        vec3 tangent_normal = texture(u_normal_texture, v_uv).xyz * 2.0 - 1.0;
+        N = normalize(cotangent_frame(N, v_world_pos, v_uv) * tangent_normal);
+    }
     vec3 V = normalize(ubo.camera_pos.xyz - v_world_pos);
 
     // A valid descriptor is always bound. Materials without a texture use the
     // renderer's 1x1 white fallback, so black texture data stays black.
-    vec3 base_color = material.base_color.rgb
-                    * texture(u_base_color_texture, v_uv).rgb;
+    vec4 sampled_base_color = material.base_color
+                            * texture(u_base_color_texture, v_uv);
+    if (material.alpha_cutoff >= 0.0 && sampled_base_color.a < material.alpha_cutoff) {
+        discard;
+    }
+    vec3 base_color = sampled_base_color.rgb;
+    float metallic_value = material.metallic;
+    float roughness_value = material.roughness;
+    float ao_value = material.ao;
+    vec3 emissive_color = material.emissive.rgb;
+    if ((texture_flags & 4u) != 0u) {
+        vec4 metallic_roughness = texture(u_metallic_roughness_texture, v_uv);
+        roughness_value *= metallic_roughness.g;
+        metallic_value *= metallic_roughness.b;
+    }
+    roughness_value = clamp(roughness_value, 0.04, 1.0);
+    if ((texture_flags & 8u) != 0u) {
+        ao_value *= texture(u_occlusion_texture, v_uv).r;
+    }
+    if ((texture_flags & 16u) != 0u) {
+        emissive_color *= texture(u_emissive_texture, v_uv).rgb;
+    }
 
-    vec3 F0 = mix(vec3(0.04), base_color, material.metallic);
+    vec3 F0 = mix(vec3(0.04), base_color, metallic_value);
 
     // CSM shadow factor for the UBO directional light
     float shadow = compute_csm_shadow();
@@ -151,7 +198,7 @@ void main() {
         N, V, L_dir,
         ubo.light_color.rgb, ubo.light_color.a,
         base_color, F0,
-        material.roughness, material.metallic,
+        roughness_value, metallic_value,
         1.0
     ) * shadow;
 
@@ -197,19 +244,19 @@ void main() {
             N, V, L,
             lt.color.rgb, lt.color.a,
             base_color, F0,
-            material.roughness, material.metallic,
+            roughness_value, metallic_value,
             atten
         );
     }
 
     // IBL ambient: diffuse (irradiance) + specular (prefiltered env map)
     vec3 irradiance = texture(u_irradiance_map, N).rgb;
-    vec3 diffuse_ibl = (1.0 - F0) * (1.0 - material.metallic) * irradiance * base_color;
+    vec3 diffuse_ibl = (1.0 - F0) * (1.0 - metallic_value) * irradiance * base_color;
 
     vec3 R = reflect(-V, N);
-    vec3 specular_ibl = textureLod(u_irradiance_map, R, material.roughness * MAX_REFLECTION_LOD).rgb * F0;
+    vec3 specular_ibl = textureLod(u_irradiance_map, R, roughness_value * MAX_REFLECTION_LOD).rgb * F0;
 
-    vec3 ambient = (diffuse_ibl + specular_ibl) * material.ao;
+    vec3 ambient = (diffuse_ibl + specular_ibl) * ao_value;
 
-    out_color = vec4(Lo + ambient, 1.0);
+    out_color = vec4(Lo + ambient + emissive_color, sampled_base_color.a);
 }

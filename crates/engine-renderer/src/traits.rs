@@ -514,15 +514,24 @@ fn validate_material_upload(upload: &MaterialUpload) -> Vec<Diagnostic> {
     if let Some(diagnostic) = validate_resource_id(&upload.material_id, "material") {
         diagnostics.push(diagnostic);
     }
-    if let Some(texture_id) = &upload.base_color_texture {
-        if let Some(diagnostic) = validate_resource_id(texture_id, "base-color texture") {
-            diagnostics.push(diagnostic);
+    for (texture_id, label) in upload.texture_references().into_iter().zip([
+        "base-color texture",
+        "normal texture",
+        "metallic-roughness texture",
+        "occlusion texture",
+        "emissive texture",
+    ]) {
+        if let Some(texture_id) = texture_id {
+            if let Some(diagnostic) = validate_resource_id(texture_id, label) {
+                diagnostics.push(diagnostic);
+            }
         }
     }
 
     let factors_valid = upload
         .base_color
         .iter()
+        .chain(upload.emissive.iter())
         .chain([
             &upload.metallic,
             &upload.roughness,
@@ -534,7 +543,7 @@ fn validate_material_upload(upload: &MaterialUpload) -> Vec<Diagnostic> {
             DIAG_INVALID_MATERIAL_VALUES,
             DiagnosticSeverity::Error,
             "renderer.contract",
-            "material color, metallic, roughness, and ambient occlusion must be finite values in [0, 1]",
+            "material color, emissive, metallic, roughness, and ambient occlusion must be finite values in [0, 1]",
         ));
     }
 
@@ -548,15 +557,6 @@ fn validate_material_upload(upload: &MaterialUpload) -> Vec<Diagnostic> {
             ));
         }
     }
-    if !matches!(&upload.transparency, Transparency::Opaque) || upload.double_sided {
-        diagnostics.push(Diagnostic::new(
-            DIAG_UNSUPPORTED_MATERIAL_STATE,
-            DiagnosticSeverity::Error,
-            "renderer.contract",
-            "the portable material upload path currently supports only opaque, single-sided materials",
-        ));
-    }
-
     diagnostics
 }
 

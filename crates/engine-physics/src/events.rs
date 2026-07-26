@@ -1,4 +1,4 @@
-use crate::Entity;
+use crate::{Entity, JointHandle};
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Collision Events (non‑trigger contacts with physical response)
@@ -52,6 +52,21 @@ pub struct TriggerEvent {
     pub entity_b: Entity,
 }
 
+/// A joint that exceeded one of its authored break thresholds.
+#[derive(Clone, Debug)]
+pub struct JointBreakEvent {
+    pub handle: JointHandle,
+    /// Persistent constraint entity for an ECS-authored joint. Raw runtime
+    /// joints that were not created from a component report `None`.
+    pub joint_entity: Option<Entity>,
+    pub entity_a: Entity,
+    pub entity_b: Entity,
+    /// Estimated constraint force in newtons for the fixed step that broke it.
+    pub force: f32,
+    /// Estimated constraint torque in newton-metres.
+    pub torque: f32,
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Event containers
 // ══════════════════════════════════════════════════════════════════════════════
@@ -63,6 +78,8 @@ pub struct PhysicsEvents {
     pub collisions: Vec<CollisionEvent>,
     /// Trigger (sensor) overlap events (Entered / Stay / Exited).
     pub triggers: Vec<TriggerEvent>,
+    /// Constraint break events. The joint has already been removed.
+    pub joint_breaks: Vec<JointBreakEvent>,
 }
 
 impl PhysicsEvents {
@@ -75,11 +92,12 @@ impl PhysicsEvents {
     pub fn clear(&mut self) {
         self.collisions.clear();
         self.triggers.clear();
+        self.joint_breaks.clear();
     }
 
     /// Returns `true` if there are no events of any kind.
     pub fn is_empty(&self) -> bool {
-        self.collisions.is_empty() && self.triggers.is_empty()
+        self.collisions.is_empty() && self.triggers.is_empty() && self.joint_breaks.is_empty()
     }
 
     /// Returns the number of collision events.
@@ -90,5 +108,9 @@ impl PhysicsEvents {
     /// Returns the number of trigger events.
     pub fn trigger_count(&self) -> usize {
         self.triggers.len()
+    }
+
+    pub fn joint_break_count(&self) -> usize {
+        self.joint_breaks.len()
     }
 }

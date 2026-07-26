@@ -2,6 +2,7 @@
 
 mod bounds;
 mod camera;
+mod interactable;
 mod light;
 mod name;
 mod renderable;
@@ -11,6 +12,10 @@ pub use bounds::Bounds;
 pub use camera::{
     deserialize_camera, deserialize_camera_fields, serialize_camera, serialize_camera_fields,
     Camera, CameraProjection,
+};
+pub use interactable::{
+    deserialize_interactable, deserialize_interactable_fields, serialize_interactable,
+    serialize_interactable_fields, validate_interactable_fields, Interactable,
 };
 pub use light::{
     deserialize_light, deserialize_light_fields, serialize_light, serialize_light_fields, Light,

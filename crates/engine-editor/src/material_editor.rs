@@ -21,6 +21,10 @@ pub enum ShaderParamType {
     Color,
     /// Texture-slot binding (asset path / ID).
     Texture,
+    /// One value selected from a bounded authoring list.
+    Choice,
+    /// Boolean surface switch.
+    Bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +44,11 @@ pub struct ShaderParam {
     pub color_value: [f32; 4],
     /// Current texture asset path / ID (used when `param_type == Texture`).
     pub texture_value: Option<String>,
+    /// Current choice value and legal options.
+    pub choice_value: String,
+    pub choice_options: Vec<String>,
+    /// Current boolean value.
+    pub bool_value: bool,
 }
 
 impl ShaderParam {
@@ -51,6 +60,9 @@ impl ShaderParam {
             float_value: default,
             color_value: [1.0, 1.0, 1.0, 1.0],
             texture_value: None,
+            choice_value: String::new(),
+            choice_options: Vec::new(),
+            bool_value: false,
         }
     }
 
@@ -62,6 +74,9 @@ impl ShaderParam {
             float_value: 0.0,
             color_value: default,
             texture_value: None,
+            choice_value: String::new(),
+            choice_options: Vec::new(),
+            bool_value: false,
         }
     }
 
@@ -73,6 +88,39 @@ impl ShaderParam {
             float_value: 0.0,
             color_value: [1.0, 1.0, 1.0, 1.0],
             texture_value: None,
+            choice_value: String::new(),
+            choice_options: Vec::new(),
+            bool_value: false,
+        }
+    }
+
+    pub fn new_choice(
+        name: impl Into<String>,
+        value: impl Into<String>,
+        options: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            param_type: ShaderParamType::Choice,
+            float_value: 0.0,
+            color_value: [1.0, 1.0, 1.0, 1.0],
+            texture_value: None,
+            choice_value: value.into(),
+            choice_options: options.into_iter().map(Into::into).collect(),
+            bool_value: false,
+        }
+    }
+
+    pub fn new_bool(name: impl Into<String>, value: bool) -> Self {
+        Self {
+            name: name.into(),
+            param_type: ShaderParamType::Bool,
+            float_value: 0.0,
+            color_value: [1.0, 1.0, 1.0, 1.0],
+            texture_value: None,
+            choice_value: String::new(),
+            choice_options: Vec::new(),
+            bool_value: value,
         }
     }
 }
@@ -179,6 +227,11 @@ impl MaterialEditorPanel {
         let metallic = self.float_parameter("Metallic")?;
         let roughness = self.float_parameter("Roughness")?;
         let ambient_occlusion = self.float_parameter("Ambient Occlusion")?;
+        let emissive_color = self.color_parameter("Emissive")?;
+        let emissive = [emissive_color[0], emissive_color[1], emissive_color[2]];
+        let transparency = self.choice_parameter("Alpha Mode")?;
+        let alpha_cutoff = self.float_parameter("Alpha Cutoff")?;
+        let double_sided = self.bool_parameter("Double Sided")?;
         for (field, value) in [
             ("base_color[0]", base_color[0]),
             ("base_color[1]", base_color[1]),
@@ -187,6 +240,10 @@ impl MaterialEditorPanel {
             ("metallic", metallic),
             ("roughness", roughness),
             ("ambient_occlusion", ambient_occlusion),
+            ("emissive[0]", emissive[0]),
+            ("emissive[1]", emissive[1]),
+            ("emissive[2]", emissive[2]),
+            ("alpha_cutoff", alpha_cutoff),
         ] {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 return Err(format!(
@@ -203,9 +260,15 @@ impl MaterialEditorPanel {
                 metallic,
                 roughness,
                 ambient_occlusion,
+                emissive,
                 base_color_texture: self.texture_parameter("AlbedoMap"),
-                transparency: "Opaque".to_string(),
-                double_sided: false,
+                normal_texture: self.texture_parameter("NormalMap"),
+                metallic_roughness_texture: self.texture_parameter("MetallicRoughnessMap"),
+                occlusion_texture: self.texture_parameter("OcclusionMap"),
+                emissive_texture: self.texture_parameter("EmissiveMap"),
+                transparency,
+                alpha_cutoff,
+                double_sided,
             },
         }))
     }
@@ -243,6 +306,41 @@ impl MaterialEditorPanel {
             .map(str::trim)
             .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("(none)"))
             .map(str::to_string)
+    }
+
+    fn choice_parameter(&self, name: &str) -> Result<String, String> {
+        let parameter = self
+            .shader_params
+            .iter()
+            .find(|parameter| {
+                parameter.param_type == ShaderParamType::Choice
+                    && parameter.name.eq_ignore_ascii_case(name)
+            })
+            .ok_or_else(|| {
+                format!("material parameter '{name}' is missing or has the wrong type")
+            })?;
+        if !parameter
+            .choice_options
+            .iter()
+            .any(|option| option == &parameter.choice_value)
+        {
+            return Err(format!(
+                "material parameter '{name}' must be one of: {}",
+                parameter.choice_options.join(", ")
+            ));
+        }
+        Ok(parameter.choice_value.clone())
+    }
+
+    fn bool_parameter(&self, name: &str) -> Result<bool, String> {
+        self.shader_params
+            .iter()
+            .find(|parameter| {
+                parameter.param_type == ShaderParamType::Bool
+                    && parameter.name.eq_ignore_ascii_case(name)
+            })
+            .map(|parameter| parameter.bool_value)
+            .ok_or_else(|| format!("material parameter '{name}' is missing or has the wrong type"))
     }
 }
 
@@ -286,12 +384,50 @@ pub fn load_material(
         panel
             .shader_params
             .push(ShaderParam::new_color("Albedo", material.base_color));
+        panel.shader_params.push(ShaderParam::new_color(
+            "Emissive",
+            [
+                material.emissive[0],
+                material.emissive[1],
+                material.emissive[2],
+                1.0,
+            ],
+        ));
         let mut base_color_texture = ShaderParam::new_texture("AlbedoMap");
         base_color_texture.texture_value = material
             .base_color_texture
             .as_ref()
             .map(|texture| texture.id.clone());
         panel.shader_params.push(base_color_texture);
+        for (name, texture) in [
+            ("NormalMap", material.normal_texture.as_ref()),
+            (
+                "MetallicRoughnessMap",
+                material.metallic_roughness_texture.as_ref(),
+            ),
+            ("OcclusionMap", material.occlusion_texture.as_ref()),
+            ("EmissiveMap", material.emissive_texture.as_ref()),
+        ] {
+            let mut parameter = ShaderParam::new_texture(name);
+            parameter.texture_value = texture.map(|texture| texture.id.clone());
+            panel.shader_params.push(parameter);
+        }
+        let (alpha_mode, alpha_cutoff) = match &material.transparency {
+            engine_renderer::Transparency::Opaque => ("Opaque", 0.5),
+            engine_renderer::Transparency::Masked { cutoff } => ("Masked", *cutoff),
+            engine_renderer::Transparency::Blend => ("Blend", 0.5),
+        };
+        panel.shader_params.push(ShaderParam::new_choice(
+            "Alpha Mode",
+            alpha_mode,
+            ["Opaque", "Masked", "Blend"],
+        ));
+        panel
+            .shader_params
+            .push(ShaderParam::new_float("Alpha Cutoff", alpha_cutoff));
+        panel
+            .shader_params
+            .push(ShaderParam::new_bool("Double Sided", material.double_sided));
         return;
     }
 
@@ -318,7 +454,12 @@ mod tests {
                 metallic: 0.25,
                 roughness: 0.75,
                 ambient_occlusion: 0.9,
+                emissive: [0.1, 0.2, 0.3],
                 base_color_texture: Some(AssetId::new("texture-project")),
+                normal_texture: None,
+                metallic_roughness_texture: None,
+                occlusion_texture: None,
+                emissive_texture: None,
                 transparency: Transparency::Opaque,
                 double_sided: false,
                 content_hash: [9; 32],
@@ -388,6 +529,18 @@ mod tests {
         assert!(p.texture_value.is_none());
     }
 
+    #[test]
+    fn shader_param_surface_constructors_are_typed() {
+        let choice = ShaderParam::new_choice("Alpha Mode", "Masked", ["Opaque", "Masked", "Blend"]);
+        assert_eq!(choice.param_type, ShaderParamType::Choice);
+        assert_eq!(choice.choice_value, "Masked");
+        assert_eq!(choice.choice_options.len(), 3);
+
+        let toggle = ShaderParam::new_bool("Double Sided", true);
+        assert_eq!(toggle.param_type, ShaderParamType::Bool);
+        assert!(toggle.bool_value);
+    }
+
     // ── load_material ───────────────────────────────────────────────
 
     #[test]
@@ -445,7 +598,12 @@ mod tests {
                 metallic: 0.8,
                 roughness: 0.2,
                 ambient_occlusion: 0.6,
+                emissive: [0.15, 0.25, 0.35],
                 base_color_texture: Some(AssetId::new("tex-runtime")),
+                normal_texture: Some(AssetId::new("tex-normal")),
+                metallic_roughness_texture: Some(AssetId::new("tex-metallic-roughness")),
+                occlusion_texture: Some(AssetId::new("tex-occlusion")),
+                emissive_texture: Some(AssetId::new("tex-emissive")),
                 transparency: Transparency::Opaque,
                 double_sided: false,
                 content_hash: [7; 32],
@@ -463,8 +621,21 @@ mod tests {
             .iter()
             .any(|param| { param.name == "Albedo" && param.color_value == [0.1, 0.3, 0.7, 1.0] }));
         assert!(panel.shader_params.iter().any(|param| {
+            param.name == "Emissive" && param.color_value == [0.15, 0.25, 0.35, 1.0]
+        }));
+        assert!(panel.shader_params.iter().any(|param| {
             param.name == "AlbedoMap" && param.texture_value.as_deref() == Some("tex-runtime")
         }));
+        for (name, texture) in [
+            ("NormalMap", "tex-normal"),
+            ("MetallicRoughnessMap", "tex-metallic-roughness"),
+            ("OcclusionMap", "tex-occlusion"),
+            ("EmissiveMap", "tex-emissive"),
+        ] {
+            assert!(panel.shader_params.iter().any(|param| {
+                param.name == name && param.texture_value.as_deref() == Some(texture)
+            }));
+        }
     }
 
     #[test]
@@ -484,6 +655,12 @@ mod tests {
             .find(|parameter| parameter.name == "Albedo")
             .unwrap()
             .color_value = [0.8, 0.6, 0.4, 1.0];
+        panel
+            .shader_params
+            .iter_mut()
+            .find(|parameter| parameter.name == "NormalMap")
+            .unwrap()
+            .texture_value = Some("texture-normal".into());
 
         panel.request_save();
 
@@ -493,10 +670,50 @@ mod tests {
         assert_eq!(request.source.schema, MATERIAL_SOURCE_SCHEMA);
         assert_eq!(request.source.roughness, 0.33);
         assert_eq!(request.source.base_color, [0.8, 0.6, 0.4, 1.0]);
+        assert_eq!(request.source.emissive, [0.1, 0.2, 0.3]);
         assert_eq!(
             request.source.base_color_texture.as_deref(),
             Some("texture-project")
         );
+        assert_eq!(
+            request.source.normal_texture.as_deref(),
+            Some("texture-normal")
+        );
+    }
+
+    #[test]
+    fn masked_double_sided_surface_state_round_trips_through_editor_save() {
+        use engine_renderer::Transparency;
+
+        let mut registry = material_registry("mat-surface", [1.0, 1.0, 1.0, 0.7]);
+        registry.insert_typed(
+            AssetId::new("mat-surface"),
+            MaterialUpload {
+                material_id: AssetId::new("mat-surface"),
+                base_color: [1.0, 1.0, 1.0, 0.7],
+                metallic: 0.0,
+                roughness: 0.8,
+                ambient_occlusion: 1.0,
+                emissive: [0.0; 3],
+                base_color_texture: None,
+                normal_texture: None,
+                metallic_roughness_texture: None,
+                occlusion_texture: None,
+                emissive_texture: None,
+                transparency: Transparency::Masked { cutoff: 0.36 },
+                double_sided: true,
+                content_hash: [8; 32],
+            },
+        );
+        let mut panel = MaterialEditorPanel::new();
+        load_material(&mut panel, "mat-surface", &registry);
+        panel.set_save_access(MaterialSaveAccess::Writable);
+        panel.request_save();
+
+        let source = panel.take_save_request().unwrap().unwrap().source;
+        assert_eq!(source.transparency, "Masked");
+        assert_eq!(source.alpha_cutoff, 0.36);
+        assert!(source.double_sided);
     }
 
     #[test]
@@ -521,6 +738,8 @@ mod tests {
         assert_eq!(ShaderParamType::Float, ShaderParamType::Float);
         assert_eq!(ShaderParamType::Color, ShaderParamType::Color);
         assert_eq!(ShaderParamType::Texture, ShaderParamType::Texture);
+        assert_eq!(ShaderParamType::Choice, ShaderParamType::Choice);
+        assert_eq!(ShaderParamType::Bool, ShaderParamType::Bool);
         assert_ne!(ShaderParamType::Float, ShaderParamType::Color);
     }
 

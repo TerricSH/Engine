@@ -87,6 +87,7 @@ mod tests {
         assert!(reg.is_registered("engine.renderable"));
         assert!(reg.is_registered("engine.camera"));
         assert!(reg.is_registered("engine.light"));
+        assert!(reg.is_registered("engine.interactable"));
         assert!(reg.is_registered("engine.bounds"));
         assert!(reg.is_registered("engine.prefab_instance_ref"));
 
@@ -100,6 +101,7 @@ mod tests {
                 "engine.renderable",
                 "engine.camera",
                 "engine.light",
+                "engine.interactable",
                 "engine.bounds",
                 "engine.prefab_instance_ref",
             ]
@@ -112,12 +114,13 @@ mod tests {
         reg.register_core();
 
         let storages = reg.create_storages();
-        assert_eq!(storages.len(), 7);
+        assert_eq!(storages.len(), 8);
         assert!(storages.contains_key("engine.name"));
         assert!(storages.contains_key("engine.transform"));
         assert!(storages.contains_key("engine.renderable"));
         assert!(storages.contains_key("engine.camera"));
         assert!(storages.contains_key("engine.light"));
+        assert!(storages.contains_key("engine.interactable"));
         assert!(storages.contains_key("engine.bounds"));
         assert!(storages.contains_key("engine.prefab_instance_ref"));
 
@@ -132,7 +135,7 @@ mod tests {
         let mut reg = ComponentRegistry::new();
         reg.register_core();
 
-        for type_id in ["engine.camera", "engine.light"] {
+        for type_id in ["engine.camera", "engine.light", "engine.interactable"] {
             let ext = reg.get(type_id).expect("core component registered");
             assert!(ext.serialize.is_some(), "{type_id} needs a serialize hook");
             assert!(

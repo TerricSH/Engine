@@ -637,10 +637,17 @@ pub fn camera_relative_render_origin(world: &World) -> Option<glam::Vec3> {
 /// tolerance. The position is **origin-relative**: add
 /// [`World::world_origin`] for the logical position.
 pub fn entity_world_position(world: &World, entity: crate::Entity) -> Option<glam::Vec3> {
-    let world_matrices = resolve_world_transforms(world).ok()?;
-    world_matrices
-        .get(&entity)
-        .map(|matrix| matrix.transform_point3(glam::Vec3::ZERO))
+    entity_world_transform(world, entity).map(|matrix| matrix.transform_point3(glam::Vec3::ZERO))
+}
+
+/// World-space transform of one entity, resolved through its parent chain.
+///
+/// Returns `None` when the entity has no `Transform` or any transform in the
+/// chain is invalid. The matrix is origin-relative, matching
+/// [`entity_world_position`].
+pub fn entity_world_transform(world: &World, entity: crate::Entity) -> Option<glam::Mat4> {
+    world.get::<components::Transform>(entity)?;
+    resolve_world_transforms(world).ok()?.get(&entity).copied()
 }
 
 /// World-space position of the base-view camera, independent of any render

@@ -359,7 +359,7 @@ impl EngineRuntime {
                 self.additive_typed_plan(&upload.texture_id, upload),
             ),
             DecodedCookedAsset::Material(path, upload) => {
-                if let Some(texture_id) = upload.base_color_texture.as_ref() {
+                for texture_id in upload.texture_references().into_iter().flatten() {
                     let available = material_texture_available(
                         self,
                         &BTreeSet::new(),

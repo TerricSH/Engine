@@ -456,6 +456,8 @@ pub struct WorldOriginShift {
     pub nav_agents: usize,
     /// Point gravity source centers translated.
     pub gravity_sources: usize,
+    /// Live world-space CPU particles translated.
+    pub vfx_particles: usize,
 }
 
 /// Standard game loop that wires together all engine subsystems.
@@ -593,6 +595,165 @@ impl GameLoop {
         self.bind_scene_character();
         self.init_physics();
         Ok(())
+    }
+
+    /// Capture a complete live-world checkpoint.
+    ///
+    /// `custom_state` is the project-owned portion of the save (inventory,
+    /// objectives, dialogue flags, and similar rules). The engine adds the
+    /// live ECS scene, world origin, game state, and transient rigid-body
+    /// state.
+    pub fn capture_save_game(
+        &self,
+        custom_state: std::collections::BTreeMap<String, engine_serialize::Value>,
+    ) -> Result<crate::SaveGameSnapshot, crate::SaveGameError> {
+        let scene = crate::savegame::capture_live_scene(&self.runtime)?;
+        let world_origin = self
+            .runtime
+            .with_world(|world| world.world_origin())
+            .ok_or(crate::SaveGameError::NoWorld)?;
+
+        #[cfg(feature = "gameplay")]
+        let physics_bodies = if let Some(physics) = &self.physics {
+            let states = physics.runtime_body_states();
+            self.runtime
+                .with_world(|world| {
+                    states
+                        .into_iter()
+                        .filter_map(|(entity, state)| {
+                            Some(crate::SavedPhysicsBody {
+                                entity_id: world.persistent_id(entity)?.to_string(),
+                                position: state.position,
+                                rotation: state.rotation,
+                                linear_velocity: state.linear_velocity,
+                                angular_velocity: state.angular_velocity,
+                                sleeping: state.sleeping,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(feature = "gameplay"))]
+        let physics_bodies = Vec::new();
+
+        #[cfg(feature = "gameplay")]
+        let game_state = Some(self.state_manager.current().to_u32());
+        #[cfg(not(feature = "gameplay"))]
+        let game_state = None;
+
+        let mut snapshot = crate::SaveGameSnapshot {
+            schema_version: crate::SAVE_GAME_SCHEMA_VERSION,
+            scene,
+            world_origin,
+            world_origin_shift_count: self.world_origin_shift_count,
+            game_state,
+            physics_bodies,
+            custom_state,
+        };
+        snapshot
+            .physics_bodies
+            .sort_by(|left, right| left.entity_id.cmp(&right.entity_id));
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Restore a previously decoded checkpoint.
+    ///
+    /// Scene installation is transactional: validation and ECS construction
+    /// finish before the active world is replaced. Missing physics entities
+    /// are reported as skips so saves remain forward-compatible with a scene
+    /// that intentionally removed a prop.
+    pub fn restore_save_game(
+        &mut self,
+        snapshot: crate::SaveGameSnapshot,
+    ) -> Result<crate::SaveGameRestoreReport, crate::SaveGameError> {
+        snapshot.validate()?;
+        let crate::SaveGameSnapshot {
+            scene,
+            world_origin,
+            world_origin_shift_count,
+            game_state,
+            physics_bodies,
+            custom_state,
+            ..
+        } = snapshot;
+        self.load_scene(scene).map_err(|diagnostics| {
+            crate::SaveGameError::SceneRestore(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        })?;
+        self.runtime
+            .with_world_mut(|world| world.restore_world_origin(world_origin))
+            .expect("load_scene installed a world")
+            .map_err(|error| crate::SaveGameError::InvalidSnapshot(error.to_string()))?;
+        self.world_origin_shift_count = world_origin_shift_count;
+        self.last_world_origin_shift = None;
+
+        #[cfg(feature = "gameplay")]
+        if let Some(state) = game_state.and_then(engine_gameplay::GameState::from_u32) {
+            self.state_manager.force_transition(state);
+        }
+
+        #[cfg(feature = "gameplay")]
+        let (restored_physics_bodies, skipped_physics_bodies) = {
+            let mut restored = 0;
+            let mut skipped = Vec::new();
+            let runtime = &self.runtime;
+            let resolved = runtime
+                .with_world(|world| {
+                    physics_bodies
+                        .iter()
+                        .map(|body| (body, world.entity_by_persistent_id(&body.entity_id)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if let Some(physics) = &mut self.physics {
+                for (body, entity) in resolved {
+                    let Some(entity) = entity else {
+                        skipped.push(body.entity_id.clone());
+                        continue;
+                    };
+                    let state = engine_physics::RigidBodyRuntimeState {
+                        position: body.position,
+                        rotation: body.rotation,
+                        linear_velocity: body.linear_velocity,
+                        angular_velocity: body.angular_velocity,
+                        sleeping: body.sleeping,
+                    };
+                    if physics.restore_runtime_body_state(entity, &state) {
+                        restored += 1;
+                    } else {
+                        skipped.push(body.entity_id.clone());
+                    }
+                }
+                runtime.with_world_mut(|world| physics.sync_to_ecs(world));
+            } else {
+                skipped.extend(physics_bodies.iter().map(|body| body.entity_id.clone()));
+            }
+            (restored, skipped)
+        };
+        #[cfg(not(feature = "gameplay"))]
+        let (restored_physics_bodies, skipped_physics_bodies) = {
+            let _ = game_state;
+            let skipped = physics_bodies
+                .into_iter()
+                .map(|body| body.entity_id)
+                .collect();
+            (0, skipped)
+        };
+
+        Ok(crate::SaveGameRestoreReport {
+            restored_physics_bodies,
+            skipped_physics_bodies,
+            custom_state,
+        })
     }
 
     fn bind_scene_character(&mut self) {
@@ -760,6 +921,7 @@ impl GameLoop {
     /// - every navigation agent's target and in-progress path
     ///   (`runtime-subsystems` feature),
     /// - every point `GravitySource` center (`gameplay` feature).
+    /// - every live world-space CPU particle.
     ///
     /// Audio needs no sweep: emitter/listener snapshots are rebuilt from ECS
     /// transforms every `update()`, and emitters and listener shift together
@@ -770,7 +932,7 @@ impl GameLoop {
     /// Returns `None` when no world is active.
     pub fn shift_world_origin(&mut self, delta: [f64; 3]) -> Option<WorldOriginShift> {
         let offset = Vec3::new(delta[0] as f32, delta[1] as f32, delta[2] as f32);
-        let (transforms, character_controllers, nav_agents, gravity_sources) =
+        let (transforms, character_controllers, nav_agents, gravity_sources, vfx_particles) =
             self.runtime.with_world_mut(|world| {
                 let transforms = world.shift_world_origin(delta);
 
@@ -798,7 +960,15 @@ impl GameLoop {
                 #[cfg(not(feature = "gameplay"))]
                 let gravity_sources = 0usize;
 
-                (transforms, characters, nav_agents, gravity_sources)
+                let vfx_particles = engine_vfx::shift_world_positions(world, -offset);
+
+                (
+                    transforms,
+                    characters,
+                    nav_agents,
+                    gravity_sources,
+                    vfx_particles,
+                )
             })?;
 
         #[cfg(feature = "gameplay")]
@@ -826,6 +996,7 @@ impl GameLoop {
             character_controllers,
             nav_agents,
             gravity_sources,
+            vfx_particles,
         };
         self.world_origin_shift_count += 1;
         self.last_world_origin_shift = Some(shift);
@@ -837,6 +1008,7 @@ impl GameLoop {
             character_controllers = shift.character_controllers,
             nav_agents = shift.nav_agents,
             gravity_sources = shift.gravity_sources,
+            vfx_particles = shift.vfx_particles,
             count = self.world_origin_shift_count,
             "world origin shifted"
         );
@@ -847,6 +1019,86 @@ impl GameLoop {
     #[cfg(feature = "gameplay")]
     pub fn take_physics_events(&mut self) -> PhysicsEvents {
         std::mem::take(&mut self.physics_events)
+    }
+
+    /// Switch a scene-authored ragdoll between animation and physics
+    /// ownership. Activation impulse is distributed across generated bodies;
+    /// deactivation blends back over `recovery_duration` seconds.
+    #[cfg(all(feature = "runtime-subsystems", feature = "gameplay"))]
+    pub fn set_ragdoll_active(
+        &mut self,
+        entity_id: &str,
+        active: bool,
+        recovery_duration: f32,
+        impulse: Vec3,
+    ) -> Result<Vec<String>, String> {
+        let previous = self
+            .runtime
+            .with_world(|world| {
+                world
+                    .entity_by_persistent_id(entity_id)
+                    .and_then(|entity| world.get::<engine_animation::RagdollComponent>(entity))
+                    .cloned()
+            })
+            .flatten()
+            .ok_or_else(|| format!("entity '{entity_id}' has no Ragdoll component"))?;
+        crate::ragdoll_runtime::set_active(self, entity_id, active, recovery_duration, impulse)?;
+        crate::ragdoll_runtime::reconcile_before_physics(self);
+        let generated = self
+            .runtime
+            .with_world(|world| {
+                let entity = world
+                    .entity_by_persistent_id(entity_id)
+                    .ok_or_else(|| format!("ragdoll target '{entity_id}' disappeared"))?;
+                let ragdoll = world
+                    .get::<engine_animation::RagdollComponent>(entity)
+                    .ok_or_else(|| format!("entity '{entity_id}' lost its Ragdoll component"))?;
+                if ragdoll.generated_body_ids.len() != ragdoll.bodies.len()
+                    || ragdoll.generated_joint_ids.len() != ragdoll.constraints.len()
+                {
+                    return Err(format!(
+                        "ragdoll graph for '{entity_id}' could not be generated"
+                    ));
+                }
+                let mut body_ids = Vec::with_capacity(ragdoll.generated_body_ids.len());
+                for body_id in ragdoll.generated_body_ids.values() {
+                    let body = world.entity_by_persistent_id(body_id).ok_or_else(|| {
+                        format!("ragdoll body '{body_id}' for '{entity_id}' is missing")
+                    })?;
+                    if world.get::<engine_physics::RigidBody>(body).is_none()
+                        || world.get::<engine_physics::Collider>(body).is_none()
+                    {
+                        return Err(format!(
+                            "ragdoll body '{body_id}' for '{entity_id}' is incomplete"
+                        ));
+                    }
+                    body_ids.push(body_id.clone());
+                }
+                for joint_id in &ragdoll.generated_joint_ids {
+                    let joint = world.entity_by_persistent_id(joint_id).ok_or_else(|| {
+                        format!("ragdoll joint '{joint_id}' for '{entity_id}' is missing")
+                    })?;
+                    if world.get::<engine_physics::PhysicsJoint>(joint).is_none() {
+                        return Err(format!(
+                            "ragdoll joint '{joint_id}' for '{entity_id}' is incomplete"
+                        ));
+                    }
+                }
+                Ok(body_ids)
+            })
+            .ok_or_else(|| "no active world".to_string())?;
+        match generated {
+            Ok(body_ids) => Ok(body_ids),
+            Err(error) => {
+                self.runtime.with_world_mut(|world| {
+                    if let Some(entity) = world.entity_by_persistent_id(entity_id) {
+                        world.add_component(entity, previous);
+                    }
+                });
+                crate::ragdoll_runtime::reconcile_before_physics(self);
+                Err(error)
+            }
+        }
     }
 
     /// Drive the kinematic character controller and sync its position back to
@@ -891,6 +1143,23 @@ impl GameLoop {
         }
     }
 
+    /// Refresh the primary controller mirror after script commands have
+    /// queued movement intent on the ECS component. The mirror drives the
+    /// next frame and would otherwise overwrite those pending commands.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    fn refresh_primary_character_from_world(&mut self) {
+        let Some(entity) = self.character_entity else {
+            return;
+        };
+        if let Some(controller) = self
+            .runtime
+            .with_world(|world| world.get::<CharacterController>(entity).cloned())
+            .flatten()
+        {
+            self.character = Some(controller);
+        }
+    }
+
     /// Advance the simulation by `dt` seconds.
     ///
     /// Handles physics stepping and ECS ↔ physics sync when the `gameplay`
@@ -912,6 +1181,8 @@ impl GameLoop {
     fn update_inner(&mut self, dt: f32) {
         #[cfg(feature = "terrain")]
         self.tick_terrain(None);
+        #[cfg(all(feature = "runtime-subsystems", feature = "gameplay"))]
+        crate::ragdoll_runtime::reconcile_before_physics(self);
         // Tick physics (ECS → physics → ECS sync) — gameplay feature
         #[cfg(feature = "gameplay")]
         {
@@ -983,6 +1254,14 @@ impl GameLoop {
             // stepped physics world; scripts observe the results with the
             // next frame snapshot.
             self.execute_script_physics_queries();
+            // Forces and impulses are queued after queries and execute safely
+            // at the start of the next physics step.
+            self.queue_script_physics_mutations();
+            self.process_script_damage_requests();
+            #[cfg(feature = "runtime-subsystems")]
+            self.process_script_ragdoll_requests();
+            #[cfg(not(feature = "runtime-subsystems"))]
+            let _ = self.runtime.take_pending_ragdoll_requests();
             self.runtime.frame_timing_end_stage("script_tick");
         }
         #[cfg(all(feature = "subsystem-scripting-csharp", not(feature = "gameplay")))]
@@ -996,13 +1275,26 @@ impl GameLoop {
                 &script_ui_events,
             );
             // Without a physics world no query can be answered; drop drained
-            // queries so the runtime queue cannot accumulate.
+            // work so the runtime queues cannot accumulate.
             let _ = self.runtime.take_pending_physics_queries();
+            let _ = self.runtime.take_pending_physics_mutations();
+            let _ = self.runtime.take_pending_damage_requests();
+            let _ = self.runtime.take_pending_ragdoll_requests();
             self.runtime.frame_timing_end_stage("script_tick");
+        }
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        self.refresh_primary_character_from_world();
+
+        #[cfg(feature = "runtime-subsystems")]
+        {
+            #[cfg(feature = "gameplay")]
+            crate::ragdoll_runtime::reconcile_after_physics(self, dt);
         }
 
         #[cfg(feature = "runtime-subsystems")]
         self.update_runtime_animation(dt);
+        self.runtime
+            .with_world_mut(|world| engine_vfx::update_vfx(world, dt));
         #[cfg(feature = "runtime-audio-output")]
         self.update_runtime_audio(dt);
     }
@@ -1718,7 +2010,12 @@ impl GameLoop {
                 let mut by_entity =
                     std::collections::BTreeMap::<String, Vec<GameplayPhysicsEvent>>::new();
                 let mut record_pair =
-                    |entity_a, entity_b, kind: GameplayPhysicsEventKind| {
+                    |entity_a,
+                     entity_b,
+                     kind: GameplayPhysicsEventKind,
+                     joint_id: Option<String>,
+                     force: Option<f32>,
+                     torque: Option<f32>| {
                         let Some(entity_a) = world.persistent_id(entity_a) else {
                             return;
                         };
@@ -1729,12 +2026,18 @@ impl GameLoop {
                             GameplayPhysicsEvent {
                                 kind,
                                 other_entity_id: entity_b.to_owned(),
+                                joint_id: joint_id.clone(),
+                                force,
+                                torque,
                             },
                         );
                         by_entity.entry(entity_b.to_owned()).or_default().push(
                             GameplayPhysicsEvent {
                                 kind,
                                 other_entity_id: entity_a.to_owned(),
+                                joint_id,
+                                force,
+                                torque,
                             },
                         );
                     };
@@ -1751,7 +2054,7 @@ impl GameLoop {
                             GameplayPhysicsEventKind::CollisionExited
                         }
                     };
-                    record_pair(event.entity_a, event.entity_b, kind);
+                    record_pair(event.entity_a, event.entity_b, kind, None, None, None);
                 }
                 for event in &self.physics_events.triggers {
                     let kind = match event.kind {
@@ -1759,7 +2062,21 @@ impl GameLoop {
                         TriggerEventKind::Stay => GameplayPhysicsEventKind::TriggerStayed,
                         TriggerEventKind::Exited => GameplayPhysicsEventKind::TriggerExited,
                     };
-                    record_pair(event.entity_a, event.entity_b, kind);
+                    record_pair(event.entity_a, event.entity_b, kind, None, None, None);
+                }
+                for event in &self.physics_events.joint_breaks {
+                    let joint_id = event
+                        .joint_entity
+                        .and_then(|entity| world.persistent_id(entity))
+                        .map(str::to_owned);
+                    record_pair(
+                        event.entity_a,
+                        event.entity_b,
+                        GameplayPhysicsEventKind::JointBroken,
+                        joint_id,
+                        Some(event.force),
+                        Some(event.torque),
+                    );
                 }
                 by_entity
             })
@@ -1788,6 +2105,393 @@ impl GameLoop {
             results.entry(entity_id).or_default().push(result);
         }
         self.script_physics_query_results = results;
+    }
+
+    /// Resolve validated script forces/impulses by persistent id and queue
+    /// them for the next safe physics step.
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    fn queue_script_physics_mutations(&mut self) {
+        let pending = self.runtime.take_pending_physics_mutations();
+        if self.physics.is_none() {
+            return;
+        }
+        for engine_script::OwnedGameplayPhysicsMutation {
+            owner_entity_id: _,
+            mutation,
+        } in pending
+        {
+            use engine_script::{GameplayJointType, GameplayPhysicsMutation};
+            match mutation {
+                GameplayPhysicsMutation::ApplyForce { entity_id, force } => {
+                    let entity = self
+                        .runtime
+                        .with_world(|world| world.entity_by_persistent_id(&entity_id))
+                        .flatten();
+                    if let (Some(entity), Some(physics)) = (entity, self.physics.as_mut()) {
+                        physics.queue_command(engine_physics::PhysicsCommand::ApplyForce {
+                            entity,
+                            force: Vec3::from(force),
+                        });
+                    }
+                }
+                GameplayPhysicsMutation::ApplyImpulse { entity_id, impulse } => {
+                    let entity = self
+                        .runtime
+                        .with_world(|world| world.entity_by_persistent_id(&entity_id))
+                        .flatten();
+                    if let (Some(entity), Some(physics)) = (entity, self.physics.as_mut()) {
+                        physics.queue_command(engine_physics::PhysicsCommand::ApplyImpulse {
+                            entity,
+                            impulse: Vec3::from(impulse),
+                        });
+                    }
+                }
+                GameplayPhysicsMutation::ApplyTorque { entity_id, torque } => {
+                    let entity = self
+                        .runtime
+                        .with_world(|world| world.entity_by_persistent_id(&entity_id))
+                        .flatten();
+                    if let (Some(entity), Some(physics)) = (entity, self.physics.as_mut()) {
+                        physics.queue_command(engine_physics::PhysicsCommand::ApplyTorque {
+                            entity,
+                            torque: Vec3::from(torque),
+                        });
+                    }
+                }
+                GameplayPhysicsMutation::ApplyTorqueImpulse {
+                    entity_id,
+                    torque_impulse,
+                } => {
+                    let entity = self
+                        .runtime
+                        .with_world(|world| world.entity_by_persistent_id(&entity_id))
+                        .flatten();
+                    if let (Some(entity), Some(physics)) = (entity, self.physics.as_mut()) {
+                        physics.queue_command(engine_physics::PhysicsCommand::ApplyTorqueImpulse {
+                            entity,
+                            torque_impulse: Vec3::from(torque_impulse),
+                        });
+                    }
+                }
+                GameplayPhysicsMutation::CreateJoint {
+                    joint_id,
+                    body_a,
+                    body_b,
+                    joint_type,
+                    anchor_a,
+                    anchor_b,
+                    axis,
+                    limits,
+                    motor,
+                    break_force,
+                    break_torque,
+                } => {
+                    self.runtime.with_world_mut(|world| {
+                        if world.entity_by_persistent_id(&body_a).is_none()
+                            || world.entity_by_persistent_id(&body_b).is_none()
+                        {
+                            return;
+                        }
+                        let constraint = match world.entity_by_persistent_id(&joint_id) {
+                            Some(entity) => entity,
+                            None => {
+                                let Ok(entity) = world.create_persistent_entity(joint_id.clone())
+                                else {
+                                    return;
+                                };
+                                entity
+                            }
+                        };
+                        world.add_component(
+                            constraint,
+                            engine_physics::PhysicsJoint {
+                                enabled: true,
+                                body_a,
+                                body_b,
+                                joint_type: match joint_type {
+                                    GameplayJointType::Fixed => engine_physics::JointType::Fixed,
+                                    GameplayJointType::Revolute => {
+                                        engine_physics::JointType::Revolute
+                                    }
+                                    GameplayJointType::Prismatic => {
+                                        engine_physics::JointType::Prismatic
+                                    }
+                                    GameplayJointType::Spherical => {
+                                        engine_physics::JointType::Spherical
+                                    }
+                                },
+                                anchor_a,
+                                anchor_b,
+                                axis,
+                                limits: limits.map(|limits| engine_physics::JointLimits {
+                                    min: limits.min,
+                                    max: limits.max,
+                                    stiffness: limits.stiffness,
+                                    damping: limits.damping,
+                                }),
+                                motor: motor.map(|motor| engine_physics::JointMotor {
+                                    target_vel: motor.target_vel,
+                                    target_pos: motor.target_pos,
+                                    stiffness: motor.stiffness,
+                                    damping: motor.damping,
+                                }),
+                                break_force,
+                                break_torque,
+                            },
+                        );
+                    });
+                }
+                GameplayPhysicsMutation::RemoveJoint { joint_id } => {
+                    self.runtime.with_world_mut(|world| {
+                        if let Some(entity) = world.entity_by_persistent_id(&joint_id) {
+                            world.remove_component::<engine_physics::PhysicsJoint>(entity);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    fn process_script_damage_requests(&mut self) {
+        let pending = self.runtime.take_pending_damage_requests();
+        for request in pending {
+            let target = self
+                .runtime
+                .with_world(|world| world.entity_by_persistent_id(&request.target_entity_id))
+                .flatten();
+            let source = self
+                .runtime
+                .with_world(|world| world.entity_by_persistent_id(&request.owner_entity_id))
+                .flatten();
+            let Some(target) = target else {
+                continue;
+            };
+            let damage_request = engine_physics::DamageRequest {
+                source,
+                amount: request.amount,
+                kind: match request.damage_kind {
+                    engine_script::GameplayDamageKind::Generic => {
+                        engine_physics::DamageKind::Generic
+                    }
+                    engine_script::GameplayDamageKind::Impact => engine_physics::DamageKind::Impact,
+                    engine_script::GameplayDamageKind::Bullet => engine_physics::DamageKind::Bullet,
+                    engine_script::GameplayDamageKind::Blast => engine_physics::DamageKind::Blast,
+                    engine_script::GameplayDamageKind::Fire => engine_physics::DamageKind::Fire,
+                },
+                hit_position: request.hit_position,
+                impulse: request.impulse,
+            };
+            let result = self.runtime.with_world_mut(|world| {
+                engine_physics::apply_damage(world, target, &damage_request)
+            });
+            let event = match result {
+                Some(Ok(Some(event))) => event,
+                Some(Ok(None)) => continue,
+                Some(Err(error)) => {
+                    let mut diagnostic = engine_serialize::Diagnostic::new(
+                        "SCRIPT_DAMAGE_REJECTED",
+                        engine_serialize::DiagnosticSeverity::Error,
+                        "script",
+                        format!(
+                            "script entity '{}' could not damage '{}': {error}",
+                            request.owner_entity_id, request.target_entity_id
+                        ),
+                    );
+                    diagnostic.entity = Some(request.owner_entity_id);
+                    self.runtime
+                        .diagnostics_collector_mut()
+                        .push_script_diags(vec![diagnostic]);
+                    continue;
+                }
+                None => continue,
+            };
+
+            let mut spawned_entity_ids = Vec::new();
+            if event.broke {
+                let source_state = self.physics.as_ref().and_then(|physics| {
+                    physics
+                        .runtime_body_states()
+                        .into_iter()
+                        .find_map(|(entity, state)| (entity == target).then_some(state))
+                });
+                let target_translation = self
+                    .runtime
+                    .with_world(|world| {
+                        world
+                            .get::<engine_scene::components::Transform>(target)
+                            .map(|transform| transform.translation.to_array())
+                    })
+                    .flatten()
+                    .or(event.hit_position);
+                let before_ids = self
+                    .runtime
+                    .with_world(|world| {
+                        world
+                            .persistent_entities()
+                            .map(|(id, _)| id.to_owned())
+                            .collect::<std::collections::BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let mut fracture_diagnostics = Vec::new();
+                let replacement_succeeded = if let Some(prefab) = event.replacement_prefab.as_ref()
+                {
+                    self.runtime.spawn_script_prefab(
+                        &request.owner_entity_id,
+                        &prefab.id,
+                        target_translation,
+                        &mut fracture_diagnostics,
+                        0,
+                    );
+                    let after_ids = self
+                        .runtime
+                        .with_world(|world| {
+                            world
+                                .persistent_entities()
+                                .map(|(id, _)| id.to_owned())
+                                .collect::<std::collections::BTreeSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    spawned_entity_ids = after_ids
+                        .difference(&before_ids)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    !spawned_entity_ids.is_empty()
+                } else {
+                    true
+                };
+
+                if replacement_succeeded {
+                    if let Some(physics) = self.physics.as_mut() {
+                        let rigid_pieces = self
+                            .runtime
+                            .with_world(|world| {
+                                spawned_entity_ids
+                                    .iter()
+                                    .filter_map(|id| {
+                                        let entity = world.entity_by_persistent_id(id)?;
+                                        world
+                                            .get::<engine_physics::RigidBody>(entity)
+                                            .map(|_| entity)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let piece_count = rigid_pieces.len().max(1) as f32;
+                        for piece in rigid_pieces {
+                            if event.inherit_velocity {
+                                if let Some(state) = source_state.as_ref() {
+                                    physics.queue_command(
+                                        engine_physics::PhysicsCommand::SetLinearVelocity {
+                                            entity: piece,
+                                            velocity: Vec3::from(state.linear_velocity),
+                                        },
+                                    );
+                                    physics.queue_command(
+                                        engine_physics::PhysicsCommand::SetAngularVelocity {
+                                            entity: piece,
+                                            velocity: Vec3::from(state.angular_velocity),
+                                        },
+                                    );
+                                }
+                            }
+                            let impulse = Vec3::from(event.impulse)
+                                * (event.fracture_impulse_scale / piece_count);
+                            if impulse != Vec3::ZERO {
+                                physics.queue_command(
+                                    engine_physics::PhysicsCommand::ApplyImpulse {
+                                        entity: piece,
+                                        impulse,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    if event.destroy_on_break {
+                        crate::destroy_script_entity(
+                            &self.runtime.world_slot,
+                            &mut self.runtime.script_engine,
+                            &request.owner_entity_id,
+                            &request.target_entity_id,
+                            &mut fracture_diagnostics,
+                        );
+                    }
+                }
+                if !fracture_diagnostics.is_empty() {
+                    self.runtime
+                        .diagnostics_collector_mut()
+                        .push_script_diags(fracture_diagnostics);
+                }
+            }
+
+            let gameplay_event = engine_script::GameplayDamageEvent {
+                target_entity_id: request.target_entity_id.clone(),
+                source_entity_id: Some(request.owner_entity_id.clone()),
+                damage_kind: request.damage_kind,
+                raw_damage: event.raw_damage,
+                applied_damage: event.applied_damage,
+                remaining_health: event.remaining_health,
+                hit_position: event.hit_position,
+                impulse: event.impulse,
+                broke: event.broke,
+                spawned_entity_ids,
+            };
+            self.runtime
+                .push_script_damage_event(request.target_entity_id.clone(), gameplay_event.clone());
+            if request.owner_entity_id != request.target_entity_id {
+                self.runtime
+                    .push_script_damage_event(request.owner_entity_id, gameplay_event);
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "subsystem-scripting-csharp",
+        feature = "gameplay",
+        feature = "runtime-subsystems"
+    ))]
+    fn process_script_ragdoll_requests(&mut self) {
+        let pending = self.runtime.take_pending_ragdoll_requests();
+        for request in pending {
+            match self.set_ragdoll_active(
+                &request.target_entity_id,
+                request.active,
+                request.recovery_duration,
+                Vec3::from(request.impulse),
+            ) {
+                Ok(body_entity_ids) => {
+                    let event = engine_script::GameplayRagdollEvent {
+                        entity_id: request.target_entity_id.clone(),
+                        active: request.active,
+                        recovering: !request.active && request.recovery_duration > 0.0,
+                        body_entity_ids,
+                    };
+                    self.runtime
+                        .push_script_ragdoll_event(request.target_entity_id.clone(), event.clone());
+                    if request.owner_entity_id != request.target_entity_id {
+                        self.runtime
+                            .push_script_ragdoll_event(request.owner_entity_id, event);
+                    }
+                }
+                Err(error) => {
+                    let mut diagnostic = engine_serialize::Diagnostic::new(
+                        "SCRIPT_RAGDOLL_REJECTED",
+                        engine_serialize::DiagnosticSeverity::Error,
+                        "script",
+                        format!(
+                            "script entity '{}' could not change ragdoll ownership for '{}': {error}",
+                            request.owner_entity_id, request.target_entity_id
+                        ),
+                    );
+                    diagnostic.entity = Some(request.owner_entity_id);
+                    self.runtime
+                        .diagnostics_collector_mut()
+                        .push_script_diags(vec![diagnostic]);
+                }
+            }
+        }
     }
 
     /// Run one validated script physics query against the physics world,
@@ -1820,19 +2524,30 @@ impl GameLoop {
         /// when the hit collider has no persistent id to name.
         fn hit_result(
             hit: Option<engine_physics::RaycastHit>,
-            persistent_id: impl Fn(engine_physics::Entity) -> Option<String>,
-            hit_kind: impl Fn(String, [f32; 3], [f32; 3], f32) -> GameplayPhysicsQueryResult,
+            metadata: impl Fn(
+                engine_physics::Entity,
+                f32,
+            )
+                -> Option<(String, Option<engine_script::GameplayInteractionSnapshot>)>,
+            hit_kind: impl Fn(
+                String,
+                [f32; 3],
+                [f32; 3],
+                f32,
+                Option<engine_script::GameplayInteractionSnapshot>,
+            ) -> GameplayPhysicsQueryResult,
             miss: impl Fn() -> GameplayPhysicsQueryResult,
         ) -> GameplayPhysicsQueryResult {
             let Some(hit) = hit else {
                 return miss();
             };
-            match persistent_id(hit.entity) {
-                Some(entity_id) => hit_kind(
+            match metadata(hit.entity, hit.distance) {
+                Some((entity_id, interaction)) => hit_kind(
                     entity_id,
                     hit.point.to_array(),
                     hit.normal.to_array(),
                     hit.distance,
+                    interaction,
                 ),
                 // A collider without a persistent id cannot be named to
                 // scripts, so the query reports no usable hit.
@@ -1840,9 +2555,23 @@ impl GameLoop {
             }
         }
 
-        let persistent_id_of = |entity: engine_physics::Entity| {
+        let hit_metadata = |entity: engine_physics::Entity, distance: f32| {
             self.runtime
-                .with_world(|world| world.persistent_id(entity).map(str::to_owned))
+                .with_world(|world| {
+                    let entity_id = world.persistent_id(entity)?.to_owned();
+                    let interaction = world
+                        .get::<engine_scene::components::Interactable>(entity)
+                        .filter(|interactable| {
+                            interactable.enabled && distance <= interactable.max_distance
+                        })
+                        .map(|interactable| engine_script::GameplayInteractionSnapshot {
+                            prompt: interactable.prompt.clone(),
+                            action: interactable.action.clone(),
+                            max_distance: interactable.max_distance,
+                            grabbable: interactable.grabbable,
+                        });
+                    Some((entity_id, interaction))
+                })
                 .flatten()
         };
 
@@ -1871,13 +2600,16 @@ impl GameLoop {
                 );
                 hit_result(
                     hit,
-                    persistent_id_of,
-                    |entity_id, point, normal, distance| GameplayPhysicsQueryResult::RaycastHit {
-                        query_id,
-                        entity_id,
-                        point,
-                        normal,
-                        distance,
+                    hit_metadata,
+                    |entity_id, point, normal, distance, interaction| {
+                        GameplayPhysicsQueryResult::RaycastHit {
+                            query_id,
+                            entity_id,
+                            point,
+                            normal,
+                            distance,
+                            interaction,
+                        }
                     },
                     miss,
                 )
@@ -1909,14 +2641,15 @@ impl GameLoop {
                 );
                 hit_result(
                     hit,
-                    persistent_id_of,
-                    |entity_id, point, normal, distance| {
+                    hit_metadata,
+                    |entity_id, point, normal, distance, interaction| {
                         GameplayPhysicsQueryResult::SphereCastHit {
                             query_id,
                             entity_id,
                             point,
                             normal,
                             distance,
+                            interaction,
                         }
                     },
                     miss,
@@ -2696,6 +3429,213 @@ mod character_scene_tests {
         let _ = std::fs::remove_dir_all(cooked);
     }
 
+    #[cfg(feature = "runtime-subsystems")]
+    #[test]
+    fn ragdoll_generates_physics_graph_switches_pose_ownership_and_recovers() {
+        use engine_animation::{
+            AnimationPlayer, Joint, JointTransform, RagdollBody, RagdollComponent,
+            RagdollConstraint, RagdollMode, Skeleton, SkeletonComponent,
+        };
+
+        let skeleton = Skeleton {
+            joints: vec![
+                Joint {
+                    name: "hips".into(),
+                    parent_index: None,
+                    local_transform: JointTransform::IDENTITY,
+                },
+                Joint {
+                    name: "chest".into(),
+                    parent_index: Some(0),
+                    local_transform: JointTransform {
+                        translation: [0.0, 0.75, 0.0],
+                        ..JointTransform::IDENTITY
+                    },
+                },
+            ],
+            inverse_bind_matrices: vec![
+                glam::Mat4::IDENTITY.to_cols_array_2d(),
+                glam::Mat4::from_translation(Vec3::new(0.0, -0.75, 0.0)).to_cols_array_2d(),
+            ],
+        };
+        skeleton.validate().unwrap();
+
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        let skeleton_id = engine_serialize::AssetId::new("npc.skeleton");
+        game_loop
+            .runtime
+            .asset_registry_mut()
+            .insert_typed(skeleton_id.clone(), skeleton);
+        game_loop
+            .runtime
+            .loaded_extension_asset_ids
+            .entry("skeleton".into())
+            .or_default()
+            .insert(skeleton_id);
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let owner = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(
+                    owner,
+                    engine_scene::components::Transform {
+                        translation: Vec3::new(0.0, 3.0, 0.0),
+                        ..Default::default()
+                    },
+                );
+                world.add_component(owner, SkeletonComponent::new("npc.skeleton"));
+                world.add_component(owner, AnimationPlayer::default());
+                world.add_component(
+                    owner,
+                    RagdollComponent {
+                        bodies: vec![
+                            RagdollBody {
+                                bone: "hips".into(),
+                                ..Default::default()
+                            },
+                            RagdollBody {
+                                bone: "chest".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        constraints: vec![RagdollConstraint {
+                            parent_bone: "hips".into(),
+                            child_bone: "chest".into(),
+                            limits: Some([-0.6, 0.6]),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+
+        game_loop.update(0.0);
+        let (body_ids, joint_ids) = game_loop
+            .runtime
+            .with_world(|world| {
+                let owner = world.entity_by_persistent_id("cube-01").unwrap();
+                let ragdoll = world.get::<RagdollComponent>(owner).unwrap();
+                (
+                    ragdoll
+                        .generated_body_ids
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    ragdoll.generated_joint_ids.clone(),
+                )
+            })
+            .unwrap();
+        assert_eq!(body_ids.len(), 2);
+        assert_eq!(joint_ids.len(), 1);
+        assert_eq!(game_loop.physics.as_ref().unwrap().body_count(), 2);
+        assert_eq!(game_loop.physics.as_ref().unwrap().joint_count(), 1);
+
+        assert_eq!(
+            game_loop
+                .set_ragdoll_active("cube-01", true, 0.0, Vec3::new(4.0, 0.0, 0.0))
+                .unwrap(),
+            body_ids
+        );
+        game_loop.update(1.0 / 60.0);
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let owner = world.entity_by_persistent_id("cube-01").unwrap();
+                let ragdoll = world.get::<RagdollComponent>(owner).unwrap();
+                assert_eq!(ragdoll.mode, RagdollMode::Simulated);
+                let player = world.get::<AnimationPlayer>(owner).unwrap();
+                assert_eq!(
+                    player
+                        .external_pose_override
+                        .as_ref()
+                        .expect("physics owns the rendered pose")
+                        .weight,
+                    1.0
+                );
+                for id in &body_ids {
+                    let body = world.entity_by_persistent_id(id).unwrap();
+                    assert_eq!(
+                        world
+                            .get::<engine_physics::RigidBody>(body)
+                            .unwrap()
+                            .body_type,
+                        engine_physics::BodyType::Dynamic
+                    );
+                }
+            })
+            .unwrap();
+
+        let checkpoint = game_loop
+            .capture_save_game(std::collections::BTreeMap::new())
+            .unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let first_body = world.entity_by_persistent_id(&body_ids[0]).unwrap();
+                assert!(world.destroy_entity(first_body));
+                let owner = world.entity_by_persistent_id("cube-01").unwrap();
+                world.get_mut::<RagdollComponent>(owner).unwrap().mode = RagdollMode::Animated;
+            })
+            .unwrap();
+        let restore = game_loop.restore_save_game(checkpoint).unwrap();
+        assert_eq!(restore.restored_physics_bodies, 2);
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let owner = world.entity_by_persistent_id("cube-01").unwrap();
+                assert_eq!(
+                    world.get::<RagdollComponent>(owner).unwrap().mode,
+                    RagdollMode::Simulated
+                );
+                assert!(body_ids
+                    .iter()
+                    .all(|id| world.entity_by_persistent_id(id).is_some()));
+                assert!(joint_ids
+                    .iter()
+                    .all(|id| world.entity_by_persistent_id(id).is_some()));
+            })
+            .unwrap();
+        assert_eq!(game_loop.physics.as_ref().unwrap().joint_count(), 1);
+
+        game_loop
+            .set_ragdoll_active("cube-01", false, 0.1, Vec3::ZERO)
+            .unwrap();
+        game_loop.update(0.05);
+        let blend_weight = game_loop
+            .runtime
+            .with_world(|world| {
+                let owner = world.entity_by_persistent_id("cube-01").unwrap();
+                world
+                    .get::<AnimationPlayer>(owner)
+                    .unwrap()
+                    .external_pose_override
+                    .as_ref()
+                    .unwrap()
+                    .weight
+            })
+            .unwrap();
+        assert!((blend_weight - 0.5).abs() < 1.0e-4, "{blend_weight}");
+
+        game_loop.update(0.05);
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let owner = world.entity_by_persistent_id("cube-01").unwrap();
+                assert_eq!(
+                    world.get::<RagdollComponent>(owner).unwrap().mode,
+                    RagdollMode::Animated
+                );
+                assert!(world
+                    .get::<AnimationPlayer>(owner)
+                    .unwrap()
+                    .external_pose_override
+                    .is_none());
+            })
+            .unwrap();
+    }
+
     #[test]
     fn game_loop_advances_non_primary_character_controllers() {
         let mut scene = engine_scene::sample_scene();
@@ -3390,6 +4330,9 @@ mod gameplay_script_bridge_tests {
             Some(&vec![GameplayPhysicsEvent {
                 kind: GameplayPhysicsEventKind::CollisionEntered,
                 other_entity_id: "camera-main".into(),
+                joint_id: None,
+                force: None,
+                torque: None,
             }])
         );
         assert_eq!(
@@ -3397,8 +4340,53 @@ mod gameplay_script_bridge_tests {
             Some(&vec![GameplayPhysicsEvent {
                 kind: GameplayPhysicsEventKind::CollisionEntered,
                 other_entity_id: "cube-01".into(),
+                joint_id: None,
+                force: None,
+                torque: None,
             }])
         );
+    }
+
+    #[test]
+    fn joint_breaks_reach_both_script_bodies_with_constraint_and_load() {
+        use engine_physics::{JointBreakEvent, JointHandle};
+        use engine_script::{GameplayPhysicsEvent, GameplayPhysicsEventKind};
+
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        let (cube, camera, constraint) = game_loop
+            .runtime
+            .with_world_mut(|world| {
+                (
+                    world.entity_by_persistent_id("cube-01").unwrap(),
+                    world.entity_by_persistent_id("camera-main").unwrap(),
+                    world.create_persistent_entity("cube-tether").unwrap(),
+                )
+            })
+            .unwrap();
+        game_loop.physics_events.joint_breaks.push(JointBreakEvent {
+            handle: JointHandle(7),
+            joint_entity: Some(constraint),
+            entity_a: cube,
+            entity_b: camera,
+            force: 1250.0,
+            torque: 75.0,
+        });
+
+        let events = game_loop.resolved_script_physics_events();
+        let expected_for_cube = GameplayPhysicsEvent {
+            kind: GameplayPhysicsEventKind::JointBroken,
+            other_entity_id: "camera-main".into(),
+            joint_id: Some("cube-tether".into()),
+            force: Some(1250.0),
+            torque: Some(75.0),
+        };
+        let expected_for_camera = GameplayPhysicsEvent {
+            other_entity_id: "cube-01".into(),
+            ..expected_for_cube.clone()
+        };
+        assert_eq!(events.get("cube-01"), Some(&vec![expected_for_cube]));
+        assert_eq!(events.get("camera-main"), Some(&vec![expected_for_camera]));
     }
 
     #[test]
@@ -3448,6 +4436,9 @@ mod gameplay_script_bridge_tests {
         let expected = GameplayPhysicsEvent {
             kind: GameplayPhysicsEventKind::TriggerEntered,
             other_entity_id: "camera-main".into(),
+            joint_id: None,
+            force: None,
+            torque: None,
         };
         game_loop.runtime.tick_scripts_with_input_and_physics(
             1.0 / 60.0,
@@ -3761,6 +4752,19 @@ mod gameplay_script_bridge_tests {
             },
         );
         target.components.insert(
+            "engine.interactable".into(),
+            engine_scene::ComponentRecord {
+                schema_version: SchemaVersion::new(0, 1, 0),
+                enabled: true,
+                fields: BTreeMap::from([
+                    ("prompt".into(), Value::Str("Pick up cube".into())),
+                    ("action".into(), Value::Str("pickup".into())),
+                    ("max_distance".into(), Value::Float32(5.0)),
+                    ("grabbable".into(), Value::Bool(true)),
+                ]),
+            },
+        );
+        target.components.insert(
             "engine.script".into(),
             engine_scene::ComponentRecord {
                 schema_version: SchemaVersion::new(0, 1, 0),
@@ -3803,12 +4807,23 @@ mod gameplay_script_bridge_tests {
                     point,
                     normal,
                     distance,
-                } => Some((entity_id.clone(), *point, *normal, *distance)),
+                    interaction,
+                } => Some((
+                    entity_id.clone(),
+                    *point,
+                    *normal,
+                    *distance,
+                    interaction.clone(),
+                )),
                 _ => None,
             })
             .expect("raycast hit result for query 11");
         assert_eq!(hit.0, "cube-01");
         assert!((hit.1[1] - 0.5).abs() < 1.0e-4, "hit point: {:?}", hit.1);
+        let interaction = hit.4.expect("enabled in-range interactable metadata");
+        assert_eq!(interaction.prompt, "Pick up cube");
+        assert_eq!(interaction.action, "pickup");
+        assert!(interaction.grabbable);
         assert!(
             hit.1[0].abs() < 1.0e-4 && hit.1[2].abs() < 1.0e-4,
             "hit point: {:?}",
@@ -3965,6 +4980,144 @@ mod gameplay_script_bridge_tests {
         assert_eq!(game_loop.runtime.take_pending_physics_queries().len(), 1);
     }
 
+    #[test]
+    fn script_impulse_resolves_persistent_id_and_reaches_physics_step() {
+        use engine_physics::{Collider, RigidBody};
+        use engine_scene::components::Transform;
+
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop.runtime.with_world_mut(|world| {
+            let cube = world.entity_by_persistent_id("cube-01").unwrap();
+            world.add_component(cube, Transform::default());
+            world.add_component(cube, RigidBody::default());
+            world.add_component(cube, Collider::default());
+        });
+        game_loop.init_physics();
+
+        let diagnostics = game_loop.runtime.apply_script_gameplay_commands(vec![
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::PhysicsMutation {
+                    mutation: engine_script::GameplayPhysicsMutation::ApplyImpulse {
+                        entity_id: "cube-01".into(),
+                        impulse: [12.0, 0.0, 0.0],
+                    },
+                },
+            },
+        ]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        game_loop.queue_script_physics_mutations();
+        game_loop.update(1.0 / 60.0);
+
+        let cube = game_loop
+            .runtime
+            .with_world(|world| world.entity_by_persistent_id("cube-01").unwrap())
+            .unwrap();
+        let state = game_loop
+            .physics
+            .as_ref()
+            .unwrap()
+            .runtime_body_states()
+            .into_iter()
+            .find(|(entity, _)| *entity == cube)
+            .unwrap()
+            .1;
+        assert!(state.linear_velocity[0] > 0.0, "{state:?}");
+    }
+
+    #[test]
+    fn script_joint_mutations_create_update_and_remove_a_persistent_constraint() {
+        use engine_physics::{BodyType, Collider, PhysicsJoint, RigidBody};
+        use engine_scene::components::Transform;
+        use engine_script::{GameplayJointLimits, GameplayJointType, GameplayPhysicsMutation};
+
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop.runtime.with_world_mut(|world| {
+            let cube = world.entity_by_persistent_id("cube-01").unwrap();
+            let camera = world.entity_by_persistent_id("camera-main").unwrap();
+            world.add_component(cube, Transform::default());
+            world.add_component(cube, RigidBody::default());
+            world.add_component(cube, Collider::default());
+            world.add_component(camera, Transform::default());
+            world.add_component(
+                camera,
+                RigidBody {
+                    body_type: BodyType::Static,
+                    ..RigidBody::default()
+                },
+            );
+        });
+        game_loop.init_physics();
+
+        let create = |max: f32, break_force: f32| GameplayCommand::PhysicsMutation {
+            mutation: GameplayPhysicsMutation::CreateJoint {
+                joint_id: "script-hinge".into(),
+                body_a: "camera-main".into(),
+                body_b: "cube-01".into(),
+                joint_type: GameplayJointType::Revolute,
+                anchor_a: [0.0; 3],
+                anchor_b: [0.0; 3],
+                axis: [0.0, 1.0, 0.0],
+                limits: Some(GameplayJointLimits {
+                    min: -max,
+                    max,
+                    stiffness: 20.0,
+                    damping: 2.0,
+                }),
+                motor: None,
+                break_force,
+                break_torque: 0.0,
+            },
+        };
+
+        for command in [create(1.0, 1000.0), create(0.5, 500.0)] {
+            let diagnostics = game_loop.runtime.apply_script_gameplay_commands(vec![
+                engine_script::OwnedGameplayCommand {
+                    entity_id: "cube-01".into(),
+                    command,
+                },
+            ]);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            game_loop.queue_script_physics_mutations();
+            game_loop.update(0.0);
+            assert_eq!(game_loop.physics.as_ref().unwrap().joint_count(), 1);
+        }
+
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let constraint = world.entity_by_persistent_id("script-hinge").unwrap();
+                let joint = world.get::<PhysicsJoint>(constraint).unwrap();
+                assert_eq!(joint.break_force, 500.0);
+                assert_eq!(joint.limits.as_ref().unwrap().max, 0.5);
+            })
+            .unwrap();
+
+        let diagnostics = game_loop.runtime.apply_script_gameplay_commands(vec![
+            engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::PhysicsMutation {
+                    mutation: GameplayPhysicsMutation::RemoveJoint {
+                        joint_id: "script-hinge".into(),
+                    },
+                },
+            },
+        ]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        game_loop.queue_script_physics_mutations();
+        game_loop.update(0.0);
+        assert_eq!(game_loop.physics.as_ref().unwrap().joint_count(), 0);
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let constraint = world.entity_by_persistent_id("script-hinge").unwrap();
+                assert!(world.get::<PhysicsJoint>(constraint).is_none());
+            })
+            .unwrap();
+    }
+
     // ── Sweep / filter fixtures ─────────────────────────────────────────
 
     /// Script instance that issues a fixed, pre-built command batch once.
@@ -4040,6 +5193,219 @@ mod gameplay_script_bridge_tests {
             enabled: true,
             fields,
         }
+    }
+
+    fn register_damage_test_prefab(game_loop: &mut GameLoop, prefab_id: &str) {
+        let mut prefab = engine_scene::Prefab::new(engine_serialize::AssetId::new(prefab_id));
+        prefab.add_entity(engine_scene::EntityRecord {
+            persistent_id: "root".into(),
+            parent: None,
+            name: Some("Fracture piece".into()),
+            enabled: true,
+            components: BTreeMap::from([
+                ("engine.transform".into(), component_record(BTreeMap::new())),
+                (
+                    "engine.physics.rigid_body".into(),
+                    component_record(BTreeMap::new()),
+                ),
+                (
+                    "engine.physics.collider".into(),
+                    component_record(BTreeMap::new()),
+                ),
+            ]),
+        });
+        let asset_id = engine_serialize::AssetId::new(prefab_id);
+        game_loop
+            .runtime
+            .asset_registry_mut()
+            .insert_typed(asset_id.clone(), prefab);
+        game_loop
+            .runtime
+            .loaded_extension_asset_ids
+            .entry("prefab".into())
+            .or_default()
+            .insert(asset_id);
+    }
+
+    fn damage_command(
+        owner: &str,
+        target: &str,
+        amount: f32,
+        impulse: [f32; 3],
+    ) -> engine_script::OwnedGameplayCommand {
+        engine_script::OwnedGameplayCommand {
+            entity_id: owner.into(),
+            command: GameplayCommand::ApplyDamage {
+                entity_id: target.into(),
+                amount,
+                damage_kind: engine_script::GameplayDamageKind::Impact,
+                hit_position: Some([3.0, 4.0, 5.0]),
+                impulse,
+            },
+        }
+    }
+
+    #[test]
+    fn script_damage_breaks_once_replaces_prefab_and_inherits_physics_state() {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        let target = game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let target = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(
+                    target,
+                    engine_scene::components::Transform {
+                        translation: Vec3::new(3.0, 4.0, 5.0),
+                        ..Default::default()
+                    },
+                );
+                world.add_component(target, engine_physics::RigidBody::default());
+                world.add_component(target, engine_physics::Collider::default());
+                world.add_component(
+                    target,
+                    engine_physics::Destructible {
+                        max_health: 10.0,
+                        health: 10.0,
+                        replacement_prefab: Some(engine_serialize::AssetId::new("crate-fracture")),
+                        fracture_impulse_scale: 0.5,
+                        ..Default::default()
+                    },
+                );
+                target
+            })
+            .unwrap();
+        game_loop.resync_physics_from_world();
+        let source_state = engine_physics::RigidBodyRuntimeState {
+            position: [3.0, 4.0, 5.0],
+            rotation: glam::Quat::IDENTITY.to_array(),
+            linear_velocity: [2.0, 3.0, 4.0],
+            angular_velocity: [0.0, 1.5, 0.0],
+            sleeping: false,
+        };
+        assert!(game_loop
+            .physics
+            .as_mut()
+            .unwrap()
+            .restore_runtime_body_state(target, &source_state));
+        register_damage_test_prefab(&mut game_loop, "crate-fracture");
+
+        let diagnostics = game_loop
+            .runtime
+            .apply_script_gameplay_commands(vec![damage_command(
+                "camera-main",
+                "cube-01",
+                10.0,
+                [6.0, 0.0, 0.0],
+            )]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        game_loop.process_script_damage_requests();
+
+        let fragment = game_loop
+            .runtime
+            .with_world(|world| {
+                assert!(world.entity_by_persistent_id("cube-01").is_none());
+                let fragment = world
+                    .entity_by_persistent_id("crate-fracture")
+                    .expect("replacement prefab root");
+                assert_eq!(
+                    world
+                        .get::<engine_scene::components::Transform>(fragment)
+                        .unwrap()
+                        .translation,
+                    Vec3::new(3.0, 4.0, 5.0)
+                );
+                fragment
+            })
+            .unwrap();
+        let delivered = &game_loop.runtime.script_damage_events["camera-main"];
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].broke);
+        assert_eq!(
+            delivered[0].spawned_entity_ids,
+            vec!["crate-fracture".to_string()]
+        );
+
+        {
+            let physics = game_loop.physics.as_mut().unwrap();
+            game_loop
+                .runtime
+                .with_world_mut(|world| physics.step(0.0, world))
+                .unwrap();
+        }
+        let fragment_state = game_loop
+            .physics
+            .as_ref()
+            .unwrap()
+            .runtime_body_states()
+            .into_iter()
+            .find_map(|(entity, state)| (entity == fragment).then_some(state))
+            .expect("fracture piece body state");
+        assert!(fragment_state.linear_velocity[0] > source_state.linear_velocity[0]);
+        assert_eq!(
+            fragment_state.linear_velocity[1],
+            source_state.linear_velocity[1]
+        );
+        assert_eq!(
+            fragment_state.linear_velocity[2],
+            source_state.linear_velocity[2]
+        );
+        assert_eq!(
+            fragment_state.angular_velocity,
+            source_state.angular_velocity
+        );
+    }
+
+    #[test]
+    fn failed_fracture_prefab_does_not_delete_the_broken_source() {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let target = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(
+                    target,
+                    engine_physics::Destructible {
+                        max_health: 1.0,
+                        health: 1.0,
+                        replacement_prefab: Some(engine_serialize::AssetId::new(
+                            "missing-fracture",
+                        )),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+
+        assert!(game_loop
+            .runtime
+            .apply_script_gameplay_commands(vec![damage_command(
+                "camera-main",
+                "cube-01",
+                1.0,
+                [0.0; 3],
+            )])
+            .is_empty());
+        game_loop.process_script_damage_requests();
+
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let target = world
+                    .entity_by_persistent_id("cube-01")
+                    .expect("failed replacement keeps source entity");
+                let destructible = world.get::<engine_physics::Destructible>(target).unwrap();
+                assert!(destructible.broken);
+                assert_eq!(destructible.health, 0.0);
+            })
+            .unwrap();
+        assert!(game_loop
+            .runtime
+            .diagnostics_collector()
+            .script_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "SCRIPT_PREFAB_UNKNOWN"));
     }
 
     /// A static box entity at `translation` with a collider on
@@ -4193,6 +5559,7 @@ mod gameplay_script_bridge_tests {
                     point,
                     normal,
                     distance,
+                    ..
                 } => Some((entity_id.clone(), *point, *normal, *distance)),
                 _ => None,
             })
@@ -4772,6 +6139,240 @@ mod world_origin_tests {
         );
         let listener = frame.listener.as_ref().unwrap();
         assert!(listener.position.length() < 1e-4, "{listener:?}");
+    }
+}
+
+#[cfg(test)]
+mod savegame_tests {
+    use std::collections::BTreeMap;
+
+    use engine_scene::components::Transform;
+    use engine_serialize::Value;
+
+    use super::*;
+
+    #[test]
+    fn checkpoint_restores_live_scene_origin_and_project_state() {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(
+                    cube,
+                    Transform {
+                        translation: Vec3::new(1010.0, 2.0, 3.0),
+                        ..Transform::default()
+                    },
+                );
+            })
+            .unwrap();
+        game_loop
+            .shift_world_origin([1000.0, 0.0, 0.0])
+            .expect("origin shift");
+        let expected_relative = game_loop
+            .runtime
+            .with_world(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                world.get::<Transform>(cube).unwrap().translation
+            })
+            .unwrap();
+        let save = game_loop
+            .capture_save_game(BTreeMap::from([
+                ("chapter".into(), Value::UInt(4)),
+                ("suit".into(), Value::Bool(true)),
+            ]))
+            .unwrap();
+
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                world.get_mut::<Transform>(cube).unwrap().translation = Vec3::splat(-99.0);
+            })
+            .unwrap();
+        let report = game_loop.restore_save_game(save).unwrap();
+
+        assert_eq!(game_loop.world_origin(), [1000.0, 0.0, 0.0]);
+        assert_eq!(
+            game_loop
+                .runtime
+                .with_world(|world| {
+                    let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                    world.get::<Transform>(cube).unwrap().translation
+                })
+                .unwrap(),
+            expected_relative
+        );
+        assert_eq!(report.custom_state["chapter"], Value::UInt(4));
+        assert_eq!(report.custom_state["suit"], Value::Bool(true));
+    }
+
+    #[cfg(feature = "gameplay")]
+    #[test]
+    fn checkpoint_restores_transient_rigid_body_state_by_persistent_id() {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        let cube = game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(cube, Transform::default());
+                world.add_component(cube, engine_physics::RigidBody::default());
+                world.add_component(cube, engine_physics::Collider::default());
+                cube
+            })
+            .unwrap();
+        game_loop.resync_physics_from_world();
+        let expected = engine_physics::RigidBodyRuntimeState {
+            position: [2.0, 3.0, 4.0],
+            rotation: glam::Quat::from_rotation_y(0.5).to_array(),
+            linear_velocity: [5.0, -1.0, 0.5],
+            angular_velocity: [0.0, 2.0, 0.0],
+            sleeping: false,
+        };
+        assert!(game_loop
+            .physics
+            .as_mut()
+            .unwrap()
+            .restore_runtime_body_state(cube, &expected));
+
+        let save = game_loop.capture_save_game(BTreeMap::new()).unwrap();
+        let report = game_loop.restore_save_game(save).unwrap();
+        assert_eq!(report.restored_physics_bodies, 1);
+        assert!(report.skipped_physics_bodies.is_empty());
+
+        let restored = game_loop
+            .physics
+            .as_ref()
+            .unwrap()
+            .runtime_body_states()
+            .into_iter()
+            .find(|(entity, _)| {
+                game_loop
+                    .runtime
+                    .with_world(|world| world.persistent_id(*entity) == Some("cube-01"))
+                    == Some(true)
+            })
+            .expect("restored cube state")
+            .1;
+        assert_eq!(restored.linear_velocity, expected.linear_velocity);
+        assert_eq!(restored.angular_velocity, expected.angular_velocity);
+        assert_eq!(restored.position, expected.position);
+    }
+
+    #[cfg(feature = "gameplay")]
+    #[test]
+    fn checkpoint_rebuilds_persistent_joint_without_serializing_backend_handles() {
+        use engine_physics::{BodyType, PhysicsJoint, RigidBody};
+
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                let camera = world.entity_by_persistent_id("camera-main").unwrap();
+                world.add_component(cube, Transform::default());
+                world.add_component(cube, RigidBody::default());
+                world.add_component(camera, Transform::default());
+                world.add_component(
+                    camera,
+                    RigidBody {
+                        body_type: BodyType::Static,
+                        ..RigidBody::default()
+                    },
+                );
+                let constraint = world.create_persistent_entity("save-tether").unwrap();
+                world.add_component(
+                    constraint,
+                    PhysicsJoint {
+                        body_a: "camera-main".into(),
+                        body_b: "cube-01".into(),
+                        break_force: 2500.0,
+                        ..PhysicsJoint::default()
+                    },
+                );
+            })
+            .unwrap();
+        game_loop.resync_physics_from_world();
+        assert_eq!(game_loop.physics.as_ref().unwrap().joint_count(), 1);
+
+        let save = game_loop.capture_save_game(BTreeMap::new()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let constraint = world.entity_by_persistent_id("save-tether").unwrap();
+                world.remove_component::<PhysicsJoint>(constraint);
+            })
+            .unwrap();
+        game_loop.resync_physics_from_world();
+        assert_eq!(game_loop.physics.as_ref().unwrap().joint_count(), 0);
+
+        game_loop.restore_save_game(save).unwrap();
+        assert_eq!(game_loop.physics.as_ref().unwrap().joint_count(), 1);
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let constraint = world.entity_by_persistent_id("save-tether").unwrap();
+                assert_eq!(
+                    world.get::<PhysicsJoint>(constraint).unwrap().break_force,
+                    2500.0
+                );
+            })
+            .unwrap();
+    }
+
+    #[cfg(feature = "gameplay")]
+    #[test]
+    fn checkpoint_restores_destructible_health_and_break_state() {
+        let mut game_loop = GameLoop::new(EngineConfig::default());
+        game_loop.load_scene(engine_scene::sample_scene()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(
+                    cube,
+                    engine_physics::Destructible {
+                        max_health: 75.0,
+                        health: 0.0,
+                        minimum_damage: 4.0,
+                        replacement_prefab: Some(engine_serialize::AssetId::new("crate-fracture")),
+                        broken: true,
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+
+        let save = game_loop.capture_save_game(BTreeMap::new()).unwrap();
+        game_loop
+            .runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                *world.get_mut::<engine_physics::Destructible>(cube).unwrap() =
+                    engine_physics::Destructible::default();
+            })
+            .unwrap();
+        game_loop.restore_save_game(save).unwrap();
+
+        game_loop
+            .runtime
+            .with_world(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                let destructible = world.get::<engine_physics::Destructible>(cube).unwrap();
+                assert_eq!(destructible.max_health, 75.0);
+                assert_eq!(destructible.health, 0.0);
+                assert_eq!(destructible.minimum_damage, 4.0);
+                assert_eq!(
+                    destructible.replacement_prefab.as_ref().unwrap().id,
+                    "crate-fracture"
+                );
+                assert!(destructible.broken);
+            })
+            .unwrap();
     }
 }
 

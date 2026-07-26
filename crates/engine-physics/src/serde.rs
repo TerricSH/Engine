@@ -10,7 +10,75 @@ use std::collections::BTreeMap;
 use engine_serialize::Value;
 
 use crate::components::{BodyType, Collider, ColliderShape, PhysicsMaterial, RigidBody};
+use crate::destruction::Destructible;
 use crate::gravity::{GravityFalloff, GravityMode, GravitySource};
+use crate::joints::{JointLimits, JointMotor, JointType, PhysicsJoint};
+
+pub(super) fn serialize_destructible(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
+    let destructible = component
+        .downcast_ref::<Destructible>()
+        .expect("Destructible expected");
+    let mut fields = BTreeMap::new();
+    fields.insert("enabled".into(), Value::Bool(destructible.enabled));
+    fields.insert("max_health".into(), Value::Float32(destructible.max_health));
+    fields.insert("health".into(), Value::Float32(destructible.health));
+    fields.insert(
+        "minimum_damage".into(),
+        Value::Float32(destructible.minimum_damage),
+    );
+    fields.insert(
+        "damage_scale".into(),
+        Value::Float32(destructible.damage_scale),
+    );
+    if let Some(prefab) = &destructible.replacement_prefab {
+        fields.insert("replacement_prefab".into(), Value::Asset(prefab.clone()));
+    }
+    fields.insert(
+        "destroy_on_break".into(),
+        Value::Bool(destructible.destroy_on_break),
+    );
+    fields.insert(
+        "inherit_velocity".into(),
+        Value::Bool(destructible.inherit_velocity),
+    );
+    fields.insert(
+        "fracture_impulse_scale".into(),
+        Value::Float32(destructible.fracture_impulse_scale),
+    );
+    fields.insert("broken".into(), Value::Bool(destructible.broken));
+    fields
+}
+
+pub(super) fn deserialize_destructible(fields: &BTreeMap<String, Value>) -> Box<dyn std::any::Any> {
+    let defaults = Destructible::default();
+    let max_health = finite_non_negative_field(fields, "max_health")
+        .filter(|value| *value > 0.0)
+        .unwrap_or(defaults.max_health);
+    let broken = bool_field(fields, "broken").unwrap_or(false);
+    let health = finite_non_negative_field(fields, "health")
+        .unwrap_or(if broken { 0.0 } else { max_health })
+        .min(max_health);
+    Box::new(Destructible {
+        enabled: bool_field(fields, "enabled").unwrap_or(true),
+        max_health,
+        health: if broken { 0.0 } else { health },
+        minimum_damage: finite_non_negative_field(fields, "minimum_damage")
+            .unwrap_or(defaults.minimum_damage),
+        damage_scale: finite_non_negative_field(fields, "damage_scale")
+            .unwrap_or(defaults.damage_scale),
+        replacement_prefab: match fields.get("replacement_prefab") {
+            Some(Value::Asset(asset)) => Some(asset.clone()),
+            _ => None,
+        },
+        destroy_on_break: bool_field(fields, "destroy_on_break")
+            .or_else(|| bool_field(fields, "destroy_source"))
+            .unwrap_or(true),
+        inherit_velocity: bool_field(fields, "inherit_velocity").unwrap_or(true),
+        fracture_impulse_scale: finite_non_negative_field(fields, "fracture_impulse_scale")
+            .unwrap_or(defaults.fracture_impulse_scale),
+        broken,
+    })
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // RigidBody
@@ -84,6 +152,100 @@ pub(super) fn deserialize_rigid_body(fields: &BTreeMap<String, Value>) -> Box<dy
         can_sleep,
         ccd_enabled,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Persistent physics joint
+// ---------------------------------------------------------------------------
+
+pub(super) fn serialize_physics_joint(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
+    let joint = component
+        .downcast_ref::<PhysicsJoint>()
+        .expect("PhysicsJoint expected");
+    let mut fields = BTreeMap::new();
+    fields.insert("enabled".into(), Value::Bool(joint.enabled));
+    fields.insert("body_a".into(), Value::Str(joint.body_a.clone()));
+    fields.insert("body_b".into(), Value::Str(joint.body_b.clone()));
+    fields.insert(
+        "joint_type".into(),
+        Value::Enum(
+            match joint.joint_type {
+                JointType::Fixed => "Fixed",
+                JointType::Revolute => "Revolute",
+                JointType::Prismatic => "Prismatic",
+                JointType::Spherical => "Spherical",
+            }
+            .into(),
+        ),
+    );
+    fields.insert("anchor_a".into(), Value::Vec3(joint.anchor_a));
+    fields.insert("anchor_b".into(), Value::Vec3(joint.anchor_b));
+    fields.insert("axis".into(), Value::Vec3(joint.axis));
+    if let Some(limits) = &joint.limits {
+        fields.insert(
+            "limits".into(),
+            Value::Map(BTreeMap::from([
+                ("min".into(), Value::Float32(limits.min)),
+                ("max".into(), Value::Float32(limits.max)),
+                ("stiffness".into(), Value::Float32(limits.stiffness)),
+                ("damping".into(), Value::Float32(limits.damping)),
+            ])),
+        );
+    }
+    if let Some(motor) = &joint.motor {
+        fields.insert(
+            "motor".into(),
+            Value::Map(BTreeMap::from([
+                ("target_vel".into(), Value::Float32(motor.target_vel)),
+                ("target_pos".into(), Value::Float32(motor.target_pos)),
+                ("stiffness".into(), Value::Float32(motor.stiffness)),
+                ("damping".into(), Value::Float32(motor.damping)),
+            ])),
+        );
+    }
+    fields.insert("break_force".into(), Value::Float32(joint.break_force));
+    fields.insert("break_torque".into(), Value::Float32(joint.break_torque));
+    fields
+}
+
+pub(super) fn deserialize_physics_joint(
+    fields: &BTreeMap<String, Value>,
+) -> Box<dyn std::any::Any> {
+    let defaults = PhysicsJoint::default();
+    let body_a = string_field(fields, "body_a").unwrap_or_default();
+    let body_b = string_field(fields, "body_b").unwrap_or_default();
+    let joint_type = match fields.get("joint_type") {
+        Some(Value::Enum(value)) if value == "Revolute" => JointType::Revolute,
+        Some(Value::Enum(value)) if value == "Prismatic" => JointType::Prismatic,
+        Some(Value::Enum(value)) if value == "Spherical" => JointType::Spherical,
+        _ => JointType::Fixed,
+    };
+    let limits = map_field(fields, "limits").map(|values| JointLimits {
+        min: finite_float_field(values, "min").unwrap_or(0.0),
+        max: finite_float_field(values, "max").unwrap_or(0.0),
+        stiffness: finite_non_negative_field(values, "stiffness").unwrap_or(0.0),
+        damping: finite_non_negative_field(values, "damping").unwrap_or(0.0),
+    });
+    let motor = map_field(fields, "motor").map(|values| JointMotor {
+        target_vel: finite_float_field(values, "target_vel").unwrap_or(0.0),
+        target_pos: finite_float_field(values, "target_pos").unwrap_or(0.0),
+        stiffness: finite_non_negative_field(values, "stiffness").unwrap_or(0.0),
+        damping: finite_non_negative_field(values, "damping").unwrap_or(0.0),
+    });
+    let joint = PhysicsJoint {
+        enabled: bool_field(fields, "enabled").unwrap_or(true),
+        body_a,
+        body_b,
+        joint_type,
+        anchor_a: finite_vec3_field(fields, "anchor_a").unwrap_or(defaults.anchor_a),
+        anchor_b: finite_vec3_field(fields, "anchor_b").unwrap_or(defaults.anchor_b),
+        axis: finite_vec3_field(fields, "axis").unwrap_or(defaults.axis),
+        limits,
+        motor,
+        break_force: finite_non_negative_field(fields, "break_force").unwrap_or(0.0),
+        break_torque: finite_non_negative_field(fields, "break_torque").unwrap_or(0.0),
+    };
+    Box::new(joint)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -389,6 +551,38 @@ fn uint_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<u64> {
     match fields.get(key)? {
         Value::UInt(v) => Some(*v),
         Value::Int(v) if *v >= 0 => Some(*v as u64),
+        _ => None,
+    }
+}
+
+fn string_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+    match fields.get(key)? {
+        Value::Str(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn map_field<'a>(
+    fields: &'a BTreeMap<String, Value>,
+    key: &str,
+) -> Option<&'a BTreeMap<String, Value>> {
+    match fields.get(key)? {
+        Value::Map(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn finite_float_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<f32> {
+    float_field(fields, key).filter(|value| value.is_finite())
+}
+
+fn finite_non_negative_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<f32> {
+    finite_float_field(fields, key).filter(|value| *value >= 0.0)
+}
+
+fn finite_vec3_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<[f32; 3]> {
+    match fields.get(key)? {
+        Value::Vec3(value) if value.iter().all(|component| component.is_finite()) => Some(*value),
         _ => None,
     }
 }

@@ -1792,10 +1792,15 @@ fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(), String> 
     let mut total_entities = 0usize;
     let mut script_assembly = None;
     let mut script_components = 0usize;
-    let mut strict_runtime = engine_core::EngineRuntime::new(engine_core::EngineConfig {
-        application_name: format!("{}-project-check", project.manifest.name),
-        gpu_timestamps: true,
-    });
+    let mut strict_runtime_builder =
+        engine_core::EngineRuntime::builder(engine_core::EngineConfig {
+            application_name: format!("{}-project-check", project.manifest.name),
+            gpu_timestamps: true,
+        });
+    engine_animation::loader::register_asset_types(
+        strict_runtime_builder.asset_type_registry_mut(),
+    );
+    let mut strict_runtime = strict_runtime_builder.build();
     for (scene_id, scene_path) in project.scenes() {
         let scene = Scene::load_from_file(&scene_path).map_err(|error| {
             format!(
@@ -2224,7 +2229,6 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
     let project = GameProject::load(&request.project).map_err(|error| error.to_string())?;
     validate_import_asset_id(&request.asset_id)?;
     let import_folder = normalize_existing_import_folder(&project.asset_source, &request.folder)?;
-    let import_directory = project.asset_source.join(&import_folder);
 
     let source_file = std::fs::canonicalize(&request.source_file).map_err(|error| {
         format!(
@@ -2249,25 +2253,159 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
                 source_file.display()
             )
         })?;
-
-    if let Some(conflict) = find_case_insensitive_entry(&import_directory, source_name)? {
-        return Err(format!(
-            "source asset target already exists and will not be overwritten: {}",
-            conflict.display()
-        ));
-    }
     let relative_source = import_folder.join(source_name);
     let copied_source = project.asset_source.join(&relative_source);
-    let cooked_name = format!("{}.cooked", request.asset_id);
-    if let Some(conflict) = find_case_insensitive_entry(&project.cooked_assets, &cooked_name)? {
-        return Err(format!(
-            "cooked asset target already exists and will not be overwritten: {}",
-            conflict.display()
-        ));
-    }
-    let cooked_target = project.cooked_assets.join(&cooked_name);
+    let external_sources = if asset_type == AssetType::Mesh {
+        gltf_external_source_files(&source_file)?
+            .into_iter()
+            .map(|(source, relative)| {
+                let target = project.asset_source.join(import_folder.join(relative));
+                (source, target)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
-    let (manifest_path, mut manifest) = load_import_manifest(&project, &request.asset_id)?;
+    let mut prepared_assets = Vec::<SourceAssetEntry>::new();
+    let mut generated_sources = Vec::<(PathBuf, Vec<u8>)>::new();
+    if asset_type == AssetType::Mesh {
+        let scene = engine_asset::gltf::load_gltf_scene(&source_file)
+            .map_err(|error| format!("could not inspect glTF import: {error}"))?;
+        if scene.primitives.is_empty() {
+            return Err("glTF import contains no mesh primitives".into());
+        }
+        for primitive_index in 0..scene.primitives.len() {
+            let id = if primitive_index == 0 {
+                request.asset_id.clone()
+            } else {
+                format!("{}.mesh.{primitive_index}", request.asset_id)
+            };
+            validate_import_asset_id(&id)?;
+            let mut cook_rules = CookRules::default();
+            if scene.primitives.len() > 1 {
+                cook_rules.gltf_primitive_index = Some(primitive_index as u32);
+            }
+            prepared_assets.push(SourceAssetEntry {
+                id: AssetId::new(id),
+                asset_type: AssetType::Mesh,
+                source_path: manifest_source_path(&relative_source),
+                cook_rules,
+            });
+        }
+
+        let imported_skins = engine_animation::import_gltf_animation_assets(&scene)?;
+        for imported_skin in imported_skins {
+            let skeleton_id = format!(
+                "{}.skeleton.{}",
+                request.asset_id, imported_skin.source_skin_index
+            );
+            validate_import_asset_id(&skeleton_id)?;
+            let skeleton_name = format!(
+                "{}.skin{}.skel",
+                request.asset_id, imported_skin.source_skin_index
+            );
+            let skeleton_relative = import_folder.join(&skeleton_name);
+            let skeleton_bytes = bincode::serialize(&imported_skin.skeleton)
+                .map_err(|error| format!("could not serialize imported skeleton: {error}"))?;
+            generated_sources.push((
+                project.asset_source.join(&skeleton_relative),
+                skeleton_bytes,
+            ));
+            prepared_assets.push(SourceAssetEntry {
+                id: AssetId::new(skeleton_id),
+                asset_type: AssetType::Skeleton,
+                source_path: manifest_source_path(&skeleton_relative),
+                cook_rules: CookRules::default(),
+            });
+
+            for (animation_index, animation) in imported_skin.animations.iter().enumerate() {
+                let animation_id = format!(
+                    "{}.animation.{}.{}",
+                    request.asset_id, imported_skin.source_skin_index, animation_index
+                );
+                validate_import_asset_id(&animation_id)?;
+                let animation_name = format!(
+                    "{}.skin{}.animation{}.anim",
+                    request.asset_id, imported_skin.source_skin_index, animation_index
+                );
+                let animation_relative = import_folder.join(&animation_name);
+                let animation_bytes = bincode::serialize(animation).map_err(|error| {
+                    format!(
+                        "could not serialize imported animation '{}': {error}",
+                        animation.name
+                    )
+                })?;
+                generated_sources.push((
+                    project.asset_source.join(&animation_relative),
+                    animation_bytes,
+                ));
+                prepared_assets.push(SourceAssetEntry {
+                    id: AssetId::new(animation_id),
+                    asset_type: AssetType::Animation,
+                    source_path: manifest_source_path(&animation_relative),
+                    cook_rules: CookRules::default(),
+                });
+            }
+        }
+    } else {
+        prepared_assets.push(SourceAssetEntry {
+            id: AssetId::new(request.asset_id.clone()),
+            asset_type: asset_type.clone(),
+            source_path: manifest_source_path(&relative_source),
+            cook_rules: CookRules::default(),
+        });
+    }
+
+    let mut planned_source_names = BTreeSet::new();
+    for target in std::iter::once(&copied_source)
+        .chain(external_sources.iter().map(|(_, target)| target))
+        .chain(generated_sources.iter().map(|(path, _)| path))
+    {
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "generated import path is not portable: {}",
+                    target.display()
+                )
+            })?;
+        let portable_target = target.to_string_lossy().to_ascii_lowercase();
+        if !planned_source_names.insert(portable_target) {
+            return Err(format!(
+                "import would generate duplicate source path '{}'",
+                target.display()
+            ));
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| format!("import target has no parent: {}", target.display()))?;
+        if let Some(conflict) = find_case_insensitive_entry(parent, name)? {
+            return Err(format!(
+                "source asset target already exists and will not be overwritten: {}",
+                conflict.display()
+            ));
+        }
+    }
+
+    let requested_ids = prepared_assets
+        .iter()
+        .map(|entry| entry.id.id.clone())
+        .collect::<Vec<_>>();
+    let mut cooked_targets = Vec::with_capacity(prepared_assets.len());
+    for entry in &prepared_assets {
+        let cooked_name = format!("{}.cooked", entry.id.id);
+        if let Some(conflict) = find_case_insensitive_entry(&project.cooked_assets, &cooked_name)? {
+            return Err(format!(
+                "cooked asset target already exists and will not be overwritten: {}",
+                conflict.display()
+            ));
+        }
+        cooked_targets.push(project.cooked_assets.join(cooked_name));
+    }
+
+    let (manifest_path, mut manifest) = load_import_manifest(&project, &requested_ids)?;
     let original_manifest =
         if manifest_path.is_file() {
             Some(std::fs::read(&manifest_path).map_err(|error| {
@@ -2282,16 +2420,7 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
             None
         };
 
-    manifest.assets.push(SourceAssetEntry {
-        id: AssetId::new(request.asset_id.clone()),
-        asset_type: asset_type.clone(),
-        source_path: relative_source
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/"),
-        cook_rules: CookRules::default(),
-    });
+    manifest.assets.extend(prepared_assets.iter().cloned());
     manifest.assets.sort_by(|left, right| {
         left.id
             .id
@@ -2304,59 +2433,86 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
     manifest_json.push('\n');
     let staging_dir = import_staging_directory(&project)?;
 
+    let mut created_sources =
+        Vec::with_capacity(generated_sources.len() + external_sources.len() + 1);
     copy_file_create_new(&source_file, &copied_source)?;
+    created_sources.push(copied_source.clone());
+    for (source, target) in &external_sources {
+        if let Some(parent) = target.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                cleanup_import_files(&created_sources);
+                return Err(format!(
+                    "could not create glTF dependency directory {}: {error}",
+                    parent.display()
+                ));
+            }
+        }
+        if let Err(error) = copy_file_create_new(source, target) {
+            cleanup_import_files(&created_sources);
+            return Err(error);
+        }
+        created_sources.push(target.clone());
+    }
+    for (target, bytes) in &generated_sources {
+        if let Err(error) = write_bytes_create_new(target, bytes) {
+            cleanup_import_files(&created_sources);
+            return Err(error);
+        }
+        created_sources.push(target.clone());
+    }
     if let Err(error) = write_text(&manifest_path, &manifest_json) {
         return Err(rollback_import_failure(
             error,
             &manifest_path,
             original_manifest.as_deref(),
-            &copied_source,
-            None,
+            &created_sources,
+            &[],
         ));
     }
 
     let mut graph = DependencyGraph::new();
-    let runtime_builder = engine_core::EngineRuntime::builder(engine_core::EngineConfig {
+    let mut runtime_builder = engine_core::EngineRuntime::builder(engine_core::EngineConfig {
         application_name: format!("{}-asset-import", project.manifest.name),
         gpu_timestamps: true,
     });
+    engine_animation::loader::register_asset_types(runtime_builder.asset_type_registry_mut());
     let cook_report = cook_orchestrate_checked_with_registry(
         &project.asset_source,
         &staging_dir,
         &mut graph,
         runtime_builder.asset_type_registry(),
     );
-    let staged_cooked = staging_dir.join(&cooked_name);
     let cook_result = if !cook_report.is_success() {
         Err(cook_report_failure(&cook_report))
-    } else if !cook_report
-        .results
-        .iter()
-        .any(|result| result.success && result.asset_id == request.asset_id)
-    {
-        Err(format!(
-            "cook succeeded without reporting imported asset '{}'",
-            request.asset_id
-        ))
     } else {
-        read_cooked_artifact(&staged_cooked)
-            .map_err(|error| {
+        prepared_assets.iter().try_for_each(|entry| {
+            if !cook_report
+                .results
+                .iter()
+                .any(|result| result.success && result.asset_id == entry.id.id)
+            {
+                return Err(format!(
+                    "cook succeeded without reporting imported asset '{}'",
+                    entry.id.id
+                ));
+            }
+            let staged_cooked = staging_dir.join(format!("{}.cooked", entry.id.id));
+            let artifact = read_cooked_artifact(&staged_cooked).map_err(|error| {
                 format!(
                     "imported asset did not produce a valid cooked artifact {}: {error}",
                     staged_cooked.display()
                 )
-            })
-            .and_then(|artifact| {
-                if artifact.header.asset_kind == asset_type.kind_code() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "imported asset cooked as kind {}, expected {}",
-                        artifact.header.asset_kind,
-                        asset_type.kind_code()
-                    ))
-                }
-            })
+            })?;
+            if artifact.header.asset_kind != entry.asset_type.kind_code() {
+                return Err(format!(
+                    "imported asset '{}' cooked as kind {}, expected {}",
+                    entry.id.id,
+                    artifact.header.asset_kind,
+                    entry.asset_type.kind_code()
+                ));
+            }
+            Ok(())
+        })
     };
     if let Err(error) = cook_result {
         remove_import_staging(&project, &staging_dir);
@@ -2364,8 +2520,8 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
             error,
             &manifest_path,
             original_manifest.as_deref(),
-            &copied_source,
-            None,
+            &created_sources,
+            &[],
         ));
     }
 
@@ -2378,35 +2534,52 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
             ),
             &manifest_path,
             original_manifest.as_deref(),
-            &copied_source,
-            None,
+            &created_sources,
+            &[],
         ));
     }
-    if let Err(error) = copy_file_create_new(&staged_cooked, &cooked_target) {
-        remove_import_staging(&project, &staging_dir);
-        return Err(rollback_import_failure(
-            error,
-            &manifest_path,
-            original_manifest.as_deref(),
-            &copied_source,
-            None,
-        ));
-    }
-    if let Err(error) = read_cooked_artifact(&cooked_target) {
-        remove_import_staging(&project, &staging_dir);
-        return Err(rollback_import_failure(
-            format!(
-                "installed cooked artifact {} failed validation: {error}",
-                cooked_target.display()
-            ),
-            &manifest_path,
-            original_manifest.as_deref(),
-            &copied_source,
-            Some(&cooked_target),
-        ));
+    let mut installed_cooked = Vec::with_capacity(prepared_assets.len());
+    for (entry, cooked_target) in prepared_assets.iter().zip(&cooked_targets) {
+        let staged_cooked = staging_dir.join(format!("{}.cooked", entry.id.id));
+        if let Err(error) = copy_file_create_new(&staged_cooked, cooked_target) {
+            remove_import_staging(&project, &staging_dir);
+            return Err(rollback_import_failure(
+                error,
+                &manifest_path,
+                original_manifest.as_deref(),
+                &created_sources,
+                &installed_cooked,
+            ));
+        }
+        installed_cooked.push(cooked_target.clone());
+        if let Err(error) = read_cooked_artifact(cooked_target) {
+            remove_import_staging(&project, &staging_dir);
+            return Err(rollback_import_failure(
+                format!(
+                    "installed cooked artifact {} failed validation: {error}",
+                    cooked_target.display()
+                ),
+                &manifest_path,
+                original_manifest.as_deref(),
+                &created_sources,
+                &installed_cooked,
+            ));
+        }
     }
     remove_import_staging(&project, &staging_dir);
 
+    let imported_assets = prepared_assets
+        .iter()
+        .zip(&cooked_targets)
+        .map(|(entry, cooked)| {
+            serde_json::json!({
+                "asset_id": entry.id.id,
+                "asset_type": import_asset_type_label(&entry.asset_type),
+                "source": absolute_for_report(&project.asset_source.join(&entry.source_path)),
+                "cooked": absolute_for_report(cooked),
+            })
+        })
+        .collect::<Vec<_>>();
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -2416,13 +2589,99 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
             "asset_type": import_asset_type_label(&asset_type),
             "source": absolute_for_report(&copied_source),
             "manifest": absolute_for_report(&manifest_path),
-            "cooked": absolute_for_report(&cooked_target),
+            "cooked": absolute_for_report(&cooked_targets[0]),
+            "assets": imported_assets,
             "cooked_assets_checked": cook_report.succeeded_asset_count,
             "imported": true
         }))
         .expect("JSON value serialization cannot fail")
     );
     Ok(())
+}
+
+fn manifest_source_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn gltf_external_source_files(source_file: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let document = gltf::Gltf::open(source_file)
+        .map_err(|error| format!("could not inspect glTF dependencies: {error}"))?;
+    let source_directory = source_file.parent().ok_or_else(|| {
+        format!(
+            "glTF source has no parent directory: {}",
+            source_file.display()
+        )
+    })?;
+    let source_directory = std::fs::canonicalize(source_directory).map_err(|error| {
+        format!(
+            "could not resolve glTF source directory {}: {error}",
+            source_directory.display()
+        )
+    })?;
+
+    let mut uris = Vec::new();
+    for buffer in document.buffers() {
+        if let gltf::buffer::Source::Uri(uri) = buffer.source() {
+            uris.push(uri.to_string());
+        }
+    }
+    for image in document.images() {
+        if let gltf::image::Source::Uri { uri, .. } = image.source() {
+            uris.push(uri.to_string());
+        }
+    }
+
+    let mut portable_paths = BTreeSet::new();
+    let mut dependencies = Vec::new();
+    for uri in uris {
+        if uri.starts_with("data:") {
+            continue;
+        }
+        if uri.contains(':') {
+            return Err(format!(
+                "glTF dependency URI '{uri}' uses an unsupported external scheme"
+            ));
+        }
+        let decoded = urlencoding::decode(&uri)
+            .map_err(|error| format!("glTF dependency URI '{uri}' is invalid: {error}"))?;
+        let decoded_path = PathBuf::from(decoded.as_ref());
+        let mut relative = PathBuf::new();
+        for component in decoded_path.components() {
+            match component {
+                Component::Normal(part) => relative.push(part),
+                Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "glTF dependency URI '{uri}' escapes its source directory"
+                    ));
+                }
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            return Err(format!("glTF dependency URI '{uri}' has no file path"));
+        }
+        let portable = relative
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if !portable_paths.insert(portable) {
+            continue;
+        }
+        let resolved = std::fs::canonicalize(source_directory.join(&relative))
+            .map_err(|error| format!("could not resolve glTF dependency '{uri}': {error}"))?;
+        if !resolved.starts_with(&source_directory) || !resolved.is_file() {
+            return Err(format!(
+                "glTF dependency '{uri}' is not a regular file below {}",
+                source_directory.display()
+            ));
+        }
+        dependencies.push((resolved, relative));
+    }
+    dependencies.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(dependencies)
 }
 
 #[cfg(feature = "tooling-editor")]
@@ -2444,7 +2703,7 @@ pub(crate) fn import_project_asset_from(
 
 fn load_import_manifest(
     project: &GameProject,
-    requested_asset_id: &str,
+    requested_asset_ids: &[String],
 ) -> Result<(PathBuf, SourceManifest), String> {
     let paths = source_manifest_paths(&project.asset_source)?;
     let mut portable_ids = BTreeSet::new();
@@ -2486,10 +2745,19 @@ fn load_import_manifest(
         }
     }
 
-    if portable_ids.contains(&requested_asset_id.to_ascii_lowercase()) {
-        return Err(format!(
-            "asset id '{requested_asset_id}' already exists or differs only by case"
-        ));
+    let mut requested_portable_ids = BTreeSet::new();
+    for requested_asset_id in requested_asset_ids {
+        let portable_id = requested_asset_id.to_ascii_lowercase();
+        if !requested_portable_ids.insert(portable_id.clone()) {
+            return Err(format!(
+                "generated asset id '{requested_asset_id}' is duplicated or differs only by case"
+            ));
+        }
+        if portable_ids.contains(&portable_id) {
+            return Err(format!(
+                "asset id '{requested_asset_id}' already exists or differs only by case"
+            ));
+        }
     }
     Ok(game_manifest.unwrap_or_else(|| {
         (
@@ -2815,8 +3083,8 @@ fn rollback_import_failure(
     failure: String,
     manifest_path: &Path,
     original_manifest: Option<&[u8]>,
-    copied_source: &Path,
-    copied_cooked: Option<&Path>,
+    copied_sources: &[PathBuf],
+    copied_cooked: &[PathBuf],
 ) -> String {
     let mut rollback_errors = Vec::new();
     let manifest_restore = match original_manifest {
@@ -2830,7 +3098,7 @@ fn rollback_import_failure(
             manifest_path.display()
         ));
     }
-    if copied_source.exists() {
+    for copied_source in copied_sources.iter().rev().filter(|path| path.exists()) {
         if let Err(error) = std::fs::remove_file(copied_source) {
             rollback_errors.push(format!(
                 "could not remove copied source {}: {error}",
@@ -2838,7 +3106,7 @@ fn rollback_import_failure(
             ));
         }
     }
-    if let Some(cooked) = copied_cooked.filter(|path| path.exists()) {
+    for cooked in copied_cooked.iter().rev().filter(|path| path.exists()) {
         if let Err(error) = std::fs::remove_file(cooked) {
             rollback_errors.push(format!(
                 "could not remove copied cooked artifact {}: {error}",
@@ -2853,6 +3121,12 @@ fn rollback_import_failure(
             "{failure}\nasset import rollback also failed:\n{}",
             rollback_errors.join("\n")
         )
+    }
+}
+
+fn cleanup_import_files(paths: &[PathBuf]) {
+    for path in paths.iter().rev().filter(|path| path.exists()) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -2880,10 +3154,11 @@ pub(crate) fn cook_project(path: &Path) -> Result<(), String> {
             )
         })?;
     let mut graph = DependencyGraph::new();
-    let runtime_builder = engine_core::EngineRuntime::builder(engine_core::EngineConfig {
+    let mut runtime_builder = engine_core::EngineRuntime::builder(engine_core::EngineConfig {
         application_name: format!("{}-asset-cook", project.manifest.name),
         gpu_timestamps: true,
     });
+    engine_animation::loader::register_asset_types(runtime_builder.asset_type_registry_mut());
     let report = cook_orchestrate_checked_with_registry(
         &project.asset_source,
         staging.path(),
@@ -3064,6 +3339,99 @@ fn absolute_for_report(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    fn write_skinned_gltf_fixture(directory: &Path) -> PathBuf {
+        std::fs::create_dir_all(directory).unwrap();
+        let gltf_path = directory.join("skinned.gltf");
+        let mut bytes = Vec::new();
+        for position in [[-1.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for value in position {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for _ in 0..3 {
+            bytes.extend_from_slice(&[0, 1, 1, 1]);
+        }
+        for _ in 0..3 {
+            for value in [0.75f32, 0.25, 0.0, 0.0] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for index in [0u16, 1, 2] {
+            bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0, 0]);
+        for _ in 0..2 {
+            for column in 0..4 {
+                for row in 0..4 {
+                    let value = if column == row { 1.0f32 } else { 0.0 };
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        for time in [0.0f32, 1.0] {
+            bytes.extend_from_slice(&time.to_le_bytes());
+        }
+        for translation in [[0.0f32, 1.0, 0.0], [0.0, 2.0, 0.0]] {
+            for value in translation {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        std::fs::write(directory.join("skinned.bin"), bytes).unwrap();
+        std::fs::write(
+            &gltf_path,
+            r#"{
+                "asset": { "version": "2.0" },
+                "buffers": [{ "uri": "skinned.bin", "byteLength": 264 }],
+                "bufferViews": [
+                    { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+                    { "buffer": 0, "byteOffset": 36, "byteLength": 12 },
+                    { "buffer": 0, "byteOffset": 48, "byteLength": 48 },
+                    { "buffer": 0, "byteOffset": 96, "byteLength": 6 },
+                    { "buffer": 0, "byteOffset": 104, "byteLength": 128 },
+                    { "buffer": 0, "byteOffset": 232, "byteLength": 8 },
+                    { "buffer": 0, "byteOffset": 240, "byteLength": 24 }
+                ],
+                "accessors": [
+                    { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [-1, 0, 0], "max": [1, 1, 0] },
+                    { "bufferView": 1, "componentType": 5121, "count": 3, "type": "VEC4" },
+                    { "bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC4" },
+                    { "bufferView": 3, "componentType": 5123, "count": 3, "type": "SCALAR" },
+                    { "bufferView": 4, "componentType": 5126, "count": 2, "type": "MAT4" },
+                    { "bufferView": 5, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0], "max": [1] },
+                    { "bufferView": 6, "componentType": 5126, "count": 2, "type": "VEC3" }
+                ],
+                "meshes": [{
+                    "name": "SkinnedTriangle",
+                    "primitives": [
+                        {
+                            "attributes": { "POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2 },
+                            "indices": 3
+                        },
+                        {
+                            "attributes": { "POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2 },
+                            "indices": 3
+                        }
+                    ]
+                }],
+                "nodes": [
+                    { "name": "Mesh", "mesh": 0, "skin": 0 },
+                    { "name": "RootJoint", "children": [2] },
+                    { "name": "ChildJoint" }
+                ],
+                "skins": [{ "name": "Rig", "joints": [2, 1], "skeleton": 1, "inverseBindMatrices": 4 }],
+                "animations": [{
+                    "name": "Raise",
+                    "samplers": [{ "input": 5, "output": 6, "interpolation": "LINEAR" }],
+                    "channels": [{ "sampler": 0, "target": { "node": 2, "path": "translation" } }]
+                }],
+                "scenes": [{ "nodes": [0, 1] }],
+                "scene": 0
+            }"#,
+        )
+        .unwrap();
+        gltf_path
+    }
+
     #[test]
     fn parses_headless_project_run() {
         let request =
@@ -3074,6 +3442,76 @@ mod tests {
         assert_eq!(request.frames, Some(4));
         assert_eq!(request.report, None);
         assert!(!request.stream_cells);
+    }
+
+    #[test]
+    fn gltf_project_import_generates_mesh_skeleton_animation_and_copies_dependencies() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("gltf-project");
+        create_project(&project_root, Some("glTF Project"), false).unwrap();
+        let gltf_path = write_skinned_gltf_fixture(&temp.path().join("external"));
+
+        import_project_asset(&ProjectImportRequest {
+            project: project_root.clone(),
+            source_file: gltf_path,
+            asset_id: "hero".into(),
+            asset_type: None,
+            folder: PathBuf::new(),
+        })
+        .unwrap();
+
+        let source_root = project_root.join("assets/source");
+        assert!(source_root.join("skinned.gltf").is_file());
+        assert!(source_root.join("skinned.bin").is_file());
+        assert!(source_root.join("hero.skin0.skel").is_file());
+        assert!(source_root.join("hero.skin0.animation0.anim").is_file());
+
+        let manifest: SourceManifest =
+            serde_json::from_slice(&std::fs::read(source_root.join("game.manifest")).unwrap())
+                .unwrap();
+        let ids = manifest
+            .assets
+            .iter()
+            .map(|entry| entry.id.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                "hero",
+                "hero.mesh.1",
+                "hero.skeleton.0",
+                "hero.animation.0.0",
+            ])
+        );
+
+        let cooked_root = project_root.join("build/cooked");
+        let mesh = read_cooked_artifact(&cooked_root.join("hero.cooked")).unwrap();
+        assert_eq!(mesh.header.asset_kind, AssetType::Mesh.kind_code());
+        let second_mesh = read_cooked_artifact(&cooked_root.join("hero.mesh.1.cooked")).unwrap();
+        assert_eq!(second_mesh.header.asset_kind, AssetType::Mesh.kind_code());
+        let skeleton = read_cooked_artifact(&cooked_root.join("hero.skeleton.0.cooked")).unwrap();
+        assert_eq!(skeleton.header.asset_kind, AssetType::Skeleton.kind_code());
+        assert_eq!(
+            engine_animation::load_skeleton(&skeleton.payload)
+                .unwrap()
+                .joint_count(),
+            2
+        );
+        let animation =
+            read_cooked_artifact(&cooked_root.join("hero.animation.0.0.cooked")).unwrap();
+        assert_eq!(
+            animation.header.asset_kind,
+            AssetType::Animation.kind_code()
+        );
+        assert_eq!(
+            engine_animation::load_animation_clip(&animation.payload)
+                .unwrap()
+                .name(),
+            "Raise"
+        );
+        check_project(&project_root, None).unwrap();
+        cook_project(&project_root).unwrap();
+        check_project(&project_root, None).unwrap();
     }
 
     #[test]

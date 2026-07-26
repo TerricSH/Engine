@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use tracing::debug;
@@ -6,9 +6,9 @@ use tracing::debug;
 use crate::backend::{RapierBackend, RaycastHit};
 use crate::components::{ColliderShape, RigidBody};
 use crate::debug::{ColliderDebugInfo, PhysicsDebugDraw};
-use crate::events::{CollisionEvent, PhysicsEvents, TriggerEvent};
+use crate::events::{CollisionEvent, JointBreakEvent, PhysicsEvents, TriggerEvent};
 use crate::gravity::{sum_source_gravity, GravitySource};
-use crate::joints::{JointDescriptor, JointHandle};
+use crate::joints::{JointDescriptor, JointHandle, PhysicsJoint};
 use crate::queries::{
     OverlapQuery, PhysicsQueryFilter, QueryBatcher, QueryResults, RaycastQuery, SweepQuery,
 };
@@ -27,6 +27,13 @@ pub enum PhysicsCommand {
     ApplyForce { entity: Entity, force: glam::Vec3 },
     /// Apply an instantaneous impulse at the centre of mass.
     ApplyImpulse { entity: Entity, impulse: glam::Vec3 },
+    /// Apply a continuous torque.
+    ApplyTorque { entity: Entity, torque: glam::Vec3 },
+    /// Apply an instantaneous angular impulse.
+    ApplyTorqueImpulse {
+        entity: Entity,
+        torque_impulse: glam::Vec3,
+    },
     /// Teleport the body to a new position.
     SetBodyPosition {
         entity: Entity,
@@ -37,6 +44,58 @@ pub enum PhysicsCommand {
         entity: Entity,
         rotation: glam::Quat,
     },
+    SetLinearVelocity {
+        entity: Entity,
+        velocity: glam::Vec3,
+    },
+    SetAngularVelocity {
+        entity: Entity,
+        velocity: glam::Vec3,
+    },
+    /// Switch physics ownership without rebuilding the body or its joints.
+    SetBodyType { entity: Entity, body_type: BodyType },
+}
+
+/// Serializable simulation state that is not part of the authored
+/// [`RigidBody`] component.
+///
+/// Save games use this to preserve moving props across a checkpoint. Backend
+/// handles and solver caches remain private and are rebuilt on restore.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RigidBodyRuntimeState {
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+    pub linear_velocity: [f32; 3],
+    pub angular_velocity: [f32; 3],
+    pub sleeping: bool,
+}
+
+impl RigidBodyRuntimeState {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self
+            .position
+            .iter()
+            .chain(self.rotation.iter())
+            .chain(self.linear_velocity.iter())
+            .chain(self.angular_velocity.iter())
+            .all(|value| value.is_finite())
+        {
+            return Err("rigid-body runtime state contains a non-finite value".into());
+        }
+        let rotation_length_squared = self.rotation.iter().map(|value| value * value).sum::<f32>();
+        if rotation_length_squared <= f32::EPSILON {
+            return Err("rigid-body runtime state has a zero-length rotation".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SyncedSceneJoint {
+    component: PhysicsJoint,
+    entity_a: Entity,
+    entity_b: Entity,
+    handle: JointHandle,
 }
 
 // ── PhysicsWorld ────────────────────────────────────────────────────────────
@@ -57,6 +116,8 @@ pub struct PhysicsWorld {
     pending_commands: Vec<PhysicsCommand>,
     pending_events: Vec<CollisionEvent>,
     pending_triggers: Vec<TriggerEvent>,
+    pending_joint_breaks: Vec<JointBreakEvent>,
+    scene_joints: HashMap<Entity, SyncedSceneJoint>,
     debug_colliders: Arc<Mutex<Vec<ColliderDebugInfo>>>,
     /// Accumulated queries waiting for batched execution.
     query_batcher: QueryBatcher,
@@ -78,6 +139,8 @@ impl PhysicsWorld {
             pending_commands: Vec::new(),
             pending_events: Vec::new(),
             pending_triggers: Vec::new(),
+            pending_joint_breaks: Vec::new(),
+            scene_joints: HashMap::new(),
             debug_colliders: Arc::new(Mutex::new(Vec::new())),
             query_batcher: QueryBatcher::new(),
             gravity_overridden: HashSet::new(),
@@ -127,14 +190,19 @@ impl PhysicsWorld {
     }
 
     /// Drain and execute all queued commands.
-    fn execute_pending_commands(&mut self, world: &crate::World) {
+    fn execute_pending_commands(&mut self, world: &mut crate::World) {
         let commands = std::mem::take(&mut self.pending_commands);
         for cmd in commands {
             let entity = match &cmd {
                 PhysicsCommand::ApplyForce { entity, .. }
                 | PhysicsCommand::ApplyImpulse { entity, .. }
+                | PhysicsCommand::ApplyTorque { entity, .. }
+                | PhysicsCommand::ApplyTorqueImpulse { entity, .. }
                 | PhysicsCommand::SetBodyPosition { entity, .. }
-                | PhysicsCommand::SetBodyRotation { entity, .. } => *entity,
+                | PhysicsCommand::SetBodyRotation { entity, .. }
+                | PhysicsCommand::SetLinearVelocity { entity, .. }
+                | PhysicsCommand::SetAngularVelocity { entity, .. }
+                | PhysicsCommand::SetBodyType { entity, .. } => *entity,
             };
             if !world.is_alive(entity) {
                 continue;
@@ -147,6 +215,15 @@ impl PhysicsWorld {
                 PhysicsCommand::ApplyImpulse { entity, impulse } => {
                     self.backend.apply_impulse(entity, impulse);
                 }
+                PhysicsCommand::ApplyTorque { entity, torque } => {
+                    self.backend.apply_torque(entity, torque);
+                }
+                PhysicsCommand::ApplyTorqueImpulse {
+                    entity,
+                    torque_impulse,
+                } => {
+                    self.backend.apply_torque_impulse(entity, torque_impulse);
+                }
                 PhysicsCommand::SetBodyPosition { entity, position } => {
                     if let Some((_, rot)) = self.backend.sync_body_transform(entity) {
                         self.backend.set_body_transform(entity, position, rot);
@@ -156,6 +233,18 @@ impl PhysicsWorld {
                     if let Some((pos, _)) = self.backend.sync_body_transform(entity) {
                         self.backend.set_body_transform(entity, pos, rotation);
                     }
+                }
+                PhysicsCommand::SetLinearVelocity { entity, velocity } => {
+                    self.backend.set_linear_velocity(entity, velocity);
+                }
+                PhysicsCommand::SetAngularVelocity { entity, velocity } => {
+                    self.backend.set_angular_velocity(entity, velocity);
+                }
+                PhysicsCommand::SetBodyType { entity, body_type } => {
+                    if let Some(component) = world.get_mut::<RigidBody>(entity) {
+                        component.body_type = body_type.clone();
+                    }
+                    self.backend.set_body_type(entity, body_type);
                 }
             }
         }
@@ -193,6 +282,19 @@ impl PhysicsWorld {
             let events = self.backend.step();
             self.pending_events.extend(events.collisions);
             self.pending_triggers.extend(events.triggers);
+            for mut event in events.joint_breaks {
+                let joint_entity = self.scene_joints.iter().find_map(|(entity, synced)| {
+                    (synced.handle == event.handle).then_some(*entity)
+                });
+                if let Some(joint_entity) = joint_entity {
+                    event.joint_entity = Some(joint_entity);
+                    self.scene_joints.remove(&joint_entity);
+                    // A broken persistent joint must not be recreated by the
+                    // next ECS sync or by a checkpoint captured afterwards.
+                    world.remove_component::<PhysicsJoint>(joint_entity);
+                }
+                self.pending_joint_breaks.push(event);
+            }
 
             self.accumulator -= self.fixed_timestep;
             steps_taken += 1;
@@ -246,6 +348,25 @@ impl PhysicsWorld {
     /// Number of bodies currently registered in the backend.
     pub fn body_count(&self) -> usize {
         self.backend.body_map.len()
+    }
+
+    /// Snapshot every registered body's transient simulation state.
+    pub fn runtime_body_states(&self) -> Vec<(Entity, RigidBodyRuntimeState)> {
+        self.backend.runtime_body_states()
+    }
+
+    /// Restore transient state after the authored ECS body has been rebuilt.
+    ///
+    /// Returns `false` if the state is invalid or the entity has no body.
+    pub fn restore_runtime_body_state(
+        &mut self,
+        entity: Entity,
+        state: &RigidBodyRuntimeState,
+    ) -> bool {
+        if state.validate().is_err() {
+            return false;
+        }
+        self.backend.restore_runtime_body_state(entity, state)
     }
 
     /// Synchronise ECS components → Rapier backend.
@@ -325,6 +446,60 @@ impl PhysicsWorld {
             .collect();
         for entity in to_remove_colliders {
             self.backend.remove_collider(entity);
+        }
+
+        self.sync_joints_from_ecs(world);
+    }
+
+    fn sync_joints_from_ecs(&mut self, world: &crate::World) {
+        let desired = world
+            .query::<PhysicsJoint>()
+            .filter(|(_, joint)| joint.enabled && joint.validate().is_ok())
+            .filter_map(|(joint_entity, joint)| {
+                let entity_a = world.entity_by_persistent_id(&joint.body_a)?;
+                let entity_b = world.entity_by_persistent_id(&joint.body_b)?;
+                (self.backend.has_body(entity_a) && self.backend.has_body(entity_b))
+                    .then_some((joint_entity, (joint.clone(), entity_a, entity_b)))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let stale = self
+            .scene_joints
+            .iter()
+            .filter_map(|(joint_entity, synced)| {
+                let keep =
+                    desired
+                        .get(joint_entity)
+                        .is_some_and(|(component, entity_a, entity_b)| {
+                            component == &synced.component
+                                && entity_a == &synced.entity_a
+                                && entity_b == &synced.entity_b
+                                && self.backend.has_joint(synced.handle)
+                        });
+                (!keep).then_some((*joint_entity, synced.handle))
+            })
+            .collect::<Vec<_>>();
+        for (joint_entity, handle) in stale {
+            self.backend.remove_joint(handle);
+            self.scene_joints.remove(&joint_entity);
+        }
+
+        for (joint_entity, (component, entity_a, entity_b)) in desired {
+            if self.scene_joints.contains_key(&joint_entity) {
+                continue;
+            }
+            let descriptor = component.descriptor(entity_a, entity_b);
+            if let Some(handle) = self.create_joint(descriptor) {
+                self.scene_joints.insert(
+                    joint_entity,
+                    SyncedSceneJoint {
+                        component,
+                        entity_a,
+                        entity_b,
+                        handle,
+                    },
+                );
+            }
         }
     }
 
@@ -474,6 +649,7 @@ impl PhysicsWorld {
         PhysicsEvents {
             collisions: std::mem::take(&mut self.pending_events),
             triggers: std::mem::take(&mut self.pending_triggers),
+            joint_breaks: std::mem::take(&mut self.pending_joint_breaks),
         }
     }
 
@@ -485,6 +661,10 @@ impl PhysicsWorld {
     /// Read (without draining) the pending trigger events.
     pub fn pending_triggers(&self) -> &[TriggerEvent] {
         &self.pending_triggers
+    }
+
+    pub fn pending_joint_breaks(&self) -> &[JointBreakEvent] {
+        &self.pending_joint_breaks
     }
 
     // ── Queries ─────────────────────────────────────────────────────────

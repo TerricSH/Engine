@@ -165,8 +165,9 @@ Authoring notes and current limitations:
 - Once a cell's asset stream is enqueued it is never cancelled; leaving the
   cell's bounds before the merge only skips the merge, and the committed
   assets stay installed.
-- Save/rollback semantics remain whole-scene only; a failed scene transition
-  rolls back to the retained scene snapshot exactly as without streaming.
+- Checkpoints capture the whole currently live ECS world. Streaming-driver
+  residency, desired-cell, and in-flight asset-request state is not serialized;
+  after restore the driver rebaselines from the restored world and focus.
 - The editor is unaffected: streaming is a player-runtime behaviour and the
   editor continues to open whole scenes.
 
@@ -189,7 +190,7 @@ sandbox project editor <project>
 
 `sandbox game` and `sandbox editor` are short aliases for the last two commands. A project path may be either the project directory or its manifest.
 
-`project import` copies a supported source into the configured `asset_source`, adds it to `game.manifest`, cooks the project in an isolated staging directory, and installs the validated `<asset-id>.cooked` artifact. Mesh imports accept glTF/GLB, textures accept supported image formats such as PNG, JPEG, and PPM, and materials accept `MaterialSource-v0` JSON. Runtime subsystem assets accept WAV/MP3/OGG/FLAC audio, bincode `.anim` animation clips, bincode `.skel` skeletons, and bincode `.navmesh`/`.nav` navigation meshes. Prefab imports accept the canonical `Prefab-v0.1.0` RON source (`*.prefab.ron`), which is also the extension inferred when `--type` is omitted. Type inference is used only for unambiguous extensions; `--type material` can identify a plain `.json` material. Asset IDs are portable and case-insensitively unique. Existing source or cooked files are never overwritten, and a failed cook restores the manifest and removes the copied source.
+`project import` copies a supported source into the configured `asset_source`, adds it to `game.manifest`, cooks the project in an isolated staging directory, and installs validated cooked artifacts. A glTF/GLB import preserves normalized `JOINTS_0`/`WEIGHTS_0`, remaps joint indices into parent-before-child order, imports inverse-bind matrices and LINEAR/STEP/CUBICSPLINE translation/rotation/scale channels, and selects the skinned GPU vertex layout automatically. STEP tracks are converted to held linear keys; CUBICSPLINE tracks are deterministically baked at 60 Hz (with a bounded per-segment sample count), including component-wise quaternion Hermite evaluation followed by normalization. Multi-primitive files produce `<asset-id>`, `<asset-id>.mesh.1`, and later mesh IDs. Each skin produces `<asset-id>.skeleton.<skin-index>` and its matching clips produce `<asset-id>.animation.<skin-index>.<clip-index>`. Relative external buffer and image dependencies are copied without allowing paths to escape the source directory. Generated `.skel`/`.anim` sources keep subsequent `project cook` deterministic. Morph targets, animation compression, retargeting, and event tracks remain unsupported. Textures accept supported image formats such as PNG, JPEG, and PPM. `MaterialSource-v0` materials support metallic-roughness/emissive factors, base-color/normal/metallic-roughness/occlusion/emissive texture slots, opaque, alpha-masked, alpha-blended, and double-sided surfaces; see [`MATERIAL_SURFACES.md`](MATERIAL_SURFACES.md). Runtime subsystem assets also accept standalone WAV/MP3/OGG/FLAC audio, bincode `.anim` animation clips, bincode `.skel` skeletons, and bincode `.navmesh`/`.nav` navigation meshes. Prefab imports accept the canonical `Prefab-v0.1.0` RON source (`*.prefab.ron`), which is also the extension inferred when `--type` is omitted. Type inference is used only for unambiguous extensions; `--type material` can identify a plain `.json` material. Asset IDs are portable and case-insensitively unique. Existing source or cooked files are never overwritten, and a failed cook restores the manifest and removes every copied/generated source and cooked artifact.
 
 The editor Asset Browser exposes **Reimport Project Assets**. It recooks the
 configured source tree and refreshes the live typed asset registry without restarting
@@ -229,7 +230,12 @@ translations, and script errors. See
 [`GAME_ENGINE_BOUNDARY.md`](GAME_ENGINE_BOUNDARY.md) for the enforced ownership
 and review rules.
 
-The generated `Main` derives from `EngineBehaviour`. During `OnCreate`, `OnStart`, and `OnUpdate`, it can read and write its owning entity's local `Transform`, read the current resolved project input actions, query persistent entities, edit another entity's Transform, destroy entities, and request a cataloged scene by ID:
+The generated `Main` derives from `EngineBehaviour`. During `OnCreate`,
+`OnStart`, and `OnUpdate`, it can read and write its owning entity's local
+`Transform`, read the current resolved project input actions, queue bounded
+movement intent through `Character.Move` / `Jump` / `Control`, query
+persistent entities, edit another entity's Transform, destroy entities, and
+request a cataloged scene by ID:
 
 ```csharp
 public void OnStart()
@@ -244,6 +250,12 @@ public void OnUpdate(float deltaTime)
     bool jumpEnded = Input.WasReleased("jump");
     var position = Transform.Translation;
     Transform.Translation = new Vector3(position.X + Speed * deltaTime, position.Y, position.Z);
+
+    // Prefer controller intent over direct Transform writes for playable or
+    // AI characters that carry engine.character_controller.
+    Character.Move(new Vector3(1.0f, 0.0f, 0.0f), 5.0f);
+    if (Input.WasPressed("jump"))
+        Character.Jump();
 
     var enemy = Scene.FindEntity("enemy-01");
     if (enemy?.HasTransform == true)
@@ -269,7 +281,11 @@ public void OnUpdate(float deltaTime)
     if (Input.WasPressed("fire"))
         _groundProbe = Physics.Raycast(position, new Vector3(0.0f, -1.0f, 0.0f), 10.0f);
     if (Physics.TryGetRaycastHit(_groundProbe, out var groundHit))
+    {
         Console.WriteLine($"ray hit {groundHit.EntityId} at {groundHit.Point}");
+        if (Input.WasPressed("use") && groundHit.Entity != null)
+            Physics.ApplyImpulse(groundHit.Entity, new Vector3(0.0f, 2.0f, 12.0f));
+    }
 
     // Sweeps and filters share the same handle model: a sphere cast for a
     // character controller, excluding the character's own colliders.
@@ -290,13 +306,18 @@ public void OnUpdate(float deltaTime)
 }
 ```
 
+Scene colliders can opt into the project-facing use convention with
+`engine.interactable`. `Interaction.Probe` returns a deferred query and
+`Interaction.TryGetTarget` exposes its prompt, action key, distance, and
+grabbable flag on the next frame; see [`INTERACTION.md`](INTERACTION.md).
+
 `Scene.Entities`, `Scene.Exists(id)`, `Scene.FindEntity(id)`, and `Scene.GetEntity(id)` operate on the current frame's persistent-entity snapshot. `Scene.CreateEntity(id)` and `Scene.CreateEntity(id, translation)` enqueue a new persistent entity with an identity Transform or the requested translation. Creation is validated and committed at the frame boundary, so the entity becomes queryable in the next frame; duplicate same-frame IDs use deterministic first-wins semantics. `Scene.DestroySelf()`, `Scene.Destroy(id)`, and `Entity.Destroy()` use the same deferred mutation boundary. Scripts never receive raw ECS handles.
 
 `Scene.Spawn(prefabId)` and `Scene.Spawn(prefabId, translation)` instantiate a cooked prefab asset. `prefabId` is the asset id declared for a `Prefab` entry in the project's source manifest — not a file path — and it follows the same identifier rules as entity ids. Spawning is validated and committed at the frame boundary exactly like `Scene.CreateEntity`, so the new hierarchy becomes queryable through `Scene.FindEntity` on the next frame. The spawned root takes the first free persistent id from `prefabId`, `prefabId-2`, `prefabId-3`, …; every other spawned entity takes `<rootId>.<prefab-local id>` (with the same `-N` suffix on conflict), so two spawns of `prefab-enemy` produce `prefab-enemy` + `prefab-enemy.<child>` and `prefab-enemy-2` + `prefab-enemy-2.<child>`. The optional translation override replaces the prefab root's Transform translation while preserving the prefab's own rotation and scale. `engine.script` components inside the prefab attach to the spawned entities as part of the same boundary: their `OnCreate` runs immediately, and commands it enqueues (including further spawns, depth-bounded) are applied recursively before the next frame. Unknown or invalid prefab ids, non-finite translations, and unloadable prefab graphs surface as script errors; a failed spawn rolls back the whole instance.
 
 To author a spawnable prefab, write a `Prefab-v0.1.0` RON document under the configured `asset_source` (for example `assets/source/Prefabs/enemy.prefab.ron`) or import an existing file with `project import --type prefab`, declare it in `game.manifest` with `asset_type: "Prefab"`, and cook the project. `project check` parses every declared prefab source, verifies that component fields reference only declared assets or engine builtins, requires nested `child_prefab_refs` to point at other declared prefab assets, and rejects missing children and cycles in the nested graph.
 
-`Physics.Events` contains the owning entity's collision and trigger events for the current frame. Event kinds are `collision_entered`, `collision_stayed`, `collision_exited`, `trigger_entered`, `trigger_stayed`, and `trigger_exited`; `OtherEntityId` and `Other` identify the other persistent scene entity. The native physics queue is drained every frame even when no script consumes it, so events cannot accumulate indefinitely.
+`Physics.Events` contains the owning entity's collision, trigger, and joint-break events for the current frame. Event kinds are `collision_entered`, `collision_stayed`, `collision_exited`, `trigger_entered`, `trigger_stayed`, `trigger_exited`, and `joint_broken`; `OtherEntityId` and `Other` identify the other persistent scene entity. A joint-break event also exposes `JointId`, `Force`, and `Torque`. The native physics queue is drained every frame even when no script consumes it, so events cannot accumulate indefinitely.
 
 `Physics.Raycast(origin, direction, maxDistance)`, `Physics.SphereCast(origin, radius, direction, maxDistance)`, and `Physics.OverlapSphere(center, radius)` query the physics world. Queries are deferred: each call validates its arguments (non-finite values, a zero-length ray/sweep direction, or a non-positive distance/radius throw immediately and surface as script errors), returns a `PhysicsQuery` handle, and the engine executes the query against the physics world at the frame boundary. The result arrives with the next frame's context. `Physics.TryGetRaycastHit(query, out var hit)` and `Physics.TryGetSphereCastHit(query, out var hit)` report the closest hit's `EntityId`, `Entity`, world-space `Point` and `Normal`, and `Distance`, returning false on a miss; `Physics.TryGetOverlapResult(query, out var entityIds)` reports the overlapped persistent entity ids. Raycasts and sphere casts share the `RaycastHit` payload: for a sphere cast the point is the world-space contact on the hit collider, the normal is that collider's outward surface normal, and the distance is the sweep's travel distance. Results are frame-local — delivered in exactly one frame and expired afterwards — and a handle never resolves on the frame that issued it. Ray distance, sweep distance, and sphere radii are clamped to `ScriptPhysics.MaxQueryDistance` (10,000), and overlap results are sorted and bounded to `ScriptPhysics.MaxOverlapResults` (64). Queries report persistent entity ids, never raw ECS handles.
 
@@ -304,9 +325,17 @@ Every query kind accepts an optional trailing `PhysicsQueryFilter` with three in
 
 `Physics.DrainAll()` is the batch counterpart to the per-handle lookups: one call returns every result delivered for the frame as `PhysicsQueryResult` entries (each exposing its `Query` handle, a `Kind` — `RaycastHit`, `RaycastMiss`, `SphereCastHit`, `SphereCastMiss`, or `OverlapSphere` — and the matching `Hit`/`EntityIds` payload), ordered by query id. Drained results are consumed, so the `TryGet*` lookups no longer resolve them afterwards; issuing several queries in one frame and draining them all next frame is the intended batch workflow. The per-frame query budget remains 256 queries per script command drain.
 
-`Components.Query(entityId, componentType)` and `Entity.QueryComponent(componentType)` read the engine's built-in components beyond Transform. Access is registry-driven, not a hardcoded list: a component type is queryable when its component-registry entry declares a script access level of `ReadOnly` or `ReadWrite` **and** carries the scene serde hooks (so scripts and scene files share one field layout). The queryable set is currently `engine.camera`, `engine.light`, `engine.audio_source`, `engine.audio_listener`, `engine.physics.rigid_body`, `engine.physics.collider`, `engine.physics.physics_material`, `engine.gravity_source`, `engine.nav_agent`, and — read-only — `engine.character_controller`; the full per-component matrix with reconciler status and caveats is kept in [COMPONENT_SCRIPT_ACCESS.md](COMPONENT_SCRIPT_ACCESS.md), guarded by a drift test. Any other key — unknown, opted out, hook-less, or routed through a dedicated API such as Transform commands or the retained `UICanvas` handles — is rejected with a `SCRIPT_COMPONENT_UNKNOWN` script error listing the supported set. Reads are deferred exactly like physics queries: `Query` returns a frame-local `ComponentQuery` handle, the engine snapshots the component's fields at the frame boundary (after that frame's commands apply, so same-frame writes are observed), and `Components.TryGet(query, out var snapshot)` delivers the `ComponentSnapshot` with the next frame's context. A handle never resolves on its issuing frame, results are frame-local, and `Components.IsMissing(query)` reports that the entity exists but does not have the component (querying an unknown entity reports missing as well rather than failing). Snapshots expose typed getters — `GetBool`, `GetInt`, `GetUInt`, `GetFloat`, `GetString`, `GetEnum`, `GetAsset`, `GetVector3`, `GetQuaternion`, `GetColor`, `GetList`, and `GetMap` — over the same field map the scene format uses; `HasField` checks presence, and reading an unknown field or with the wrong getter type throws.
+`Physics.ApplyForce(entity, force)` / `Physics.ApplyForce(entityId, force)` and the matching `ApplyImpulse`, `ApplyTorque`, and `ApplyTorqueImpulse` overloads enqueue validated rigid-body mutations. Targets use persistent IDs, vectors must be finite, every component is bounded by `ScriptPhysics.MaxMutationComponent` (1,000,000), and the native bridge accepts at most 256 mutations per command drain. Queries issued in the same callback observe the already-stepped current frame; mutations execute at the start of the next physics step. Unknown targets produce script diagnostics and targets without a live dynamic rigid body are safe no-ops in the backend.
 
-`Components.Set(entityId, componentType, fields)`, `Components.SetField(entityId, componentType, field, value)`, and the matching `Entity.SetComponent`/`Entity.SetComponentField` helpers write component fields. Only `ReadWrite` components accept writes: writing a `ReadOnly` component such as `engine.character_controller` is rejected with a `SCRIPT_COMPONENT_READ_ONLY` script error, distinct from `SCRIPT_COMPONENT_UNKNOWN` (not script-accessible at all) and `SCRIPT_COMPONENT_PAYLOAD_INVALID` (malformed fields). Writes are deferred merge commands committed after all script callbacks finish: each provided field merges over the entity's current component (or over authored defaults when the entity lacks the component), so unmentioned fields keep their values. Field values are `ComponentValue` instances produced by the `ComponentValue.From*` factories (with implicit conversions from `bool`, `int`, `long`, `uint`, `ulong`, `float`, `string`, `Vector3`, and `Quaternion`). The engine validates every write against the component's scene schema — unknown fields, wrong value types, and invalid enum cases are rejected with a `SCRIPT_COMPONENT_PAYLOAD_INVALID` script error listing the rejected and known fields — so a failed write never partially applies. Backend caveats per component are tracked in [COMPONENT_SCRIPT_ACCESS.md](COMPONENT_SCRIPT_ACCESS.md): writes to `engine.physics.rigid_body`/`engine.physics.collider`/`engine.physics.physics_material` update ECS state (read-back and scene saves observe them) but do not re-sync bodies already created in the physics simulation, `engine.gravity_source` writes take effect on the next physics step because the step re-reads sources from the ECS world, `engine.nav_agent` writes take effect live and restart path following, and `engine.audio_source`/`engine.audio_listener` writes take effect through the audio output reconciler on targets that enable it.
+`Physics.CreateJoint(jointId, bodyA, bodyB, settings)` creates or replaces a persistent fixed, revolute, prismatic, or spherical constraint. Reusing the same `jointId` is the update operation; `Physics.UpdateJoint` is its explicit alias, and `Physics.RemoveJoint` removes it. `Physics.Grab` / `Physics.ReleaseGrab` are fixed-joint conveniences intended for a kinematic hand or gravity-gun anchor. Anchors, axes, limits, motors, and break thresholds are validated on both the managed and native boundaries. Joints survive scene serialization and checkpoints, follow cell/body availability incrementally, and remove their component after a measured `break_force` or `break_torque` overload so they cannot be recreated on the next sync. See [`PHYSICS_JOINTS.md`](PHYSICS_JOINTS.md).
+
+`Damage.Apply(entity, amount, kind, hitPosition, impulse)` and its persistent-ID overload enqueue bounded damage against `engine.physics.destructible`. Accepted hits apply the component's threshold and scale, persist current health, and emit next-frame `Damage.Events`. On the first break, an optional replacement prefab is spawned at the original position; rigid pieces can inherit the original linear/angular velocity and share the scaled hit impulse. The original entity is removed only after replacement succeeds. See [`PHYSICS_DESTRUCTION.md`](PHYSICS_DESTRUCTION.md).
+
+`Ragdoll.Activate(entity, impulse)`, `Ragdoll.Recover(entity, duration)`, and `Ragdoll.SnapToAnimation(entity)` control an authored `engine.ragdoll` through persistent IDs. The native reconciler generates bounded bone rigid bodies and persistent constraints, switches animation/physics ownership without rebuilding the graph, writes simulated body transforms back into the final skinning pose, and blends back to animation over the requested duration. Confirmed changes arrive in next-frame `Ragdoll.Events`. Generated bodies, joints, active/recovery state, velocities, and recovery progress survive checkpoints. See [`RAGDOLLS.md`](RAGDOLLS.md).
+
+`Components.Query(entityId, componentType)` and `Entity.QueryComponent(componentType)` read the engine's built-in components beyond Transform. Access is registry-driven, not a hardcoded list: a component type is queryable when its component-registry entry declares a script access level of `ReadOnly` or `ReadWrite` **and** carries the scene serde hooks (so scripts and scene files share one field layout). The queryable set is currently `engine.camera`, `engine.light`, `engine.audio_source`, `engine.audio_listener`, `engine.physics.rigid_body`, `engine.physics.collider`, `engine.physics.physics_material`, `engine.gravity_source`, `engine.nav_agent`, `engine.vfx.particle_emitter`, `engine.vfx.decal`, and — read-only — `engine.character_controller`; the full per-component matrix with reconciler status and caveats is kept in [COMPONENT_SCRIPT_ACCESS.md](COMPONENT_SCRIPT_ACCESS.md), guarded by a drift test. Any other key — unknown, opted out, hook-less, or routed through a dedicated API such as Transform commands or the retained `UICanvas` handles — is rejected with a `SCRIPT_COMPONENT_UNKNOWN` script error listing the supported set. Reads are deferred exactly like physics queries: `Query` returns a frame-local `ComponentQuery` handle, the engine snapshots the component's fields at the frame boundary (after that frame's commands apply, so same-frame writes are observed), and `Components.TryGet(query, out var snapshot)` delivers the `ComponentSnapshot` with the next frame's context. A handle never resolves on its issuing frame, results are frame-local, and `Components.IsMissing(query)` reports that the entity exists but does not have the component (querying an unknown entity reports missing as well rather than failing). Snapshots expose typed getters — `GetBool`, `GetInt`, `GetUInt`, `GetFloat`, `GetString`, `GetEnum`, `GetAsset`, `GetVector3`, `GetQuaternion`, `GetColor`, `GetList`, and `GetMap` — over the same field map the scene format uses; `HasField` checks presence, and reading an unknown field or with the wrong getter type throws.
+
+`Components.Set(entityId, componentType, fields)`, `Components.SetField(entityId, componentType, field, value)`, and the matching `Entity.SetComponent`/`Entity.SetComponentField` helpers write component fields. Only `ReadWrite` components accept writes: writing a `ReadOnly` component such as `engine.character_controller` is rejected with a `SCRIPT_COMPONENT_READ_ONLY` script error, distinct from `SCRIPT_COMPONENT_UNKNOWN` (not script-accessible at all) and `SCRIPT_COMPONENT_PAYLOAD_INVALID` (malformed fields). Writes are deferred merge commands committed after all script callbacks finish: each provided field merges over the entity's current component (or over authored defaults when the entity lacks the component), so unmentioned fields keep their values. Field values are `ComponentValue` instances produced by the `ComponentValue.From*` factories (with implicit conversions from `bool`, `int`, `long`, `uint`, `ulong`, `float`, `string`, `Vector3`, and `Quaternion`). The engine validates every write against the component's scene schema — unknown fields, wrong value types, and invalid enum cases are rejected with a `SCRIPT_COMPONENT_PAYLOAD_INVALID` script error listing the rejected and known fields — so a failed write never partially applies. Backend caveats per component are tracked in [COMPONENT_SCRIPT_ACCESS.md](COMPONENT_SCRIPT_ACCESS.md): writes to `engine.physics.rigid_body`/`engine.physics.collider`/`engine.physics.physics_material` update ECS state (read-back and scene saves observe them) but do not re-sync bodies already created in the physics simulation, `engine.gravity_source` writes take effect on the next physics step because the step re-reads sources from the ECS world, `engine.nav_agent` writes take effect live and restart path following, `engine.vfx.particle_emitter`/`engine.vfx.decal` writes take effect live while intentionally restarting transient particles or lifetime clocks, and `engine.audio_source`/`engine.audio_listener` writes take effect through the audio output reconciler on targets that enable it.
 
 The process host uses a frame snapshot/command model: entity Transforms and input values are sent before lifecycle execution, then validated commands are committed after all scripts finish. This avoids re-entering the single JSON pipe from inside `OnUpdate`. Consequently, scripts do not observe another script's same-frame writes.
 
@@ -325,7 +354,7 @@ script errors instead of being silently ignored.
 
 `UI.Events` contains the runtime UI clicks routed during the current script update. Each `GameplayUiEvent` retains its `CanvasId`, numeric `ElementId`, and optional `CallbackId`; events without a callback ID remain visible in the list. `UI.WasClicked(callbackId)` is a convenience query using an exact, case-sensitive callback-ID match. This bridge currently emits click events only. It does not automatically change or expose Toggle, Checkbox, or Slider values; game code must not infer value changes from a click alone.
 
-This bridge does not yet provide component access beyond the registry-driven `Components` set (Transform keeps its dedicated path and UI canvases stay on their retained handles), named callback methods such as `OnCollisionEnter`, physics-aware movement commands, or in-process `Engine.API` calls. Runtime creation currently supplies a Transform; collision and trigger data is consumed through `Physics.Events`, and spatial queries through the deferred `Physics.Raycast`/`Physics.SphereCast`/`Physics.OverlapSphere` handles. `ProcessHost` scripts must use this IPC gameplay API; direct `engine-ffi` P/Invoke remains intentionally rejected across processes.
+This bridge does not yet provide component access beyond the registry-driven `Components` set (Transform, joints, destructibles, ragdolls, and UI canvases keep dedicated paths), named callback methods such as `OnCollisionEnter`, character-controller movement commands, automatic ragdoll fitting, runtime geometric fracture, automatic collision-impulse damage, or in-process `Engine.API` calls. Runtime creation currently supplies a Transform; collision, trigger, and joint-break data is consumed through `Physics.Events`, damage results through `Damage.Events`, ragdoll ownership results through `Ragdoll.Events`, spatial queries through the deferred `Physics.Raycast`/`Physics.SphereCast`/`Physics.OverlapSphere` handles, and pushable/constraint-driven rigid bodies through the physics mutation commands. `ProcessHost` scripts must use this IPC gameplay API; direct `engine-ffi` P/Invoke remains intentionally rejected across processes.
 
 The editor scene panel lists the catalog, creates and opens scenes, and can set
 the startup scene. Switching away from a dirty scene requires an explicit
@@ -337,7 +366,7 @@ Stop restores the open authoring document rather than saving runtime changes.
 
 The cooker writes validated `.cooked` artifacts. A formal `project cook` builds a complete staging directory and swaps it into place only after every declared asset succeeds, so a failed rebuild preserves the previous playable batch. `project check` validates declared cooker/loader mappings and any existing cooked artifact against its manifest kind.
 
-The player verifies each header, payload length, compression marker, and SHA-256 before committing a complete load batch. Mesh, RGBA8 texture, the current opaque PBR material subset, audio clips, animation clips, skeletons, navigation meshes, and prefabs are installed into the shared typed runtime asset registry. If any artifact or subsystem loader fails, the previous runtime batch remains active. Shader, scene, and logic artifacts remain available for their dedicated consumers and are reported as skipped.
+The player verifies each header, payload length, compression marker, and SHA-256 before committing a complete load batch. Mesh, RGBA8 texture, portable PBR materials (opaque, masked, blended, and double-sided), audio clips, animation clips, skeletons, navigation meshes, and prefabs are installed into the shared typed runtime asset registry. If any artifact or subsystem loader fails, the previous runtime batch remains active. Shader, scene, and logic artifacts remain available for their dedicated consumers and are reported as skipped.
 
 Under the hood the whole-directory load is a three-stage pipeline — `decode_cooked_batch` → `validate_cooked_batch` → `commit_cooked_batch` — that game code can also drive directly. `install_cooked_assets_additive(paths)` commits an explicit set of artifacts without unloading anything: an asset ID that is already installed with an identical decoded payload is a no-op success (reported as `identical_assets`), while a differing payload under the same ID is an `AS0003` validation error and the batch installs nothing. For incremental streaming, `enqueue_cooked_asset_stream(paths)` decodes and structurally validates the batch on a background worker thread — every enqueued ID is observable as `AssetState::Loading` via `AssetRegistry::asset_state`/`pending_loads` — and `drain_cooked_asset_stream()` commits finished work additively at the frame boundary, at most `set_cooked_asset_stream_budget(n)` assets per call (default 8) so commit cost per frame is bounded. A batch that fails to decode installs nothing; a commit-time conflict discards the remainder of that batch while previously installed assets stay active. Textures commit before materials within a batch, so same-batch material → texture references resolve even when a budget splits the batch across frames. Additively installed assets join the tracked cooked set, so a later whole-directory replace load unloads them like any startup asset.
 
@@ -554,6 +583,49 @@ source writes are re-read by the physics step and therefore take effect on
 the next fixed step — a script can, for example, move `center` every frame to
 track a flying planet or toggle `enabled` to switch the field off.
 
+## Save games and checkpoints
+
+Authoring scenes remain immutable starting points. Runtime checkpoints use
+`GameLoop::capture_save_game(custom_state)` to capture the live ECS scene,
+gameplay state, double-precision world origin and shift count, plus the pose,
+linear/angular velocity, and sleeping state of every live rigid body keyed by
+persistent entity ID. Project-owned inventory, objective, dialogue, and quest
+state travels in the typed `BTreeMap<String, engine_serialize::Value>` supplied
+by the caller; arbitrary managed C# object fields are intentionally not
+reflected or serialized automatically.
+
+```rust
+use std::collections::BTreeMap;
+use engine_core::{read_save_game, write_save_game};
+use engine_serialize::Value;
+
+let custom = BTreeMap::from([
+    ("chapter".into(), Value::UInt(4)),
+    ("has_suit".into(), Value::Bool(true)),
+]);
+let checkpoint = game_loop.capture_save_game(custom)?;
+write_save_game("saves/quicksave.engsave", &checkpoint)?;
+
+let checkpoint = read_save_game("saves/quicksave.engsave")?;
+let restored = game_loop.restore_save_game(checkpoint)?;
+let project_state = restored.custom_state;
+```
+
+The binary format has a fixed magic header, schema version, bounded payload
+length, and SHA-256 payload checksum. Decoding and complete scene construction
+finish before the live world is replaced. File replacement writes and flushes
+a same-directory temporary file, retains the previous file as a temporary
+backup, and rolls it back if the final rename fails. Missing rigid-body IDs are
+reported in `SaveGameRestoreReport::skipped_physics_bodies`, allowing a newer
+project version to remove a prop without corrupting the entire save.
+
+Persistent joints, destructible health/break state, and ragdoll ownership,
+generated graph, and recovery progress are rebuilt from the captured scene,
+while rigid-body pose and velocity use the transient state section. Current
+checkpoint scope does not include physics solver caches, streaming-driver
+request state, automatic C# field reflection, or a user-facing save-slot/
+autosave UI. Those belong above the native snapshot API.
+
 ## World origin shifting
 
 Large worlds eventually exceed the range where f32 coordinates stay precise
@@ -646,12 +718,11 @@ code never needs to add the origin itself.
 - **f32 storage still bounds local scale.** Shifting keeps the *viewer* near
   the origin; content more than ~threshold metres from the reference still
   loses f32 precision. Size cells and streaming radii accordingly.
-- **Save/load stores relative coordinates.** Scenes serialize
-  origin-relative transforms, and the world origin is runtime-only state in
-  this version: it always starts at zero on load and is not persisted into
-  save data. A save captured mid-session therefore reloads at the same
-  logical positions with a zero origin — consistent, but the origin counter
-  itself is not restored.
+- **Authoring scenes and checkpoints differ.** Plain scene files serialize
+  origin-relative authored transforms and load with a zero runtime origin.
+  `SaveGameSnapshot` stores that relative scene together with its exact
+  double-precision origin and shift counter, restoring both without translating
+  the already-relative component data a second time.
 - **Cell scenes keep non-Transform world-space data un-rebased.** When a cell
   merges under a non-zero origin, only hierarchy-root `Transform`s are rebased
   by `-origin`; other world-space component data authored inside the cell

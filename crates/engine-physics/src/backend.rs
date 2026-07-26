@@ -7,7 +7,8 @@ use rapier3d::prelude::*;
 use crate::components::{BodyType, Collider, ColliderShape, RigidBody};
 use crate::convert::{from_rapier_isometry, from_rapier_vec, to_rapier_isometry, to_rapier_vec};
 use crate::events::{
-    CollisionEvent, CollisionEventKind, PhysicsEvents, TriggerEvent, TriggerEventKind,
+    CollisionEvent, CollisionEventKind, JointBreakEvent, PhysicsEvents, TriggerEvent,
+    TriggerEventKind,
 };
 use crate::joints::{JointDescriptor, JointHandle, JointType};
 use crate::queries::{
@@ -15,6 +16,7 @@ use crate::queries::{
     SweepHitResult,
 };
 use crate::Entity;
+use crate::RigidBodyRuntimeState;
 use crate::Transform;
 
 // Note: all rapier types are imported via rapier3d::prelude::* above.
@@ -197,6 +199,10 @@ pub struct RapierBackend {
     pub(crate) joint_entity_map: HashMap<Entity, HashSet<u32>>,
     /// Maps our JointHandle.0 → full Rapier ImpulseJointHandle (with generation).
     pub(crate) joint_handle_lookup: HashMap<u32, ImpulseJointHandle>,
+    /// Authored break thresholds keyed by engine joint handle.
+    joint_break_limits: HashMap<u32, (f32, f32)>,
+    /// Complete body entities for break-event reporting.
+    joint_bodies: HashMap<u32, (Entity, Entity)>,
     /// Auto-incrementing counter for JointHandle IDs.
     next_joint_id: u32,
 
@@ -232,6 +238,8 @@ impl RapierBackend {
             collider_map: HashMap::new(),
             joint_entity_map: HashMap::new(),
             joint_handle_lookup: HashMap::new(),
+            joint_break_limits: HashMap::new(),
+            joint_bodies: HashMap::new(),
             next_joint_id: 0,
             active_sensor_overlaps: HashSet::new(),
             active_collision_overlaps: HashSet::new(),
@@ -261,6 +269,7 @@ impl RapierBackend {
             &(),
             &handler,
         );
+        let joint_breaks = self.break_overloaded_joints();
 
         // ── Build reverse collider → entity map ──────────────────────────
         let mut collider_to_entity = HashMap::new();
@@ -407,6 +416,7 @@ impl RapierBackend {
         PhysicsEvents {
             collisions,
             triggers,
+            joint_breaks,
         }
     }
 
@@ -621,6 +631,10 @@ impl RapierBackend {
         self.joint_handle_lookup
             .retain(|_, rapier_handle| self.impulse_joints.get(*rapier_handle).is_some());
         let valid_joint_ids: HashSet<u32> = self.joint_handle_lookup.keys().copied().collect();
+        self.joint_break_limits
+            .retain(|joint_id, _| valid_joint_ids.contains(joint_id));
+        self.joint_bodies
+            .retain(|joint_id, _| valid_joint_ids.contains(joint_id));
         self.joint_entity_map.retain(|_, joint_ids| {
             joint_ids.retain(|joint_id| valid_joint_ids.contains(joint_id));
             !joint_ids.is_empty()
@@ -643,6 +657,7 @@ impl RapierBackend {
         body_a_handle: RigidBodyHandle,
         body_b_handle: RigidBodyHandle,
     ) -> Option<JointHandle> {
+        desc.validate().ok()?;
         let frame_a = na::Isometry3::from_parts(
             na::Translation3::new(desc.anchor_a[0], desc.anchor_a[1], desc.anchor_a[2]),
             na::UnitQuaternion::identity(),
@@ -746,6 +761,10 @@ impl RapierBackend {
         let our_id = self.next_joint_id;
         self.next_joint_id += 1;
         self.joint_handle_lookup.insert(our_id, rapier_handle);
+        self.joint_break_limits
+            .insert(our_id, (desc.break_force, desc.break_torque));
+        self.joint_bodies
+            .insert(our_id, (desc.entity_a, desc.entity_b));
 
         // Track entity → joint mapping.
         self.joint_entity_map
@@ -765,6 +784,8 @@ impl RapierBackend {
         if let Some(rapier_handle) = self.joint_handle_lookup.remove(&handle.0) {
             self.impulse_joints.remove(rapier_handle, true);
         }
+        self.joint_break_limits.remove(&handle.0);
+        self.joint_bodies.remove(&handle.0);
         // Clean up entity tracking.
         self.joint_entity_map.retain(|_, handles| {
             handles.remove(&handle.0);
@@ -775,6 +796,62 @@ impl RapierBackend {
     /// Number of active impulse joints.
     pub fn joint_count(&self) -> usize {
         self.impulse_joints.len()
+    }
+
+    pub fn has_joint(&self, handle: JointHandle) -> bool {
+        self.joint_handle_lookup
+            .get(&handle.0)
+            .is_some_and(|rapier_handle| self.impulse_joints.get(*rapier_handle).is_some())
+    }
+
+    /// Remove joints whose solver impulse exceeded an authored force/torque
+    /// threshold during the completed fixed step.
+    ///
+    /// Rapier exposes constraint impulses (N·s and N·m·s). Dividing their
+    /// linear/angular norms by Rapier's final TGS substep duration yields the
+    /// reaction force/torque estimate used for deterministic break decisions.
+    fn break_overloaded_joints(&mut self) -> Vec<JointBreakEvent> {
+        let substep_dt = self.integration.dt / self.integration.num_solver_iterations.get() as f32;
+        if !substep_dt.is_finite() || substep_dt <= 0.0 {
+            return Vec::new();
+        }
+        let mut broken = Vec::new();
+        for (&joint_id, &rapier_handle) in &self.joint_handle_lookup {
+            let Some(&(break_force, break_torque)) = self.joint_break_limits.get(&joint_id) else {
+                continue;
+            };
+            if break_force <= 0.0 && break_torque <= 0.0 {
+                continue;
+            }
+            let Some(joint) = self.impulse_joints.get(rapier_handle) else {
+                continue;
+            };
+            let linear_impulse =
+                na::Vector3::new(joint.impulses[0], joint.impulses[1], joint.impulses[2]);
+            let angular_impulse =
+                na::Vector3::new(joint.impulses[3], joint.impulses[4], joint.impulses[5]);
+            let force = linear_impulse.norm() / substep_dt;
+            let torque = angular_impulse.norm() / substep_dt;
+            let force_broke = break_force > 0.0 && (!force.is_finite() || force > break_force);
+            let torque_broke = break_torque > 0.0 && (!torque.is_finite() || torque > break_torque);
+            if force_broke || torque_broke {
+                let Some(&(entity_a, entity_b)) = self.joint_bodies.get(&joint_id) else {
+                    continue;
+                };
+                broken.push(JointBreakEvent {
+                    handle: JointHandle(joint_id),
+                    joint_entity: None,
+                    entity_a,
+                    entity_b,
+                    force,
+                    torque,
+                });
+            }
+        }
+        for event in &broken {
+            self.remove_joint(event.handle);
+        }
+        broken
     }
 
     /// Remove a collider but keep the body.
@@ -794,6 +871,93 @@ impl RapierBackend {
         let handle = self.body_map.get(&entity)?;
         let body = self.bodies.get(*handle)?;
         Some(from_rapier_isometry(body.position()))
+    }
+
+    pub(crate) fn runtime_body_states(&self) -> Vec<(Entity, RigidBodyRuntimeState)> {
+        self.body_map
+            .iter()
+            .filter_map(|(&entity, &handle)| {
+                let body = self.bodies.get(handle)?;
+                let (position, rotation) = from_rapier_isometry(body.position());
+                Some((
+                    entity,
+                    RigidBodyRuntimeState {
+                        position: position.to_array(),
+                        rotation: rotation.to_array(),
+                        linear_velocity: [body.linvel().x, body.linvel().y, body.linvel().z],
+                        angular_velocity: [body.angvel().x, body.angvel().y, body.angvel().z],
+                        sleeping: body.is_sleeping(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_runtime_body_state(
+        &mut self,
+        entity: Entity,
+        state: &RigidBodyRuntimeState,
+    ) -> bool {
+        let Some(&handle) = self.body_map.get(&entity) else {
+            return false;
+        };
+        let Some(body) = self.bodies.get_mut(handle) else {
+            return false;
+        };
+        let rotation = glam::Quat::from_array(state.rotation).normalize();
+        body.set_position(
+            to_rapier_isometry(glam::Vec3::from_array(state.position), rotation),
+            false,
+        );
+        body.set_linvel(
+            to_rapier_vec(glam::Vec3::from_array(state.linear_velocity)),
+            false,
+        );
+        body.set_angvel(
+            to_rapier_vec(glam::Vec3::from_array(state.angular_velocity)),
+            false,
+        );
+        if state.sleeping {
+            body.sleep();
+        } else {
+            body.wake_up(true);
+        }
+        self.query_pipeline_dirty = true;
+        true
+    }
+
+    pub(crate) fn set_linear_velocity(&mut self, entity: Entity, velocity: glam::Vec3) {
+        let Some(&handle) = self.body_map.get(&entity) else {
+            return;
+        };
+        if let Some(body) = self.bodies.get_mut(handle) {
+            body.set_linvel(to_rapier_vec(velocity), true);
+        }
+    }
+
+    pub(crate) fn set_angular_velocity(&mut self, entity: Entity, velocity: glam::Vec3) {
+        let Some(&handle) = self.body_map.get(&entity) else {
+            return;
+        };
+        if let Some(body) = self.bodies.get_mut(handle) {
+            body.set_angvel(to_rapier_vec(velocity), true);
+        }
+    }
+
+    pub(crate) fn set_body_type(&mut self, entity: Entity, body_type: BodyType) {
+        let Some(&handle) = self.body_map.get(&entity) else {
+            return;
+        };
+        let Some(body) = self.bodies.get_mut(handle) else {
+            return;
+        };
+        let body_type = match body_type {
+            BodyType::Static => RigidBodyType::Fixed,
+            BodyType::Dynamic => RigidBodyType::Dynamic,
+            BodyType::Kinematic => RigidBodyType::KinematicPositionBased,
+        };
+        body.set_body_type(body_type, true);
+        self.query_pipeline_dirty = true;
     }
 
     /// Set the world-space transform of a body.
@@ -871,6 +1035,24 @@ impl RapierBackend {
         if let Some(&handle) = self.body_map.get(&entity) {
             if let Some(body) = self.bodies.get_mut(handle) {
                 body.apply_impulse(to_rapier_vec(impulse), true);
+            }
+        }
+    }
+
+    /// Apply a torque to a rigid body.
+    pub fn apply_torque(&mut self, entity: Entity, torque: glam::Vec3) {
+        if let Some(&handle) = self.body_map.get(&entity) {
+            if let Some(body) = self.bodies.get_mut(handle) {
+                body.add_torque(to_rapier_vec(torque), true);
+            }
+        }
+    }
+
+    /// Apply an instantaneous angular impulse to a rigid body.
+    pub fn apply_torque_impulse(&mut self, entity: Entity, torque_impulse: glam::Vec3) {
+        if let Some(&handle) = self.body_map.get(&entity) {
+            if let Some(body) = self.bodies.get_mut(handle) {
+                body.apply_torque_impulse(to_rapier_vec(torque_impulse), true);
             }
         }
     }

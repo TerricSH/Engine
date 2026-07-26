@@ -338,6 +338,111 @@ impl CommandEncoder for Dx12CommandEncoder {
         }
     }
 
+    fn bind_sampled_texture_set(
+        &mut self,
+        pipeline_layout: PipelineLayoutHandle,
+        textures: &[TextureHandle],
+    ) -> bool {
+        if textures.is_empty() {
+            return false;
+        }
+        unsafe {
+            let device = &*self.device;
+            let (_, layout_index) = Dx12Device::decode_handle(pipeline_layout.index);
+            let Some(layout) = device.pipeline_layouts.get(layout_index) else {
+                return false;
+            };
+            let (Some(srv_parameter), Some(sampler_parameter)) =
+                (layout.sampled_texture_parameter, layout.sampler_parameter)
+            else {
+                return false;
+            };
+            let mut sources = Vec::with_capacity(textures.len());
+            for handle in textures {
+                let (_, index) = Dx12Device::decode_handle(handle.index);
+                let Some(texture) = device.textures.get(index) else {
+                    return false;
+                };
+                let (Some(srv), Some(sampler)) = (
+                    texture.sampled_srv_heap.as_ref(),
+                    texture.sampled_sampler_heap.as_ref(),
+                ) else {
+                    return false;
+                };
+                sources.push((srv, sampler));
+            }
+            let descriptor_count = textures.len() as u32;
+            let srv_heap: ID3D12DescriptorHeap =
+                match device
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: descriptor_count,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    }) {
+                    Ok(heap) => heap,
+                    Err(_) => return false,
+                };
+            let sampler_heap: ID3D12DescriptorHeap =
+                match device
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                        NumDescriptors: descriptor_count,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    }) {
+                    Ok(heap) => heap,
+                    Err(_) => return false,
+                };
+            let srv_size = device
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let sampler_size = device
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+                as usize;
+            let srv_start = srv_heap.GetCPUDescriptorHandleForHeapStart();
+            let sampler_start = sampler_heap.GetCPUDescriptorHandleForHeapStart();
+            for (index, (srv, sampler)) in sources.into_iter().enumerate() {
+                device.device.CopyDescriptorsSimple(
+                    1,
+                    D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: srv_start.ptr + index * srv_size,
+                    },
+                    srv.GetCPUDescriptorHandleForHeapStart(),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+                device.device.CopyDescriptorsSimple(
+                    1,
+                    D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: sampler_start.ptr + index * sampler_size,
+                    },
+                    sampler.GetCPUDescriptorHandleForHeapStart(),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                );
+            }
+            self.cmd_list
+                .SetDescriptorHeaps(&[Some(srv_heap.clone()), Some(sampler_heap.clone())]);
+            self.cmd_list.SetGraphicsRootDescriptorTable(
+                srv_parameter,
+                srv_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            self.cmd_list.SetGraphicsRootDescriptorTable(
+                sampler_parameter,
+                sampler_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            let Ok(mut in_flight) = device.descriptor_heaps_in_flight.lock() else {
+                return false;
+            };
+            in_flight.push(srv_heap);
+            in_flight.push(sampler_heap);
+            true
+        }
+    }
+
     fn bind_uniform_buffer(
         &mut self,
         pipeline_layout: PipelineLayoutHandle,

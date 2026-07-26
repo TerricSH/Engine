@@ -1447,8 +1447,10 @@ impl Device for Dx12Device {
                             (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1)
                         }
                         "sampled_texture_pair" => (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2),
+                        "sampled_texture_set" => (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6),
                         "sampler" => (D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1),
                         "sampler_pair" => (D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 2),
+                        "sampler_set" => (D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 6),
                         "uniform_buffer" => {
                             uniform_bindings.push((binding.binding, u32::from(layout.set_index)));
                             continue;
@@ -1719,14 +1721,52 @@ impl Device for Dx12Device {
             };
 
             // Build PSO description
+            let (blend_enabled, source_color, destination_color, source_alpha, destination_alpha) =
+                match descriptor
+                    .blend_state
+                    .mode
+                    .as_deref()
+                    .unwrap_or("opaque")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "alpha" => (
+                        true,
+                        D3D12_BLEND_SRC_ALPHA,
+                        D3D12_BLEND_INV_SRC_ALPHA,
+                        D3D12_BLEND_ONE,
+                        D3D12_BLEND_INV_SRC_ALPHA,
+                    ),
+                    "premultiplied" | "premultipliedalpha" => (
+                        true,
+                        D3D12_BLEND_ONE,
+                        D3D12_BLEND_INV_SRC_ALPHA,
+                        D3D12_BLEND_ONE,
+                        D3D12_BLEND_INV_SRC_ALPHA,
+                    ),
+                    "add" | "additive" => (
+                        true,
+                        D3D12_BLEND_SRC_ALPHA,
+                        D3D12_BLEND_ONE,
+                        D3D12_BLEND_ONE,
+                        D3D12_BLEND_ONE,
+                    ),
+                    _ => (
+                        false,
+                        D3D12_BLEND_ONE,
+                        D3D12_BLEND_ZERO,
+                        D3D12_BLEND_ONE,
+                        D3D12_BLEND_ZERO,
+                    ),
+                };
             let blend_target = D3D12_RENDER_TARGET_BLEND_DESC {
-                BlendEnable: BOOL(0),
+                BlendEnable: blend_enabled.into(),
                 LogicOpEnable: BOOL(0),
-                SrcBlend: D3D12_BLEND_ONE,
-                DestBlend: D3D12_BLEND_ZERO,
+                SrcBlend: source_color,
+                DestBlend: destination_color,
                 BlendOp: D3D12_BLEND_OP_ADD,
-                SrcBlendAlpha: D3D12_BLEND_ONE,
-                DestBlendAlpha: D3D12_BLEND_ZERO,
+                SrcBlendAlpha: source_alpha,
+                DestBlendAlpha: destination_alpha,
                 BlendOpAlpha: D3D12_BLEND_OP_ADD,
                 LogicOp: D3D12_LOGIC_OP_NOOP,
                 RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,

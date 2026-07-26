@@ -641,6 +641,7 @@ pub(crate) fn cook_source_entry_atomic(
         &source_path,
         &staging_path,
         &entry.asset_type,
+        &entry.cook_rules,
         asset_type_registry,
     );
     let mut result = match cooked {
@@ -687,10 +688,13 @@ fn dispatch_source_entry(
     source_path: &Path,
     output_path: &Path,
     asset_type: &AssetType,
+    cook_rules: &CookRules,
     asset_type_registry: &AssetTypeRegistry,
 ) -> Result<CookResult, CookError> {
     match asset_type {
-        AssetType::Mesh => mesh::cook_mesh(source_path, output_path),
+        AssetType::Mesh => {
+            mesh::cook_mesh_primitive(source_path, output_path, cook_rules.gltf_primitive_index)
+        }
         AssetType::Texture => texture::cook_texture(source_path, output_path),
         AssetType::Material => material::cook_material(source_path, output_path),
         AssetType::Shader => {

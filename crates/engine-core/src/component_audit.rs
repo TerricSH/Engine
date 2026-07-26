@@ -72,6 +72,14 @@ const AUDIT_ANNOTATIONS: &[(&str, AuditAnnotation)] = &[
         },
     ),
     (
+        "engine.interactable",
+        AuditAnnotation {
+            reconciler: "per physics query (interaction metadata extraction)",
+            caveat: "write takes effect live on the next interaction probe",
+            decision: "ReadWrite — engine-owned targeting metadata; project scripts own the action's gameplay effect",
+        },
+    ),
+    (
         "engine.bounds",
         AuditAnnotation {
             reconciler: "per frame (frustum culling)",
@@ -101,6 +109,22 @@ const AUDIT_ANNOTATIONS: &[(&str, AuditAnnotation)] = &[
             reconciler: "load time (backend body created when first seen)",
             caveat: "write is scene-state only — does not re-sync an already-created physics body",
             decision: "ReadWrite — curated set; caveat documented for game code",
+        },
+    ),
+    (
+        "engine.physics.joint",
+        AuditAnnotation {
+            reconciler: "per physics sync (persistent ids resolve to backend joint handles)",
+            caveat: "dedicated API — Physics.CreateJoint/UpdateJoint/RemoveJoint/Grab",
+            decision: "DedicatedApi — the typed API validates cross-entity references and supports safe upsert/remove semantics",
+        },
+    ),
+    (
+        "engine.physics.destructible",
+        AuditAnnotation {
+            reconciler: "per damage command (health update and optional prefab fracture transaction)",
+            caveat: "dedicated API — Damage.Apply",
+            decision: "DedicatedApi — the bounded typed API owns damage validation, one-shot break state, and fracture replacement",
         },
     ),
     (
@@ -160,6 +184,22 @@ const AUDIT_ANNOTATIONS: &[(&str, AuditAnnotation)] = &[
         },
     ),
     (
+        "engine.ragdoll",
+        AuditAnnotation {
+            reconciler: "before/after physics step (body graph, ownership, and pose override)",
+            caveat: "dedicated API — Ragdoll.Activate/Recover/SnapToAnimation",
+            decision: "DedicatedApi — typed transitions preserve animation/physics ownership and generated graph invariants",
+        },
+    ),
+    (
+        "engine.ragdoll_part",
+        AuditAnnotation {
+            reconciler: "per frame (internal generated-part cleanup)",
+            caveat: "n/a — not script-accessible",
+            decision: "None — internal persistent ownership marker for generated ragdoll bodies and joints",
+        },
+    ),
+    (
         "engine.skeleton",
         AuditAnnotation {
             reconciler: "per frame (skinned extraction resolves cooked assets)",
@@ -181,6 +221,22 @@ const AUDIT_ANNOTATIONS: &[(&str, AuditAnnotation)] = &[
             reconciler: "per frame (navigation driver re-reads the agent)",
             caveat: "write takes effect live; path following restarts (repath on next navigation update)",
             decision: "ReadWrite — newly exposed; serialized fields are plain configuration the driver re-reads each frame",
+        },
+    ),
+    (
+        "engine.vfx.particle_emitter",
+        AuditAnnotation {
+            reconciler: "per frame (CPU simulation and render extraction)",
+            caveat: "write takes effect live; transient particles and emitter clock restart",
+            decision: "ReadWrite — authored configuration is safe to query/write; transient simulation state is intentionally not scene-serializable",
+        },
+    ),
+    (
+        "engine.vfx.decal",
+        AuditAnnotation {
+            reconciler: "per frame (lifetime update and render extraction)",
+            caveat: "write takes effect live; finite lifetime restarts",
+            decision: "ReadWrite — plain surface configuration with intentionally transient elapsed lifetime",
         },
     ),
 ];
@@ -348,6 +404,8 @@ mod tests {
         for (type_id, access) in [
             ("engine.character_controller", ScriptAccess::ReadOnly),
             ("engine.physics.rigid_body", ScriptAccess::ReadWrite),
+            ("engine.physics.joint", ScriptAccess::DedicatedApi),
+            ("engine.physics.destructible", ScriptAccess::DedicatedApi),
             ("engine.physics.collider", ScriptAccess::ReadWrite),
             ("engine.physics.physics_material", ScriptAccess::ReadWrite),
             ("engine.gravity_source", ScriptAccess::ReadWrite),
@@ -355,9 +413,13 @@ mod tests {
             ("engine.audio_source", ScriptAccess::ReadWrite),
             ("engine.audio_listener", ScriptAccess::ReadWrite),
             ("engine.animation_player", ScriptAccess::None),
+            ("engine.ragdoll", ScriptAccess::DedicatedApi),
+            ("engine.ragdoll_part", ScriptAccess::None),
             ("engine.skeleton", ScriptAccess::None),
             ("engine.ik_target", ScriptAccess::None),
             ("engine.nav_agent", ScriptAccess::ReadWrite),
+            ("engine.vfx.particle_emitter", ScriptAccess::ReadWrite),
+            ("engine.vfx.decal", ScriptAccess::ReadWrite),
         ] {
             registry
                 .register(ComponentExtension {

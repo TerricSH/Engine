@@ -19,6 +19,10 @@ impl Pose {
         skeleton.rest_pose()
     }
 
+    pub fn from_local_transforms(local: Vec<BoneTransform>) -> Self {
+        Self { local }
+    }
+
     /// Read-only access to per-bone local-space transforms.
     pub fn local_transforms(&self) -> &[BoneTransform] {
         &self.local
@@ -68,8 +72,10 @@ impl Pose {
 
         for i in 0..count {
             let current = current_global[i].to_mat4();
-            let inverse_rest = rest_global[i].to_mat4().inverse();
-            matrices.push(current * inverse_rest);
+            let inverse_bind = skeleton
+                .inverse_bind_matrix(BoneIndex(i as u16))
+                .unwrap_or_else(|| rest_global[i].to_mat4().inverse());
+            matrices.push(current * inverse_bind);
         }
 
         matrices

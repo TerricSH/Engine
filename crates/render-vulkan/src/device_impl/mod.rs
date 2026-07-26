@@ -189,6 +189,9 @@ pub struct VulkanDevice {
     pub(crate) hdr_forward_rp: Option<vk::RenderPass>,
     /// Forward HDR pipeline (targets hdr_forward_rp).
     pub(crate) hdr_forward_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_forward_double_sided_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_forward_blend_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_forward_blend_double_sided_pipeline: Option<vk::Pipeline>,
     /// Skybox pipeline rendered before opaque geometry in the HDR pass.
     pub(crate) hdr_skybox_pipeline: Option<vk::Pipeline>,
     pub(crate) hdr_forward_pipeline_layout: Option<vk::PipelineLayout>,
@@ -384,6 +387,9 @@ impl VulkanDevice {
             tone_desc_layout: None,
             hdr_forward_rp: None,
             hdr_forward_pipeline: None,
+            hdr_forward_double_sided_pipeline: None,
+            hdr_forward_blend_pipeline: None,
+            hdr_forward_blend_double_sided_pipeline: None,
             hdr_skybox_pipeline: None,
             hdr_forward_pipeline_layout: None,
             hdr_forward_fb: None,

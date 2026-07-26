@@ -1671,6 +1671,26 @@ impl EditorApp {
                 parameter.texture_value = serde_json::from_value(params.value)
                     .map_err(|error| validation_error(error.to_string()))?;
             }
+            ShaderParamType::Choice => {
+                let value: String = serde_json::from_value(params.value)
+                    .map_err(|error| validation_error(error.to_string()))?;
+                if !parameter
+                    .choice_options
+                    .iter()
+                    .any(|option| option == &value)
+                {
+                    return Err(validation_error(format!(
+                        "material parameter '{}' must be one of: {}",
+                        parameter.name,
+                        parameter.choice_options.join(", ")
+                    )));
+                }
+                parameter.choice_value = value;
+            }
+            ShaderParamType::Bool => {
+                parameter.bool_value = serde_json::from_value(params.value)
+                    .map_err(|error| validation_error(error.to_string()))?;
+            }
         }
         Ok(())
     }

@@ -16,20 +16,36 @@ use super::{write_cooked_artifact, AssetType, CookResult};
 /// one primitive. Multi-primitive sources must use [`cook_meshes`] so cooking
 /// never silently aliases the first primitive.
 pub fn cook_mesh(source: &Path, output: &Path) -> Result<CookResult, CookError> {
+    cook_mesh_primitive(source, output, None)
+}
+
+/// Cook one selected primitive from a glTF source. Without an explicit
+/// selection the source must contain exactly one primitive.
+pub fn cook_mesh_primitive(
+    source: &Path,
+    output: &Path,
+    primitive_index: Option<u32>,
+) -> Result<CookResult, CookError> {
     let scene = crate::gltf::load_gltf_scene(source)
         .map_err(|error| CookError::Parse(error.to_string()))?;
-    if scene.primitives.len() != 1 {
+    if primitive_index.is_none() && scene.primitives.len() != 1 {
         return Err(CookError::InvalidAsset(format!(
             "single mesh asset requires exactly one glTF primitive, found {}; use multi-mesh import for this source",
             scene.primitives.len()
         )));
     }
+    let selected_index = primitive_index.unwrap_or(0) as usize;
     let mesh_data = scene
         .primitives
-        .into_iter()
-        .next()
-        .expect("primitive count validated")
-        .mesh;
+        .get(selected_index)
+        .ok_or_else(|| {
+            CookError::InvalidAsset(format!(
+                "glTF primitive selection {selected_index} is out of range for {} primitives",
+                scene.primitives.len()
+            ))
+        })?
+        .mesh
+        .clone();
 
     // 2. Serialize with bincode.
     let payload =

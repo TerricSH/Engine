@@ -577,11 +577,33 @@ fn decode_cooked_asset(
             if mesh.positions.is_empty() {
                 return Err("cooked mesh has no vertices".into());
             }
-            let (vertex_bytes, index_bytes, index_count, _) =
-                engine_asset::mesh::mesh_data_to_upload_bytes(&mesh);
+            let (vertex_format, vertex_bytes, index_bytes, index_count) = if mesh.joints.is_empty()
+                && mesh.weights.is_empty()
+            {
+                let (vertex_bytes, index_bytes, index_count, _) =
+                    engine_asset::mesh::mesh_data_to_upload_bytes(&mesh);
+                (
+                    MeshVertexFormat::Pbr32,
+                    vertex_bytes,
+                    index_bytes,
+                    index_count,
+                )
+            } else {
+                let (vertex_bytes, index_bytes, index_count, _) =
+                        engine_asset::mesh::mesh_data_to_skinned_bytes(&mesh).ok_or_else(|| {
+                            "cooked skinned mesh must provide exactly four joints and weights per vertex"
+                                .to_string()
+                        })?;
+                (
+                    MeshVertexFormat::Skinned64,
+                    vertex_bytes,
+                    index_bytes,
+                    index_count,
+                )
+            };
             Ok(DecodedCookedAsset::Mesh(MeshUpload {
                 mesh_id: id,
-                vertex_format: MeshVertexFormat::Pbr32,
+                vertex_format,
                 vertex_count: u32::try_from(mesh.positions.len())
                     .map_err(|_| "cooked mesh vertex count exceeds u32".to_string())?,
                 vertex_bytes,
@@ -630,6 +652,9 @@ fn decode_cooked_asset(
                 ("metallic", material.metallic),
                 ("roughness", material.roughness),
                 ("ambient_occlusion", material.ambient_occlusion),
+                ("emissive[0]", material.emissive[0]),
+                ("emissive[1]", material.emissive[1]),
+                ("emissive[2]", material.emissive[2]),
             ] {
                 if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                     return Err(format!(
@@ -639,10 +664,17 @@ fn decode_cooked_asset(
             }
             let transparency = match material.transparency {
                 engine_asset::cook::MaterialTransparency::Opaque => Transparency::Opaque,
+                engine_asset::cook::MaterialTransparency::Masked { cutoff } => {
+                    if !cutoff.is_finite() || !(0.0..=1.0).contains(&cutoff) {
+                        return Err(
+                            "cooked material alpha cutoff must be finite and in the range 0..=1"
+                                .into(),
+                        );
+                    }
+                    Transparency::Masked { cutoff }
+                }
+                engine_asset::cook::MaterialTransparency::Blend => Transparency::Blend,
             };
-            if material.double_sided {
-                return Err("double-sided cooked materials are not supported".into());
-            }
             Ok(DecodedCookedAsset::Material(
                 path.to_path_buf(),
                 MaterialUpload {
@@ -651,9 +683,14 @@ fn decode_cooked_asset(
                     metallic: material.metallic,
                     roughness: material.roughness,
                     ambient_occlusion: material.ambient_occlusion,
+                    emissive: material.emissive,
                     base_color_texture: material.base_color_texture,
+                    normal_texture: material.normal_texture,
+                    metallic_roughness_texture: material.metallic_roughness_texture,
+                    occlusion_texture: material.occlusion_texture,
+                    emissive_texture: material.emissive_texture,
                     transparency,
-                    double_sided: false,
+                    double_sided: material.double_sided,
                     content_hash: artifact.header.content_hash,
                 },
             ))
@@ -706,15 +743,20 @@ fn validate_material_texture_dependencies(
 
     materials
         .iter()
-        .filter_map(|(path, upload)| {
-            let texture_id = upload.base_color_texture.as_ref()?;
-            (!material_texture_available(
-                runtime,
-                &batch_texture_ids,
-                replaced_asset_ids,
-                texture_id,
-            ))
-            .then(|| missing_texture_error(path, &upload.material_id, texture_id))
+        .flat_map(|(path, upload)| {
+            upload
+                .texture_references()
+                .into_iter()
+                .filter_map(|texture_id| {
+                    let texture_id = texture_id?;
+                    (!material_texture_available(
+                        runtime,
+                        &batch_texture_ids,
+                        replaced_asset_ids,
+                        texture_id,
+                    ))
+                    .then(|| missing_texture_error(path, &upload.material_id, texture_id))
+                })
         })
         .collect()
 }
@@ -858,6 +900,33 @@ pub(crate) mod tests {
         engine_asset::cook::cook_material(&source, &dir.join(format!("{id}.cooked"))).unwrap();
     }
 
+    fn cook_test_surface_material(
+        dir: &Path,
+        id: &str,
+        transparency: &str,
+        alpha_cutoff: f32,
+        double_sided: bool,
+    ) {
+        let source = dir.join(format!("{id}.material.json"));
+        std::fs::write(
+            &source,
+            format!(
+                r#"{{
+                    "schema": "MaterialSource-v0",
+                    "base_color": [0.8, 0.7, 0.6, 0.5],
+                    "metallic": 0.25,
+                    "roughness": 0.5,
+                    "ambient_occlusion": 1.0,
+                    "transparency": "{transparency}",
+                    "alpha_cutoff": {alpha_cutoff},
+                    "double_sided": {double_sided}
+                }}"#
+            ),
+        )
+        .unwrap();
+        engine_asset::cook::cook_material(&source, &dir.join(format!("{id}.cooked"))).unwrap();
+    }
+
     fn texture_upload(id: &str) -> TextureUpload {
         TextureUpload {
             texture_id: AssetId::new(id),
@@ -882,7 +951,12 @@ pub(crate) mod tests {
             metallic: 0.0,
             roughness: 1.0,
             ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
             base_color_texture: texture.map(AssetId::new),
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
             transparency: Transparency::Opaque,
             double_sided: false,
             content_hash: [2; 32],
@@ -911,6 +985,38 @@ pub(crate) mod tests {
         let levels = split_rgba8_mips(2, 2, 2, &[0; 20]).unwrap();
         assert_eq!(levels.len(), 2);
         assert_eq!((levels[1].width, levels[1].height), (1, 1));
+    }
+
+    #[test]
+    fn cooked_skinned_mesh_reaches_the_runtime_as_skinned64() {
+        let dir = cooked_case("skinned_mesh");
+        let mesh = engine_asset::mesh::MeshData {
+            positions: vec![glam::Vec3::ZERO, glam::Vec3::X, glam::Vec3::Y],
+            normals: vec![glam::Vec3::Z; 3],
+            uvs: vec![glam::Vec2::ZERO; 3],
+            indices: vec![0, 1, 2],
+            bounds: (glam::Vec3::ZERO, glam::Vec3::ONE),
+            joints: vec![[0, 1, 0, 0]; 3],
+            weights: vec![[0.75, 0.25, 0.0, 0.0]; 3],
+        };
+        engine_asset::cook::write_cooked_artifact(
+            &dir.join("mesh.skinned.cooked"),
+            AssetType::Mesh.kind_code(),
+            &bincode::serialize(&mesh).unwrap(),
+            engine_serialize::SchemaVersion::new(0, 1, 0),
+        )
+        .unwrap();
+
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+        runtime.load_cooked_assets(&dir).unwrap();
+        let upload = runtime
+            .asset_registry()
+            .get::<MeshUpload>(&AssetId::new("mesh.skinned"))
+            .expect("skinned mesh upload");
+        assert_eq!(upload.get().vertex_format, MeshVertexFormat::Skinned64);
+        assert_eq!(upload.get().vertex_bytes.len(), 3 * 64);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -964,6 +1070,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn auxiliary_material_texture_dependencies_are_validated() {
+        let runtime = EngineRuntime::new(crate::EngineConfig::default());
+        let path = PathBuf::from("missing-normal-dependency.cooked");
+        let mut upload = material_upload("material.invalid-normal", None);
+        upload.normal_texture = Some(AssetId::new("texture.normal-missing"));
+
+        let diagnostics = validate_material_texture_dependencies(
+            &runtime,
+            &[],
+            &[(path.clone(), upload)],
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].path.as_deref(), path.to_str());
+        assert!(diagnostics[0].message.contains("texture.normal-missing"));
+    }
+
+    #[test]
     fn cooked_material_is_registered_and_counted() {
         let dir = cooked_case("load");
         cook_test_material(&dir, "material.plain", None);
@@ -978,6 +1103,33 @@ pub(crate) mod tests {
             .asset_registry()
             .get::<MaterialUpload>(&AssetId::new("material.plain"))
             .is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cooked_surface_materials_preserve_alpha_and_culling_state() {
+        let dir = cooked_case("surface_states");
+        cook_test_surface_material(&dir, "material.masked", "Masked", 0.37, true);
+        cook_test_surface_material(&dir, "material.blended", "Blend", 0.5, false);
+        let mut runtime = EngineRuntime::new(crate::EngineConfig::default());
+
+        runtime.load_cooked_assets(&dir).unwrap();
+
+        let masked = runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.masked"))
+            .unwrap();
+        assert_eq!(
+            masked.get().transparency,
+            Transparency::Masked { cutoff: 0.37 }
+        );
+        assert!(masked.get().double_sided);
+        let blended = runtime
+            .asset_registry()
+            .get::<MaterialUpload>(&AssetId::new("material.blended"))
+            .unwrap();
+        assert_eq!(blended.get().transparency, Transparency::Blend);
+        assert!(!blended.get().double_sided);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -39,13 +39,14 @@ impl VulkanDevice {
     }
 
     /// Write the COMBINED_IMAGE_SAMPLER descriptor for `asset_id` into
-    /// the given `desc_set` at binding=1 (set=2 — binding=0 is the MaterialUBO).
+    /// one declared material binding in the given descriptor set.
     ///
     /// Returns `Ok(true)` when the descriptor was written, `Ok(false)` if
     /// the texture is not in the cache, or `Err` on device error.
-    pub(crate) fn bind_material_texture(
+    pub(crate) fn bind_material_texture_at(
         &self,
         asset_id: &str,
+        binding: u32,
         desc_set: vk::DescriptorSet,
     ) -> VkResult<bool> {
         let Some(gpu_tex) = self.textures.get(asset_id) else {
@@ -59,7 +60,7 @@ impl VulkanDevice {
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [vk::WriteDescriptorSet::default()
             .dst_set(desc_set)
-            .dst_binding(1)
+            .dst_binding(binding)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_info)];
         // SAFETY: `d` is a valid AshDevice; `desc_set` is a valid descriptor

@@ -590,7 +590,7 @@ pub fn update_animation_pipeline(
 
     // ── 3. Apply IK post-processing ──────────────────────────────────────
     let pre_ik = pose.clone();
-    let pose = if let Some(ik_comp) = ik {
+    let mut pose = if let Some(ik_comp) = ik {
         if ik_comp.enabled && ik_comp.blend_weight > 0.0 {
             let mut ik_pose = pose;
             solve_pose_multi(
@@ -612,11 +612,22 @@ pub fn update_animation_pipeline(
         pose
     };
 
-    // ── 4. Cache bone world positions for C# query ───────────────────────
-    let global = pose.global_transforms(skel);
-    player.cached_bone_positions = global.iter().map(|bt| bt.translation.to_array()).collect();
+    // ── 4. Apply external pose ownership (ragdoll / physical animation) ──
+    if let Some(override_pose) = player.external_pose_override.as_ref() {
+        if override_pose.local_transforms.len() == skel.bone_count()
+            && override_pose.weight.is_finite()
+            && override_pose.weight > 0.0
+        {
+            let external = Pose::from_local_transforms(override_pose.local_transforms.clone());
+            pose = Pose::blend(&pose, &external, override_pose.weight);
+        }
+    }
 
-    // ── 5. Compute skin matrices ─────────────────────────────────────────
+    // ── 5. Cache bone world positions for C# query ───────────────────────
+    let global = pose.global_transforms(skel);
+    player.set_cached_bone_positions(&global);
+
+    // ── 6. Compute skin matrices ─────────────────────────────────────────
     pose.skin_matrices(skel)
         .iter()
         .map(|m| m.to_cols_array_2d())

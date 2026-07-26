@@ -89,6 +89,8 @@ struct BoneData {
     name: String,
     parent: Option<BoneIndex>,
     rest_transform: BoneTransform,
+    #[serde(default)]
+    inverse_bind_matrix: Option<[[f32; 4]; 4]>,
     children: Vec<BoneIndex>,
 }
 
@@ -150,6 +152,7 @@ impl Skeleton {
             name,
             parent,
             rest_transform,
+            inverse_bind_matrix: None,
             children: Vec::new(),
         });
 
@@ -184,6 +187,26 @@ impl Skeleton {
             .get(index.0 as usize)
             .map(|b| b.children.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Store an authored inverse-bind matrix for a bone.
+    pub fn set_inverse_bind_matrix(
+        &mut self,
+        index: BoneIndex,
+        inverse_bind_matrix: [[f32; 4]; 4],
+    ) -> bool {
+        let Some(bone) = self.bones.get_mut(index.0 as usize) else {
+            return false;
+        };
+        bone.inverse_bind_matrix = Some(inverse_bind_matrix);
+        true
+    }
+
+    pub(crate) fn inverse_bind_matrix(&self, index: BoneIndex) -> Option<Mat4> {
+        self.bones
+            .get(index.0 as usize)
+            .and_then(|bone| bone.inverse_bind_matrix)
+            .map(|matrix| Mat4::from_cols_array_2d(&matrix))
     }
 
     /// Build a `Pose` initialised with every bone's rest (bind) transform.

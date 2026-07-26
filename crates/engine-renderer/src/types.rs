@@ -439,11 +439,7 @@ pub struct TextureUpload {
     pub content_hash: HashDigest,
 }
 
-/// Owned parameters for the first portable metallic-roughness material path.
-///
-/// The current renderer contract accepts opaque, single-sided materials. The
-/// other states remain representable so callers receive a structured
-/// unsupported-feature diagnostic instead of silently losing authoring data.
+/// Owned parameters for the portable metallic-roughness material path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MaterialUpload {
     pub material_id: AssetId,
@@ -451,10 +447,29 @@ pub struct MaterialUpload {
     pub metallic: f32,
     pub roughness: f32,
     pub ambient_occlusion: f32,
+    pub emissive: [f32; 3],
     pub base_color_texture: Option<AssetId>,
+    pub normal_texture: Option<AssetId>,
+    pub metallic_roughness_texture: Option<AssetId>,
+    pub occlusion_texture: Option<AssetId>,
+    pub emissive_texture: Option<AssetId>,
     pub transparency: Transparency,
     pub double_sided: bool,
     pub content_hash: HashDigest,
+}
+
+impl MaterialUpload {
+    /// Texture dependencies in stable shader-slot order: base color, normal,
+    /// metallic-roughness, ambient occlusion, and emissive.
+    pub fn texture_references(&self) -> [Option<&AssetId>; 5] {
+        [
+            self.base_color_texture.as_ref(),
+            self.normal_texture.as_ref(),
+            self.metallic_roughness_texture.as_ref(),
+            self.occlusion_texture.as_ref(),
+            self.emissive_texture.as_ref(),
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

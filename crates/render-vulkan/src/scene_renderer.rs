@@ -7,14 +7,14 @@
 //! references them. The render graph records shadow, HDR forward, tone-map and
 //! present passes with explicit abort handling when any pass fails.
 //!
-//! The portable material contract currently accepts opaque, single-sided PBR
-//! base-color materials. Unsupported alpha and raster states are rejected by
-//! the contract instead of being rendered with an implicit approximation.
+//! The portable material contract supports opaque, alpha-masked, alpha-blended,
+//! and double-sided PBR base-color materials through explicit pipeline
+//! variants.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ash::vk;
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 
 use engine_renderer::{
     render_graph2, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, LightItem,
@@ -211,7 +211,14 @@ fn apply_registered_custom_pass_declarations(
 }
 
 fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
-    let mut bytes = Vec::with_capacity(32);
+    let texture_references = upload.texture_references();
+    let texture_flags = texture_references
+        .iter()
+        .enumerate()
+        .fold(0_u32, |flags, (index, texture)| {
+            flags | u32::from(texture.is_some()) << index
+        });
+    let mut bytes = Vec::with_capacity(MATERIAL_UBO_SIZE);
     for value in upload.base_color {
         bytes.extend_from_slice(&value.to_ne_bytes());
     }
@@ -219,23 +226,39 @@ fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
         upload.metallic,
         upload.roughness,
         upload.ambient_occlusion,
-        0.0,
+        match upload.transparency {
+            engine_renderer::Transparency::Masked { cutoff } => cutoff,
+            engine_renderer::Transparency::Opaque | engine_renderer::Transparency::Blend => -1.0,
+        },
     ] {
         bytes.extend_from_slice(&value.to_ne_bytes());
     }
-    let textures = upload
-        .base_color_texture
-        .as_ref()
-        .map(|texture| {
-            vec![TextureSlot {
-                binding: 1,
+    for value in [
+        upload.emissive[0],
+        upload.emissive[1],
+        upload.emissive[2],
+        texture_flags as f32,
+    ] {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    let textures = texture_references
+        .into_iter()
+        .zip(MATERIAL_TEXTURE_BINDINGS)
+        .enumerate()
+        .filter_map(|(index, (texture, binding))| {
+            texture.map(|texture| TextureSlot {
+                binding,
                 texture: texture.clone(),
                 sampler: AssetId::new(format!("{}::sampler", texture.id)),
-                color_space: engine_renderer::ColorSpace::Srgb,
+                color_space: if matches!(index, 0 | 4) {
+                    engine_renderer::ColorSpace::Srgb
+                } else {
+                    engine_renderer::ColorSpace::Linear
+                },
                 mip_bias: 0.0,
-            }]
+            })
         })
-        .unwrap_or_default();
+        .collect();
     MaterialBinding {
         material_id: upload.material_id.clone(),
         pipeline: AssetId::new(SCENE_FORWARD_PIPELINE_ID),
@@ -251,7 +274,7 @@ fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
     }
 }
 
-/// CPU-side material UBO layout (32 bytes total).
+/// CPU-side material UBO layout (48 bytes total).
 ///
 /// Field layout (std140):
 /// | offset | field       | type      | bytes |
@@ -260,24 +283,29 @@ fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
 /// |     16 | metallic    | float    |     4 |
 /// |     20 | roughness   | float    |     4 |
 /// |     24 | ao          | float    |     4 |
-/// |     28 | _padding    | float    |     4 |
-/// Total: 32 bytes.
+/// |     28 | alpha_cutoff| float    |     4 |
+/// |     32 | emissive     | vec4     |    16 |
+/// Total: 48 bytes.
 #[repr(C)]
 struct MaterialUBO {
     base_color: [f32; 4],
     metallic: f32,
     roughness: f32,
     ao: f32,
-    _padding: [f32; 1],
+    alpha_cutoff: f32,
+    emissive: [f32; 4],
 }
+
+const MATERIAL_UBO_SIZE: usize = std::mem::size_of::<MaterialUBO>();
+const MATERIAL_TEXTURE_BINDINGS: [u32; 5] = [1, 3, 4, 5, 6];
 
 /// Cache entry for a material descriptor set + UBO buffer.
 struct MaterialCacheEntry {
     desc_set: vk::DescriptorSet,
     handle: BufferHandle,
     buffer: vk::Buffer,
-    ubo_data: [u8; 32],
-    bound_texture_id: String,
+    ubo_data: [u8; MATERIAL_UBO_SIZE],
+    bound_texture_ids: [String; 5],
 }
 
 const MAX_MATERIALS: usize = 256;
@@ -285,7 +313,7 @@ const MAX_MATERIALS: usize = 256;
 /// Cache entry for a bone palette descriptor set.
 struct BonePaletteCacheEntry {
     desc_set: vk::DescriptorSet,
-    bound_texture_id: String,
+    bound_texture_ids: [String; 5],
 }
 
 /// Cached bone UBO buffer (handle for writes + raw VkBuffer for descriptor binding).
@@ -1301,7 +1329,7 @@ impl SceneRenderer {
             .chain(input.skinned_items.iter().map(|item| &item.material))
         {
             let material = self.material_binding_for_drawable(input, material_id)?;
-            self.selected_material_texture_id(&material)?;
+            self.selected_material_texture_ids(&material)?;
         }
         Ok(())
     }
@@ -1432,7 +1460,7 @@ impl SceneRenderer {
     /// Get or create a combined material + bone descriptor set for a skinned drawable.
     /// The descriptor set has:
     ///   binding=0: material UBO
-    ///   binding=1: texture (updated later via bind_material_texture)
+    ///   bindings=1,3..=6: material textures (updated after allocation)
     ///   binding=2: bone palette UBO
     fn get_or_create_skinned_desc_set(
         &mut self,
@@ -1470,7 +1498,12 @@ impl SceneRenderer {
         // Allocate a new skinned descriptor set from the material pool
         let desc_set = self
             .device
-            .allocate_skinned_material_descriptor_set(mat_buffer, 32, bone_buffer, 4096)
+            .allocate_skinned_material_descriptor_set(
+                mat_buffer,
+                MATERIAL_UBO_SIZE as u64,
+                bone_buffer,
+                4096,
+            )
             .map_err(|e| {
                 vec![Diagnostic::new(
                     "RV0221",
@@ -1485,8 +1518,9 @@ impl SceneRenderer {
             cache_key.clone(),
             BonePaletteCacheEntry {
                 desc_set,
-                bound_texture_id: crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID
-                    .to_string(),
+                bound_texture_ids: std::array::from_fn(|_| {
+                    crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID.to_string()
+                }),
             },
         );
         self.skinned_desc_cache_order.push(cache_key);
@@ -1520,7 +1554,7 @@ impl SceneRenderer {
                 fallback
             }
         };
-        let read_vec4 = |offset: usize| -> [f32; 4] {
+        let read_vec4 = |offset: usize, fallback: [f32; 4]| -> [f32; 4] {
             if offset + 16 <= bytes.len() {
                 [
                     f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap()),
@@ -1529,44 +1563,63 @@ impl SceneRenderer {
                     f32::from_ne_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()),
                 ]
             } else {
-                [0.8, 0.6, 0.4, 1.0]
+                fallback
             }
         };
         MaterialUBO {
-            base_color: read_vec4(0),
+            base_color: read_vec4(0, [0.8, 0.6, 0.4, 1.0]),
             metallic: read_f32(16, 0.0).clamp(0.0, 1.0),
             roughness: read_f32(20, 1.0).clamp(0.04, 1.0),
             ao: read_f32(24, 1.0).clamp(0.0, 1.0),
-            _padding: [0.0],
+            alpha_cutoff: read_f32(28, -1.0),
+            emissive: read_vec4(32, [0.0; 4]),
         }
     }
 
-    fn selected_material_texture_id(
+    fn material_texture_flags(material: &MaterialBinding) -> f32 {
+        MATERIAL_TEXTURE_BINDINGS
+            .iter()
+            .enumerate()
+            .fold(0_u32, |flags, (index, binding)| {
+                flags
+                    | (u32::from(
+                        material
+                            .textures
+                            .iter()
+                            .any(|slot| slot.binding == *binding),
+                    ) << index)
+            }) as f32
+    }
+
+    fn selected_material_texture_ids(
         &self,
         material: &MaterialBinding,
-    ) -> Result<String, Vec<Diagnostic>> {
+    ) -> Result<[String; 5], Vec<Diagnostic>> {
         use crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID;
 
-        let Some(slot) = material
-            .textures
-            .iter()
-            .find(|slot| slot.binding == 1)
-            .or_else(|| material.textures.first())
-        else {
-            return Ok(FALLBACK_MATERIAL_TEXTURE_ID.to_string());
-        };
-        if !self.device.textures.contains_key(&slot.texture.id) {
-            return Err(vec![Diagnostic::new(
-                "RV0260",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!(
-                    "material '{}' references texture '{}' before a successful upload",
-                    material.material_id.id, slot.texture.id
-                ),
-            )]);
+        let mut selected = std::array::from_fn(|_| FALLBACK_MATERIAL_TEXTURE_ID.to_string());
+        for (index, binding) in MATERIAL_TEXTURE_BINDINGS.into_iter().enumerate() {
+            let Some(slot) = material
+                .textures
+                .iter()
+                .find(|slot| slot.binding == binding)
+            else {
+                continue;
+            };
+            if !self.device.textures.contains_key(&slot.texture.id) {
+                return Err(vec![Diagnostic::new(
+                    "RV0260",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!(
+                        "material '{}' references texture '{}' at binding {} before a successful upload",
+                        material.material_id.id, slot.texture.id, binding
+                    ),
+                )]);
+            }
+            selected[index] = slot.texture.id.clone();
         }
-        Ok(slot.texture.id.clone())
+        Ok(selected)
     }
 
     fn bind_material_texture_if_changed(
@@ -1575,12 +1628,12 @@ impl SceneRenderer {
         material: &MaterialBinding,
         descriptor_set: vk::DescriptorSet,
     ) -> Result<(), Vec<Diagnostic>> {
-        let selected = self.selected_material_texture_id(material)?;
+        let selected = self.selected_material_texture_ids(material)?;
         let current = self
             .material_cache
             .get(material_id)
-            .map(|entry| entry.bound_texture_id.clone())
-            .unwrap_or_default();
+            .map(|entry| entry.bound_texture_ids.clone())
+            .unwrap_or_else(|| std::array::from_fn(|_| String::new()));
         if current == selected {
             return Ok(());
         }
@@ -1592,27 +1645,38 @@ impl SceneRenderer {
                 format!("cannot update in-flight material texture: {error:?}"),
             )]
         })?;
-        let bound = self
-            .device
-            .bind_material_texture(&selected, descriptor_set)
-            .map_err(|error| {
-                vec![Diagnostic::new(
-                    "RV0262",
+        for (index, binding) in MATERIAL_TEXTURE_BINDINGS.into_iter().enumerate() {
+            if current[index] == selected[index] {
+                continue;
+            }
+            let bound = self
+                .device
+                .bind_material_texture_at(&selected[index], binding, descriptor_set)
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0262",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!(
+                            "bind material texture '{}' at binding {binding}: {error:?}",
+                            selected[index]
+                        ),
+                    )]
+                })?;
+            if !bound {
+                return Err(vec![Diagnostic::new(
+                    "RV0263",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    format!("bind material texture '{selected}': {error:?}"),
-                )]
-            })?;
-        if !bound {
-            return Err(vec![Diagnostic::new(
-                "RV0263",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("material texture '{selected}' disappeared before descriptor update"),
-            )]);
+                    format!(
+                        "material texture '{}' disappeared before descriptor update",
+                        selected[index]
+                    ),
+                )]);
+            }
         }
         if let Some(entry) = self.material_cache.get_mut(material_id) {
-            entry.bound_texture_id = selected;
+            entry.bound_texture_ids = selected;
         }
         Ok(())
     }
@@ -1623,12 +1687,12 @@ impl SceneRenderer {
         material: &MaterialBinding,
         descriptor_set: vk::DescriptorSet,
     ) -> Result<(), Vec<Diagnostic>> {
-        let selected = self.selected_material_texture_id(material)?;
+        let selected = self.selected_material_texture_ids(material)?;
         let current = self
             .skinned_desc_cache
             .get(cache_key)
-            .map(|entry| entry.bound_texture_id.clone())
-            .unwrap_or_default();
+            .map(|entry| entry.bound_texture_ids.clone())
+            .unwrap_or_else(|| std::array::from_fn(|_| String::new()));
         if current == selected {
             return Ok(());
         }
@@ -1640,27 +1704,38 @@ impl SceneRenderer {
                 format!("cannot update in-flight skinned texture: {error:?}"),
             )]
         })?;
-        let bound = self
-            .device
-            .bind_material_texture(&selected, descriptor_set)
-            .map_err(|error| {
-                vec![Diagnostic::new(
-                    "RV0265",
+        for (index, binding) in MATERIAL_TEXTURE_BINDINGS.into_iter().enumerate() {
+            if current[index] == selected[index] {
+                continue;
+            }
+            let bound = self
+                .device
+                .bind_material_texture_at(&selected[index], binding, descriptor_set)
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0265",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!(
+                            "bind skinned texture '{}' at binding {binding}: {error:?}",
+                            selected[index]
+                        ),
+                    )]
+                })?;
+            if !bound {
+                return Err(vec![Diagnostic::new(
+                    "RV0266",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    format!("bind skinned texture '{selected}': {error:?}"),
-                )]
-            })?;
-        if !bound {
-            return Err(vec![Diagnostic::new(
-                "RV0266",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("skinned texture '{selected}' disappeared before descriptor update"),
-            )]);
+                    format!(
+                        "skinned texture '{}' disappeared before descriptor update",
+                        selected[index]
+                    ),
+                )]);
+            }
         }
         if let Some(entry) = self.skinned_desc_cache.get_mut(cache_key) {
-            entry.bound_texture_id = selected;
+            entry.bound_texture_ids = selected;
         }
         Ok(())
     }
@@ -1672,12 +1747,12 @@ impl SceneRenderer {
         material_id: &str,
         ubo_data: &[u8],
     ) -> Result<(vk::DescriptorSet, vk::Buffer), Vec<Diagnostic>> {
-        let ubo_array: [u8; 32] = ubo_data.try_into().map_err(|_| {
+        let ubo_array: [u8; MATERIAL_UBO_SIZE] = ubo_data.try_into().map_err(|_| {
             vec![Diagnostic::new(
                 "RV0250",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                "material UBO must be exactly 32 bytes",
+                format!("material UBO must be exactly {MATERIAL_UBO_SIZE} bytes"),
             )]
         })?;
         // Check cache first (and move to front for LRU)
@@ -1730,9 +1805,9 @@ impl SceneRenderer {
             )]);
         }
 
-        // Create a small UBO buffer (32 bytes for MaterialUBO)
+        // Create a small UBO buffer for MaterialUBO.
         let buf_desc = BufferDescriptor {
-            size_bytes: 32,
+            size_bytes: MATERIAL_UBO_SIZE as u64,
             usage_flags: render_core::BufferUsage::UNIFORM,
             memory_hint: MemoryHint::CpuToGpu,
             debug_label: Some(format!("mat-ubo-{material_id}")),
@@ -1773,7 +1848,10 @@ impl SceneRenderer {
         }
 
         // Allocate and update descriptor set via the device
-        let desc_set = match self.device.allocate_material_descriptor_set(vk_buf, 32) {
+        let desc_set = match self
+            .device
+            .allocate_material_descriptor_set(vk_buf, MATERIAL_UBO_SIZE as u64)
+        {
             Ok(desc_set) => desc_set,
             Err(error) => {
                 self.device.destroy_buffer(buf);
@@ -1791,7 +1869,9 @@ impl SceneRenderer {
             handle: buf,
             buffer: vk_buf,
             ubo_data: ubo_array,
-            bound_texture_id: crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID.to_string(),
+            bound_texture_ids: std::array::from_fn(|_| {
+                crate::device_impl::texture::FALLBACK_MATERIAL_TEXTURE_ID.to_string()
+            }),
         };
         self.material_cache.insert(material_id.to_string(), entry);
         self.material_cache_order.push(material_id.to_string());
@@ -2286,9 +2366,35 @@ impl SceneRenderer {
             }
         }
 
-        // Draw calls with dynamic batching (drawables pre-sorted by (material, mesh))
+        // Opaque/masked drawables retain extraction order for batching. Blended
+        // drawables render afterwards, back-to-front, with depth writes disabled.
+        let camera_position = Mat4::from_cols_array(&render_view.view_matrix)
+            .inverse()
+            .w_axis
+            .truncate();
+        let mut ordered_drawables = Vec::with_capacity(input.drawables.len());
+        let mut blended_drawables = Vec::new();
+        for drawable in &input.drawables {
+            let material = self.material_binding_for_drawable(input, &drawable.material)?;
+            if matches!(material.transparency, engine_renderer::Transparency::Blend) {
+                let translation = Vec3::new(
+                    drawable.world_transform[12],
+                    drawable.world_transform[13],
+                    drawable.world_transform[14],
+                );
+                blended_drawables
+                    .push(((translation - camera_position).length_squared(), drawable));
+            } else {
+                ordered_drawables.push(drawable);
+            }
+        }
+        blended_drawables.sort_by(|left, right| right.0.total_cmp(&left.0));
+        ordered_drawables.extend(blended_drawables.into_iter().map(|(_, drawable)| drawable));
+
+        // Draw calls with dynamic batching.
         let mut last_material_id: Option<&str> = None;
         let mut last_mesh_id: Option<&str> = None;
+        let mut current_material_pipeline = hdr_pl;
         #[allow(unused_assignments)]
         let mut cached_vb = vk::Buffer::null();
         #[allow(unused_assignments)]
@@ -2296,7 +2402,7 @@ impl SceneRenderer {
         #[allow(unused_assignments)]
         let mut cached_idx_ty = vk::IndexType::UINT32;
         let mut cached_index_count = 0u32;
-        for drawable in &input.drawables {
+        for drawable in ordered_drawables {
             let mesh_id = &drawable.mesh.id;
             let material_id = &drawable.material.id;
 
@@ -2349,7 +2455,40 @@ impl SceneRenderer {
             // Skip material descriptor rebind when same as last drawable
             if Some(material_id.as_str()) != last_material_id {
                 let material = self.material_binding_for_drawable(input, &drawable.material)?;
-                let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+                let next_pipeline = match (&material.transparency, material.double_sided) {
+                    (engine_renderer::Transparency::Blend, true) => self
+                        .device
+                        .hdr_forward_blend_double_sided_pipeline
+                        .unwrap_or(vk::Pipeline::null()),
+                    (engine_renderer::Transparency::Blend, false) => self
+                        .device
+                        .hdr_forward_blend_pipeline
+                        .unwrap_or(vk::Pipeline::null()),
+                    (_, true) => self
+                        .device
+                        .hdr_forward_double_sided_pipeline
+                        .unwrap_or(vk::Pipeline::null()),
+                    (_, false) => hdr_pl,
+                };
+                if next_pipeline == vk::Pipeline::null() {
+                    return Err(vec![Diagnostic::new(
+                        "RV0322",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!(
+                            "material '{}' requires an unavailable surface pipeline",
+                            material.material_id.id
+                        ),
+                    )]);
+                }
+                if next_pipeline != current_material_pipeline {
+                    unsafe {
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, next_pipeline);
+                    }
+                    current_material_pipeline = next_pipeline;
+                }
+                let mut material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+                material_ubo.emissive[3] = Self::material_texture_flags(&material);
                 let ubo_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
                         &material_ubo as *const _ as *const u8,
@@ -2396,6 +2535,25 @@ impl SceneRenderer {
             stats.triangles += cached_index_count as u64 / 3;
         }
 
+        // Skinned items use the same surface variants and transparent ordering.
+        let mut ordered_skinned = Vec::with_capacity(input.skinned_items.len());
+        let mut blended_skinned = Vec::new();
+        for item in &input.skinned_items {
+            let material = self.material_binding_for_drawable(input, &item.material)?;
+            if matches!(material.transparency, engine_renderer::Transparency::Blend) {
+                let translation = Vec3::new(
+                    item.world_transform[12],
+                    item.world_transform[13],
+                    item.world_transform[14],
+                );
+                blended_skinned.push(((translation - camera_position).length_squared(), item));
+            } else {
+                ordered_skinned.push(item);
+            }
+        }
+        blended_skinned.sort_by(|left, right| right.0.total_cmp(&left.0));
+        ordered_skinned.extend(blended_skinned.into_iter().map(|(_, item)| item));
+
         // Skinned items (less batching opportunity due to unique per-item bone data)
         let mut last_skinned_mesh: Option<&str> = None;
         #[allow(unused_assignments)]
@@ -2405,7 +2563,7 @@ impl SceneRenderer {
         #[allow(unused_assignments)]
         let mut skinned_cached_idx_ty = vk::IndexType::UINT32;
         let mut skinned_cached_index_count = 0u32;
-        for skinned in &input.skinned_items {
+        for skinned in ordered_skinned {
             let mesh_id = &skinned.mesh.id;
             let material_id = &skinned.material.id;
 
@@ -2460,7 +2618,40 @@ impl SceneRenderer {
 
             // Per-item: material descriptor, bone buffer, skinned descriptor set
             let material = self.material_binding_for_drawable(input, &skinned.material)?;
-            let material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+            let next_pipeline = match (&material.transparency, material.double_sided) {
+                (engine_renderer::Transparency::Blend, true) => self
+                    .device
+                    .hdr_forward_blend_double_sided_pipeline
+                    .unwrap_or(vk::Pipeline::null()),
+                (engine_renderer::Transparency::Blend, false) => self
+                    .device
+                    .hdr_forward_blend_pipeline
+                    .unwrap_or(vk::Pipeline::null()),
+                (_, true) => self
+                    .device
+                    .hdr_forward_double_sided_pipeline
+                    .unwrap_or(vk::Pipeline::null()),
+                (_, false) => hdr_pl,
+            };
+            if next_pipeline == vk::Pipeline::null() {
+                return Err(vec![Diagnostic::new(
+                    "RV0322",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!(
+                        "material '{}' requires an unavailable surface pipeline",
+                        material.material_id.id
+                    ),
+                )]);
+            }
+            if next_pipeline != current_material_pipeline {
+                unsafe {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, next_pipeline);
+                }
+                current_material_pipeline = next_pipeline;
+            }
+            let mut material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+            material_ubo.emissive[3] = Self::material_texture_flags(&material);
             let ubo_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(
                     &material_ubo as *const _ as *const u8,
@@ -2681,6 +2872,14 @@ impl SceneRenderer {
             let mut shadow_cached_index_count = 0u32;
             for drawable in &input.drawables {
                 if !drawable.cast_shadows {
+                    last_shadow_mesh = None;
+                    continue;
+                }
+                if matches!(
+                    self.material_binding_for_drawable(input, &drawable.material)?
+                        .transparency,
+                    engine_renderer::Transparency::Blend
+                ) {
                     last_shadow_mesh = None;
                     continue;
                 }
@@ -3674,17 +3873,25 @@ impl BackendRenderer for SceneRenderer {
                 )]);
             }
         }
-        let descriptor_sets: Vec<vk::DescriptorSet> = self
+        let descriptor_targets: Vec<(vk::DescriptorSet, u32)> = self
             .material_cache
             .values()
-            .filter(|entry| entry.bound_texture_id == texture_id)
-            .map(|entry| entry.desc_set)
-            .chain(
-                self.skinned_desc_cache
-                    .values()
-                    .filter(|entry| entry.bound_texture_id == texture_id)
-                    .map(|entry| entry.desc_set),
-            )
+            .flat_map(|entry| {
+                entry
+                    .bound_texture_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bound)| *bound == &texture_id)
+                    .map(|(index, _)| (entry.desc_set, MATERIAL_TEXTURE_BINDINGS[index]))
+            })
+            .chain(self.skinned_desc_cache.values().flat_map(|entry| {
+                entry
+                    .bound_texture_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bound)| *bound == &texture_id)
+                    .map(|(index, _)| (entry.desc_set, MATERIAL_TEXTURE_BINDINGS[index]))
+            }))
             .collect();
         let mut old_texture = self.device.textures.insert(texture_id.clone(), new_texture);
         let mut rebind_diagnostics = Vec::new();
@@ -3699,10 +3906,10 @@ impl BackendRenderer for SceneRenderer {
                 format!("failed to rebind replacement UI texture '{texture_id}': {error}"),
             ));
         }
-        for descriptor_set in descriptor_sets.iter().copied() {
+        for (descriptor_set, binding) in descriptor_targets.iter().copied() {
             match self
                 .device
-                .bind_material_texture(&texture_id, descriptor_set)
+                .bind_material_texture_at(&texture_id, binding, descriptor_set)
             {
                 Ok(true) => {}
                 Ok(false) => rebind_diagnostics.push(Diagnostic::new(
@@ -3740,10 +3947,10 @@ impl BackendRenderer for SceneRenderer {
                         ),
                     ));
                 }
-                for descriptor_set in descriptor_sets {
+                for (descriptor_set, binding) in descriptor_targets {
                     match self
                         .device
-                        .bind_material_texture(&texture_id, descriptor_set)
+                        .bind_material_texture_at(&texture_id, binding, descriptor_set)
                     {
                         Ok(true) => {}
                         Ok(false) => rebind_diagnostics.push(Diagnostic::new(
@@ -3787,7 +3994,7 @@ impl BackendRenderer for SceneRenderer {
         &mut self,
         upload: MaterialUpload,
     ) -> Result<UploadReceipt, Vec<Diagnostic>> {
-        if let Some(texture) = &upload.base_color_texture {
+        for texture in upload.texture_references().into_iter().flatten() {
             if !self.device.textures.contains_key(&texture.id) {
                 return Err(vec![Diagnostic::new(
                     "RV0240",
@@ -3875,23 +4082,39 @@ impl BackendRenderer for SceneRenderer {
                         format!("cannot remove in-flight texture '{resource_id}': {error:?}"),
                     )]
                 })?;
-                let material_keys: Vec<String> = self
+                let material_keys: Vec<(String, usize)> = self
                     .material_cache
                     .iter()
-                    .filter(|(_, entry)| entry.bound_texture_id == resource_id)
-                    .map(|(key, _)| key.clone())
+                    .flat_map(|(key, entry)| {
+                        entry
+                            .bound_texture_ids
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, bound)| bound.as_str() == resource_id)
+                            .map(|(index, _)| (key.clone(), index))
+                    })
                     .collect();
-                let skinned_keys: Vec<String> = self
+                let skinned_keys: Vec<(String, usize)> = self
                     .skinned_desc_cache
                     .iter()
-                    .filter(|(_, entry)| entry.bound_texture_id == resource_id)
-                    .map(|(key, _)| key.clone())
+                    .flat_map(|(key, entry)| {
+                        entry
+                            .bound_texture_ids
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, bound)| bound.as_str() == resource_id)
+                            .map(|(index, _)| (key.clone(), index))
+                    })
                     .collect();
-                for key in &material_keys {
+                for (key, index) in &material_keys {
                     let descriptor_set = self.material_cache[key].desc_set;
                     let bound = self
                         .device
-                        .bind_material_texture(FALLBACK_MATERIAL_TEXTURE_ID, descriptor_set)
+                        .bind_material_texture_at(
+                            FALLBACK_MATERIAL_TEXTURE_ID,
+                            MATERIAL_TEXTURE_BINDINGS[*index],
+                            descriptor_set,
+                        )
                         .map_err(|error| {
                             vec![Diagnostic::new(
                                 "RV0280",
@@ -3911,11 +4134,15 @@ impl BackendRenderer for SceneRenderer {
                         )]);
                     }
                 }
-                for key in &skinned_keys {
+                for (key, index) in &skinned_keys {
                     let descriptor_set = self.skinned_desc_cache[key].desc_set;
                     let bound = self
                         .device
-                        .bind_material_texture(FALLBACK_MATERIAL_TEXTURE_ID, descriptor_set)
+                        .bind_material_texture_at(
+                            FALLBACK_MATERIAL_TEXTURE_ID,
+                            MATERIAL_TEXTURE_BINDINGS[*index],
+                            descriptor_set,
+                        )
                         .map_err(|error| {
                             vec![Diagnostic::new(
                                 "RV0282",
@@ -3935,14 +4162,14 @@ impl BackendRenderer for SceneRenderer {
                         )]);
                     }
                 }
-                for key in material_keys {
+                for (key, index) in material_keys {
                     if let Some(entry) = self.material_cache.get_mut(&key) {
-                        entry.bound_texture_id = FALLBACK_MATERIAL_TEXTURE_ID.to_owned();
+                        entry.bound_texture_ids[index] = FALLBACK_MATERIAL_TEXTURE_ID.to_owned();
                     }
                 }
-                for key in skinned_keys {
+                for (key, index) in skinned_keys {
                     if let Some(entry) = self.skinned_desc_cache.get_mut(&key) {
-                        entry.bound_texture_id = FALLBACK_MATERIAL_TEXTURE_ID.to_owned();
+                        entry.bound_texture_ids[index] = FALLBACK_MATERIAL_TEXTURE_ID.to_owned();
                     }
                 }
                 self.device
@@ -4042,6 +4269,87 @@ mod tests {
     use render_core::PipelineHandle;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn surface_upload(
+        transparency: engine_renderer::Transparency,
+        double_sided: bool,
+    ) -> MaterialUpload {
+        MaterialUpload {
+            material_id: AssetId::new("material.surface"),
+            base_color: [0.2, 0.3, 0.4, 0.6],
+            metallic: 0.1,
+            roughness: 0.7,
+            ambient_occlusion: 0.8,
+            emissive: [0.05, 0.1, 0.15],
+            base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
+            transparency,
+            double_sided,
+            content_hash: [7; 32],
+        }
+    }
+
+    #[test]
+    fn uploaded_material_binding_preserves_surface_state_and_mask_cutoff() {
+        let binding = uploaded_material_binding(&surface_upload(
+            engine_renderer::Transparency::Masked { cutoff: 0.37 },
+            true,
+        ));
+        assert_eq!(
+            binding.transparency,
+            engine_renderer::Transparency::Masked { cutoff: 0.37 }
+        );
+        assert!(binding.double_sided);
+        assert_eq!(
+            SceneRenderer::parse_material_ubo(&binding.uniforms.bytes).alpha_cutoff,
+            0.37
+        );
+        assert_eq!(
+            SceneRenderer::parse_material_ubo(&binding.uniforms.bytes).emissive,
+            [0.05, 0.1, 0.15, 0.0]
+        );
+        assert_eq!(binding.uniforms.bytes.len(), MATERIAL_UBO_SIZE);
+
+        let blended =
+            uploaded_material_binding(&surface_upload(engine_renderer::Transparency::Blend, false));
+        assert_eq!(
+            SceneRenderer::parse_material_ubo(&blended.uniforms.bytes).alpha_cutoff,
+            -1.0
+        );
+    }
+
+    #[test]
+    fn uploaded_material_binding_preserves_all_pbr_texture_slots_and_flags() {
+        let mut upload = surface_upload(engine_renderer::Transparency::Opaque, false);
+        upload.base_color_texture = Some(AssetId::new("base"));
+        upload.normal_texture = Some(AssetId::new("normal"));
+        upload.metallic_roughness_texture = Some(AssetId::new("metallic-roughness"));
+        upload.occlusion_texture = Some(AssetId::new("occlusion"));
+        upload.emissive_texture = Some(AssetId::new("emissive"));
+        let binding = uploaded_material_binding(&upload);
+        assert_eq!(
+            binding
+                .textures
+                .iter()
+                .map(|slot| (slot.binding, slot.texture.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "base"),
+                (3, "normal"),
+                (4, "metallic-roughness"),
+                (5, "occlusion"),
+                (6, "emissive"),
+            ]
+        );
+        assert_eq!(
+            SceneRenderer::parse_material_ubo(&binding.uniforms.bytes).emissive[3],
+            31.0
+        );
+        assert_eq!(SceneRenderer::material_texture_flags(&binding), 31.0);
+    }
 
     struct MockDevice {
         next_index: u32,

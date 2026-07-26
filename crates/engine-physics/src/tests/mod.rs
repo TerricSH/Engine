@@ -1,10 +1,13 @@
 use crate::{
-    BodyType, Collider, ColliderDebugInfo, ColliderShape, CollisionEvent, CollisionEventKind,
-    Component, Entity, JointDescriptor, JointType, PhysicsCommand, PhysicsEvents, PhysicsMaterial,
-    PhysicsWorld, RapierBackend, RigidBody, Transform, TriggerEvent, TriggerEventKind,
+    apply_damage, BodyType, Collider, ColliderDebugInfo, ColliderShape, CollisionEvent,
+    CollisionEventKind, Component, DamageKind, DamageRequest, Destructible, Entity,
+    JointDescriptor, JointLimits, JointMotor, JointType, PhysicsCommand, PhysicsEvents,
+    PhysicsJoint, PhysicsMaterial, PhysicsWorld, RapierBackend, RigidBody, Transform, TriggerEvent,
+    TriggerEventKind,
 };
 use engine_renderer::DebugDrawProvider;
 use engine_scene::World;
+use glam::Vec3;
 
 fn entity(index: u32) -> Entity {
     Entity::new(index, 0)
@@ -75,6 +78,175 @@ fn physics_material_default_values() {
 #[test]
 fn physics_material_type_id() {
     assert_eq!(PhysicsMaterial::TYPE_ID, "engine.physics.physics_material");
+}
+
+#[test]
+fn persistent_joint_validates_authoring_contract() {
+    let joint = PhysicsJoint {
+        body_a: "door".into(),
+        body_b: "frame".into(),
+        joint_type: JointType::Revolute,
+        limits: Some(JointLimits {
+            min: -1.0,
+            max: 1.0,
+            stiffness: 0.0,
+            damping: 0.0,
+        }),
+        motor: Some(JointMotor {
+            target_vel: 1.0,
+            target_pos: 0.0,
+            stiffness: 10.0,
+            damping: 1.0,
+        }),
+        break_force: 500.0,
+        break_torque: 50.0,
+        ..PhysicsJoint::default()
+    };
+    assert_eq!(PhysicsJoint::TYPE_ID, "engine.physics.joint");
+    assert!(joint.validate().is_ok());
+
+    let mut invalid = joint.clone();
+    invalid.axis = [0.0; 3];
+    assert!(invalid.validate().is_err());
+    invalid = joint.clone();
+    invalid.body_b = invalid.body_a.clone();
+    assert!(invalid.validate().is_err());
+    invalid = joint;
+    invalid.break_force = f32::NAN;
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn persistent_joint_scene_fields_roundtrip_all_runtime_rebuild_data() {
+    let expected = PhysicsJoint {
+        enabled: true,
+        body_a: "frame".into(),
+        body_b: "door".into(),
+        joint_type: JointType::Revolute,
+        anchor_a: [1.0, 2.0, 3.0],
+        anchor_b: [-1.0, 0.5, 0.0],
+        axis: [0.0, 1.0, 0.0],
+        limits: Some(JointLimits {
+            min: -1.25,
+            max: 1.25,
+            stiffness: 40.0,
+            damping: 4.0,
+        }),
+        motor: Some(JointMotor {
+            target_vel: 2.0,
+            target_pos: 0.5,
+            stiffness: 12.0,
+            damping: 1.5,
+        }),
+        break_force: 5000.0,
+        break_torque: 750.0,
+    };
+    let fields = crate::serde::serialize_physics_joint(&expected);
+    let decoded = crate::serde::deserialize_physics_joint(&fields)
+        .downcast::<PhysicsJoint>()
+        .unwrap();
+    assert_eq!(*decoded, expected);
+}
+
+#[test]
+fn destructible_damage_respects_threshold_scale_and_breaks_once() {
+    let mut world = World::new();
+    let target = world.create_entity();
+    world.add_component(
+        target,
+        Destructible {
+            max_health: 50.0,
+            health: 50.0,
+            minimum_damage: 5.0,
+            damage_scale: 2.0,
+            replacement_prefab: Some(engine_serialize::AssetId::new("crate.fragments")),
+            ..Destructible::default()
+        },
+    );
+    let ignored = apply_damage(
+        &mut world,
+        target,
+        &DamageRequest {
+            source: None,
+            amount: 4.0,
+            kind: DamageKind::Impact,
+            hit_position: None,
+            impulse: [0.0; 3],
+        },
+    )
+    .unwrap();
+    assert!(ignored.is_none());
+
+    let damaged = apply_damage(
+        &mut world,
+        target,
+        &DamageRequest {
+            source: None,
+            amount: 10.0,
+            kind: DamageKind::Bullet,
+            hit_position: Some([1.0, 2.0, 3.0]),
+            impulse: [2.0, 0.0, 0.0],
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(damaged.applied_damage, 20.0);
+    assert_eq!(damaged.remaining_health, 30.0);
+    assert!(!damaged.broke);
+
+    let broken = apply_damage(
+        &mut world,
+        target,
+        &DamageRequest {
+            source: None,
+            amount: 100.0,
+            kind: DamageKind::Blast,
+            hit_position: None,
+            impulse: [3.0, 0.0, 0.0],
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert!(broken.broke);
+    assert_eq!(broken.remaining_health, 0.0);
+    assert_eq!(
+        broken.replacement_prefab.unwrap().id,
+        "crate.fragments".to_string()
+    );
+    assert!(apply_damage(
+        &mut world,
+        target,
+        &DamageRequest {
+            source: None,
+            amount: 1.0,
+            kind: DamageKind::Generic,
+            hit_position: None,
+            impulse: [0.0; 3],
+        },
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[test]
+fn destructible_scene_fields_roundtrip_runtime_state_and_replacement() {
+    let expected = Destructible {
+        enabled: false,
+        max_health: 40.0,
+        health: 0.0,
+        minimum_damage: 3.0,
+        damage_scale: 0.5,
+        replacement_prefab: Some(engine_serialize::AssetId::new("broken.wall")),
+        destroy_on_break: false,
+        inherit_velocity: false,
+        fracture_impulse_scale: 2.5,
+        broken: true,
+    };
+    let fields = crate::serde::serialize_destructible(&expected);
+    let decoded = crate::serde::deserialize_destructible(&fields)
+        .downcast::<Destructible>()
+        .unwrap();
+    assert_eq!(*decoded, expected);
 }
 
 #[test]
@@ -1235,6 +1407,41 @@ fn set_body_position_command() {
 }
 
 #[test]
+fn set_body_type_command_updates_backend_and_scene_component_without_rebuild() {
+    let mut physics = PhysicsWorld::new(Vec3::new(0.0, -9.81, 0.0));
+    let mut ecs = World::new();
+    let entity = ecs.create_entity();
+    ecs.add_component(entity, Transform::default());
+    ecs.add_component(
+        entity,
+        RigidBody {
+            body_type: BodyType::Kinematic,
+            ..RigidBody::default()
+        },
+    );
+    physics.step(0.0, &mut ecs);
+    assert_eq!(physics.body_count(), 1);
+
+    physics.queue_command(PhysicsCommand::SetBodyType {
+        entity,
+        body_type: BodyType::Dynamic,
+    });
+    physics.step(1.0 / 60.0, &mut ecs);
+
+    assert_eq!(physics.body_count(), 1);
+    assert_eq!(
+        ecs.get::<RigidBody>(entity).unwrap().body_type,
+        BodyType::Dynamic
+    );
+    let state = physics
+        .runtime_body_states()
+        .into_iter()
+        .find_map(|(candidate, state)| (candidate == entity).then_some(state))
+        .unwrap();
+    assert!(state.position[1] < 0.0, "{state:?}");
+}
+
+#[test]
 fn translate_bodies_teleports_positions_and_preserves_velocity() {
     let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
 
@@ -1911,6 +2118,179 @@ fn joints_are_keyed_by_complete_entity_and_removed_on_recycle() {
 }
 
 #[test]
+fn persistent_joint_component_syncs_updates_and_removes_incrementally() {
+    let mut ecs = World::new();
+    let body_a = ecs.create_persistent_entity("body-a").unwrap();
+    let body_b = ecs.create_persistent_entity("body-b").unwrap();
+    let constraint = ecs.create_persistent_entity("joint-door").unwrap();
+    for body in [body_a, body_b] {
+        ecs.add_component(body, Transform::default());
+        ecs.add_component(body, RigidBody::default());
+    }
+    ecs.add_component(
+        constraint,
+        PhysicsJoint {
+            body_a: "body-a".into(),
+            body_b: "body-b".into(),
+            ..PhysicsJoint::default()
+        },
+    );
+
+    let mut physics = PhysicsWorld::new(glam::Vec3::ZERO);
+    physics.sync_from_ecs(&ecs);
+    assert_eq!(physics.joint_count(), 1);
+
+    ecs.get_mut::<PhysicsJoint>(constraint).unwrap().break_force = 25.0;
+    physics.sync_from_ecs(&ecs);
+    assert_eq!(
+        physics.joint_count(),
+        1,
+        "editing a persistent joint replaces rather than duplicates it"
+    );
+
+    ecs.remove_component::<PhysicsJoint>(constraint);
+    physics.sync_from_ecs(&ecs);
+    assert_eq!(physics.joint_count(), 0);
+}
+
+#[test]
+fn break_force_removes_persistent_joint_and_reports_constraint_entity() {
+    let mut ecs = World::new();
+    let body_a = ecs.create_persistent_entity("anchor").unwrap();
+    let body_b = ecs.create_persistent_entity("crate").unwrap();
+    let constraint = ecs.create_persistent_entity("breakable-joint").unwrap();
+    ecs.add_component(body_a, Transform::default());
+    ecs.add_component(
+        body_a,
+        RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+    );
+    ecs.add_component(
+        body_b,
+        Transform {
+            translation: glam::Vec3::new(10.0, 0.0, 0.0),
+            ..Transform::default()
+        },
+    );
+    ecs.add_component(body_b, RigidBody::default());
+    ecs.add_component(body_b, Collider::default());
+    ecs.add_component(
+        constraint,
+        PhysicsJoint {
+            body_a: "anchor".into(),
+            body_b: "crate".into(),
+            break_force: 0.001,
+            ..PhysicsJoint::default()
+        },
+    );
+
+    let mut physics = PhysicsWorld::new(glam::Vec3::ZERO);
+    physics.step(0.0, &mut ecs);
+    assert_eq!(physics.joint_count(), 1);
+    physics
+        .backend
+        .apply_force(body_b, glam::Vec3::new(100.0, 0.0, 0.0));
+    physics.step(physics.fixed_timestep() * 1.5, &mut ecs);
+    assert_eq!(physics.joint_count(), 0);
+    assert!(ecs.get::<PhysicsJoint>(constraint).is_none());
+    let events = physics.drain_events();
+    assert_eq!(events.joint_break_count(), 1);
+    assert_eq!(events.joint_breaks[0].joint_entity, Some(constraint));
+    assert_eq!(events.joint_breaks[0].entity_a, body_a);
+    assert_eq!(events.joint_breaks[0].entity_b, body_b);
+    assert!(events.joint_breaks[0].force > 0.001);
+}
+
+#[test]
+fn break_torque_uses_solver_reaction_and_reports_measured_load() {
+    let mut ecs = World::new();
+    let body_a = ecs.create_persistent_entity("torque-anchor").unwrap();
+    let body_b = ecs.create_persistent_entity("torque-body").unwrap();
+    let constraint = ecs.create_persistent_entity("torque-joint").unwrap();
+    ecs.add_component(body_a, Transform::default());
+    ecs.add_component(
+        body_a,
+        RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+    );
+    ecs.add_component(body_b, Transform::default());
+    ecs.add_component(body_b, RigidBody::default());
+    ecs.add_component(body_b, Collider::default());
+    ecs.add_component(
+        constraint,
+        PhysicsJoint {
+            body_a: "torque-anchor".into(),
+            body_b: "torque-body".into(),
+            break_torque: 0.001,
+            ..PhysicsJoint::default()
+        },
+    );
+
+    let mut physics = PhysicsWorld::new(glam::Vec3::ZERO);
+    physics.step(0.0, &mut ecs);
+    physics
+        .backend
+        .apply_torque(body_b, glam::Vec3::new(0.0, 100.0, 0.0));
+    physics.step(physics.fixed_timestep() * 1.5, &mut ecs);
+
+    assert_eq!(physics.joint_count(), 0);
+    let events = physics.drain_events();
+    assert_eq!(events.joint_break_count(), 1);
+    assert_eq!(events.joint_breaks[0].joint_entity, Some(constraint));
+    assert!(events.joint_breaks[0].torque > 0.001);
+}
+
+#[test]
+fn rigid_body_runtime_state_roundtrips_velocity_pose_and_sleep() {
+    let mut physics = PhysicsWorld::new(glam::Vec3::ZERO);
+    let entity = Entity::new(12, 4);
+    physics
+        .backend
+        .create_body(entity, &RigidBody::default(), &Transform::default());
+    let expected = crate::RigidBodyRuntimeState {
+        position: [3.0, 4.0, 5.0],
+        rotation: glam::Quat::from_rotation_y(0.75).to_array(),
+        linear_velocity: [6.0, -2.0, 1.0],
+        angular_velocity: [0.5, 0.25, -0.75],
+        sleeping: false,
+    };
+
+    assert!(physics.restore_runtime_body_state(entity, &expected));
+    let states = physics.runtime_body_states();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].0, entity);
+    let actual = &states[0].1;
+    for (actual, expected) in actual
+        .position
+        .iter()
+        .chain(actual.rotation.iter())
+        .chain(actual.linear_velocity.iter())
+        .chain(actual.angular_velocity.iter())
+        .zip(
+            expected
+                .position
+                .iter()
+                .chain(expected.rotation.iter())
+                .chain(expected.linear_velocity.iter())
+                .chain(expected.angular_velocity.iter()),
+        )
+    {
+        assert!((actual - expected).abs() < 1.0e-5);
+    }
+    assert!(!actual.sleeping);
+
+    let invalid = crate::RigidBodyRuntimeState {
+        linear_velocity: [f32::NAN, 0.0, 0.0],
+        ..expected
+    };
+    assert!(!physics.restore_runtime_body_state(entity, &invalid));
+}
+
+#[test]
 fn events_preserve_entity_generations() {
     let mut backend = RapierBackend::new(glam::Vec3::ZERO);
     let sensor = Entity::new(1, 11);
@@ -2040,6 +2420,9 @@ fn physics_component_type_ids_are_unique() {
     assert_ne!(RigidBody::TYPE_ID, Collider::TYPE_ID);
     assert_ne!(RigidBody::TYPE_ID, PhysicsMaterial::TYPE_ID);
     assert_ne!(Collider::TYPE_ID, PhysicsMaterial::TYPE_ID);
+    assert_ne!(PhysicsJoint::TYPE_ID, RigidBody::TYPE_ID);
+    assert_ne!(PhysicsJoint::TYPE_ID, Collider::TYPE_ID);
+    assert_ne!(Destructible::TYPE_ID, PhysicsJoint::TYPE_ID);
 }
 
 #[test]
@@ -2054,12 +2437,16 @@ fn register_physics_extensions_adds_all_components() {
     assert!(component_registry.is_registered(RigidBody::TYPE_ID));
     assert!(component_registry.is_registered(Collider::TYPE_ID));
     assert!(component_registry.is_registered(PhysicsMaterial::TYPE_ID));
+    assert!(component_registry.is_registered(PhysicsJoint::TYPE_ID));
+    assert!(component_registry.is_registered(Destructible::TYPE_ID));
 
     // Verify that storages can be created.
     let storages = component_registry.create_storages();
     assert!(storages.contains_key(RigidBody::TYPE_ID));
     assert!(storages.contains_key(Collider::TYPE_ID));
     assert!(storages.contains_key(PhysicsMaterial::TYPE_ID));
+    assert!(storages.contains_key(PhysicsJoint::TYPE_ID));
+    assert!(storages.contains_key(Destructible::TYPE_ID));
 }
 
 #[test]

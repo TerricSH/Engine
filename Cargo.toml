@@ -25,6 +25,7 @@ members = [
     "crates/engine-terrain",
     "crates/engine-character",
     "crates/engine-gameplay",
+    "crates/engine-vfx",
     "crates/engine-ffi",
     "crates/sandbox",
 ]
@@ -69,6 +70,7 @@ tao = "0.35"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
+urlencoding = "2.1"
 windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",

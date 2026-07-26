@@ -5300,8 +5300,14 @@ mod tests {
             metallic: 0.2,
             roughness,
             ambient_occlusion: 0.9,
+            emissive: [0.0; 3],
             base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
             transparency: "Opaque".to_string(),
+            alpha_cutoff: 0.5,
             double_sided: false,
         }
     }

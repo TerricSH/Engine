@@ -13,11 +13,13 @@ pub mod debug;
 pub mod events;
 pub mod extract;
 pub mod foot_ik;
+pub mod gltf_import;
 pub mod ik;
 pub mod layers;
 pub mod loader;
 pub mod locomotion_clips;
 pub mod player;
+pub mod ragdoll;
 pub mod root_motion;
 pub mod state_machine;
 
@@ -35,12 +37,18 @@ pub use debug::{SkeletonDebugDraw, SkeletonDebugInfo};
 pub use events::{check_event_trigger, AnimEvent, AnimEventCollector, AnimEventDef};
 pub use extract::{bridge_skinned_items, PendingSkinnedItem, SkinnedExtractProducer};
 pub use foot_ik::*;
+pub use gltf_import::{import_gltf_animation_assets, skeleton_from_gltf_skin, ImportedGltfSkin};
 pub use ik::{
     solve_pose, solve_pose_multi, IkChain, IkConstraint, IkConstraintSet, IkDebugDraw, IkDebugInfo,
     IkEffector, IkEffectorSpace, IkSolverType,
 };
 pub use loader::{load_animation_clip, load_skeleton, register_asset_types};
 pub use player::{update_animation, AnimationEvaluator};
+pub use ragdoll::{
+    ExternalPoseOverride, RagdollBody, RagdollComponent, RagdollConstraint, RagdollJointType,
+    RagdollMode, RagdollPart, RagdollPartRole, RagdollShape, MAX_RAGDOLL_BODIES,
+    MAX_RAGDOLL_CONSTRAINTS,
+};
 pub use root_motion::{extract_root_motion, RootMotionApplyTo, RootMotionConfig, RootMotionDelta};
 
 pub use layers::{AnimLayer, LayerBlendMode};
@@ -87,6 +95,12 @@ pub fn register_animation_extensions(
     fn ik_target_storage() -> Box<dyn ComponentStorageDyn> {
         Box::new(SparseSet::<IkTargetComponent>::new())
     }
+    fn ragdoll_storage() -> Box<dyn ComponentStorageDyn> {
+        Box::new(SparseSet::<RagdollComponent>::new())
+    }
+    fn ragdoll_part_storage() -> Box<dyn ComponentStorageDyn> {
+        Box::new(SparseSet::<RagdollPart>::new())
+    }
 
     let _ = component_reg.register(ComponentExtension {
         meta: ComponentMeta {
@@ -99,6 +113,30 @@ pub fn register_animation_extensions(
         storage_factory: anim_player_storage,
         serialize: Some(component_serde::serialize_animation_player),
         deserialize: Some(component_serde::deserialize_animation_player),
+    });
+    let _ = component_reg.register(ComponentExtension {
+        meta: ComponentMeta {
+            type_id: RagdollPart::TYPE_ID,
+            display_name: "Ragdoll Part",
+            schema_version: (0, 1, 0),
+            has_editor: false,
+            script_access: engine_scene::ScriptAccess::None,
+        },
+        storage_factory: ragdoll_part_storage,
+        serialize: Some(ragdoll::serialize_ragdoll_part),
+        deserialize: Some(ragdoll::deserialize_ragdoll_part),
+    });
+    let _ = component_reg.register(ComponentExtension {
+        meta: ComponentMeta {
+            type_id: RagdollComponent::TYPE_ID,
+            display_name: "Ragdoll",
+            schema_version: (0, 1, 0),
+            has_editor: true,
+            script_access: engine_scene::ScriptAccess::DedicatedApi,
+        },
+        storage_factory: ragdoll_storage,
+        serialize: Some(ragdoll::serialize_ragdoll),
+        deserialize: Some(ragdoll::deserialize_ragdoll),
     });
     let _ = component_reg.register(ComponentExtension {
         meta: ComponentMeta {

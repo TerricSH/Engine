@@ -282,42 +282,67 @@ impl VulkanDevice {
         let vs = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
-        let rs = vk::PipelineRasterizationStateCreateInfo::default()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::CLOCKWISE)
-            .line_width(1.0);
         let ms = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        let blend_attachment = super::blend_attachment_from_mode("Alpha");
-        let cba = [blend_attachment];
-        let cb = vk::PipelineColorBlendStateCreateInfo::default()
-            .logic_op_enable(false)
-            .attachments(&cba);
-        let ds = vk::PipelineDepthStencilStateCreateInfo::default()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS);
         let dyns = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let ds2 = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyns);
-        let pinfo = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&sr)
-            .vertex_input_state(&vi)
-            .input_assembly_state(&ia)
-            .viewport_state(&vs)
-            .rasterization_state(&rs)
-            .multisample_state(&ms)
-            .depth_stencil_state(&ds)
-            .color_blend_state(&cb)
-            .dynamic_state(&ds2)
-            .layout(pll)
-            .render_pass(rp)
-            .subpass(0);
-        // SAFETY: `d` is a valid AshDevice; `pinfo` describes a valid graphics
-        // pipeline; `vk::PipelineCache::null()` is allowed.
-        let pipeline =
-            unsafe { d.create_graphics_pipelines(vk::PipelineCache::null(), &[pinfo], None) }
-                .map_err(|(_, r)| VulkanError::vk("cgp_hdr_forward", r))?[0];
+        let mut material_pipelines = Vec::with_capacity(4);
+        for (cull_mode, blend_mode, depth_write) in [
+            (vk::CullModeFlags::BACK, "Opaque", true),
+            (vk::CullModeFlags::NONE, "Opaque", true),
+            (vk::CullModeFlags::BACK, "Alpha", false),
+            (vk::CullModeFlags::NONE, "Alpha", false),
+        ] {
+            let raster = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(cull_mode)
+                .front_face(vk::FrontFace::CLOCKWISE)
+                .line_width(1.0);
+            let blend_attachments = [super::blend_attachment_from_mode(blend_mode)];
+            let blend = vk::PipelineColorBlendStateCreateInfo::default()
+                .logic_op_enable(false)
+                .attachments(&blend_attachments);
+            let depth = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(depth_write)
+                .depth_compare_op(vk::CompareOp::LESS);
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&sr)
+                .vertex_input_state(&vi)
+                .input_assembly_state(&ia)
+                .viewport_state(&vs)
+                .rasterization_state(&raster)
+                .multisample_state(&ms)
+                .depth_stencil_state(&depth)
+                .color_blend_state(&blend)
+                .dynamic_state(&ds2)
+                .layout(pll)
+                .render_pass(rp)
+                .subpass(0);
+            let pipeline_result = unsafe {
+                d.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            };
+            let pipeline = match pipeline_result {
+                Ok(pipelines) => pipelines[0],
+                Err((_, result)) => {
+                    unsafe {
+                        for pipeline in material_pipelines {
+                            d.destroy_pipeline(pipeline, None);
+                        }
+                        d.destroy_shader_module(vm, None);
+                        d.destroy_shader_module(fm, None);
+                        d.destroy_pipeline_layout(pll, None);
+                        d.destroy_render_pass(rp, None);
+                    }
+                    return Err(VulkanError::vk("cgp_hdr_forward_variant", result));
+                }
+            };
+            material_pipelines.push(pipeline);
+        }
+        let pipeline = material_pipelines[0];
+        let double_sided_pipeline = material_pipelines[1];
+        let blend_pipeline = material_pipelines[2];
+        let blend_double_sided_pipeline = material_pipelines[3];
 
         // SAFETY: shader modules are no longer needed after pipeline creation.
         unsafe {
@@ -358,12 +383,17 @@ impl VulkanDevice {
         let sky_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(&sky_blend_attachments);
+        let sky_raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0);
         let sky_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&sky_stages)
             .vertex_input_state(&sky_vi)
             .input_assembly_state(&ia)
             .viewport_state(&vs)
-            .rasterization_state(&rs)
+            .rasterization_state(&sky_raster)
             .multisample_state(&ms)
             .depth_stencil_state(&sky_depth)
             .color_blend_state(&sky_blend)
@@ -401,6 +431,9 @@ impl VulkanDevice {
         self.hdr_forward_rp = Some(rp);
         self.hdr_forward_pipeline_layout = Some(pll);
         self.hdr_forward_pipeline = Some(pipeline);
+        self.hdr_forward_double_sided_pipeline = Some(double_sided_pipeline);
+        self.hdr_forward_blend_pipeline = Some(blend_pipeline);
+        self.hdr_forward_blend_double_sided_pipeline = Some(blend_double_sided_pipeline);
         self.hdr_skybox_pipeline = Some(skybox_pipeline);
         self.hdr_forward_fb = Some(fb);
 
@@ -724,6 +757,21 @@ impl VulkanDevice {
             }
         }
         if let Some(p) = self.hdr_forward_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_forward_double_sided_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_forward_blend_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_forward_blend_double_sided_pipeline.take() {
             unsafe {
                 d.destroy_pipeline(p, None);
             }

@@ -515,6 +515,8 @@ fn animation_player_roundtrip() {
         state_machine: None,
         layers: vec![AnimLayer::new("base")],
         cached_bone_positions: Vec::new(),
+        cached_bone_transforms: Vec::new(),
+        external_pose_override: None,
     };
     let bytes = bincode::serialize(&p).unwrap();
     let restored: AnimationPlayer = bincode::deserialize(&bytes).unwrap();
@@ -1047,6 +1049,8 @@ fn register_animation_extensions_registers_components() {
 
     // Components
     assert!(component_reg.is_registered("engine.animation_player"));
+    assert!(component_reg.is_registered("engine.ragdoll"));
+    assert!(component_reg.is_registered("engine.ragdoll_part"));
     assert!(component_reg.is_registered("engine.skeleton"));
     assert!(component_reg.is_registered("engine.ik_target"));
 
@@ -1091,6 +1095,28 @@ fn update_animation_no_clip_returns_empty() {
     };
     let palette = update_animation(&mut player, None, Some(&skel), 1.0);
     assert!(palette.is_empty());
+}
+
+#[test]
+fn external_pose_override_owns_the_final_skinning_pose() {
+    let skel = old_test_skeleton();
+    let mut local = skel.rest_pose().local_transforms().to_vec();
+    local[0].translation = Vec3::new(2.0, 3.0, 4.0);
+    let mut player = AnimationPlayer::default();
+    player.external_pose_override = Some(ExternalPoseOverride {
+        local_transforms: local,
+        weight: 1.0,
+    });
+    let mut state_machine = None;
+
+    let palette = update_animation_pipeline(&mut player, &mut state_machine, &[], &skel, None, 0.0);
+
+    assert_eq!(palette.len(), skel.bone_count());
+    assert_eq!(
+        player.cached_bone_transforms[0].translation,
+        Vec3::new(2.0, 3.0, 4.0)
+    );
+    assert_eq!(player.cached_bone_positions[0], [2.0, 3.0, 4.0]);
 }
 
 #[test]
@@ -1163,6 +1189,24 @@ fn unified_skeleton_conversion() {
     assert_eq!(joint_map.len(), 2);
     assert_eq!(joint_map[0], BoneIndex(0));
     assert_eq!(joint_map[1], BoneIndex(1));
+}
+
+#[test]
+fn imported_inverse_bind_matrix_is_used_by_runtime_skinning() {
+    let inverse_bind = Mat4::from_translation(Vec3::new(-2.0, 0.0, 0.0)).to_cols_array_2d();
+    let asset = Skeleton {
+        joints: vec![Joint {
+            name: "root".into(),
+            parent_index: None,
+            local_transform: JointTransform::IDENTITY,
+        }],
+        inverse_bind_matrices: vec![inverse_bind],
+    };
+    let (runtime, _) = skeleton_asset_to_runtime(&asset);
+    let matrices = runtime.rest_pose().skin_matrices(&runtime);
+
+    assert_eq!(matrices.len(), 1);
+    assert!((matrices[0].w_axis.x + 2.0).abs() < 1e-5);
 }
 
 #[test]

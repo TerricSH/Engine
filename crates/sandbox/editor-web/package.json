@@ -10,7 +10,7 @@
     "check:contract": "node scripts/check-protocol-contract.mjs",
     "check:ui": "node scripts/check-ui-controls.mjs",
     "check:context-menu": "node scripts/check-context-menu-semantics.mjs",
-    "test:context-menu-geometry": "node --test src/components/ContextMenuGeometry.test.mjs",
+    "test:context-menu-geometry": "node --experimental-strip-types --test src/components/ContextMenuGeometry.test.mjs",
     "check:keyboard": "node scripts/check-keyboard-routing.mjs",
     "check:state": "node scripts/check-editor-state.mjs",
     "check:telemetry": "node scripts/check-telemetry-state.mjs"

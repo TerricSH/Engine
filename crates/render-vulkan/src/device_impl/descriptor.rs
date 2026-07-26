@@ -198,8 +198,8 @@ impl VulkanDevice {
         }
         let d = &self.logical_device.device;
 
-        // Layout: UBO at binding=0, combined image sampler at binding=1,
-        // bone UBO at binding=2 (used by skinned vertex shader).
+        // Layout: UBO at binding=0, base color sampler at binding=1, bone UBO
+        // at binding=2, then normal/MR/AO/emissive samplers at bindings 3..=6.
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -216,13 +216,33 @@ impl VulkanDevice {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::VERTEX),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let ds_layout = unsafe { d.create_descriptor_set_layout(&layout_info, None) }
             .map_err(|r| VulkanError::vk("create_material_ds_layout", r))?;
 
         // Pool: 256 material sets plus 64 skinned sets. Every set owns a
-        // sampler descriptor; skinned sets consume a second UBO descriptor.
+        // five sampler descriptors; skinned sets consume a second UBO descriptor.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -230,7 +250,7 @@ impl VulkanDevice {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 320,
+                descriptor_count: 1_600,
             },
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
@@ -299,6 +319,26 @@ impl VulkanDevice {
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(6)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
         ];
         // SAFETY: `d` is a valid AshDevice; descriptor set, buffer are valid.
         unsafe {
@@ -335,7 +375,7 @@ impl VulkanDevice {
     /// Used by skinned-item rendering: allocates from the material pool, writes
     /// the material UBO at binding=0 and the bone palette UBO at binding=2.
     /// The texture binding (binding=1) is left unwritten and can be updated
-    /// later via [`bind_material_texture`](Self::bind_material_texture).
+    /// later via [`bind_material_texture_at`](Self::bind_material_texture_at).
     pub(crate) fn allocate_skinned_material_descriptor_set(
         &self,
         material_buffer: vk::Buffer,
@@ -398,6 +438,26 @@ impl VulkanDevice {
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&buf_info[1..2]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(6)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
         ];
         // SAFETY: `d` is a valid AshDevice; descriptor set and buffers are valid.
         unsafe {

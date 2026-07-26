@@ -21,8 +21,9 @@ pub use component::{Component, ComponentStorageDyn, SparseSet};
 pub use entity::{Entity, EntityManager};
 pub use extraction::{
     aabb_in_frustum, active_camera_world_position, camera_relative_render_origin,
-    entity_world_position, extract_frustum_planes, extract_renderer_input_from_world,
-    extract_renderer_input_from_world_with_viewport, RenderViewportContext,
+    entity_world_position, entity_world_transform, extract_frustum_planes,
+    extract_renderer_input_from_world, extract_renderer_input_from_world_with_viewport,
+    render_layer_bit, RenderViewportContext,
 };
 pub use pool::{ObjectPool, ObjectPoolError};
 pub use prefab::{
@@ -45,7 +46,7 @@ pub use validation::{
     SceneAuthoringValidationError, SCENE_ONLY_COMPONENT_TYPES,
 };
 pub use world::merge::{DestroySubtreeError, DestroyedSubtree, MergeError};
-pub use world::{PersistentEntityCreateError, World};
+pub use world::{PersistentEntityCreateError, World, WorldOriginRestoreError};
 pub use world_slot::{WeakWorldSlot, WorldSlot};
 
 #[cfg(test)]

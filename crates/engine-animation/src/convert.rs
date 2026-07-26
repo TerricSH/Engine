@@ -85,6 +85,11 @@ pub fn skeleton_asset_to_runtime(
             joint.name.clone(),
             BoneTransform::from(joint.local_transform.clone()),
         );
+        if let Some(inverse_bind_matrix) =
+            asset_skel.inverse_bind_matrices.get(joint_index).copied()
+        {
+            runtime.set_inverse_bind_matrix(bone_idx, inverse_bind_matrix);
+        }
         joint_map.push(bone_idx);
     }
 

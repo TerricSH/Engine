@@ -40,6 +40,13 @@ pub enum PersistentEntityCreateError {
     AlreadyPersistent(String),
 }
 
+/// Invalid runtime origin supplied while restoring a save-game snapshot.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum WorldOriginRestoreError {
+    #[error("world origin must contain only finite values")]
+    NonFinite,
+}
+
 /// The ECS World — owns all entities and component storages.
 ///
 /// Provides typed component access, entity lifecycle management, and
@@ -155,6 +162,24 @@ impl World {
     /// loading a scene always starts at a zero origin.
     pub fn world_origin(&self) -> [f64; 3] {
         self.world_origin
+    }
+
+    /// Restore an already-rebased world's runtime origin without translating
+    /// any component data.
+    ///
+    /// This is intentionally distinct from [`Self::shift_world_origin`].
+    /// Save-game snapshots store both the origin and every origin-relative
+    /// component value, so translating the values again during restore would
+    /// double-apply the shift. Normal scene loading should never call this.
+    pub fn restore_world_origin(
+        &mut self,
+        origin: [f64; 3],
+    ) -> Result<(), WorldOriginRestoreError> {
+        if !origin.iter().all(|value| value.is_finite()) {
+            return Err(WorldOriginRestoreError::NonFinite);
+        }
+        self.world_origin = origin;
+        Ok(())
     }
 
     /// Shift the world origin by `delta`, preserving logical positions.
@@ -1235,5 +1260,30 @@ mod tests {
 
         world.clear();
         assert_eq!(world.world_origin(), [0.0; 3]);
+    }
+
+    #[test]
+    fn save_restore_origin_does_not_translate_relative_transforms_twice() {
+        let mut world = World::new();
+        let entity = world
+            .create_persistent_entity("saved")
+            .expect("persistent entity");
+        world.add_component(
+            entity,
+            Transform {
+                translation: glam::Vec3::new(12.0, 3.0, -4.0),
+                ..Transform::default()
+            },
+        );
+
+        world
+            .restore_world_origin([1000.0, 0.0, 250.0])
+            .expect("valid origin");
+        assert_eq!(world.world_origin(), [1000.0, 0.0, 250.0]);
+        assert_eq!(
+            world.get::<Transform>(entity).unwrap().translation,
+            glam::Vec3::new(12.0, 3.0, -4.0)
+        );
+        assert!(world.restore_world_origin([f64::NAN, 0.0, 0.0]).is_err());
     }
 }

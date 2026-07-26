@@ -70,13 +70,65 @@ pub enum GameplayPhysicsEventKind {
     TriggerEntered,
     TriggerStayed,
     TriggerExited,
+    JointBroken,
 }
 
 /// Entity-relative physics event exposed through the gameplay snapshot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GameplayPhysicsEvent {
     pub kind: GameplayPhysicsEventKind,
     pub other_entity_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torque: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameplayDamageKind {
+    #[default]
+    Generic,
+    Impact,
+    Bullet,
+    Blast,
+    Fire,
+}
+
+/// Frame-local result of one accepted damage request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameplayDamageEvent {
+    pub target_entity_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_entity_id: Option<String>,
+    pub damage_kind: GameplayDamageKind,
+    pub raw_damage: f32,
+    pub applied_damage: f32,
+    pub remaining_health: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_position: Option<[f32; 3]>,
+    pub impulse: [f32; 3],
+    pub broke: bool,
+    #[serde(default)]
+    pub spawned_entity_ids: Vec<String>,
+}
+
+pub const MAX_DAMAGE_AMOUNT: f32 = 1_000_000.0;
+pub const MAX_PENDING_DAMAGE_REQUESTS: usize = 256;
+pub const MAX_RAGDOLL_RECOVERY_SECONDS: f32 = 30.0;
+pub const MAX_PENDING_RAGDOLL_REQUESTS: usize = 64;
+/// Maximum movement speed a script may request from a character controller.
+pub const MAX_CHARACTER_CONTROL_SPEED: f32 = 100.0;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameplayRagdollEvent {
+    pub entity_id: String,
+    pub active: bool,
+    pub recovering: bool,
+    #[serde(default)]
+    pub body_entity_ids: Vec<String>,
 }
 
 /// Upper bound applied to script physics query distances and radii.
@@ -92,6 +144,227 @@ pub const MAX_PHYSICS_OVERLAP_RESULTS: usize = 64;
 /// Maximum script physics queries the runtime buffers from one command
 /// drain. Queries beyond the cap are rejected with a script diagnostic.
 pub const MAX_PENDING_PHYSICS_QUERIES: usize = 256;
+
+/// Maximum script physics mutations the runtime buffers from one command
+/// drain. Mutations beyond the cap are rejected with a script diagnostic.
+pub const MAX_PENDING_PHYSICS_MUTATIONS: usize = 256;
+
+/// Per-axis force/impulse bound accepted from untrusted script hosts.
+pub const MAX_PHYSICS_MUTATION_COMPONENT: f32 = 1_000_000.0;
+
+/// Joint type accepted by the script gameplay bridge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameplayJointType {
+    Fixed,
+    Revolute,
+    Prismatic,
+    Spherical,
+}
+
+/// Optional authored limits for a script-created joint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameplayJointLimits {
+    pub min: f32,
+    pub max: f32,
+    pub stiffness: f32,
+    pub damping: f32,
+}
+
+/// Optional motor configuration for a script-created joint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameplayJointMotor {
+    pub target_vel: f32,
+    pub target_pos: f32,
+    pub stiffness: f32,
+    pub damping: f32,
+}
+
+/// A bounded physics mutation requested by gameplay code.
+///
+/// The runtime resolves persistent IDs at the frame boundary and never
+/// exposes raw ECS or physics-backend handles to managed code.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GameplayPhysicsMutation {
+    ApplyForce {
+        entity_id: String,
+        force: [f32; 3],
+    },
+    ApplyImpulse {
+        entity_id: String,
+        impulse: [f32; 3],
+    },
+    ApplyTorque {
+        entity_id: String,
+        torque: [f32; 3],
+    },
+    ApplyTorqueImpulse {
+        entity_id: String,
+        torque_impulse: [f32; 3],
+    },
+    /// Create or replace a persistent joint. Reusing `joint_id` is the
+    /// supported way to update limits, motor targets, anchors, or break
+    /// thresholds without leaking backend handles.
+    CreateJoint {
+        joint_id: String,
+        body_a: String,
+        body_b: String,
+        joint_type: GameplayJointType,
+        anchor_a: [f32; 3],
+        anchor_b: [f32; 3],
+        axis: [f32; 3],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limits: Option<GameplayJointLimits>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        motor: Option<GameplayJointMotor>,
+        break_force: f32,
+        break_torque: f32,
+    },
+    RemoveJoint {
+        joint_id: String,
+    },
+}
+
+impl GameplayPhysicsMutation {
+    pub fn entity_id(&self) -> &str {
+        match self {
+            Self::ApplyForce { entity_id, .. }
+            | Self::ApplyImpulse { entity_id, .. }
+            | Self::ApplyTorque { entity_id, .. }
+            | Self::ApplyTorqueImpulse { entity_id, .. } => entity_id,
+            Self::CreateJoint { body_a, .. } => body_a,
+            Self::RemoveJoint { joint_id } => joint_id,
+        }
+    }
+
+    /// Persistent entities that must already exist when this command enters
+    /// the native runtime. A create-joint command deliberately omits its
+    /// `joint_id` because that dedicated constraint entity is created by the
+    /// engine.
+    pub fn required_existing_entity_ids(&self) -> Vec<&str> {
+        match self {
+            Self::ApplyForce { entity_id, .. }
+            | Self::ApplyImpulse { entity_id, .. }
+            | Self::ApplyTorque { entity_id, .. }
+            | Self::ApplyTorqueImpulse { entity_id, .. } => vec![entity_id],
+            Self::CreateJoint { body_a, body_b, .. } => vec![body_a, body_b],
+            Self::RemoveJoint { joint_id } => vec![joint_id],
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::ApplyForce { entity_id, force } => {
+                validate_entity_id(entity_id)?;
+                validate_physics_vector("force", force, false)
+            }
+            Self::ApplyImpulse { entity_id, impulse } => {
+                validate_entity_id(entity_id)?;
+                validate_physics_vector("impulse", impulse, false)
+            }
+            Self::ApplyTorque { entity_id, torque } => {
+                validate_entity_id(entity_id)?;
+                validate_physics_vector("torque", torque, false)
+            }
+            Self::ApplyTorqueImpulse {
+                entity_id,
+                torque_impulse,
+            } => {
+                validate_entity_id(entity_id)?;
+                validate_physics_vector("torque impulse", torque_impulse, false)
+            }
+            Self::CreateJoint {
+                joint_id,
+                body_a,
+                body_b,
+                joint_type,
+                anchor_a,
+                anchor_b,
+                axis,
+                limits,
+                motor,
+                break_force,
+                break_torque,
+            } => {
+                validate_entity_id(joint_id)?;
+                validate_entity_id(body_a)?;
+                validate_entity_id(body_b)?;
+                if body_a == body_b {
+                    return Err("joint body_a and body_b must name different entities".into());
+                }
+                validate_physics_vector("joint anchor_a", anchor_a, false)?;
+                validate_physics_vector("joint anchor_b", anchor_b, false)?;
+                validate_physics_vector("joint axis", axis, false)?;
+                if matches!(
+                    joint_type,
+                    GameplayJointType::Revolute | GameplayJointType::Prismatic
+                ) && axis.iter().map(|value| value * value).sum::<f32>() <= f32::EPSILON
+                {
+                    return Err("revolute/prismatic joint axis must be non-zero".into());
+                }
+                if let Some(limits) = limits {
+                    let values = [limits.min, limits.max, limits.stiffness, limits.damping];
+                    if !values.iter().all(|value| value.is_finite())
+                        || values
+                            .iter()
+                            .any(|value| value.abs() > MAX_PHYSICS_MUTATION_COMPONENT)
+                        || limits.min > limits.max
+                        || limits.stiffness < 0.0
+                        || limits.damping < 0.0
+                    {
+                        return Err("joint limits are invalid or out of range".into());
+                    }
+                }
+                if let Some(motor) = motor {
+                    let values = [
+                        motor.target_vel,
+                        motor.target_pos,
+                        motor.stiffness,
+                        motor.damping,
+                    ];
+                    if !values.iter().all(|value| value.is_finite())
+                        || values
+                            .iter()
+                            .any(|value| value.abs() > MAX_PHYSICS_MUTATION_COMPONENT)
+                        || motor.stiffness < 0.0
+                        || motor.damping < 0.0
+                    {
+                        return Err("joint motor is invalid or out of range".into());
+                    }
+                }
+                for (name, value) in [
+                    ("break_force", *break_force),
+                    ("break_torque", *break_torque),
+                ] {
+                    if !value.is_finite() || value < 0.0 || value > MAX_PHYSICS_MUTATION_COMPONENT {
+                        return Err(format!("{name} is invalid or out of range"));
+                    }
+                }
+                Ok(())
+            }
+            Self::RemoveJoint { joint_id } => validate_entity_id(joint_id),
+        }
+    }
+}
+
+fn validate_physics_vector(kind: &str, vector: &[f32; 3], reject_zero: bool) -> Result<(), String> {
+    if !vector.iter().all(|value| value.is_finite()) {
+        return Err(format!("{kind} must contain only finite values"));
+    }
+    if vector
+        .iter()
+        .any(|value| value.abs() > MAX_PHYSICS_MUTATION_COMPONENT)
+    {
+        return Err(format!(
+            "{kind} components must not exceed {MAX_PHYSICS_MUTATION_COMPONENT}"
+        ));
+    }
+    if reject_zero && vector.iter().map(|value| value * value).sum::<f32>() <= f32::EPSILON {
+        return Err(format!("{kind} must be non-zero"));
+    }
+    Ok(())
+}
 
 /// Optional filter applied to a script physics query.
 ///
@@ -284,6 +557,14 @@ fn validate_sweep_direction(direction: &[f32; 3], query_kind: &str) -> Result<()
 /// Results are frame-local: they appear in exactly one snapshot and are not
 /// repeated. Every result echoes the issuing query's `query_id`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameplayInteractionSnapshot {
+    pub prompt: String,
+    pub action: String,
+    pub max_distance: f32,
+    pub grabbable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GameplayPhysicsQueryResult {
     /// A raycast found a collider attached to the given persistent entity.
@@ -298,6 +579,10 @@ pub enum GameplayPhysicsQueryResult {
         normal: [f32; 3],
         /// Distance from the ray origin to the intersection.
         distance: f32,
+        /// Present only when the hit carries an enabled Interactable whose
+        /// authored maximum distance includes this hit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interaction: Option<GameplayInteractionSnapshot>,
     },
     /// A raycast found no collider within range.
     RaycastMiss {
@@ -319,6 +604,8 @@ pub enum GameplayPhysicsQueryResult {
         normal: [f32; 3],
         /// Travel distance from the sweep origin to the impact.
         distance: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interaction: Option<GameplayInteractionSnapshot>,
     },
     /// A sphere cast found no collider within range.
     SphereCastMiss {
@@ -838,6 +1125,13 @@ pub struct GameplayContext {
     /// Collision and trigger events involving the owning entity this frame.
     #[serde(default)]
     pub physics_events: Vec<GameplayPhysicsEvent>,
+    /// Damage accepted for the owning entity or issued by it in the previous
+    /// frame. Events are delivered exactly once.
+    #[serde(default)]
+    pub damage_events: Vec<GameplayDamageEvent>,
+    /// Confirmed ragdoll ownership changes from the previous frame.
+    #[serde(default)]
+    pub ragdoll_events: Vec<GameplayRagdollEvent>,
     /// Results of physics queries issued by the owning script instance in a
     /// previous frame.
     ///
@@ -921,6 +1215,38 @@ pub enum GameplayCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         translation: Option<[f32; 3]>,
     },
+    /// Apply bounded damage to a persistent Destructible entity.
+    ApplyDamage {
+        entity_id: String,
+        amount: f32,
+        #[serde(default)]
+        damage_kind: GameplayDamageKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hit_position: Option<[f32; 3]>,
+        #[serde(default)]
+        impulse: [f32; 3],
+    },
+    /// Switch an authored ragdoll between animation and physics ownership.
+    SetRagdoll {
+        entity_id: String,
+        active: bool,
+        #[serde(default)]
+        recovery_duration: f32,
+        #[serde(default)]
+        impulse: [f32; 3],
+    },
+    /// Queue movement intent for a persistent CharacterController.
+    ///
+    /// The controller consumes this command on its next simulation update;
+    /// scripts express movement intent rather than writing transforms.
+    CharacterControl {
+        entity_id: String,
+        direction: [f32; 3],
+        #[serde(default)]
+        jump: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speed: Option<f32>,
+    },
     /// Mutate retained runtime UI through the managed class API.
     Ui {
         command: GameplayUiCommand,
@@ -931,6 +1257,13 @@ pub enum GameplayCommand {
     /// arrives in the next frame's [`GameplayContext::physics_query_results`].
     PhysicsQuery {
         query: GameplayPhysicsQuery,
+    },
+    /// Queue a force or impulse for a persistent rigid body.
+    ///
+    /// The mutation is resolved after script callbacks complete and is
+    /// executed safely at the start of the next physics step.
+    PhysicsMutation {
+        mutation: GameplayPhysicsMutation,
     },
     /// Request a snapshot of one script-accessible component on a persistent
     /// entity.
@@ -988,8 +1321,91 @@ impl GameplayCommand {
                 }
                 Ok(())
             }
+            Self::ApplyDamage {
+                entity_id,
+                amount,
+                hit_position,
+                impulse,
+                ..
+            } => {
+                validate_entity_id(entity_id)?;
+                if !amount.is_finite() || *amount <= 0.0 || *amount > MAX_DAMAGE_AMOUNT {
+                    return Err(format!(
+                        "damage amount must be finite, greater than zero, and at most {MAX_DAMAGE_AMOUNT}"
+                    ));
+                }
+                if !hit_position
+                    .iter()
+                    .flatten()
+                    .chain(impulse.iter())
+                    .all(|value| value.is_finite() && value.abs() <= MAX_PHYSICS_MUTATION_COMPONENT)
+                {
+                    return Err(
+                        "damage position/impulse must be finite and within the physics mutation bound"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+            Self::SetRagdoll {
+                entity_id,
+                recovery_duration,
+                impulse,
+                ..
+            } => {
+                validate_entity_id(entity_id)?;
+                if !recovery_duration.is_finite()
+                    || *recovery_duration < 0.0
+                    || *recovery_duration > MAX_RAGDOLL_RECOVERY_SECONDS
+                {
+                    return Err(format!(
+                        "ragdoll recovery duration must be finite, non-negative, and at most {MAX_RAGDOLL_RECOVERY_SECONDS} seconds"
+                    ));
+                }
+                if !impulse
+                    .iter()
+                    .all(|value| value.is_finite() && value.abs() <= MAX_PHYSICS_MUTATION_COMPONENT)
+                {
+                    return Err(
+                        "ragdoll impulse must be finite and within the physics mutation bound"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+            Self::CharacterControl {
+                entity_id,
+                direction,
+                speed,
+                ..
+            } => {
+                validate_entity_id(entity_id)?;
+                if !direction.iter().all(|value| value.is_finite()) {
+                    return Err("character direction must contain only finite values".into());
+                }
+                let horizontal_length_squared =
+                    direction[0] * direction[0] + direction[2] * direction[2];
+                if horizontal_length_squared > 1.000_2 {
+                    return Err(
+                        "character direction must have horizontal length no greater than one"
+                            .into(),
+                    );
+                }
+                if direction[1].abs() > f32::EPSILON {
+                    return Err("character direction must be horizontal (Y must be zero)".into());
+                }
+                if let Some(speed) = speed {
+                    if !speed.is_finite() || *speed <= 0.0 || *speed > MAX_CHARACTER_CONTROL_SPEED {
+                        return Err(format!(
+                            "character speed must be finite, greater than zero, and at most {MAX_CHARACTER_CONTROL_SPEED}"
+                        ));
+                    }
+                }
+                Ok(())
+            }
             Self::Ui { command } => command.validate(),
             Self::PhysicsQuery { query } => query.validate(),
+            Self::PhysicsMutation { mutation } => mutation.validate(),
             Self::ComponentQuery { query } => query.validate(),
             Self::SetComponent {
                 entity_id,
@@ -1332,6 +1748,33 @@ pub struct OwnedGameplayPhysicsQuery {
     pub query: GameplayPhysicsQuery,
 }
 
+/// A validated physics mutation paired with the entity that owns the script
+/// instance that issued it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnedGameplayPhysicsMutation {
+    pub owner_entity_id: String,
+    pub mutation: GameplayPhysicsMutation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnedGameplayDamageRequest {
+    pub owner_entity_id: String,
+    pub target_entity_id: String,
+    pub amount: f32,
+    pub damage_kind: GameplayDamageKind,
+    pub hit_position: Option<[f32; 3]>,
+    pub impulse: [f32; 3],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnedGameplayRagdollRequest {
+    pub owner_entity_id: String,
+    pub target_entity_id: String,
+    pub active: bool,
+    pub recovery_duration: f32,
+    pub impulse: [f32; 3],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,6 +1801,27 @@ mod tests {
             physics_events: vec![GameplayPhysicsEvent {
                 kind: GameplayPhysicsEventKind::CollisionEntered,
                 other_entity_id: "floor".into(),
+                joint_id: None,
+                force: None,
+                torque: None,
+            }],
+            damage_events: vec![GameplayDamageEvent {
+                target_entity_id: "crate".into(),
+                source_entity_id: Some("player".into()),
+                damage_kind: GameplayDamageKind::Impact,
+                raw_damage: 10.0,
+                applied_damage: 10.0,
+                remaining_health: 90.0,
+                hit_position: Some([1.0, 2.0, 3.0]),
+                impulse: [4.0, 0.0, 0.0],
+                broke: false,
+                spawned_entity_ids: Vec::new(),
+            }],
+            ragdoll_events: vec![GameplayRagdollEvent {
+                entity_id: "npc-01".into(),
+                active: true,
+                recovering: false,
+                body_entity_ids: vec!["npc-01.__ragdoll.body.0".into()],
             }],
             physics_query_results: vec![
                 GameplayPhysicsQueryResult::RaycastHit {
@@ -1366,6 +1830,7 @@ mod tests {
                     point: [1.0, 0.5, 0.0],
                     normal: [0.0, 1.0, 0.0],
                     distance: 4.5,
+                    interaction: None,
                 },
                 GameplayPhysicsQueryResult::RaycastMiss { query_id: 8 },
                 GameplayPhysicsQueryResult::OverlapSphere {
@@ -1438,6 +1903,8 @@ mod tests {
         // Older runtimes predate origin shifting: scripts see a zero origin.
         assert_eq!(context.world_origin, [0.0; 3]);
         assert!(context.physics_events.is_empty());
+        assert!(context.damage_events.is_empty());
+        assert!(context.ragdoll_events.is_empty());
         assert!(context.physics_query_results.is_empty());
         assert!(context.component_query_results.is_empty());
         assert!(context.ui_events.is_empty());
@@ -1664,6 +2131,165 @@ mod tests {
     }
 
     #[test]
+    fn apply_damage_command_has_a_stable_bounded_contract() {
+        let command = GameplayCommand::ApplyDamage {
+            entity_id: "crate-01".into(),
+            amount: 25.0,
+            damage_kind: GameplayDamageKind::Blast,
+            hit_position: Some([1.0, 2.0, 3.0]),
+            impulse: [4.0, 0.0, -2.0],
+        };
+        assert_eq!(
+            serde_json::to_string(&command).unwrap(),
+            r#"{"type":"apply_damage","entity_id":"crate-01","amount":25.0,"damage_kind":"blast","hit_position":[1.0,2.0,3.0],"impulse":[4.0,0.0,-2.0]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(
+                r#"{"type":"apply_damage","entity_id":"crate-01","amount":25,"damage_kind":"blast","hit_position":[1,2,3],"impulse":[4,0,-2]}"#
+            )
+            .unwrap(),
+            command
+        );
+        assert!(command.validate().is_ok());
+
+        for invalid in [
+            GameplayCommand::ApplyDamage {
+                entity_id: "../crate".into(),
+                amount: 1.0,
+                damage_kind: GameplayDamageKind::Generic,
+                hit_position: None,
+                impulse: [0.0; 3],
+            },
+            GameplayCommand::ApplyDamage {
+                entity_id: "crate-01".into(),
+                amount: 0.0,
+                damage_kind: GameplayDamageKind::Generic,
+                hit_position: None,
+                impulse: [0.0; 3],
+            },
+            GameplayCommand::ApplyDamage {
+                entity_id: "crate-01".into(),
+                amount: MAX_DAMAGE_AMOUNT + 1.0,
+                damage_kind: GameplayDamageKind::Generic,
+                hit_position: None,
+                impulse: [0.0; 3],
+            },
+            GameplayCommand::ApplyDamage {
+                entity_id: "crate-01".into(),
+                amount: 1.0,
+                damage_kind: GameplayDamageKind::Generic,
+                hit_position: Some([f32::NAN, 0.0, 0.0]),
+                impulse: [0.0; 3],
+            },
+            GameplayCommand::ApplyDamage {
+                entity_id: "crate-01".into(),
+                amount: 1.0,
+                damage_kind: GameplayDamageKind::Generic,
+                hit_position: None,
+                impulse: [MAX_PHYSICS_MUTATION_COMPONENT + 1.0, 0.0, 0.0],
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn set_ragdoll_command_has_a_stable_bounded_contract() {
+        let command = GameplayCommand::SetRagdoll {
+            entity_id: "npc-01".into(),
+            active: true,
+            recovery_duration: 0.35,
+            impulse: [10.0, 2.0, 0.0],
+        };
+        assert_eq!(
+            serde_json::to_string(&command).unwrap(),
+            r#"{"type":"set_ragdoll","entity_id":"npc-01","active":true,"recovery_duration":0.35,"impulse":[10.0,2.0,0.0]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(
+                r#"{"type":"set_ragdoll","entity_id":"npc-01","active":true,"recovery_duration":0.35,"impulse":[10,2,0]}"#
+            )
+            .unwrap(),
+            command
+        );
+        assert!(command.validate().is_ok());
+
+        for invalid in [
+            GameplayCommand::SetRagdoll {
+                entity_id: "../npc".into(),
+                active: true,
+                recovery_duration: 0.0,
+                impulse: [0.0; 3],
+            },
+            GameplayCommand::SetRagdoll {
+                entity_id: "npc-01".into(),
+                active: false,
+                recovery_duration: MAX_RAGDOLL_RECOVERY_SECONDS + 1.0,
+                impulse: [0.0; 3],
+            },
+            GameplayCommand::SetRagdoll {
+                entity_id: "npc-01".into(),
+                active: true,
+                recovery_duration: 0.0,
+                impulse: [f32::NAN, 0.0, 0.0],
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn character_control_has_a_stable_bounded_contract() {
+        let command = GameplayCommand::CharacterControl {
+            entity_id: "npc-01".into(),
+            direction: [0.6, 0.0, -0.8],
+            jump: true,
+            speed: Some(7.5),
+        };
+        assert_eq!(
+            serde_json::to_string(&command).unwrap(),
+            r#"{"type":"character_control","entity_id":"npc-01","direction":[0.6,0.0,-0.8],"jump":true,"speed":7.5}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(
+                r#"{"type":"character_control","entity_id":"npc-01","direction":[0.6,0,-0.8],"jump":true,"speed":7.5}"#
+            )
+            .unwrap(),
+            command
+        );
+        assert!(command.validate().is_ok());
+
+        for invalid in [
+            GameplayCommand::CharacterControl {
+                entity_id: "../npc".into(),
+                direction: [0.0; 3],
+                jump: false,
+                speed: None,
+            },
+            GameplayCommand::CharacterControl {
+                entity_id: "npc-01".into(),
+                direction: [1.0, 0.0, 1.0],
+                jump: false,
+                speed: None,
+            },
+            GameplayCommand::CharacterControl {
+                entity_id: "npc-01".into(),
+                direction: [0.0, 0.1, 0.0],
+                jump: false,
+                speed: None,
+            },
+            GameplayCommand::CharacterControl {
+                entity_id: "npc-01".into(),
+                direction: [0.0; 3],
+                jump: false,
+                speed: Some(MAX_CHARACTER_CONTROL_SPEED + 1.0),
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn load_scene_command_has_a_stable_json_contract() {
         let command = GameplayCommand::LoadScene {
             scene_id: "level_two".into(),
@@ -1842,6 +2468,115 @@ mod tests {
     }
 
     #[test]
+    fn physics_mutation_command_has_a_stable_bounded_contract() {
+        let impulse = GameplayCommand::PhysicsMutation {
+            mutation: GameplayPhysicsMutation::ApplyImpulse {
+                entity_id: "crate-01".into(),
+                impulse: [10.0, 2.0, -4.0],
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&impulse).unwrap(),
+            r#"{"type":"physics_mutation","mutation":{"kind":"apply_impulse","entity_id":"crate-01","impulse":[10.0,2.0,-4.0]}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(&serde_json::to_string(&impulse).unwrap())
+                .unwrap(),
+            impulse
+        );
+        assert!(impulse.validate().is_ok());
+
+        for invalid in [
+            GameplayPhysicsMutation::ApplyForce {
+                entity_id: "../crate".into(),
+                force: [1.0, 0.0, 0.0],
+            },
+            GameplayPhysicsMutation::ApplyForce {
+                entity_id: "crate".into(),
+                force: [f32::NAN, 0.0, 0.0],
+            },
+            GameplayPhysicsMutation::ApplyImpulse {
+                entity_id: "crate".into(),
+                impulse: [MAX_PHYSICS_MUTATION_COMPONENT + 1.0, 0.0, 0.0],
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+
+        let hinge = GameplayCommand::PhysicsMutation {
+            mutation: GameplayPhysicsMutation::CreateJoint {
+                joint_id: "door-hinge".into(),
+                body_a: "door-frame".into(),
+                body_b: "door".into(),
+                joint_type: GameplayJointType::Revolute,
+                anchor_a: [0.0, 1.0, 0.0],
+                anchor_b: [-0.5, 0.0, 0.0],
+                axis: [0.0, 1.0, 0.0],
+                limits: Some(GameplayJointLimits {
+                    min: -1.5,
+                    max: 1.5,
+                    stiffness: 20.0,
+                    damping: 2.0,
+                }),
+                motor: Some(GameplayJointMotor {
+                    target_vel: 1.0,
+                    target_pos: 0.25,
+                    stiffness: 10.0,
+                    damping: 1.0,
+                }),
+                break_force: 5000.0,
+                break_torque: 1000.0,
+            },
+        };
+        assert!(hinge.validate().is_ok());
+        let json = serde_json::to_string(&hinge).unwrap();
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(&json).unwrap(),
+            hinge
+        );
+        assert!(json.contains(r#""kind":"create_joint""#));
+        assert!(json.contains(r#""joint_type":"revolute""#));
+
+        let same_body = GameplayPhysicsMutation::CreateJoint {
+            joint_id: "bad-joint".into(),
+            body_a: "crate".into(),
+            body_b: "crate".into(),
+            joint_type: GameplayJointType::Fixed,
+            anchor_a: [0.0; 3],
+            anchor_b: [0.0; 3],
+            axis: [1.0, 0.0, 0.0],
+            limits: None,
+            motor: None,
+            break_force: 0.0,
+            break_torque: 0.0,
+        };
+        assert!(same_body.validate().is_err());
+    }
+
+    #[test]
+    fn joint_break_event_extends_the_legacy_physics_event_contract() {
+        let legacy: GameplayPhysicsEvent =
+            serde_json::from_str(r#"{"kind":"collision_entered","other_entity_id":"floor"}"#)
+                .unwrap();
+        assert_eq!(legacy.joint_id, None);
+        assert_eq!(legacy.force, None);
+        assert_eq!(legacy.torque, None);
+
+        let broken = GameplayPhysicsEvent {
+            kind: GameplayPhysicsEventKind::JointBroken,
+            other_entity_id: "door".into(),
+            joint_id: Some("door-hinge".into()),
+            force: Some(4200.0),
+            torque: Some(750.0),
+        };
+        assert_eq!(
+            serde_json::from_str::<GameplayPhysicsEvent>(&serde_json::to_string(&broken).unwrap())
+                .unwrap(),
+            broken
+        );
+    }
+
+    #[test]
     fn physics_query_filters_have_a_stable_validated_contract() {
         let filter = GameplayPhysicsQueryFilter {
             layer_mask: Some(0b0100),
@@ -1941,6 +2676,7 @@ mod tests {
             point: [0.0, 0.5, 0.0],
             normal: [0.0, 1.0, 0.0],
             distance: 4.5,
+            interaction: None,
         };
         assert_eq!(
             serde_json::to_string(&hit).unwrap(),
@@ -1966,10 +2702,16 @@ mod tests {
             point: [0.0, 0.5, 0.0],
             normal: [0.0, 1.0, 0.0],
             distance: 4.0,
+            interaction: Some(GameplayInteractionSnapshot {
+                prompt: "Pick up".into(),
+                action: "pickup".into(),
+                max_distance: 3.0,
+                grabbable: true,
+            }),
         };
         assert_eq!(
             serde_json::to_string(&sphere_hit).unwrap(),
-            r#"{"kind":"sphere_cast_hit","query_id":6,"entity_id":"cube-01","point":[0.0,0.5,0.0],"normal":[0.0,1.0,0.0],"distance":4.0}"#
+            r#"{"kind":"sphere_cast_hit","query_id":6,"entity_id":"cube-01","point":[0.0,0.5,0.0],"normal":[0.0,1.0,0.0],"distance":4.0,"interaction":{"prompt":"Pick up","action":"pickup","max_distance":3.0,"grabbable":true}}"#
         );
         assert_eq!(
             serde_json::from_str::<GameplayPhysicsQueryResult>(

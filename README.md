@@ -7,6 +7,7 @@ This repository contains a Rust game engine, project player, editor, asset cooke
 ```powershell
 cargo run -p sandbox -- project new .\MyGame --name MyGame
 cargo run -p sandbox -- project import .\MyGame .\checker.ppm --id checker
+cargo run -p sandbox -- project import .\MyGame .\character.glb --id character
 cargo run -p sandbox -- project scene new .\MyGame level_two --name "Level Two"
 cargo run -p sandbox -- project scene set-startup .\MyGame level_two
 cargo run -p sandbox -- project check .\MyGame
@@ -38,7 +39,10 @@ project scene catalog, protects dirty documents during scene switches and
 window close, and can recook project assets from the Asset Browser. Generated
 C# scripts can query persistent scene entities, create Transform-bearing
 runtime entities, edit or destroy target entities, request scene changes, and
-consume per-frame collision/trigger data through `Physics.Events`.
+consume per-frame collision/trigger data through `Physics.Events`. Deferred
+physics queries plus validated linear/angular force commands and persistent
+`Physics.CreateJoint` / `Physics.Grab` constraints provide the native base for
+pushable props, hinges, sliders, and gravity-gun-style interaction.
 Frame-accurate input edges are available to managed gameplay scripts through
 `Input.WasPressed(...)` and `Input.WasReleased(...)`.
 
@@ -49,8 +53,26 @@ animation, advances navigation-driven characters, and validates their typed
 cooked assets. The desktop target adds `runtime-audio-output`: scene
 `AudioSource` and `AudioListener` components drive the cpal output stream every
 frame, while headless builds retain device-free component and asset support.
+Importing a glTF/GLB character creates deterministic mesh assets plus cooked
+skeleton and animation companions; multi-primitive files and relative external
+buffer/image files are handled in the same transaction.
 See the detailed status and limits in
-[`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md).
+[`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md). The engine-versus-Half-Life-2
+readiness audit and remaining production gaps are tracked in
+[`docs/HL2_READINESS.md`](docs/HL2_READINESS.md).
+Joint authoring and the managed API are documented in
+[`docs/PHYSICS_JOINTS.md`](docs/PHYSICS_JOINTS.md).
+Destructible props, damage events, and prefab fracture replacement are
+documented in
+[`docs/PHYSICS_DESTRUCTION.md`](docs/PHYSICS_DESTRUCTION.md).
+Skeletal ragdoll authoring, pose ownership, recovery, and persistence are
+documented in [`docs/RAGDOLLS.md`](docs/RAGDOLLS.md).
+Portable opaque, masked, blended, and double-sided material surfaces are
+documented in [`docs/MATERIAL_SURFACES.md`](docs/MATERIAL_SURFACES.md).
+CPU particle emitters and mesh-based lifetime decals are documented in
+[`docs/VFX.md`](docs/VFX.md).
+Bounded character commands and the project-facing use/grab convention are
+documented in [`docs/INTERACTION.md`](docs/INTERACTION.md).
 
 The ready-to-run sample is at [`examples/minimal-game`](examples/minimal-game). It uses cooked mesh, texture, and material data in its startup scene.
 
@@ -65,5 +87,12 @@ The package contains the project manifest, every cataloged scene, cooked assets,
 
 See [`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md),
 [`docs/GAME_ENGINE_BOUNDARY.md`](docs/GAME_ENGINE_BOUNDARY.md),
+[`docs/PHYSICS_JOINTS.md`](docs/PHYSICS_JOINTS.md),
+[`docs/PHYSICS_DESTRUCTION.md`](docs/PHYSICS_DESTRUCTION.md),
+[`docs/RAGDOLLS.md`](docs/RAGDOLLS.md),
+[`docs/MATERIAL_SURFACES.md`](docs/MATERIAL_SURFACES.md),
+[`docs/VFX.md`](docs/VFX.md),
+[`docs/INTERACTION.md`](docs/INTERACTION.md),
+[`docs/HL2_READINESS.md`](docs/HL2_READINESS.md),
 [`docs/CI_RELEASE_GATES.md`](docs/CI_RELEASE_GATES.md), and
 [`docs/RELEASE_PACKAGING.md`](docs/RELEASE_PACKAGING.md) for details.

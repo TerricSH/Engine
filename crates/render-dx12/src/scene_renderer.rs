@@ -1,8 +1,7 @@
 //! DirectX 12 implementation of [`engine_renderer::BackendRenderer`].
 //!
-//! The portable upload path supports owned static PBR32 meshes and material
-//! factors. Texture uploads remain fail-closed until descriptor heaps and
-//! texture staging are implemented by this backend.
+//! The portable upload path supports owned static/skinned PBR meshes, textures,
+//! and opaque, alpha-masked, alpha-blended, or double-sided material variants.
 
 // ============================================================================
 // Windows + backend-dx12: full implementation
@@ -16,15 +15,15 @@ use engine_renderer::{
     render_graph2, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats,
     IndexFormat as RendererIndexFormat, MaterialUpload, MeshUpload,
     MeshVertexFormat as RendererMeshVertexFormat, RenderFrameInput, ResourceKind, ResourceRemoval,
-    ShadowMode, TextureUpload, UploadReceipt,
+    ShadowMode, TextureUpload, Transparency, UploadReceipt,
 };
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use glam::Mat4;
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use render_core::{
     BufferDescriptor, BufferHandle, CommandEncoder, Device, FramebufferHandle,
-    IndexFormat as RhiIndexFormat, MemoryHint, PipelineHandle, PipelineLayoutHandle,
-    RenderPassHandle, SwapchainHandle, TextureHandle,
+    IndexFormat as RhiIndexFormat, MemoryHint, PipelineDescriptor, PipelineHandle,
+    PipelineLayoutHandle, RenderPassHandle, SwapchainHandle, TextureHandle,
 };
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
@@ -46,10 +45,16 @@ pub struct Dx12GpuMesh {
 #[derive(Clone, Debug)]
 struct Dx12MaterialState {
     constants: [u8; 32],
-    texture_id: Option<String>,
+    emissive_constants: [u8; 16],
+    texture_ids: [Option<String>; 5],
+    transparency: Transparency,
+    double_sided: bool,
     content_hash: [u8; 32],
     revision: u64,
 }
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+const MATERIAL_TEXTURE_BINDINGS: [u32; 5] = [1, 3, 4, 5, 6];
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 #[derive(Clone, Debug)]
@@ -167,7 +172,13 @@ pub struct Dx12SceneRenderer {
     swapchain: SwapchainHandle,
     pipeline_layout: Option<PipelineLayoutHandle>,
     pipeline: Option<PipelineHandle>,
+    double_sided_pipeline: Option<PipelineHandle>,
+    blend_pipeline: Option<PipelineHandle>,
+    blend_double_sided_pipeline: Option<PipelineHandle>,
     skinned_pipeline: Option<PipelineHandle>,
+    skinned_double_sided_pipeline: Option<PipelineHandle>,
+    skinned_blend_pipeline: Option<PipelineHandle>,
+    skinned_blend_double_sided_pipeline: Option<PipelineHandle>,
     shadow_texture: Option<TextureHandle>,
     shadow_render_pass: Option<RenderPassHandle>,
     shadow_framebuffer: Option<FramebufferHandle>,
@@ -179,6 +190,54 @@ pub struct Dx12SceneRenderer {
     /// Any failure after handing a command list to `end_frame` makes allocator
     /// reuse ambiguous. Refuse subsequent frames until the backend is rebuilt.
     fatal_frame_error: Option<String>,
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+fn surface_variant_index(transparency: &Transparency, double_sided: bool) -> usize {
+    usize::from(double_sided)
+        + if matches!(transparency, Transparency::Blend) {
+            2
+        } else {
+            0
+        }
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+fn create_surface_pipeline_variants(
+    device: &mut Dx12Device,
+    base: &PipelineDescriptor,
+    label: &str,
+) -> Result<[PipelineHandle; 4], render_core::RhiError> {
+    let mut pipelines = Vec::with_capacity(4);
+    for (double_sided, blended) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut descriptor = base.clone();
+        descriptor.raster_state.cull_mode = Some(if double_sided { "none" } else { "back" }.into());
+        descriptor.depth_state.write_enabled = !blended;
+        descriptor.blend_state.mode = blended.then(|| "alpha".into());
+        descriptor.debug_label = Some(format!(
+            "{label}-{}-{}",
+            if double_sided {
+                "double-sided"
+            } else {
+                "single-sided"
+            },
+            if blended { "blend" } else { "opaque-mask" }
+        ));
+        match device.create_pipeline(&descriptor) {
+            Ok(pipeline) => pipelines.push(pipeline),
+            Err(error) => {
+                for pipeline in pipelines {
+                    device.destroy_pipeline(pipeline);
+                }
+                return Err(error);
+            }
+        }
+    }
+    pipelines
+        .try_into()
+        .map_err(|_| render_core::RhiError::Backend {
+            detail: "DX12 surface pipeline creation produced the wrong variant count".into(),
+        })
 }
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
@@ -196,7 +255,13 @@ impl Dx12SceneRenderer {
             swapchain,
             pipeline_layout: None,
             pipeline: None,
+            double_sided_pipeline: None,
+            blend_pipeline: None,
+            blend_double_sided_pipeline: None,
             skinned_pipeline: None,
+            skinned_double_sided_pipeline: None,
+            skinned_blend_pipeline: None,
+            skinned_blend_double_sided_pipeline: None,
             shadow_texture: None,
             shadow_render_pass: None,
             shadow_framebuffer: None,
@@ -259,7 +324,13 @@ impl Dx12SceneRenderer {
         };
 
         if self.pipeline.is_some()
+            && self.double_sided_pipeline.is_some()
+            && self.blend_pipeline.is_some()
+            && self.blend_double_sided_pipeline.is_some()
             && self.skinned_pipeline.is_some()
+            && self.skinned_double_sided_pipeline.is_some()
+            && self.skinned_blend_pipeline.is_some()
+            && self.skinned_blend_double_sided_pipeline.is_some()
             && self.shadow_pipeline.is_some()
             && self.skinned_shadow_pipeline.is_some()
             && self.shadow_texture.is_some()
@@ -284,18 +355,18 @@ impl Dx12SceneRenderer {
                 push_constant_ranges: vec![PushConstantRange {
                     stage_flags: 3,
                     offset: 0,
-                    size: 192,
+                    size: 208,
                 }],
                 bind_group_layouts: vec![BindGroupLayoutDescriptor {
                     set_index: 0,
                     bindings: vec![
                         BindGroupLayoutBinding {
                             binding: 0,
-                            resource_kind: "sampled_texture_pair".into(),
+                            resource_kind: "sampled_texture_set".into(),
                         },
                         BindGroupLayoutBinding {
                             binding: 0,
-                            resource_kind: "sampler_pair".into(),
+                            resource_kind: "sampler_set".into(),
                         },
                         BindGroupLayoutBinding {
                             binding: 1,
@@ -400,12 +471,17 @@ impl Dx12SceneRenderer {
             },
             ..PipelineDescriptor::default()
         };
-        match self.device.create_pipeline(&descriptor) {
-            Ok(handle) => self.pipeline = Some(handle),
+        let static_variants = match create_surface_pipeline_variants(
+            &mut self.device,
+            &descriptor,
+            "scene-static",
+        ) {
+            Ok(variants) => variants,
             Err(error) => {
-                tracing::error!(target: "scene_renderer", ?error, "DX12 PSO creation failed");
+                tracing::error!(target: "scene_renderer", ?error, "DX12 static surface PSO creation failed");
+                return;
             }
-        }
+        };
 
         let skinned_vertex_layout = VertexLayout {
             stride_bytes: 64,
@@ -440,14 +516,30 @@ impl Dx12SceneRenderer {
         let skinned_descriptor = PipelineDescriptor {
             shader_modules: vec![skinned_vertex_shader, pixel_shader],
             vertex_layout: skinned_vertex_layout,
-            ..descriptor
+            ..descriptor.clone()
         };
-        match self.device.create_pipeline(&skinned_descriptor) {
-            Ok(handle) => self.skinned_pipeline = Some(handle),
+        let skinned_variants = match create_surface_pipeline_variants(
+            &mut self.device,
+            &skinned_descriptor,
+            "scene-skinned",
+        ) {
+            Ok(variants) => variants,
             Err(error) => {
-                tracing::error!(target: "scene_renderer", ?error, "DX12 skinned PSO creation failed");
+                for pipeline in static_variants {
+                    self.device.destroy_pipeline(pipeline);
+                }
+                tracing::error!(target: "scene_renderer", ?error, "DX12 skinned surface PSO creation failed");
+                return;
             }
-        }
+        };
+        self.pipeline = Some(static_variants[0]);
+        self.double_sided_pipeline = Some(static_variants[1]);
+        self.blend_pipeline = Some(static_variants[2]);
+        self.blend_double_sided_pipeline = Some(static_variants[3]);
+        self.skinned_pipeline = Some(skinned_variants[0]);
+        self.skinned_double_sided_pipeline = Some(skinned_variants[1]);
+        self.skinned_blend_pipeline = Some(skinned_variants[2]);
+        self.skinned_blend_double_sided_pipeline = Some(skinned_variants[3]);
 
         let shadow_texture = match self.device.create_texture(&TextureDescriptor {
             width: 2048,
@@ -595,6 +687,72 @@ impl Dx12SceneRenderer {
         self.shadow_pipeline_layout = Some(shadow_layout);
         self.shadow_pipeline = Some(shadow_pipeline);
         self.skinned_shadow_pipeline = Some(skinned_shadow_pipeline);
+    }
+
+    fn material_surface(
+        &self,
+        input: &RenderFrameInput,
+        material_id: &engine_serialize::AssetId,
+    ) -> (Transparency, bool) {
+        input
+            .materials
+            .iter()
+            .find(|binding| binding.material_id == *material_id)
+            .map(|binding| (binding.transparency.clone(), binding.double_sided))
+            .or_else(|| {
+                self.materials
+                    .get(&material_id.id)
+                    .map(|material| (material.transparency.clone(), material.double_sided))
+            })
+            .unwrap_or((Transparency::Opaque, false))
+    }
+
+    fn material_texture_ids(
+        &self,
+        input: &RenderFrameInput,
+        material_id: &engine_serialize::AssetId,
+    ) -> [Option<String>; 5] {
+        input
+            .materials
+            .iter()
+            .find(|binding| binding.material_id == *material_id)
+            .map(|material| {
+                MATERIAL_TEXTURE_BINDINGS.map(|binding| {
+                    material
+                        .textures
+                        .iter()
+                        .find(|slot| slot.binding == binding)
+                        .map(|slot| slot.texture.id.clone())
+                })
+            })
+            .or_else(|| {
+                self.materials
+                    .get(&material_id.id)
+                    .map(|material| material.texture_ids.clone())
+            })
+            .unwrap_or_else(|| std::array::from_fn(|_| None))
+    }
+
+    fn material_texture_table(
+        &self,
+        texture_ids: &[Option<String>; 5],
+        shadow_texture: TextureHandle,
+    ) -> [TextureHandle; 6] {
+        let resolve = |texture_id: &Option<String>| {
+            texture_id
+                .as_ref()
+                .and_then(|texture_id| self.textures.get(texture_id))
+                .map(|texture| texture.handle)
+                .unwrap_or(shadow_texture)
+        };
+        [
+            resolve(&texture_ids[0]),
+            shadow_texture,
+            resolve(&texture_ids[1]),
+            resolve(&texture_ids[2]),
+            resolve(&texture_ids[3]),
+            resolve(&texture_ids[4]),
+        ]
     }
 
     fn prepare_bone_buffer(
@@ -876,6 +1034,12 @@ impl Dx12SceneRenderer {
             .iter()
             .filter(|drawable| drawable.cast_shadows)
         {
+            if matches!(
+                self.material_surface(input, &drawable.material).0,
+                Transparency::Blend
+            ) {
+                continue;
+            }
             let mesh = &self.meshes[&drawable.mesh.id];
             let world = Mat4::from_cols_array(&drawable.world_transform);
             let matrix = shadow_data.light_view_projection * world;
@@ -898,6 +1062,12 @@ impl Dx12SceneRenderer {
             .enumerate()
             .filter(|(_, item)| item.cast_shadows)
         {
+            if matches!(
+                self.material_surface(input, &item.material).0,
+                Transparency::Blend
+            ) {
+                continue;
+            }
             let mesh = self.meshes[&item.mesh.id].clone();
             let world = Mat4::from_cols_array(&item.world_transform);
             let matrix = shadow_data.light_view_projection * world;
@@ -1056,18 +1226,8 @@ impl Dx12SceneRenderer {
                     .map(|item| (&item.material, item.entity.as_ref())),
             )
         {
-            let texture_id = input
-                .materials
-                .iter()
-                .find(|binding| binding.material_id == *material_id)
-                .and_then(|binding| binding.textures.first())
-                .map(|slot| slot.texture.id.as_str())
-                .or_else(|| {
-                    self.materials
-                        .get(&material_id.id)
-                        .and_then(|material| material.texture_id.as_deref())
-                });
-            if let Some(texture_id) = texture_id {
+            let texture_ids = self.material_texture_ids(input, material_id);
+            for texture_id in texture_ids.iter().flatten() {
                 if !self.textures.contains_key(texture_id) {
                     return Err(vec![Diagnostic::new(
                         "DX1215",
@@ -1090,14 +1250,21 @@ impl Dx12SceneRenderer {
                 "DX12 pipeline layout is unavailable",
             )]
         })?;
-        let static_pipeline = self.pipeline.ok_or_else(|| {
+        let missing_pipeline = || {
             vec![Diagnostic::new(
                 "DX1203",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                "DX12 forward pipeline is unavailable",
+                "DX12 forward surface pipelines are unavailable",
             )]
-        })?;
+        };
+        let static_pipelines = [
+            self.pipeline.ok_or_else(missing_pipeline)?,
+            self.double_sided_pipeline.ok_or_else(missing_pipeline)?,
+            self.blend_pipeline.ok_or_else(missing_pipeline)?,
+            self.blend_double_sided_pipeline
+                .ok_or_else(missing_pipeline)?,
+        ];
         let shadow_texture = self.shadow_texture.ok_or_else(|| {
             vec![Diagnostic::new(
                 "DX1245",
@@ -1107,17 +1274,24 @@ impl Dx12SceneRenderer {
             )]
         })?;
         let shadow_frame_data = self.shadow_frame_data;
-        let skinned_pipeline = if input.skinned_items.is_empty() {
+        let skinned_pipelines = if input.skinned_items.is_empty() {
             None
         } else {
-            Some(self.skinned_pipeline.ok_or_else(|| {
+            let missing = || {
                 vec![Diagnostic::new(
                     "DX1229",
                     DiagnosticSeverity::Error,
                     "scene_renderer",
-                    "DX12 skinned pipeline is unavailable",
+                    "DX12 skinned surface pipelines are unavailable",
                 )]
-            })?)
+            };
+            Some([
+                self.skinned_pipeline.ok_or_else(missing)?,
+                self.skinned_double_sided_pipeline.ok_or_else(missing)?,
+                self.skinned_blend_pipeline.ok_or_else(missing)?,
+                self.skinned_blend_double_sided_pipeline
+                    .ok_or_else(missing)?,
+            ])
         };
         let mut frame = self.active_frame.take().ok_or_else(|| {
             vec![Diagnostic::new(
@@ -1128,7 +1302,8 @@ impl Dx12SceneRenderer {
             )]
         })?;
 
-        frame.encoder.bind_pipeline(static_pipeline);
+        let mut current_pipeline = static_pipelines[0];
+        frame.encoder.bind_pipeline(current_pipeline);
         frame
             .encoder
             .set_viewport(0.0, 0.0, self.width as f32, self.height as f32, 0.0, 1.0);
@@ -1137,10 +1312,35 @@ impl Dx12SceneRenderer {
         if let Some(view) = view {
             let view_matrix = Mat4::from_cols_array(&view.view_matrix);
             let projection_matrix = Mat4::from_cols_array(&view.projection_matrix);
+            let camera_position = view_matrix.inverse().w_axis.truncate();
+            let mut ordered_drawables = Vec::with_capacity(input.drawables.len());
+            let mut blended_drawables = Vec::new();
             for drawable in &input.drawables {
+                let (transparency, _) = self.material_surface(input, &drawable.material);
+                if matches!(transparency, Transparency::Blend) {
+                    let translation = Mat4::from_cols_array(&drawable.world_transform)
+                        .w_axis
+                        .truncate();
+                    blended_drawables
+                        .push(((translation - camera_position).length_squared(), drawable));
+                } else {
+                    ordered_drawables.push(drawable);
+                }
+            }
+            blended_drawables.sort_by(|left, right| right.0.total_cmp(&left.0));
+            ordered_drawables.extend(blended_drawables.into_iter().map(|(_, drawable)| drawable));
+
+            for drawable in ordered_drawables {
                 // Existence was validated before recording any draw command.
                 let mesh = &self.meshes[&drawable.mesh.id];
                 let world_matrix = Mat4::from_cols_array(&drawable.world_transform);
+                let (transparency, double_sided) = self.material_surface(input, &drawable.material);
+                let next_pipeline =
+                    static_pipelines[surface_variant_index(&transparency, double_sided)];
+                if next_pipeline != current_pipeline {
+                    frame.encoder.bind_pipeline(next_pipeline);
+                    current_pipeline = next_pipeline;
+                }
                 let mvp = (projection_matrix * view_matrix * world_matrix).to_cols_array();
                 let mut mvp_bytes = [0_u8; 64];
                 for (destination, value) in mvp_bytes.chunks_exact_mut(4).zip(mvp) {
@@ -1151,17 +1351,15 @@ impl Dx12SceneRenderer {
                     .materials
                     .iter()
                     .find(|binding| binding.material_id == drawable.material);
-                let texture_id = input_material
-                    .and_then(|binding| binding.textures.first())
-                    .map(|slot| slot.texture.id.as_str())
-                    .or_else(|| {
-                        self.materials
-                            .get(&drawable.material.id)
-                            .and_then(|material| material.texture_id.as_deref())
-                    });
+                let texture_ids = self.material_texture_ids(input, &drawable.material);
+                let texture_flags = material_texture_flags_from_ids(&texture_ids);
                 let material_constants = input_material
                     .map(|binding| {
-                        material_constants_from_bytes(&binding.uniforms.bytes, texture_id.is_some())
+                        material_constants_from_bytes(
+                            &binding.uniforms.bytes,
+                            texture_ids[0].is_some(),
+                            &binding.transparency,
+                        )
                     })
                     .or_else(|| {
                         self.materials
@@ -1183,19 +1381,30 @@ impl Dx12SceneRenderer {
                 frame
                     .encoder
                     .push_constants(layout, 0x20, 176, &light_direction);
-                let base_texture = texture_id
-                    .map(|texture_id| self.textures[texture_id].handle)
-                    .unwrap_or(shadow_texture);
+                let emissive_constants = input_material
+                    .map(|binding| {
+                        emissive_constants_from_bytes(&binding.uniforms.bytes, texture_flags)
+                    })
+                    .or_else(|| {
+                        self.materials
+                            .get(&drawable.material.id)
+                            .map(|material| material.emissive_constants)
+                    })
+                    .unwrap_or_else(default_emissive_constants);
+                frame
+                    .encoder
+                    .push_constants(layout, 0x20, 192, &emissive_constants);
+                let texture_table = self.material_texture_table(&texture_ids, shadow_texture);
                 if !frame
                     .encoder
-                    .bind_sampled_texture_pair(layout, base_texture, shadow_texture)
+                    .bind_sampled_texture_set(layout, &texture_table)
                 {
                     self.active_frame = Some(frame);
                     return Err(vec![Diagnostic::new(
                         "DX1216",
                         DiagnosticSeverity::Error,
                         "scene_renderer",
-                        "DX12 forward pass could not bind its base-color/shadow texture table",
+                        "DX12 forward pass could not bind its six-texture material table",
                     )]);
                 }
                 frame
@@ -1209,12 +1418,41 @@ impl Dx12SceneRenderer {
                 frame.triangles += u64::from(mesh.index_count / 3);
             }
 
-            if let Some(skinned_pipeline) = skinned_pipeline {
-                frame.encoder.bind_pipeline(skinned_pipeline);
-            }
+            let mut ordered_skinned = Vec::with_capacity(input.skinned_items.len());
+            let mut blended_skinned = Vec::new();
             for (item_index, item) in input.skinned_items.iter().enumerate() {
+                let (transparency, _) = self.material_surface(input, &item.material);
+                if matches!(transparency, Transparency::Blend) {
+                    let translation = Mat4::from_cols_array(&item.world_transform)
+                        .w_axis
+                        .truncate();
+                    blended_skinned.push((
+                        (translation - camera_position).length_squared(),
+                        item_index,
+                        item,
+                    ));
+                } else {
+                    ordered_skinned.push((item_index, item));
+                }
+            }
+            blended_skinned.sort_by(|left, right| right.0.total_cmp(&left.0));
+            ordered_skinned.extend(
+                blended_skinned
+                    .into_iter()
+                    .map(|(_, item_index, item)| (item_index, item)),
+            );
+
+            for (item_index, item) in ordered_skinned {
                 let mesh = self.meshes[&item.mesh.id].clone();
                 let world_matrix = Mat4::from_cols_array(&item.world_transform);
+                let (transparency, double_sided) = self.material_surface(input, &item.material);
+                let next_pipeline = skinned_pipelines
+                    .expect("skinned pipelines exist for a non-empty skinned list")
+                    [surface_variant_index(&transparency, double_sided)];
+                if next_pipeline != current_pipeline {
+                    frame.encoder.bind_pipeline(next_pipeline);
+                    current_pipeline = next_pipeline;
+                }
                 let mvp = (projection_matrix * view_matrix * world_matrix).to_cols_array();
                 let mut mvp_bytes = [0_u8; 64];
                 for (destination, value) in mvp_bytes.chunks_exact_mut(4).zip(mvp) {
@@ -1226,17 +1464,15 @@ impl Dx12SceneRenderer {
                     .materials
                     .iter()
                     .find(|binding| binding.material_id == item.material);
-                let texture_id = input_material
-                    .and_then(|binding| binding.textures.first())
-                    .map(|slot| slot.texture.id.as_str())
-                    .or_else(|| {
-                        self.materials
-                            .get(&item.material.id)
-                            .and_then(|material| material.texture_id.as_deref())
-                    });
+                let texture_ids = self.material_texture_ids(input, &item.material);
+                let texture_flags = material_texture_flags_from_ids(&texture_ids);
                 let material_constants = input_material
                     .map(|binding| {
-                        material_constants_from_bytes(&binding.uniforms.bytes, texture_id.is_some())
+                        material_constants_from_bytes(
+                            &binding.uniforms.bytes,
+                            texture_ids[0].is_some(),
+                            &binding.transparency,
+                        )
                     })
                     .or_else(|| {
                         self.materials
@@ -1258,19 +1494,30 @@ impl Dx12SceneRenderer {
                 frame
                     .encoder
                     .push_constants(layout, 0x20, 176, &light_direction);
-                let base_texture = texture_id
-                    .map(|texture_id| self.textures[texture_id].handle)
-                    .unwrap_or(shadow_texture);
+                let emissive_constants = input_material
+                    .map(|binding| {
+                        emissive_constants_from_bytes(&binding.uniforms.bytes, texture_flags)
+                    })
+                    .or_else(|| {
+                        self.materials
+                            .get(&item.material.id)
+                            .map(|material| material.emissive_constants)
+                    })
+                    .unwrap_or_else(default_emissive_constants);
+                frame
+                    .encoder
+                    .push_constants(layout, 0x20, 192, &emissive_constants);
+                let texture_table = self.material_texture_table(&texture_ids, shadow_texture);
                 if !frame
                     .encoder
-                    .bind_sampled_texture_pair(layout, base_texture, shadow_texture)
+                    .bind_sampled_texture_set(layout, &texture_table)
                 {
                     self.active_frame = Some(frame);
                     return Err(vec![Diagnostic::new(
                         "DX1216",
                         DiagnosticSeverity::Error,
                         "scene_renderer",
-                        "DX12 skinned pass could not bind its base-color/shadow texture table",
+                        "DX12 skinned pass could not bind its six-texture material table",
                     )]);
                 }
 
@@ -1642,7 +1889,7 @@ impl BackendRenderer for Dx12SceneRenderer {
                 "cannot upload a material while a DX12 frame is active",
             )]);
         }
-        if let Some(texture) = &upload.base_color_texture {
+        for texture in upload.texture_references().into_iter().flatten() {
             if !self.textures.contains_key(&texture.id) {
                 return Err(vec![Diagnostic::new(
                     "DX1234",
@@ -1666,11 +1913,18 @@ impl BackendRenderer for Dx12SceneRenderer {
             .materials
             .get(&material_id)
             .map_or(1, |existing| existing.revision.saturating_add(1));
+        let texture_ids = upload
+            .texture_references()
+            .map(|texture| texture.map(|texture| texture.id.clone()));
+        let texture_flags = material_texture_flags_from_ids(&texture_ids);
         self.materials.insert(
             material_id,
             Dx12MaterialState {
                 constants: material_constants_from_upload(&upload),
-                texture_id: upload.base_color_texture.map(|texture| texture.id),
+                emissive_constants: emissive_constants(upload.emissive, texture_flags),
+                texture_ids,
+                transparency: upload.transparency,
+                double_sided: upload.double_sided,
                 content_hash: upload.content_hash,
                 revision,
             },
@@ -1749,7 +2003,11 @@ impl BackendRenderer for Dx12SceneRenderer {
             }
             ResourceKind::Texture => {
                 if let Some(dependent) = self.materials.iter().find_map(|(id, material)| {
-                    (material.texture_id.as_deref() == Some(removal.resource_id.id.as_str()))
+                    material
+                        .texture_ids
+                        .iter()
+                        .flatten()
+                        .any(|texture_id| texture_id == &removal.resource_id.id)
                         .then_some(id)
                 }) {
                     return Err(vec![Diagnostic::new(
@@ -1779,6 +2037,11 @@ impl BackendRenderer for Dx12SceneRenderer {
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 fn default_material_constants() -> [u8; 32] {
     material_constants([0.8, 0.6, 0.4, 1.0], 0.0, 1.0, 1.0)
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+fn default_emissive_constants() -> [u8; 16] {
+    [0; 16]
 }
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
@@ -1841,25 +2104,65 @@ fn material_constants_from_upload(upload: &MaterialUpload) -> [u8; 32] {
         upload.ambient_occlusion,
     );
     constants[28..32].copy_from_slice(
-        &(if upload.base_color_texture.is_some() {
-            1.0_f32
-        } else {
-            0.0_f32
-        })
-        .to_ne_bytes(),
+        &material_surface_flags(upload.base_color_texture.is_some(), &upload.transparency)
+            .to_ne_bytes(),
     );
     constants
 }
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
-fn material_constants_from_bytes(bytes: &[u8], uses_texture: bool) -> [u8; 32] {
+fn material_constants_from_bytes(
+    bytes: &[u8],
+    uses_texture: bool,
+    transparency: &Transparency,
+) -> [u8; 32] {
     let fallback = default_material_constants();
     let mut constants = fallback;
     let copy_len = bytes.len().min(constants.len());
     constants[..copy_len].copy_from_slice(&bytes[..copy_len]);
     constants[28..32]
-        .copy_from_slice(&(if uses_texture { 1.0_f32 } else { 0.0_f32 }).to_ne_bytes());
+        .copy_from_slice(&material_surface_flags(uses_texture, transparency).to_ne_bytes());
     constants
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+fn emissive_constants_from_bytes(bytes: &[u8], texture_flags: u32) -> [u8; 16] {
+    let mut constants = default_emissive_constants();
+    if bytes.len() > 32 {
+        let copy_len = (bytes.len() - 32).min(12);
+        constants[..copy_len].copy_from_slice(&bytes[32..32 + copy_len]);
+    }
+    constants[12..16].copy_from_slice(&(texture_flags as f32).to_ne_bytes());
+    constants
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+fn emissive_constants(emissive: [f32; 3], texture_flags: u32) -> [u8; 16] {
+    float4_bytes([emissive[0], emissive[1], emissive[2], texture_flags as f32])
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+fn material_texture_flags_from_ids(texture_ids: &[Option<String>; 5]) -> u32 {
+    texture_ids
+        .iter()
+        .enumerate()
+        .fold(0_u32, |flags, (index, texture)| {
+            flags | u32::from(texture.is_some()) << index
+        })
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+fn material_surface_flags(uses_texture: bool, transparency: &Transparency) -> f32 {
+    match transparency {
+        Transparency::Masked { cutoff } => (if uses_texture { 3.0 } else { 2.0 }) + cutoff * 0.5,
+        Transparency::Opaque | Transparency::Blend => {
+            if uses_texture {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    }
 }
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
@@ -1903,11 +2206,59 @@ mod material_tests {
 
     #[test]
     fn short_material_binding_preserves_defaults_for_missing_values() {
-        let constants = material_constants_from_bytes(&0.25_f32.to_ne_bytes(), false);
+        let constants =
+            material_constants_from_bytes(&0.25_f32.to_ne_bytes(), false, &Transparency::Opaque);
         assert_eq!(read_f32(&constants, 0), 0.25);
         assert_eq!(read_f32(&constants, 16), 0.0);
         assert_eq!(read_f32(&constants, 20), 1.0);
         assert_eq!(read_f32(&constants, 24), 1.0);
+        assert_eq!(
+            emissive_constants_from_bytes(&0.25_f32.to_ne_bytes(), 0),
+            default_emissive_constants()
+        );
+    }
+
+    #[test]
+    fn emissive_constants_match_hlsl_tail_layout() {
+        let constants = emissive_constants([0.2, 0.4, 0.6], 30);
+        assert_eq!(read_f32(&constants, 0), 0.2);
+        assert_eq!(read_f32(&constants, 4), 0.4);
+        assert_eq!(read_f32(&constants, 8), 0.6);
+        assert_eq!(read_f32(&constants, 12), 30.0);
+
+        let mut binding = vec![0_u8; 48];
+        binding[32..48].copy_from_slice(&constants);
+        assert_eq!(emissive_constants_from_bytes(&binding, 30), constants);
+    }
+
+    #[test]
+    fn material_texture_flags_follow_portable_slot_order() {
+        let texture_ids = [
+            None,
+            Some("normal".to_string()),
+            Some("metallic-roughness".to_string()),
+            Some("occlusion".to_string()),
+            Some("emissive".to_string()),
+        ];
+        assert_eq!(material_texture_flags_from_ids(&texture_ids), 30);
+    }
+
+    #[test]
+    fn material_flags_encode_texture_mask_cutoff_and_surface_variant() {
+        assert_eq!(material_surface_flags(false, &Transparency::Opaque), 0.0);
+        assert_eq!(material_surface_flags(true, &Transparency::Blend), 1.0);
+        assert_eq!(
+            material_surface_flags(false, &Transparency::Masked { cutoff: 0.4 }),
+            2.2
+        );
+        assert_eq!(
+            material_surface_flags(true, &Transparency::Masked { cutoff: 0.4 }),
+            3.2
+        );
+        assert_eq!(surface_variant_index(&Transparency::Opaque, false), 0);
+        assert_eq!(surface_variant_index(&Transparency::Opaque, true), 1);
+        assert_eq!(surface_variant_index(&Transparency::Blend, false), 2);
+        assert_eq!(surface_variant_index(&Transparency::Blend, true), 3);
     }
 
     fn shadow_input(direction: [f32; 3]) -> RenderFrameInput {

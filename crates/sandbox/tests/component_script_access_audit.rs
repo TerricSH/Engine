@@ -21,6 +21,7 @@ fn canonical_game_registry() -> ComponentRegistry {
     let mut components = ComponentRegistry::new();
     components.register_core();
     engine_character::register_character_extensions(&mut components, None);
+    engine_vfx::register_vfx_extensions(&mut components);
     engine_physics::register_physics_extensions(&mut components, None);
     engine_ui::register_ui_extensions(&mut components);
 
@@ -106,6 +107,9 @@ fn curated_bridge_components_keep_their_access_levels() {
         "engine.audio_listener",
         "engine.physics.physics_material",
         "engine.nav_agent",
+        "engine.interactable",
+        "engine.vfx.particle_emitter",
+        "engine.vfx.decal",
     ] {
         assert_eq!(access(type_id), ScriptAccess::ReadWrite, "{type_id}");
     }
@@ -114,5 +118,12 @@ fn curated_bridge_components_keep_their_access_levels() {
         ScriptAccess::ReadOnly
     );
     assert_eq!(access("engine.canvas"), ScriptAccess::DedicatedApi);
+    assert_eq!(access("engine.physics.joint"), ScriptAccess::DedicatedApi);
+    assert_eq!(
+        access("engine.physics.destructible"),
+        ScriptAccess::DedicatedApi
+    );
+    assert_eq!(access("engine.ragdoll"), ScriptAccess::DedicatedApi);
+    assert_eq!(access("engine.ragdoll_part"), ScriptAccess::None);
     assert_eq!(access("engine.transform"), ScriptAccess::DedicatedApi);
 }

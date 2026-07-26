@@ -56,6 +56,16 @@ pub trait CommandEncoder: Send {
     ) -> bool {
         false
     }
+    /// Bind an ordered sampled-texture/sampler table. Scene pipelines use this
+    /// for base color, shadow, normal, metallic-roughness, occlusion, and
+    /// emissive resources while retaining the pair bridge for older backends.
+    fn bind_sampled_texture_set(
+        &mut self,
+        _pipeline_layout: PipelineLayoutHandle,
+        _textures: &[TextureHandle],
+    ) -> bool {
+        false
+    }
     /// Bind a uniform buffer through a backend root/descriptor binding used by
     /// the portable skinning path. Returns `false` if the layout does not
     /// declare a compatible binding.

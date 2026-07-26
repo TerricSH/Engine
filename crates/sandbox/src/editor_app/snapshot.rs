@@ -316,6 +316,8 @@ pub struct MaterialParameterDto {
     pub name: String,
     pub kind: &'static str,
     pub value: JsonValue,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -778,15 +780,28 @@ impl EditorApp {
                 .shader_params
                 .iter()
                 .map(|parameter| {
-                    let (kind, value) = match parameter.param_type {
-                        ShaderParamType::Float => ("float", json!(parameter.float_value)),
-                        ShaderParamType::Color => ("color", json!(parameter.color_value)),
-                        ShaderParamType::Texture => ("texture", json!(parameter.texture_value)),
+                    let (kind, value, options) = match parameter.param_type {
+                        ShaderParamType::Float => {
+                            ("float", json!(parameter.float_value), Vec::new())
+                        }
+                        ShaderParamType::Color => {
+                            ("color", json!(parameter.color_value), Vec::new())
+                        }
+                        ShaderParamType::Texture => {
+                            ("texture", json!(parameter.texture_value), Vec::new())
+                        }
+                        ShaderParamType::Choice => (
+                            "choice",
+                            json!(parameter.choice_value),
+                            parameter.choice_options.clone(),
+                        ),
+                        ShaderParamType::Bool => ("bool", json!(parameter.bool_value), Vec::new()),
                     };
                     MaterialParameterDto {
                         name: parameter.name.clone(),
                         kind,
                         value,
+                        options,
                     }
                 })
                 .collect(),

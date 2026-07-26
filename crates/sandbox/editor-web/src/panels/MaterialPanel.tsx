@@ -209,11 +209,49 @@ function TextureParameterEditor({ parameter, disabled, textureAssets, onCommit }
   )
 }
 
+function ChoiceParameterEditor({ parameter, disabled, onCommit }: ParameterEditorProps) {
+  const source = typeof parameter.value === 'string' ? parameter.value : ''
+  const options = parameter.options ?? []
+  return (
+    <div className="material-parameter-row">
+      <label htmlFor={`material-${parameter.name}`}>{parameter.name}</label>
+      <select
+        id={`material-${parameter.name}`}
+        aria-label={`${parameter.name} choice`}
+        disabled={disabled}
+        onChange={(event) => void onCommit(parameter.name, event.currentTarget.value)}
+        value={source}
+      >
+        {options.map((option) => <option key={option} value={option}>{option}</option>)}
+      </select>
+    </div>
+  )
+}
+
+function BoolParameterEditor({ parameter, disabled, onCommit }: ParameterEditorProps) {
+  const source = parameter.value === true
+  return (
+    <div className="material-parameter-row">
+      <label htmlFor={`material-${parameter.name}`}>{parameter.name}</label>
+      <input
+        id={`material-${parameter.name}`}
+        aria-label={`${parameter.name} toggle`}
+        checked={source}
+        disabled={disabled}
+        onChange={(event) => void onCommit(parameter.name, event.currentTarget.checked)}
+        type="checkbox"
+      />
+    </div>
+  )
+}
+
 function MaterialParameterEditor(props: ParameterEditorProps) {
   switch (props.parameter.kind) {
     case 'float': return <FloatParameterEditor {...props} />
     case 'color': return <ColorParameterEditor {...props} />
     case 'texture': return <TextureParameterEditor {...props} />
+    case 'choice': return <ChoiceParameterEditor {...props} />
+    case 'bool': return <BoolParameterEditor {...props} />
   }
 }
 

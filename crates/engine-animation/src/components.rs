@@ -2,6 +2,7 @@ use crate::ik::chain::IkChain;
 use crate::ik::constraint::IkConstraintSet;
 use crate::ik::effector::IkEffector;
 use crate::layers::AnimLayer;
+use crate::ragdoll::ExternalPoseOverride;
 use crate::skeleton::BoneTransform;
 use crate::state_machine::{AnimParamValue, AnimStateMachineInstance};
 use engine_scene::Component;
@@ -22,6 +23,12 @@ pub struct AnimationPlayer {
     /// Cached bone world-space positions, populated by the pipeline after evaluation.
     #[serde(skip)]
     pub cached_bone_positions: Vec<[f32; 3]>,
+    /// Global bone transforms from the most recently evaluated pose.
+    #[serde(skip)]
+    pub cached_bone_transforms: Vec<BoneTransform>,
+    /// Frame-local pose ownership supplied by ragdoll physics.
+    #[serde(skip)]
+    pub external_pose_override: Option<ExternalPoseOverride>,
 }
 
 impl Component for AnimationPlayer {
@@ -40,6 +47,8 @@ impl AnimationPlayer {
             state_machine: None,
             layers: vec![AnimLayer::new("base")],
             cached_bone_positions: Vec::new(),
+            cached_bone_transforms: Vec::new(),
+            external_pose_override: None,
         }
     }
     pub fn with_clip(clip_asset: impl Into<String>) -> Self {
@@ -53,6 +62,8 @@ impl AnimationPlayer {
             state_machine: None,
             layers: vec![AnimLayer::new("base")],
             cached_bone_positions: Vec::new(),
+            cached_bone_transforms: Vec::new(),
+            external_pose_override: None,
         }
     }
     pub fn set_state_machine(&mut self, sm: AnimStateMachineInstance) {
@@ -76,6 +87,7 @@ impl AnimationPlayer {
     }
     /// Set the cached bone world positions (called by the pipeline after evaluation).
     pub fn set_cached_bone_positions(&mut self, global_transforms: &[BoneTransform]) {
+        self.cached_bone_transforms = global_transforms.to_vec();
         self.cached_bone_positions = global_transforms
             .iter()
             .map(|bt| bt.translation.to_array())

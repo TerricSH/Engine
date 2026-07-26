@@ -50,6 +50,7 @@ engine-scene = { path = "../engine-scene" }
 engine-script = { path = "../engine-script", optional = true }
 engine-script-api = { path = "../engine-script-api" }
 engine-serialize = { path = "../engine-serialize" }
+bincode.workspace = true
 glam.workspace = true
 gltf.workspace = true
 render-core = { path = "../render-core" }
@@ -61,16 +62,17 @@ render-opengl = { path = "../render-opengl", optional = true }
 render-dx12 = { path = "../render-dx12", optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+urlencoding.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 sha2.workspace = true
 tempfile = "3"
 
 [dev-dependencies]
-bincode.workspace = true
 engine-audio = { path = "../engine-audio" }
 engine-nav = { path = "../engine-nav" }
 engine-ui = { path = "../engine-ui" }
+engine-vfx = { path = "../engine-vfx" }
 
 # Soak harness working-set sampling (ENG-71): process memory counters for the
 # memory-plateau assertion. Windows-only, test-only.

@@ -1174,9 +1174,13 @@ dependencies = [
  "engine-serialize",
  "engine-terrain",
  "engine-ui",
+ "engine-vfx",
  "glam",
  "raw-window-handle",
  "render-vulkan",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -1406,6 +1410,17 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "engine-vfx"
+version = "0.1.0"
+dependencies = [
+ "engine-renderer",
+ "engine-scene",
+ "engine-serialize",
+ "glam",
+ "serde",
 ]
 
 [[package]]
@@ -4221,6 +4236,7 @@ dependencies = [
  "engine-serialize",
  "engine-terrain",
  "engine-ui",
+ "engine-vfx",
  "glam",
  "gltf",
  "platform",
@@ -4236,6 +4252,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "windows 0.58.0",
 ]
 

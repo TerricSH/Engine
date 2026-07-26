@@ -850,6 +850,7 @@ mod tests {
                 point: [0.0, 0.5, 0.0],
                 normal: [0.0, 1.0, 0.0],
                 distance: 4.5,
+                interaction: None,
             },
             crate::GameplayPhysicsQueryResult::RaycastMiss { query_id: 8 },
             crate::GameplayPhysicsQueryResult::OverlapSphere {

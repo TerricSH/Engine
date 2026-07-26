@@ -116,11 +116,11 @@ mod tests {
                     bindings: vec![
                         BindGroupLayoutBinding {
                             binding: 0,
-                            resource_kind: "sampled_texture_pair".into(),
+                            resource_kind: "sampled_texture_set".into(),
                         },
                         BindGroupLayoutBinding {
                             binding: 0,
-                            resource_kind: "sampler_pair".into(),
+                            resource_kind: "sampler_set".into(),
                         },
                         BindGroupLayoutBinding {
                             binding: 1,
@@ -131,11 +131,11 @@ mod tests {
                 push_constant_ranges: vec![PushConstantRange {
                     stage_flags: 3,
                     offset: 0,
-                    size: 192,
+                    size: 208,
                 }],
                 debug_label: Some("root-constant-smoke".into()),
             })
-            .expect("192-byte root-constant signature with paired textures");
+            .expect("208-byte root-constant signature with paired textures");
         device.destroy_pipeline_layout(layout);
     }
 

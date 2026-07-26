@@ -21,6 +21,8 @@ pub const AUDIO_SOURCE_COMPONENT: &str = "engine.audio_source";
 pub const IK_TARGET_COMPONENT: &str = "engine.ik_target";
 pub const NAV_AGENT_COMPONENT: &str = "engine.nav_agent";
 pub const TERRAIN_VOLUME_COMPONENT: &str = "engine.terrain_volume";
+pub const INTERACTABLE_COMPONENT: &str = "engine.interactable";
+pub const DESTRUCTIBLE_COMPONENT: &str = "engine.physics.destructible";
 
 #[derive(Clone, Copy)]
 pub struct ComponentDescriptor {
@@ -174,6 +176,20 @@ fn bounds(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
         ("center".into(), Value::Vec3([0.0, 0.0, 0.0])),
         ("half_extents".into(), Value::Vec3([0.5, 0.5, 0.5])),
     ])))
+}
+
+fn interactable(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
+    Ok(record(
+        engine_scene::components::serialize_interactable_fields(
+            &engine_scene::components::Interactable::default(),
+        ),
+    ))
+}
+
+fn destructible(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
+    Ok(record(engine_physics::serialize_destructible_fields(
+        &engine_physics::Destructible::default(),
+    )))
 }
 
 fn rigid_body(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
@@ -347,7 +363,7 @@ fn terrain_volume(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
     ])))
 }
 
-const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 16] = [
+const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 18] = [
     ComponentDescriptor {
         type_id: TRANSFORM_COMPONENT,
         display_name: "Transform",
@@ -433,6 +449,22 @@ const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 16] = [
         // not own a physics rigid body or collider.
         required_components: &[TRANSFORM_COMPONENT],
         factory: character_controller,
+    },
+    ComponentDescriptor {
+        type_id: INTERACTABLE_COMPONENT,
+        display_name: "Interactable",
+        category: "Gameplay",
+        removable: true,
+        required_components: &[TRANSFORM_COMPONENT],
+        factory: interactable,
+    },
+    ComponentDescriptor {
+        type_id: DESTRUCTIBLE_COMPONENT,
+        display_name: "Destructible",
+        category: "Gameplay",
+        removable: true,
+        required_components: &[TRANSFORM_COMPONENT],
+        factory: destructible,
     },
     ComponentDescriptor {
         type_id: AUDIO_LISTENER_COMPONENT,
@@ -776,6 +808,8 @@ mod tests {
             IK_TARGET_COMPONENT,
             NAV_AGENT_COMPONENT,
             TERRAIN_VOLUME_COMPONENT,
+            INTERACTABLE_COMPONENT,
+            DESTRUCTIBLE_COMPONENT,
         ] {
             assert!(ComponentCatalog::descriptor(type_id).is_some(), "{type_id}");
         }
@@ -789,6 +823,11 @@ mod tests {
             "engine.script",
             "engine.animation_player",
             "engine.skeleton",
+            // Joint authoring needs two selected body IDs and a constraint
+            // gizmo; a generic empty component would fail validation.
+            "engine.physics.joint",
+            // Ragdolls require a body/constraint fitting workflow.
+            "engine.ragdoll",
         ] {
             assert!(ComponentCatalog::descriptor(type_id).is_none(), "{type_id}");
         }
@@ -887,6 +926,10 @@ mod tests {
             // deny set prevents a metadata-only change from exposing them.
             "engine.animation_player",
             "engine.skeleton",
+            // These need dedicated multi-entity/fitting authoring workflows;
+            // inserting their empty defaults would create invalid scenes.
+            "engine.physics.joint",
+            "engine.ragdoll",
         ]);
 
         for extension in registry

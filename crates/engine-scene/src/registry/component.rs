@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use engine_serialize::Value;
 
 use crate::component::{Component, ComponentStorageDyn, SparseSet};
-use crate::components::{Bounds, Camera, Light, Name, Renderable, Transform};
+use crate::components::{Bounds, Camera, Interactable, Light, Name, Renderable, Transform};
 use crate::prefab_instance::PrefabInstanceRef;
 
 // ---------------------------------------------------------------------------
@@ -274,6 +274,19 @@ impl ComponentRegistry {
             crate::components::serialize_light,
             crate::components::deserialize_light
         );
+        core_ext!(
+            Interactable,
+            "Interactable",
+            true,
+            ScriptAccess::ReadWrite,
+            crate::components::serialize_interactable,
+            crate::components::deserialize_interactable
+        );
+        self.register_fields_validator(
+            Interactable::TYPE_ID,
+            crate::components::validate_interactable_fields,
+        )
+        .ok();
         core_ext!(Bounds, "Bounds", true, ScriptAccess::None);
         core_ext!(
             PrefabInstanceRef,

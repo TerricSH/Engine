@@ -11,6 +11,8 @@ pub mod asset_stream;
 pub use asset_stream::*;
 pub mod cell_stream;
 pub use cell_stream::{CellStreamingConfig, CellStreamingDriver};
+pub mod savegame;
+pub use savegame::*;
 #[cfg(feature = "terrain")]
 pub mod terrain;
 #[cfg(feature = "terrain")]
@@ -32,6 +34,8 @@ use std::sync::Arc;
 
 pub mod ffi_init;
 pub mod game_loop;
+#[cfg(all(feature = "runtime-subsystems", feature = "gameplay"))]
+mod ragdoll_runtime;
 #[cfg(feature = "runtime-subsystems")]
 pub use game_loop::{RuntimeUiEvent, RuntimeUiValue};
 
@@ -43,9 +47,9 @@ pub mod script;
 mod script_components;
 #[cfg(feature = "subsystem-scripting-csharp")]
 use engine_script::{
-    GameplayCommand, GameplayContext, GameplayEntitySnapshot, GameplayInputTransitions,
-    GameplayInputValue, GameplayPhysicsEvent, GameplayUiEvent, ScriptEngine, ScriptError,
-    ScriptHost, ScriptTransform,
+    GameplayCommand, GameplayContext, GameplayDamageEvent, GameplayEntitySnapshot,
+    GameplayInputTransitions, GameplayInputValue, GameplayPhysicsEvent, GameplayRagdollEvent,
+    GameplayUiEvent, ScriptEngine, ScriptError, ScriptHost, ScriptTransform,
 };
 #[cfg(feature = "subsystem-scripting-csharp")]
 use script::{collect_scene_scripts, script_engine_state_summary};
@@ -82,12 +86,12 @@ pub struct SceneLoadRequest {
 /// Configures an [`EngineRuntime`] before its shared component registry is
 /// frozen behind an [`Arc`].
 ///
-/// Character-controller components are always registered. Physics components
-/// are additionally registered when the `gameplay` feature is enabled. The
-/// `runtime-subsystems` feature installs the existing UI, audio, animation, and
-/// navigation extensions on the same registries used by strict scene loading
-/// and rendering. Hosts can add further extensions before calling
-/// [`build`](Self::build).
+/// Character-controller and VFX components are always registered. Physics
+/// components are additionally registered when the `gameplay` feature is
+/// enabled. The `runtime-subsystems` feature installs the existing UI, audio,
+/// animation, and navigation extensions on the same registries used by strict
+/// scene loading and rendering. Hosts can add further extensions before
+/// calling [`build`](Self::build).
 pub struct EngineRuntimeBuilder {
     config: EngineConfig,
     component_registry: ComponentRegistry,
@@ -113,6 +117,7 @@ impl EngineRuntimeBuilder {
             &mut component_registry,
             Some(&mut debug_draw_registry),
         );
+        engine_vfx::register_vfx_extensions(&mut component_registry);
         #[cfg(feature = "terrain")]
         engine_terrain::register_terrain_extensions(&mut component_registry);
         #[cfg(feature = "gameplay")]
@@ -262,6 +267,20 @@ pub struct EngineRuntime {
     /// in the next frame snapshot.
     #[cfg(feature = "subsystem-scripting-csharp")]
     pending_physics_queries: Vec<engine_script::OwnedGameplayPhysicsQuery>,
+    /// Validated forces and impulses drained from scripts during the current
+    /// update. The owning GameLoop resolves them to physics commands.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pending_physics_mutations: Vec<engine_script::OwnedGameplayPhysicsMutation>,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pending_damage_requests: Vec<engine_script::OwnedGameplayDamageRequest>,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    script_damage_events:
+        std::collections::BTreeMap<String, Vec<engine_script::GameplayDamageEvent>>,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pending_ragdoll_requests: Vec<engine_script::OwnedGameplayRagdollRequest>,
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    script_ragdoll_events:
+        std::collections::BTreeMap<String, Vec<engine_script::GameplayRagdollEvent>>,
     /// Validated component queries drained from scripts during the current
     /// update. The runtime executes them against the active World right after
     /// the frame's commands apply and stages results for the next snapshot.
@@ -344,6 +363,16 @@ impl EngineRuntime {
             pending_scene_request: None,
             #[cfg(feature = "subsystem-scripting-csharp")]
             pending_physics_queries: Vec::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            pending_physics_mutations: Vec::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            pending_damage_requests: Vec::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_damage_events: std::collections::BTreeMap::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            pending_ragdoll_requests: Vec::new(),
+            #[cfg(feature = "subsystem-scripting-csharp")]
+            script_ragdoll_events: std::collections::BTreeMap::new(),
             #[cfg(feature = "subsystem-scripting-csharp")]
             pending_component_queries: Vec::new(),
             #[cfg(feature = "subsystem-scripting-csharp")]
@@ -464,6 +493,11 @@ impl EngineRuntime {
         {
             self.pending_scene_request = None;
             self.pending_physics_queries.clear();
+            self.pending_physics_mutations.clear();
+            self.pending_damage_requests.clear();
+            self.script_damage_events.clear();
+            self.pending_ragdoll_requests.clear();
+            self.script_ragdoll_events.clear();
             self.pending_component_queries.clear();
             self.script_component_query_results.clear();
             self.attach_scene_scripts(&scene);
@@ -509,6 +543,11 @@ impl EngineRuntime {
         {
             self.pending_scene_request = None;
             self.pending_physics_queries.clear();
+            self.pending_physics_mutations.clear();
+            self.pending_damage_requests.clear();
+            self.script_damage_events.clear();
+            self.pending_ragdoll_requests.clear();
+            self.script_ragdoll_events.clear();
             self.pending_component_queries.clear();
             self.script_component_query_results.clear();
             self.attach_scene_scripts(&scene);
@@ -701,11 +740,17 @@ impl EngineRuntime {
         // destroyed since the previous frame before recording a new one.
         self.drain_deferred_runtime_mesh_removals();
         self.frame_timing.begin_stage("extraction");
-        let extraction = self.world_slot.with_world(|world| match viewport {
-            Some(viewport) => {
-                extract_renderer_input_from_world_with_viewport(world, frame_index, viewport)
+        let extraction = self.world_slot.with_world(|world| {
+            let mut result = match viewport {
+                Some(viewport) => {
+                    extract_renderer_input_from_world_with_viewport(world, frame_index, viewport)
+                }
+                None => extract_renderer_input_from_world(world, frame_index),
+            };
+            if let Ok(input) = &mut result {
+                engine_vfx::extract_vfx(world, input);
             }
-            None => extract_renderer_input_from_world(world, frame_index),
+            result
         });
         let mut input = if let Some(result) = extraction {
             match result {
@@ -823,7 +868,7 @@ impl EngineRuntime {
                 .ok_or_else(|| missing_registered_render_asset("material", id))?;
             let upload = handle.get().clone();
             validate_registered_asset_id("material", id, &upload.material_id)?;
-            if let Some(texture) = &upload.base_color_texture {
+            for texture in upload.texture_references().into_iter().flatten() {
                 texture_ids.insert(texture.id.clone(), texture.clone());
             }
             materials.push(upload);
@@ -958,6 +1003,11 @@ impl EngineRuntime {
         self.script_host_name = host_name;
         self.pending_scene_request = None;
         self.pending_physics_queries.clear();
+        self.pending_physics_mutations.clear();
+        self.pending_damage_requests.clear();
+        self.script_damage_events.clear();
+        self.pending_ragdoll_requests.clear();
+        self.script_ragdoll_events.clear();
         self.pending_component_queries.clear();
         self.script_component_query_results.clear();
         Ok(())
@@ -1003,6 +1053,53 @@ impl EngineRuntime {
         &mut self,
     ) -> Vec<engine_script::OwnedGameplayPhysicsQuery> {
         std::mem::take(&mut self.pending_physics_queries)
+    }
+
+    /// Take the validated forces and impulses drained from scripts during the
+    /// current update, leaving the queue empty.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn take_pending_physics_mutations(
+        &mut self,
+    ) -> Vec<engine_script::OwnedGameplayPhysicsMutation> {
+        std::mem::take(&mut self.pending_physics_mutations)
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn take_pending_damage_requests(
+        &mut self,
+    ) -> Vec<engine_script::OwnedGameplayDamageRequest> {
+        std::mem::take(&mut self.pending_damage_requests)
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub(crate) fn push_script_damage_event(
+        &mut self,
+        entity_id: String,
+        event: GameplayDamageEvent,
+    ) {
+        self.script_damage_events
+            .entry(entity_id)
+            .or_default()
+            .push(event);
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub fn take_pending_ragdoll_requests(
+        &mut self,
+    ) -> Vec<engine_script::OwnedGameplayRagdollRequest> {
+        std::mem::take(&mut self.pending_ragdoll_requests)
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub(crate) fn push_script_ragdoll_event(
+        &mut self,
+        entity_id: String,
+        event: GameplayRagdollEvent,
+    ) {
+        self.script_ragdoll_events
+            .entry(entity_id)
+            .or_default()
+            .push(event);
     }
 
     /// Tick all scripts — call this each frame before `render_frame`.
@@ -1124,6 +1221,8 @@ impl EngineRuntime {
             physics_query_results,
         );
         let mut diagnostics = self.script_engine.set_gameplay_contexts(&contexts);
+        self.script_damage_events.clear();
+        self.script_ragdoll_events.clear();
         diagnostics.extend(self.script_engine.update(dt));
         let (commands, command_diagnostics) = self.script_engine.drain_gameplay_commands();
         diagnostics.extend(command_diagnostics);
@@ -1244,6 +1343,16 @@ impl EngineRuntime {
                     input_actions: input_actions.clone(),
                     input_transitions: input_transitions.clone(),
                     physics_events: physics_events.get(&entity_id).cloned().unwrap_or_default(),
+                    damage_events: self
+                        .script_damage_events
+                        .get(&entity_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    ragdoll_events: self
+                        .script_ragdoll_events
+                        .get(&entity_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     physics_query_results: physics_query_results
                         .get(&entity_id)
                         .cloned()
@@ -1522,6 +1631,196 @@ impl EngineRuntime {
                         depth,
                     );
                 }
+                GameplayCommand::ApplyDamage {
+                    entity_id: target_id,
+                    amount,
+                    damage_kind,
+                    hit_position,
+                    impulse,
+                } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics
+                            .push(script_owner_missing_diagnostic(&entity_id, "apply damage"));
+                        continue;
+                    }
+                    let command = GameplayCommand::ApplyDamage {
+                        entity_id: target_id.clone(),
+                        amount,
+                        damage_kind,
+                        hit_position,
+                        impulse,
+                    };
+                    if let Err(reason) = command.validate() {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_DAMAGE_INVALID",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' produced an invalid damage request: {reason}"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let target_exists = self
+                        .world_slot
+                        .with_world(|world| world.entity_by_persistent_id(&target_id).is_some())
+                        .unwrap_or(false);
+                    if !target_exists {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_DAMAGE_TARGET_MISSING",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' requested damage for unknown entity '{target_id}'"
+                            ),
+                        ));
+                        continue;
+                    }
+                    if self.pending_damage_requests.len()
+                        >= engine_script::MAX_PENDING_DAMAGE_REQUESTS
+                    {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_DAMAGE_OVERFLOW",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' exceeded the pending damage budget of {} per frame",
+                                engine_script::MAX_PENDING_DAMAGE_REQUESTS
+                            ),
+                        ));
+                        continue;
+                    }
+                    self.pending_damage_requests
+                        .push(engine_script::OwnedGameplayDamageRequest {
+                            owner_entity_id: entity_id,
+                            target_entity_id: target_id,
+                            amount,
+                            damage_kind,
+                            hit_position,
+                            impulse,
+                        });
+                }
+                GameplayCommand::SetRagdoll {
+                    entity_id: target_id,
+                    active,
+                    recovery_duration,
+                    impulse,
+                } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "change ragdoll ownership",
+                        ));
+                        continue;
+                    }
+                    let command = GameplayCommand::SetRagdoll {
+                        entity_id: target_id.clone(),
+                        active,
+                        recovery_duration,
+                        impulse,
+                    };
+                    if let Err(reason) = command.validate() {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_RAGDOLL_INVALID",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' produced an invalid ragdoll request: {reason}"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let target_exists = self
+                        .world_slot
+                        .with_world(|world| world.entity_by_persistent_id(&target_id).is_some())
+                        .unwrap_or(false);
+                    if !target_exists {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_RAGDOLL_TARGET_MISSING",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' requested ragdoll ownership for unknown entity '{target_id}'"
+                            ),
+                        ));
+                        continue;
+                    }
+                    if self.pending_ragdoll_requests.len()
+                        >= engine_script::MAX_PENDING_RAGDOLL_REQUESTS
+                    {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_RAGDOLL_OVERFLOW",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' exceeded the pending ragdoll budget of {} per frame",
+                                engine_script::MAX_PENDING_RAGDOLL_REQUESTS
+                            ),
+                        ));
+                        continue;
+                    }
+                    self.pending_ragdoll_requests.push(
+                        engine_script::OwnedGameplayRagdollRequest {
+                            owner_entity_id: entity_id,
+                            target_entity_id: target_id,
+                            active,
+                            recovery_duration,
+                            impulse,
+                        },
+                    );
+                }
+                GameplayCommand::CharacterControl {
+                    entity_id: target_id,
+                    direction,
+                    jump,
+                    speed,
+                } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "control a character",
+                        ));
+                        continue;
+                    }
+                    let command = GameplayCommand::CharacterControl {
+                        entity_id: target_id.clone(),
+                        direction,
+                        jump,
+                        speed,
+                    };
+                    if let Err(reason) = command.validate() {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_CHARACTER_CONTROL_INVALID",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' produced invalid character control: {reason}"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let applied = self
+                        .world_slot
+                        .with_world_mut(|world| {
+                            let Some(target) = world.entity_by_persistent_id(&target_id) else {
+                                return false;
+                            };
+                            let Some(controller) =
+                                world.get_mut::<engine_character::CharacterController>(target)
+                            else {
+                                return false;
+                            };
+                            controller.push_command(engine_character::CharacterCommand {
+                                direction: glam::Vec3::from(direction),
+                                desired_speed: speed.unwrap_or(0.0),
+                                jump_requested: jump,
+                            });
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !applied {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_CHARACTER_CONTROL_TARGET_MISSING",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' requested character control for '{target_id}', but it has no CharacterController"
+                            ),
+                        ));
+                    }
+                }
                 GameplayCommand::Ui { command } => {
                     if !script_command_owner_exists(&self.world_slot, &entity_id) {
                         diagnostics.push(script_owner_missing_diagnostic(
@@ -1615,6 +1914,75 @@ impl EngineRuntime {
                     }
                     self.pending_physics_queries
                         .push(engine_script::OwnedGameplayPhysicsQuery { entity_id, query });
+                }
+                GameplayCommand::PhysicsMutation { mutation } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "mutate a rigid body",
+                        ));
+                        continue;
+                    }
+                    if let Err(reason) = mutation.validate() {
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_PHYSICS_MUTATION_INVALID",
+                            DiagnosticSeverity::Error,
+                            "script",
+                            format!(
+                                "script entity '{entity_id}' produced an invalid physics mutation: {reason}"
+                            ),
+                        );
+                        diagnostic.entity = Some(entity_id);
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                    let missing_target = self
+                        .world_slot
+                        .with_world(|world| {
+                            mutation
+                                .required_existing_entity_ids()
+                                .into_iter()
+                                .find(|target_id| {
+                                    world.entity_by_persistent_id(target_id).is_none()
+                                })
+                                .map(str::to_owned)
+                        })
+                        .flatten();
+                    if let Some(target_id) = missing_target {
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_PHYSICS_MUTATION_TARGET_MISSING",
+                            DiagnosticSeverity::Error,
+                            "script",
+                            format!(
+                                "script entity '{entity_id}' requested a physics mutation for unknown entity '{target_id}'"
+                            ),
+                        );
+                        diagnostic.entity = Some(entity_id);
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                    if self.pending_physics_mutations.len()
+                        >= engine_script::MAX_PENDING_PHYSICS_MUTATIONS
+                    {
+                        let mut diagnostic = Diagnostic::new(
+                            "SCRIPT_PHYSICS_MUTATION_OVERFLOW",
+                            DiagnosticSeverity::Error,
+                            "script",
+                            format!(
+                                "script entity '{entity_id}' exceeded the pending physics mutation budget of {} per frame",
+                                engine_script::MAX_PENDING_PHYSICS_MUTATIONS
+                            ),
+                        );
+                        diagnostic.entity = Some(entity_id);
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                    self.pending_physics_mutations.push(
+                        engine_script::OwnedGameplayPhysicsMutation {
+                            owner_entity_id: entity_id,
+                            mutation,
+                        },
+                    );
                 }
                 GameplayCommand::ComponentQuery { query } => {
                     if !script_command_owner_exists(&self.world_slot, &entity_id) {
@@ -3026,10 +3394,81 @@ fn install_builtin_render_assets(registry: &mut AssetRegistry) {
             metallic: 0.0,
             roughness: 1.0,
             ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
             base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
             transparency: engine_renderer::Transparency::Opaque,
             double_sided: false,
             content_hash: engine_asset::compute_content_hash(&[b"mat-default-v1"]),
+        },
+    );
+
+    let quad = engine_asset::mesh::MeshData {
+        positions: vec![
+            glam::Vec3::new(-0.5, -0.5, 0.0),
+            glam::Vec3::new(0.5, -0.5, 0.0),
+            glam::Vec3::new(0.5, 0.5, 0.0),
+            glam::Vec3::new(-0.5, 0.5, 0.0),
+        ],
+        normals: vec![glam::Vec3::Z; 4],
+        uvs: vec![
+            glam::Vec2::new(0.0, 1.0),
+            glam::Vec2::new(1.0, 1.0),
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(0.0, 0.0),
+        ],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        bounds: (
+            glam::Vec3::new(-0.5, -0.5, 0.0),
+            glam::Vec3::new(0.5, 0.5, 0.0),
+        ),
+        joints: Vec::new(),
+        weights: Vec::new(),
+    };
+    let (vertex_bytes, index_bytes, index_count, _) =
+        engine_asset::mesh::mesh_data_to_upload_bytes(&quad);
+    let content_hash =
+        engine_asset::compute_content_hash(&[vertex_bytes.as_slice(), index_bytes.as_slice()]);
+    let mesh_id = AssetId::new(engine_vfx::BUILTIN_VFX_QUAD_MESH_ID);
+    registry.insert_typed(
+        mesh_id.clone(),
+        MeshUpload {
+            mesh_id,
+            vertex_format: MeshVertexFormat::Pbr32,
+            vertex_count: 4,
+            vertex_bytes,
+            index_format: engine_renderer::IndexFormat::U32,
+            index_count,
+            index_bytes,
+            bounds: engine_renderer::AxisAlignedBox {
+                min: quad.bounds.0.to_array(),
+                max: quad.bounds.1.to_array(),
+            },
+            content_hash,
+        },
+    );
+
+    let material_id = AssetId::new(engine_vfx::BUILTIN_VFX_MATERIAL_ID);
+    registry.insert_typed(
+        material_id.clone(),
+        MaterialUpload {
+            material_id,
+            base_color: [1.0, 1.0, 1.0, 0.75],
+            metallic: 0.0,
+            roughness: 1.0,
+            ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
+            base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
+            transparency: engine_renderer::Transparency::Blend,
+            double_sided: true,
+            content_hash: engine_asset::compute_content_hash(&[b"mat-vfx-default-v1"]),
         },
     );
 }
@@ -3315,6 +3754,48 @@ mod tests {
         assert!(builder
             .component_registry()
             .is_registered("engine.character_controller"));
+    }
+
+    #[test]
+    fn runtime_builder_registers_vfx_extensions_by_default() {
+        let builder = EngineRuntimeBuilder::default();
+        assert!(builder
+            .component_registry()
+            .is_registered("engine.vfx.particle_emitter"));
+        assert!(builder
+            .component_registry()
+            .is_registered("engine.vfx.decal"));
+    }
+
+    #[test]
+    fn runtime_extracts_vfx_and_syncs_builtin_surface_assets() {
+        let _guard = serial_ffi_world_test();
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_renderer_backend(Box::new(RecordingBackend {
+            uploads: std::sync::Arc::clone(&uploads),
+            rendered_ui_batch_counts: None,
+        }));
+        runtime
+            .load_scene(engine_scene::sample_scene())
+            .expect("sample scene loads");
+        runtime
+            .with_world_mut(|world| {
+                let cube = world.entity_by_persistent_id("cube-01").unwrap();
+                world.add_component(cube, engine_scene::components::Transform::default());
+                world.add_component(cube, engine_vfx::Decal::default());
+            })
+            .unwrap();
+
+        runtime.render_frame(0).expect("VFX frame renders");
+
+        let uploads = uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(uploads.iter().any(|entry| entry == "mesh:mesh-vfx-quad"));
+        assert!(uploads
+            .iter()
+            .any(|entry| entry == "material:mat-vfx-default"));
     }
 
     #[cfg(feature = "gameplay")]
@@ -4124,7 +4605,12 @@ mod tests {
             metallic: 0.0,
             roughness: 1.0,
             ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
             base_color_texture: Some(texture_id),
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
             transparency: engine_renderer::Transparency::Opaque,
             double_sided: false,
             content_hash: [2; 32],
@@ -5009,6 +5495,40 @@ mod tests {
                 assert!(world.entity_by_persistent_id("prefab-scripted-2").is_some());
             })
             .expect("runtime must keep an active World");
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    #[test]
+    fn script_character_control_queues_intent_on_the_target_controller() {
+        let mut runtime = EngineRuntime::new(EngineConfig::default());
+        runtime.set_world(World::from_scene(&engine_scene::sample_scene()));
+        runtime.with_world_mut(|world| {
+            let entity = world.entity_by_persistent_id("cube-01").unwrap();
+            world.add_component(entity, engine_character::CharacterController::new());
+        });
+
+        let diagnostics =
+            runtime.apply_script_gameplay_commands(vec![engine_script::OwnedGameplayCommand {
+                entity_id: "cube-01".into(),
+                command: GameplayCommand::CharacterControl {
+                    entity_id: "cube-01".into(),
+                    direction: [0.6, 0.0, -0.8],
+                    jump: true,
+                    speed: Some(7.5),
+                },
+            }]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        runtime.with_world(|world| {
+            let entity = world.entity_by_persistent_id("cube-01").unwrap();
+            let controller = world
+                .get::<engine_character::CharacterController>(entity)
+                .unwrap();
+            assert_eq!(controller.pending_commands.len(), 1);
+            let command = controller.pending_commands[0];
+            assert_eq!(command.direction.to_array(), [0.6, 0.0, -0.8]);
+            assert_eq!(command.desired_speed, 7.5);
+            assert!(command.jump_requested);
+        });
     }
 
     #[cfg(all(feature = "subsystem-scripting-csharp", feature = "runtime-subsystems"))]

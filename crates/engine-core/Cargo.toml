@@ -32,12 +32,16 @@ engine-audio = { path = "../engine-audio", optional = true }
 engine-nav = { path = "../engine-nav", optional = true }
 engine-physics = { path = "../engine-physics", optional = true }
 engine-gameplay = { path = "../engine-gameplay", optional = true }
+engine-vfx = { path = "../engine-vfx" }
 engine-ui = { path = "../engine-ui", optional = true }
 engine-terrain = { path = "../engine-terrain", optional = true }
 render-vulkan = { path = "../render-vulkan", optional = true }
 raw-window-handle = { workspace = true, optional = true }
 tracing.workspace = true
 glam.workspace = true
+bincode.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-bincode.workspace = true

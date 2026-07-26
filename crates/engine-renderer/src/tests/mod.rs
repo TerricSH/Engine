@@ -210,6 +210,30 @@ fn normalized_sub_viewports_are_valid_but_empty_or_out_of_surface_rects_are_reje
     );
 }
 
+#[test]
+fn frame_material_mask_cutoff_must_be_finite_and_bounded() {
+    let mut input = valid_frame();
+    input.materials.push(super::MaterialBinding {
+        material_id: AssetId::new("material.invalid-mask"),
+        pipeline: AssetId::new("pipeline.forward"),
+        variant_key: 0,
+        textures: Vec::new(),
+        uniforms: super::ParamBlock {
+            bytes: Vec::new(),
+            layout_hash: [0; 32],
+        },
+        pass_mask: 1,
+        transparency: Transparency::Masked { cutoff: f32::NAN },
+        double_sided: true,
+    });
+
+    let diagnostics = validate_frame_input(&input);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "RV0024"
+            && diagnostic.path.as_deref() == Some("materials[0].transparency.cutoff")
+    }));
+}
+
 // ============================================================================
 // validate_frame_input tests
 // ============================================================================
@@ -778,7 +802,12 @@ fn valid_material_upload() -> MaterialUpload {
         metallic: 0.0,
         roughness: 1.0,
         ambient_occlusion: 1.0,
+        emissive: [0.0; 3],
         base_color_texture: Some(AssetId::new("texture.checker")),
+        normal_texture: None,
+        metallic_roughness_texture: None,
+        occlusion_texture: None,
+        emissive_texture: None,
         transparency: Transparency::Opaque,
         double_sided: false,
         content_hash: [3; 32],
@@ -942,7 +971,35 @@ fn invalid_uploads_never_enter_the_backend() {
         .iter()
         .any(|diagnostic| diagnostic.code == DIAG_INVALID_MATERIAL_VALUES));
 
+    let mut emissive_material = valid_material_upload();
+    emissive_material.emissive[1] = 1.1;
+    let emissive_errors = renderer.upload_material(emissive_material).unwrap_err();
+    assert!(emissive_errors
+        .iter()
+        .any(|diagnostic| diagnostic.code == DIAG_INVALID_MATERIAL_VALUES));
+
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn masked_blended_and_double_sided_materials_enter_the_backend() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut renderer = Renderer::new_with_backend(Box::new(CountingBackend {
+        upload_calls: Arc::clone(&calls),
+    }));
+
+    let mut masked = valid_material_upload();
+    masked.material_id = AssetId::new("material.masked");
+    masked.transparency = Transparency::Masked { cutoff: 0.42 };
+    masked.double_sided = true;
+    renderer.upload_material(masked).unwrap();
+
+    let mut blended = valid_material_upload();
+    blended.material_id = AssetId::new("material.blended");
+    blended.transparency = Transparency::Blend;
+    renderer.upload_material(blended).unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[derive(Clone, Copy)]

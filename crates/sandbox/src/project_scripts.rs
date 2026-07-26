@@ -40,9 +40,9 @@ const SCRIPT_SDK_PROJECT: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
     <Nullable>enable</Nullable>
     <AssemblyName>EngineGameplay</AssemblyName>
     <RootNamespace>Engine</RootNamespace>
-    <Version>0.7.0</Version>
-    <AssemblyVersion>0.7.0.0</AssemblyVersion>
-    <FileVersion>0.7.0.0</FileVersion>
+    <Version>0.9.0</Version>
+    <AssemblyVersion>0.9.0.0</AssemblyVersion>
+    <FileVersion>0.9.0.0</FileVersion>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
@@ -86,14 +86,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.7.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.9.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.7.0";
+    public const string Version = "0.9.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
@@ -1129,6 +1129,84 @@ internal static class UIValidation
     }
 }
 
+// High-level movement intent for scene-authored CharacterController
+// components. Commands are deferred and consumed by the controller on its
+// next simulation update; scripts never teleport the character.
+public sealed class ScriptCharacter
+{
+    public const float MaxSpeed = 100.0f;
+    private readonly Func<string> _ownerId;
+    private readonly List<GameplayCommandState> _pending = new();
+
+    internal ScriptCharacter(Func<string> ownerId) => _ownerId = ownerId;
+
+    public void Move(Vector3 direction, float? speed = null) =>
+        Control(_ownerId(), direction, jump: false, speed: speed);
+
+    public void Move(Entity entity, Vector3 direction, float? speed = null) =>
+        Move(entity?.Id ?? throw new ArgumentNullException(nameof(entity)), direction, speed);
+
+    public void Move(string entityId, Vector3 direction, float? speed = null) =>
+        Control(entityId, direction, jump: false, speed: speed);
+
+    public void Jump() => Control(_ownerId(), default, jump: true);
+
+    public void Jump(Entity entity) =>
+        Jump(entity?.Id ?? throw new ArgumentNullException(nameof(entity)));
+
+    public void Jump(string entityId) => Control(entityId, default, jump: true);
+
+    public void Control(
+        Entity entity,
+        Vector3 direction,
+        bool jump = false,
+        float? speed = null) =>
+        Control(
+            entity?.Id ?? throw new ArgumentNullException(nameof(entity)),
+            direction,
+            jump,
+            speed);
+
+    public void Control(
+        string entityId,
+        Vector3 direction,
+        bool jump = false,
+        float? speed = null)
+    {
+        UIValidation.EntityId(entityId, nameof(entityId));
+        UIValidation.Finite(direction.X, nameof(direction));
+        UIValidation.Finite(direction.Y, nameof(direction));
+        UIValidation.Finite(direction.Z, nameof(direction));
+        if (MathF.Abs(direction.Y) > float.Epsilon)
+            throw new ArgumentException("Character direction must be horizontal (Y must be zero)", nameof(direction));
+        var horizontalLengthSquared =
+            direction.X * direction.X + direction.Z * direction.Z;
+        if (horizontalLengthSquared > 1.0002f)
+            throw new ArgumentOutOfRangeException(
+                nameof(direction),
+                "Character direction must have horizontal length no greater than one");
+        if (speed is { } requestedSpeed)
+        {
+            UIValidation.Positive(requestedSpeed, nameof(speed));
+            if (requestedSpeed > MaxSpeed)
+                throw new ArgumentOutOfRangeException(
+                    nameof(speed),
+                    $"Character speed must not exceed {MaxSpeed}");
+        }
+        _pending.Add(GameplayCommandState.CharacterControl(
+            entityId,
+            direction,
+            jump,
+            speed));
+    }
+
+    internal void DrainTo(List<GameplayCommandState> commands)
+    {
+        commands.AddRange(_pending);
+        _pending.Clear();
+    }
+}
+
 public sealed class PhysicsEvent
 {
     private readonly ScriptScene _scene;
@@ -1137,14 +1215,266 @@ public sealed class PhysicsEvent
     {
         Kind = state.Kind;
         OtherEntityId = state.OtherEntityId;
+        JointId = state.JointId;
+        Force = state.Force;
+        Torque = state.Torque;
         _scene = scene;
     }
 
     // collision_entered, collision_stayed, collision_exited,
-    // trigger_entered, trigger_stayed, or trigger_exited.
+    // trigger_entered, trigger_stayed, trigger_exited, or joint_broken.
     public string Kind { get; }
     public string OtherEntityId { get; }
+    public string? JointId { get; }
+    public float? Force { get; }
+    public float? Torque { get; }
     public Entity? Other => _scene.FindEntity(OtherEntityId);
+}
+
+public enum DamageKind
+{
+    Generic,
+    Impact,
+    Bullet,
+    Blast,
+    Fire,
+}
+
+public sealed class DamageEvent
+{
+    internal DamageEvent(DamageEventState state, ScriptScene scene)
+    {
+        TargetEntityId = state.TargetEntityId;
+        SourceEntityId = state.SourceEntityId;
+        Kind = state.DamageKind;
+        RawDamage = state.RawDamage;
+        AppliedDamage = state.AppliedDamage;
+        RemainingHealth = state.RemainingHealth;
+        HitPosition = state.HitPosition is { Length: 3 } point
+            ? new Vector3(point[0], point[1], point[2])
+            : null;
+        Impulse = state.Impulse is { Length: 3 } impulse
+            ? new Vector3(impulse[0], impulse[1], impulse[2])
+            : default;
+        Broke = state.Broke;
+        SpawnedEntityIds = state.SpawnedEntityIds;
+        Scene = scene;
+    }
+
+    private ScriptScene Scene { get; }
+    public string TargetEntityId { get; }
+    public string? SourceEntityId { get; }
+    public string Kind { get; }
+    public float RawDamage { get; }
+    public float AppliedDamage { get; }
+    public float RemainingHealth { get; }
+    public Vector3? HitPosition { get; }
+    public Vector3 Impulse { get; }
+    public bool Broke { get; }
+    public IReadOnlyList<string> SpawnedEntityIds { get; }
+    public Entity? Target => Scene.FindEntity(TargetEntityId);
+    public Entity? Source => SourceEntityId is null ? null : Scene.FindEntity(SourceEntityId);
+}
+
+public sealed class ScriptDamage
+{
+    public const float MaxAmount = 1000000.0f;
+    private IReadOnlyList<DamageEventState> _events = Array.Empty<DamageEventState>();
+    private readonly List<GameplayCommandState> _pending = new();
+    private readonly ScriptScene _scene;
+
+    internal ScriptDamage(ScriptScene scene) => _scene = scene;
+
+    public IReadOnlyList<DamageEvent> Events =>
+        _events.Select(state => new DamageEvent(state, _scene)).ToArray();
+
+    public void Apply(
+        Entity entity,
+        float amount,
+        DamageKind kind = DamageKind.Generic,
+        Vector3? hitPosition = null,
+        Vector3 impulse = default) =>
+        Apply(
+            entity?.Id ?? throw new ArgumentNullException(nameof(entity)),
+            amount,
+            kind,
+            hitPosition,
+            impulse);
+
+    public void Apply(
+        string entityId,
+        float amount,
+        DamageKind kind = DamageKind.Generic,
+        Vector3? hitPosition = null,
+        Vector3 impulse = default)
+    {
+        UIValidation.EntityId(entityId, nameof(entityId));
+        UIValidation.Positive(amount, nameof(amount));
+        if (amount > MaxAmount)
+            throw new ArgumentOutOfRangeException(nameof(amount), $"Damage must not exceed {MaxAmount}");
+        ValidateVector(impulse, nameof(impulse));
+        if (hitPosition is { } point)
+            ValidateVector(point, nameof(hitPosition));
+        _pending.Add(GameplayCommandState.ApplyDamage(
+            entityId,
+            amount,
+            kind.ToString().ToLowerInvariant(),
+            hitPosition,
+            impulse));
+    }
+
+    internal void Replace(IReadOnlyList<DamageEventState> events) => _events = events;
+
+    internal void DrainTo(List<GameplayCommandState> commands)
+    {
+        commands.AddRange(_pending);
+        _pending.Clear();
+    }
+
+    private static void ValidateVector(Vector3 value, string parameterName)
+    {
+        UIValidation.Finite(value.X, parameterName);
+        UIValidation.Finite(value.Y, parameterName);
+        UIValidation.Finite(value.Z, parameterName);
+        if (MathF.Abs(value.X) > ScriptPhysics.MaxMutationComponent ||
+            MathF.Abs(value.Y) > ScriptPhysics.MaxMutationComponent ||
+            MathF.Abs(value.Z) > ScriptPhysics.MaxMutationComponent)
+            throw new ArgumentOutOfRangeException(
+                parameterName,
+                $"Vector components must not exceed {ScriptPhysics.MaxMutationComponent}");
+    }
+}
+
+public sealed class RagdollEvent
+{
+    internal RagdollEvent(RagdollEventState state, ScriptScene scene)
+    {
+        EntityId = state.EntityId;
+        Active = state.Active;
+        Recovering = state.Recovering;
+        BodyEntityIds = state.BodyEntityIds;
+        Scene = scene;
+    }
+
+    private ScriptScene Scene { get; }
+    public string EntityId { get; }
+    public bool Active { get; }
+    public bool Recovering { get; }
+    public IReadOnlyList<string> BodyEntityIds { get; }
+    public Entity? Entity => Scene.FindEntity(EntityId);
+    public IReadOnlyList<Entity> Bodies =>
+        BodyEntityIds
+            .Select(Scene.FindEntity)
+            .Where(entity => entity is not null)
+            .Cast<Entity>()
+            .ToArray();
+}
+
+public sealed class ScriptRagdoll
+{
+    public const float MaxRecoveryDuration = 30.0f;
+    private IReadOnlyList<RagdollEventState> _events = Array.Empty<RagdollEventState>();
+    private readonly List<GameplayCommandState> _pending = new();
+    private readonly ScriptScene _scene;
+
+    internal ScriptRagdoll(ScriptScene scene) => _scene = scene;
+
+    public IReadOnlyList<RagdollEvent> Events =>
+        _events.Select(state => new RagdollEvent(state, _scene)).ToArray();
+
+    public void Activate(Entity entity, Vector3 impulse = default) =>
+        Activate(entity?.Id ?? throw new ArgumentNullException(nameof(entity)), impulse);
+
+    public void Activate(string entityId, Vector3 impulse = default)
+    {
+        UIValidation.EntityId(entityId, nameof(entityId));
+        ValidateVector(impulse, nameof(impulse));
+        _pending.Add(GameplayCommandState.SetRagdoll(
+            entityId,
+            active: true,
+            recoveryDuration: 0.0f,
+            impulse: impulse));
+    }
+
+    public void Recover(Entity entity, float duration = 0.35f) =>
+        Recover(entity?.Id ?? throw new ArgumentNullException(nameof(entity)), duration);
+
+    public void Recover(string entityId, float duration = 0.35f)
+    {
+        UIValidation.EntityId(entityId, nameof(entityId));
+        UIValidation.Finite(duration, nameof(duration));
+        if (duration < 0.0f || duration > MaxRecoveryDuration)
+            throw new ArgumentOutOfRangeException(
+                nameof(duration),
+                $"Recovery duration must be between 0 and {MaxRecoveryDuration} seconds");
+        _pending.Add(GameplayCommandState.SetRagdoll(
+            entityId,
+            active: false,
+            recoveryDuration: duration,
+            impulse: default));
+    }
+
+    public void SnapToAnimation(Entity entity) => Recover(entity, 0.0f);
+    public void SnapToAnimation(string entityId) => Recover(entityId, 0.0f);
+
+    internal void Replace(IReadOnlyList<RagdollEventState> events) => _events = events;
+
+    internal void DrainTo(List<GameplayCommandState> commands)
+    {
+        commands.AddRange(_pending);
+        _pending.Clear();
+    }
+
+    private static void ValidateVector(Vector3 value, string parameterName)
+    {
+        UIValidation.Finite(value.X, parameterName);
+        UIValidation.Finite(value.Y, parameterName);
+        UIValidation.Finite(value.Z, parameterName);
+        if (MathF.Abs(value.X) > ScriptPhysics.MaxMutationComponent ||
+            MathF.Abs(value.Y) > ScriptPhysics.MaxMutationComponent ||
+            MathF.Abs(value.Z) > ScriptPhysics.MaxMutationComponent)
+            throw new ArgumentOutOfRangeException(
+                parameterName,
+                $"Vector components must not exceed {ScriptPhysics.MaxMutationComponent}");
+    }
+}
+
+public enum PhysicsJointType
+{
+    Fixed,
+    Revolute,
+    Prismatic,
+    Spherical,
+}
+
+public sealed class PhysicsJointLimits
+{
+    public float Min { get; set; }
+    public float Max { get; set; }
+    public float Stiffness { get; set; }
+    public float Damping { get; set; }
+}
+
+public sealed class PhysicsJointMotor
+{
+    public float TargetVelocity { get; set; }
+    public float TargetPosition { get; set; }
+    public float Stiffness { get; set; }
+    public float Damping { get; set; }
+}
+
+// Re-submit the same joint id to update its anchors, limits, motor, or break
+// thresholds. Native physics handles never cross the script boundary.
+public sealed class PhysicsJointSettings
+{
+    public PhysicsJointType Type { get; set; } = PhysicsJointType.Fixed;
+    public Vector3 AnchorA { get; set; }
+    public Vector3 AnchorB { get; set; }
+    public Vector3 Axis { get; set; } = new Vector3(1.0f, 0.0f, 0.0f);
+    public PhysicsJointLimits? Limits { get; set; }
+    public PhysicsJointMotor? Motor { get; set; }
+    public float BreakForce { get; set; }
+    public float BreakTorque { get; set; }
 }
 
 // Correlates a deferred physics query with its result. Queries execute at
@@ -1175,6 +1505,22 @@ public sealed class PhysicsQueryFilter
     }
 }
 
+public sealed class InteractionInfo
+{
+    internal InteractionInfo(InteractionState state)
+    {
+        Prompt = state.Prompt;
+        Action = state.Action;
+        MaxDistance = state.MaxDistance;
+        Grabbable = state.Grabbable;
+    }
+
+    public string Prompt { get; }
+    public string Action { get; }
+    public float MaxDistance { get; }
+    public bool Grabbable { get; }
+}
+
 public sealed class RaycastHit
 {
     private readonly ScriptScene _scene;
@@ -1191,6 +1537,9 @@ public sealed class RaycastHit
         Normal = new Vector3(normal[0], normal[1], normal[2]);
         Distance = state.Distance
             ?? throw new InvalidOperationException("raycast hit arrived without a distance");
+        Interaction = state.Interaction is null
+            ? null
+            : new InteractionInfo(state.Interaction);
         _scene = scene;
     }
 
@@ -1198,6 +1547,7 @@ public sealed class RaycastHit
     public Vector3 Point { get; }
     public Vector3 Normal { get; }
     public float Distance { get; }
+    public InteractionInfo? Interaction { get; }
     public Entity? Entity => _scene.FindEntity(EntityId);
 }
 
@@ -1240,6 +1590,92 @@ public sealed class PhysicsQueryResult
     public IReadOnlyList<string>? EntityIds { get; }
 }
 
+public sealed class InteractionTarget
+{
+    internal InteractionTarget(RaycastHit hit)
+    {
+        Hit = hit;
+        var interaction = hit.Interaction
+            ?? throw new InvalidOperationException("interaction target requires interaction metadata");
+        Prompt = interaction.Prompt;
+        Action = interaction.Action;
+        MaxDistance = interaction.MaxDistance;
+        Grabbable = interaction.Grabbable;
+    }
+
+    public RaycastHit Hit { get; }
+    public string EntityId => Hit.EntityId;
+    public Entity? Entity => Hit.Entity;
+    public Vector3 Point => Hit.Point;
+    public Vector3 Normal => Hit.Normal;
+    public float Distance => Hit.Distance;
+    public string Prompt { get; }
+    public string Action { get; }
+    public float MaxDistance { get; }
+    public bool Grabbable { get; }
+}
+
+// Project-facing use/grab convention. Probe excludes the owning entity by
+// default and returns a deferred physics query. On the next frame,
+// TryGetTarget accepts only enabled engine.interactable hits within their
+// authored max_distance. The project decides what each action key does.
+public sealed class ScriptInteraction
+{
+    private readonly ScriptPhysics _physics;
+    private readonly Func<string> _ownerId;
+
+    internal ScriptInteraction(ScriptPhysics physics, Func<string> ownerId)
+    {
+        _physics = physics;
+        _ownerId = ownerId;
+    }
+
+    public PhysicsQuery Probe(
+        Vector3 origin,
+        Vector3 direction,
+        float maxDistance = 3.0f,
+        PhysicsQueryFilter? filter = null)
+    {
+        var resolvedFilter = new PhysicsQueryFilter
+        {
+            LayerMask = filter?.LayerMask,
+            IncludeSensors = filter?.IncludeSensors ?? false,
+            ExcludeEntityId = filter?.ExcludeEntityId ?? _ownerId()
+        };
+        return _physics.Raycast(origin, direction, maxDistance, resolvedFilter);
+    }
+
+    public bool TryGetTarget(PhysicsQuery query, out InteractionTarget target)
+    {
+        if (_physics.TryGetRaycastHit(query, out var hit) && hit.Interaction is not null)
+        {
+            target = new InteractionTarget(hit);
+            return true;
+        }
+        target = null!;
+        return false;
+    }
+
+    public void Grab(
+        string jointId,
+        Entity grabAnchor,
+        InteractionTarget target,
+        float breakForce = 0.0f,
+        float breakTorque = 0.0f)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        if (!target.Grabbable)
+            throw new InvalidOperationException(
+                $"Interaction target '{target.EntityId}' is not marked grabbable");
+        var entity = target.Entity
+            ?? throw new InvalidOperationException(
+                $"Interaction target '{target.EntityId}' no longer exists");
+        _physics.Grab(jointId, grabAnchor, entity, breakForce, breakTorque);
+    }
+
+    public void ReleaseGrab(string jointId) => _physics.ReleaseGrab(jointId);
+}
+
 public sealed class ScriptPhysics
 {
     // Mirrors the native query bounds: ray distance and sphere radius are
@@ -1247,6 +1683,7 @@ public sealed class ScriptPhysics
     // MaxOverlapResults sorted entity ids.
     public const float MaxQueryDistance = 10000.0f;
     public const int MaxOverlapResults = 64;
+    public const float MaxMutationComponent = 1000000.0f;
 
     private const float MinDirectionLengthSquared = 1e-12f;
 
@@ -1254,6 +1691,7 @@ public sealed class ScriptPhysics
     private IReadOnlyList<PhysicsEventState> _events = Array.Empty<PhysicsEventState>();
     private readonly Dictionary<uint, PhysicsQueryResultState> _queryResults = new();
     private readonly List<PhysicsQueryState> _pendingQueries = new();
+    private readonly List<PhysicsMutationState> _pendingMutations = new();
     private uint _nextQueryId = 1;
 
     internal ScriptPhysics(ScriptScene scene) => _scene = scene;
@@ -1328,6 +1766,114 @@ public sealed class ScriptPhysics
         return query;
     }
 
+    // Forces and impulses are deferred and resolved by persistent entity id.
+    // They execute at the start of the next safe physics step.
+    public void ApplyForce(Entity entity, Vector3 force) =>
+        ApplyForce(entity?.Id ?? throw new ArgumentNullException(nameof(entity)), force);
+
+    public void ApplyForce(string entityId, Vector3 force)
+    {
+        ValidateMutation(entityId, force, nameof(force));
+        _pendingMutations.Add(PhysicsMutationState.ApplyForce(entityId, force));
+    }
+
+    public void ApplyImpulse(Entity entity, Vector3 impulse) =>
+        ApplyImpulse(entity?.Id ?? throw new ArgumentNullException(nameof(entity)), impulse);
+
+    public void ApplyImpulse(string entityId, Vector3 impulse)
+    {
+        ValidateMutation(entityId, impulse, nameof(impulse));
+        _pendingMutations.Add(PhysicsMutationState.ApplyImpulse(entityId, impulse));
+    }
+
+    public void ApplyTorque(Entity entity, Vector3 torque) =>
+        ApplyTorque(entity?.Id ?? throw new ArgumentNullException(nameof(entity)), torque);
+
+    public void ApplyTorque(string entityId, Vector3 torque)
+    {
+        ValidateMutation(entityId, torque, nameof(torque));
+        _pendingMutations.Add(PhysicsMutationState.ApplyTorque(entityId, torque));
+    }
+
+    public void ApplyTorqueImpulse(Entity entity, Vector3 torqueImpulse) =>
+        ApplyTorqueImpulse(
+            entity?.Id ?? throw new ArgumentNullException(nameof(entity)),
+            torqueImpulse);
+
+    public void ApplyTorqueImpulse(string entityId, Vector3 torqueImpulse)
+    {
+        ValidateMutation(entityId, torqueImpulse, nameof(torqueImpulse));
+        _pendingMutations.Add(
+            PhysicsMutationState.ApplyTorqueImpulse(entityId, torqueImpulse));
+    }
+
+    // Creates or replaces a persistent joint at the next frame boundary.
+    // Updating is intentionally the same operation: submit the same joint id
+    // with new settings and the native backend replaces it incrementally.
+    public void CreateJoint(
+        string jointId,
+        Entity bodyA,
+        Entity bodyB,
+        PhysicsJointSettings? settings = null) =>
+        CreateJoint(
+            jointId,
+            bodyA?.Id ?? throw new ArgumentNullException(nameof(bodyA)),
+            bodyB?.Id ?? throw new ArgumentNullException(nameof(bodyB)),
+            settings);
+
+    public void CreateJoint(
+        string jointId,
+        string bodyAId,
+        string bodyBId,
+        PhysicsJointSettings? settings = null)
+    {
+        UIValidation.EntityId(jointId, nameof(jointId));
+        UIValidation.EntityId(bodyAId, nameof(bodyAId));
+        UIValidation.EntityId(bodyBId, nameof(bodyBId));
+        if (StringComparer.Ordinal.Equals(bodyAId, bodyBId))
+            throw new ArgumentException("Joint bodies must be different entities", nameof(bodyBId));
+        settings ??= new PhysicsJointSettings();
+        ValidateJointSettings(settings);
+        _pendingMutations.Add(
+            PhysicsMutationState.CreateJoint(jointId, bodyAId, bodyBId, settings));
+    }
+
+    public void UpdateJoint(
+        string jointId,
+        Entity bodyA,
+        Entity bodyB,
+        PhysicsJointSettings settings) =>
+        CreateJoint(jointId, bodyA, bodyB, settings);
+
+    public void RemoveJoint(string jointId)
+    {
+        UIValidation.EntityId(jointId, nameof(jointId));
+        _pendingMutations.Add(PhysicsMutationState.RemoveJoint(jointId));
+    }
+
+    // Convenience operation for a gravity-gun/hand grab. `grabAnchor` is
+    // normally a kinematic rigid body driven by the player or camera.
+    public void Grab(
+        string jointId,
+        Entity grabAnchor,
+        Entity body,
+        float breakForce = 0.0f,
+        float breakTorque = 0.0f)
+    {
+        CreateJoint(
+            jointId,
+            grabAnchor,
+            body,
+            new PhysicsJointSettings
+            {
+                Type = PhysicsJointType.Fixed,
+                BreakForce = breakForce,
+                BreakTorque = breakTorque
+            });
+    }
+
+    public void ReleaseGrab(string jointId) => RemoveJoint(jointId);
+
     public bool TryGetRaycastHit(PhysicsQuery query, out RaycastHit hit)
     {
         if (_queryResults.TryGetValue(query.Id, out var state) && state.Kind == "raycast_hit")
@@ -1388,7 +1934,9 @@ public sealed class ScriptPhysics
     internal void DrainTo(List<GameplayCommandState> commands)
     {
         commands.AddRange(_pendingQueries.Select(GameplayCommandState.PhysicsQuery));
+        commands.AddRange(_pendingMutations.Select(GameplayCommandState.PhysicsMutation));
         _pendingQueries.Clear();
+        _pendingMutations.Clear();
     }
 
     private static void Finite(Vector3 value, string parameterName)
@@ -1404,6 +1952,66 @@ public sealed class ScriptPhysics
         if (direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z
             <= MinDirectionLengthSquared)
             throw new ArgumentException($"{queryKind} direction must be non-zero", nameof(direction));
+    }
+
+    private static void ValidateMutation(string entityId, Vector3 value, string parameterName)
+    {
+        UIValidation.EntityId(entityId, nameof(entityId));
+        Finite(value, parameterName);
+        if (MathF.Abs(value.X) > MaxMutationComponent ||
+            MathF.Abs(value.Y) > MaxMutationComponent ||
+            MathF.Abs(value.Z) > MaxMutationComponent)
+            throw new ArgumentOutOfRangeException(
+                parameterName,
+                $"Physics mutation components must not exceed {MaxMutationComponent}");
+    }
+
+    private static void ValidateJointSettings(PhysicsJointSettings settings)
+    {
+        Finite(settings.AnchorA, nameof(settings.AnchorA));
+        Finite(settings.AnchorB, nameof(settings.AnchorB));
+        Finite(settings.Axis, nameof(settings.Axis));
+        if (settings.Type is PhysicsJointType.Revolute or PhysicsJointType.Prismatic &&
+            settings.Axis.X * settings.Axis.X +
+                settings.Axis.Y * settings.Axis.Y +
+                settings.Axis.Z * settings.Axis.Z <= MinDirectionLengthSquared)
+            throw new ArgumentException(
+                "Revolute and prismatic joint axes must be non-zero",
+                nameof(settings.Axis));
+        ValidateNonNegativeBounded(settings.BreakForce, nameof(settings.BreakForce));
+        ValidateNonNegativeBounded(settings.BreakTorque, nameof(settings.BreakTorque));
+        if (settings.Limits is { } limits)
+        {
+            ValidateBounded(limits.Min, nameof(limits.Min));
+            ValidateBounded(limits.Max, nameof(limits.Max));
+            if (limits.Min > limits.Max)
+                throw new ArgumentException("Joint limit Min must not exceed Max", nameof(settings.Limits));
+            ValidateNonNegativeBounded(limits.Stiffness, nameof(limits.Stiffness));
+            ValidateNonNegativeBounded(limits.Damping, nameof(limits.Damping));
+        }
+        if (settings.Motor is { } motor)
+        {
+            ValidateBounded(motor.TargetVelocity, nameof(motor.TargetVelocity));
+            ValidateBounded(motor.TargetPosition, nameof(motor.TargetPosition));
+            ValidateNonNegativeBounded(motor.Stiffness, nameof(motor.Stiffness));
+            ValidateNonNegativeBounded(motor.Damping, nameof(motor.Damping));
+        }
+    }
+
+    private static void ValidateBounded(float value, string parameterName)
+    {
+        UIValidation.Finite(value, parameterName);
+        if (MathF.Abs(value) > MaxMutationComponent)
+            throw new ArgumentOutOfRangeException(
+                parameterName,
+                $"Physics mutation values must not exceed {MaxMutationComponent}");
+    }
+
+    private static void ValidateNonNegativeBounded(float value, string parameterName)
+    {
+        ValidateBounded(value, parameterName);
+        if (value < 0.0f)
+            throw new ArgumentOutOfRangeException(parameterName, "Value must be non-negative");
     }
 
     private PhysicsQuery AllocateQuery()
@@ -2096,14 +2704,22 @@ public abstract class EngineBehaviour
 
     protected EngineBehaviour()
     {
+        Character = new ScriptCharacter(() => EntityId);
         Physics = new ScriptPhysics(Scene);
+        Interaction = new ScriptInteraction(Physics, () => EntityId);
+        Damage = new ScriptDamage(Scene);
+        Ragdoll = new ScriptRagdoll(Scene);
     }
 
     public string EntityId { get; private set; } = "";
     public ScriptInput Input { get; } = new();
     public ScriptUI UI { get; } = new();
     public ScriptScene Scene { get; } = new();
+    public ScriptCharacter Character { get; }
     public ScriptPhysics Physics { get; }
+    public ScriptInteraction Interaction { get; }
+    public ScriptDamage Damage { get; }
+    public ScriptRagdoll Ragdoll { get; }
     public ScriptComponents Components => Scene.Components;
     public ScriptWorldOrigin WorldOrigin { get; private set; }
     public ScriptTransform Transform => _transform ?? throw new InvalidOperationException(
@@ -2124,6 +2740,8 @@ public abstract class EngineBehaviour
         Input.Replace(context.InputActions, context.InputTransitions);
         UI.Replace(context.UiEvents);
         Physics.Replace(context.PhysicsEvents, context.PhysicsQueryResults);
+        Damage.Replace(context.DamageEvents);
+        Ragdoll.Replace(context.RagdollEvents);
         Components.Replace(context.ComponentQueryResults);
         WorldOrigin = context.WorldOrigin is { Length: 3 } origin
             ? new ScriptWorldOrigin(origin[0], origin[1], origin[2])
@@ -2143,8 +2761,11 @@ public abstract class EngineBehaviour
         if (_transformDirty && _transform != null)
             commands.Add(GameplayCommandState.SetTransform(_transform.State));
         Scene.DrainTo(commands);
+        Character.DrainTo(commands);
         UI.DrainTo(commands);
         Physics.DrainTo(commands);
+        Damage.DrainTo(commands);
+        Ragdoll.DrainTo(commands);
         Components.DrainTo(commands);
         var json = JsonSerializer.Serialize(commands, JsonOptions);
         _transformDirty = false;
@@ -2171,6 +2792,12 @@ internal sealed class GameplayContextState
 
     [JsonPropertyName("physics_events")]
     public List<PhysicsEventState> PhysicsEvents { get; set; } = new();
+
+    [JsonPropertyName("damage_events")]
+    public List<DamageEventState> DamageEvents { get; set; } = new();
+
+    [JsonPropertyName("ragdoll_events")]
+    public List<RagdollEventState> RagdollEvents { get; set; } = new();
 
     [JsonPropertyName("physics_query_results")]
     public List<PhysicsQueryResultState> PhysicsQueryResults { get; set; } = new();
@@ -2212,6 +2839,63 @@ internal sealed class PhysicsEventState
 
     [JsonPropertyName("other_entity_id")]
     public string OtherEntityId { get; set; } = "";
+
+    [JsonPropertyName("joint_id")]
+    public string? JointId { get; set; }
+
+    [JsonPropertyName("force")]
+    public float? Force { get; set; }
+
+    [JsonPropertyName("torque")]
+    public float? Torque { get; set; }
+}
+
+internal sealed class DamageEventState
+{
+    [JsonPropertyName("target_entity_id")]
+    public string TargetEntityId { get; set; } = "";
+
+    [JsonPropertyName("source_entity_id")]
+    public string? SourceEntityId { get; set; }
+
+    [JsonPropertyName("damage_kind")]
+    public string DamageKind { get; set; } = "generic";
+
+    [JsonPropertyName("raw_damage")]
+    public float RawDamage { get; set; }
+
+    [JsonPropertyName("applied_damage")]
+    public float AppliedDamage { get; set; }
+
+    [JsonPropertyName("remaining_health")]
+    public float RemainingHealth { get; set; }
+
+    [JsonPropertyName("hit_position")]
+    public float[]? HitPosition { get; set; }
+
+    [JsonPropertyName("impulse")]
+    public float[] Impulse { get; set; } = new float[3];
+
+    [JsonPropertyName("broke")]
+    public bool Broke { get; set; }
+
+    [JsonPropertyName("spawned_entity_ids")]
+    public List<string> SpawnedEntityIds { get; set; } = new();
+}
+
+internal sealed class RagdollEventState
+{
+    [JsonPropertyName("entity_id")]
+    public string EntityId { get; set; } = "";
+
+    [JsonPropertyName("active")]
+    public bool Active { get; set; }
+
+    [JsonPropertyName("recovering")]
+    public bool Recovering { get; set; }
+
+    [JsonPropertyName("body_entity_ids")]
+    public List<string> BodyEntityIds { get; set; } = new();
 }
 
 internal sealed class PhysicsQueryResultState
@@ -2236,6 +2920,24 @@ internal sealed class PhysicsQueryResultState
 
     [JsonPropertyName("distance")]
     public float? Distance { get; set; }
+
+    [JsonPropertyName("interaction")]
+    public InteractionState? Interaction { get; set; }
+}
+
+internal sealed class InteractionState
+{
+    [JsonPropertyName("prompt")]
+    public string Prompt { get; set; } = "";
+
+    [JsonPropertyName("action")]
+    public string Action { get; set; } = "";
+
+    [JsonPropertyName("max_distance")]
+    public float MaxDistance { get; set; }
+
+    [JsonPropertyName("grabbable")]
+    public bool Grabbable { get; set; }
 }
 
 internal sealed class PhysicsQueryFilterState
@@ -2259,6 +2961,192 @@ internal sealed class PhysicsQueryFilterState
                 LayerMask = filter.LayerMask,
                 IncludeSensors = filter.IncludeSensors,
                 ExcludeEntityId = filter.ExcludeEntityId
+            };
+}
+
+internal sealed class PhysicsMutationState
+{
+    [JsonPropertyName("kind")]
+    public required string Kind { get; init; }
+
+    [JsonPropertyName("entity_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EntityId { get; init; }
+
+    [JsonPropertyName("force")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Force { get; init; }
+
+    [JsonPropertyName("impulse")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Impulse { get; init; }
+
+    [JsonPropertyName("torque")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Torque { get; init; }
+
+    [JsonPropertyName("torque_impulse")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? TorqueImpulse { get; init; }
+
+    [JsonPropertyName("joint_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? JointId { get; init; }
+
+    [JsonPropertyName("body_a")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? BodyA { get; init; }
+
+    [JsonPropertyName("body_b")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? BodyB { get; init; }
+
+    [JsonPropertyName("joint_type")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? JointType { get; init; }
+
+    [JsonPropertyName("anchor_a")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? AnchorA { get; init; }
+
+    [JsonPropertyName("anchor_b")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? AnchorB { get; init; }
+
+    [JsonPropertyName("axis")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Axis { get; init; }
+
+    [JsonPropertyName("limits")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PhysicsJointLimitsState? Limits { get; init; }
+
+    [JsonPropertyName("motor")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PhysicsJointMotorState? Motor { get; init; }
+
+    [JsonPropertyName("break_force")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? BreakForce { get; init; }
+
+    [JsonPropertyName("break_torque")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? BreakTorque { get; init; }
+
+    public static PhysicsMutationState ApplyForce(string entityId, Vector3 force) =>
+        new()
+        {
+            Kind = "apply_force",
+            EntityId = entityId,
+            Force = new[] { force.X, force.Y, force.Z }
+        };
+
+    public static PhysicsMutationState ApplyImpulse(string entityId, Vector3 impulse) =>
+        new()
+        {
+            Kind = "apply_impulse",
+            EntityId = entityId,
+            Impulse = new[] { impulse.X, impulse.Y, impulse.Z }
+        };
+
+    public static PhysicsMutationState ApplyTorque(string entityId, Vector3 torque) =>
+        new()
+        {
+            Kind = "apply_torque",
+            EntityId = entityId,
+            Torque = new[] { torque.X, torque.Y, torque.Z }
+        };
+
+    public static PhysicsMutationState ApplyTorqueImpulse(
+        string entityId,
+        Vector3 torqueImpulse) =>
+        new()
+        {
+            Kind = "apply_torque_impulse",
+            EntityId = entityId,
+            TorqueImpulse = new[] { torqueImpulse.X, torqueImpulse.Y, torqueImpulse.Z }
+        };
+
+    public static PhysicsMutationState CreateJoint(
+        string jointId,
+        string bodyA,
+        string bodyB,
+        PhysicsJointSettings settings) =>
+        new()
+        {
+            Kind = "create_joint",
+            JointId = jointId,
+            BodyA = bodyA,
+            BodyB = bodyB,
+            JointType = settings.Type switch
+            {
+                PhysicsJointType.Fixed => "fixed",
+                PhysicsJointType.Revolute => "revolute",
+                PhysicsJointType.Prismatic => "prismatic",
+                _ => "spherical"
+            },
+            AnchorA = new[] { settings.AnchorA.X, settings.AnchorA.Y, settings.AnchorA.Z },
+            AnchorB = new[] { settings.AnchorB.X, settings.AnchorB.Y, settings.AnchorB.Z },
+            Axis = new[] { settings.Axis.X, settings.Axis.Y, settings.Axis.Z },
+            Limits = PhysicsJointLimitsState.From(settings.Limits),
+            Motor = PhysicsJointMotorState.From(settings.Motor),
+            BreakForce = settings.BreakForce,
+            BreakTorque = settings.BreakTorque
+        };
+
+    public static PhysicsMutationState RemoveJoint(string jointId) =>
+        new() { Kind = "remove_joint", JointId = jointId };
+}
+
+internal sealed class PhysicsJointLimitsState
+{
+    [JsonPropertyName("min")]
+    public required float Min { get; init; }
+
+    [JsonPropertyName("max")]
+    public required float Max { get; init; }
+
+    [JsonPropertyName("stiffness")]
+    public required float Stiffness { get; init; }
+
+    [JsonPropertyName("damping")]
+    public required float Damping { get; init; }
+
+    public static PhysicsJointLimitsState? From(PhysicsJointLimits? limits) =>
+        limits is null
+            ? null
+            : new PhysicsJointLimitsState
+            {
+                Min = limits.Min,
+                Max = limits.Max,
+                Stiffness = limits.Stiffness,
+                Damping = limits.Damping
+            };
+}
+
+internal sealed class PhysicsJointMotorState
+{
+    [JsonPropertyName("target_vel")]
+    public required float TargetVelocity { get; init; }
+
+    [JsonPropertyName("target_pos")]
+    public required float TargetPosition { get; init; }
+
+    [JsonPropertyName("stiffness")]
+    public required float Stiffness { get; init; }
+
+    [JsonPropertyName("damping")]
+    public required float Damping { get; init; }
+
+    public static PhysicsJointMotorState? From(PhysicsJointMotor? motor) =>
+        motor is null
+            ? null
+            : new PhysicsJointMotorState
+            {
+                TargetVelocity = motor.TargetVelocity,
+                TargetPosition = motor.TargetPosition,
+                Stiffness = motor.Stiffness,
+                Damping = motor.Damping
             };
 }
 
@@ -2840,6 +3728,42 @@ internal sealed class GameplayCommandState
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public float[]? Translation { get; init; }
 
+    [JsonPropertyName("amount")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? Amount { get; init; }
+
+    [JsonPropertyName("damage_kind")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DamageKind { get; init; }
+
+    [JsonPropertyName("hit_position")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? HitPosition { get; init; }
+
+    [JsonPropertyName("impulse")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Impulse { get; init; }
+
+    [JsonPropertyName("active")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Active { get; init; }
+
+    [JsonPropertyName("recovery_duration")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? RecoveryDuration { get; init; }
+
+    [JsonPropertyName("direction")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float[]? Direction { get; init; }
+
+    [JsonPropertyName("jump")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Jump { get; init; }
+
+    [JsonPropertyName("speed")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? Speed { get; init; }
+
     [JsonPropertyName("command")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public UiCommandState? UiCommand { get; init; }
@@ -2847,6 +3771,10 @@ internal sealed class GameplayCommandState
     [JsonPropertyName("query")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public object? Query { get; init; }
+
+    [JsonPropertyName("mutation")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PhysicsMutationState? Mutation { get; init; }
 
     [JsonPropertyName("component_type")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -2896,11 +3824,60 @@ internal sealed class GameplayCommandState
             Translation = translation
         };
 
+    public static GameplayCommandState ApplyDamage(
+        string entityId,
+        float amount,
+        string damageKind,
+        Vector3? hitPosition,
+        Vector3 impulse) =>
+        new()
+        {
+            Type = "apply_damage",
+            EntityId = entityId,
+            Amount = amount,
+            DamageKind = damageKind,
+            HitPosition = hitPosition is { } point
+                ? new[] { point.X, point.Y, point.Z }
+                : null,
+            Impulse = new[] { impulse.X, impulse.Y, impulse.Z }
+        };
+
+    public static GameplayCommandState SetRagdoll(
+        string entityId,
+        bool active,
+        float recoveryDuration,
+        Vector3 impulse) =>
+        new()
+        {
+            Type = "set_ragdoll",
+            EntityId = entityId,
+            Active = active,
+            RecoveryDuration = recoveryDuration,
+            Impulse = new[] { impulse.X, impulse.Y, impulse.Z }
+        };
+
+    public static GameplayCommandState CharacterControl(
+        string entityId,
+        Vector3 direction,
+        bool jump,
+        float? speed) =>
+        new()
+        {
+            Type = "character_control",
+            EntityId = entityId,
+            Direction = new[] { direction.X, direction.Y, direction.Z },
+            Jump = jump,
+            Speed = speed
+        };
+
     public static GameplayCommandState UI(UiCommandState command) =>
         new() { Type = "ui", UiCommand = command };
 
     public static GameplayCommandState PhysicsQuery(PhysicsQueryState query) =>
         new() { Type = "physics_query", Query = query };
+
+    public static GameplayCommandState PhysicsMutation(PhysicsMutationState mutation) =>
+        new() { Type = "physics_mutation", Mutation = mutation };
 
     public static GameplayCommandState ComponentQuery(ComponentQueryState query) =>
         new() { Type = "component_query", Query = query };
@@ -2990,6 +3967,52 @@ public sealed class ReloadFixtureBehaviour : EngineBehaviour
 
     public void OnDestroy()
     {
+    }
+
+    // Compile-time contract probe for deferred rigid-body mutations.
+    private void PhysicsMutationApiProbe(Entity entity)
+    {
+        Character.Move(new Vector3(1.0f, 0.0f, 0.0f));
+        Character.Move(entity, new Vector3(0.0f, 0.0f, 1.0f), 7.5f);
+        Character.Jump();
+        Character.Control(entity.Id, default, jump: true);
+        var useProbe = Interaction.Probe(
+            default,
+            new Vector3(0.0f, 0.0f, -1.0f));
+        if (Interaction.TryGetTarget(useProbe, out var target) && target.Grabbable)
+            Interaction.Grab("probe-use-grab", entity, target, 1000.0f);
+        Interaction.ReleaseGrab("probe-use-grab");
+        Physics.ApplyForce(entity, new Vector3(1.0f, 0.0f, 0.0f));
+        Physics.ApplyImpulse(entity.Id, new Vector3(0.0f, 1.0f, 0.0f));
+        Physics.ApplyTorque(entity, new Vector3(0.0f, 0.0f, 1.0f));
+        Physics.ApplyTorqueImpulse(entity.Id, new Vector3(0.0f, 1.0f, 0.0f));
+        Physics.CreateJoint(
+            "probe-hinge",
+            entity,
+            entity,
+            new PhysicsJointSettings
+            {
+                Type = PhysicsJointType.Revolute,
+                Axis = new Vector3(0.0f, 1.0f, 0.0f),
+                Limits = new PhysicsJointLimits { Min = -1.0f, Max = 1.0f },
+                Motor = new PhysicsJointMotor
+                {
+                    TargetVelocity = 2.0f,
+                    Stiffness = 10.0f,
+                    Damping = 1.0f
+                },
+                BreakForce = 1000.0f,
+                BreakTorque = 200.0f
+            });
+        Physics.RemoveJoint("probe-hinge");
+        Damage.Apply(
+            entity,
+            25.0f,
+            DamageKind.Impact,
+            new Vector3(1.0f, 2.0f, 3.0f),
+            new Vector3(4.0f, 0.0f, 0.0f));
+        Ragdoll.Activate(entity, new Vector3(2.0f, 1.0f, 0.0f));
+        Ragdoll.Recover(entity.Id, 0.35f);
     }
 }
 "#;
@@ -4184,6 +5207,17 @@ mod tests {
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public ScriptTransform Transform"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public ScriptScene Scene"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class Entity"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ScriptCharacter"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public ScriptCharacter Character"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void Move(Vector3 direction"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void Jump()"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"character_control\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Character.DrainTo(commands)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ScriptInteraction"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class InteractionTarget"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery Probe("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetTarget("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public ScriptInteraction Interaction"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ScriptPhysics"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public IReadOnlyList<PhysicsEvent> Events"));
         assert!(STARTER_SCRIPT_API_SOURCE
@@ -4196,6 +5230,33 @@ mod tests {
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery Raycast("));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery SphereCast("));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public PhysicsQuery OverlapSphere("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void ApplyForce(Entity entity,"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void ApplyImpulse(Entity entity,"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void ApplyTorque(Entity entity,"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void ApplyTorqueImpulse(Entity entity,"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public enum PhysicsJointType"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class PhysicsJointSettings"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void CreateJoint("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void UpdateJoint("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void RemoveJoint(string jointId)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void Grab("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void ReleaseGrab(string jointId)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ScriptDamage"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public IReadOnlyList<DamageEvent> Events"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"apply_damage\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"damage_events\")]"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Damage.Replace(context.DamageEvents)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Damage.DrainTo(commands)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ScriptRagdoll"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void Activate("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("public void Recover("));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"set_ragdoll\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"ragdoll_events\")]"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Ragdoll.Replace(context.RagdollEvents)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Ragdoll.DrainTo(commands)"));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Kind = \"create_joint\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Kind = \"remove_joint\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"joint_id\")]"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetRaycastHit("));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetSphereCastHit("));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public bool TryGetOverlapResult("));
@@ -4204,6 +5265,8 @@ mod tests {
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public List<PhysicsQueryResult> DrainAll()"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Kind = \"sphere_cast\""));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"physics_query\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("Type = \"physics_mutation\""));
+        assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"mutation\")]"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("[JsonPropertyName(\"physics_query_results\")]"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("Physics.DrainTo(commands)"));
         assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class ScriptComponents"));

@@ -143,7 +143,12 @@ export interface AssetBrowserSnapshot {
   folders: AssetFolderSnapshot[]
   selectedAsset?: string
 }
-export interface MaterialParameterSnapshot { name: string; kind: 'float' | 'color' | 'texture'; value: unknown }
+export interface MaterialParameterSnapshot {
+  name: string
+  kind: 'float' | 'color' | 'texture' | 'choice' | 'bool'
+  value: unknown
+  options?: string[]
+}
 export interface MaterialSnapshot {
   selectedMaterial?: string
   parameters: MaterialParameterSnapshot[]

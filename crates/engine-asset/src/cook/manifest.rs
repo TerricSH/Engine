@@ -107,6 +107,9 @@ pub struct CookRules {
     pub platform_overrides: Vec<String>,
     /// Optional compression codec name (e.g. "zstd", "lz4").
     pub compression: Option<String>,
+    /// Selects one primitive when multiple mesh primitives share a glTF source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gltf_primitive_index: Option<u32>,
 }
 
 #[cfg(test)]
@@ -175,6 +178,7 @@ mod tests {
         assert!(rules.variant_keys.is_empty());
         assert!(rules.platform_overrides.is_empty());
         assert!(rules.compression.is_none());
+        assert!(rules.gltf_primitive_index.is_none());
     }
 
     #[test]
@@ -183,11 +187,13 @@ mod tests {
             variant_keys: vec!["forward".into(), "deferred".into()],
             platform_overrides: vec!["mobile".into()],
             compression: Some("zstd".into()),
+            gltf_primitive_index: Some(3),
         };
         let json = serde_json::to_string(&rules).unwrap();
         let restored: CookRules = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.variant_keys.len(), 2);
         assert_eq!(restored.platform_overrides.len(), 1);
         assert_eq!(restored.compression, Some("zstd".into()));
+        assert_eq!(restored.gltf_primitive_index, Some(3));
     }
 }
