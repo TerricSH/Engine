@@ -3,12 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use engine_asset::cook::{
-    decode_cooked_material, decode_cooked_mesh, decode_cooked_texture, read_cooked_artifact,
+    decode_cooked_environment_map, decode_cooked_material, decode_cooked_mesh,
+    decode_cooked_morph_target_set, decode_cooked_texture, read_cooked_artifact,
     registered_asset_type_id, AssetType,
 };
 use engine_renderer::{
-    AssetId, AxisAlignedBox, ColorSpace, IndexFormat, MaterialUpload, MeshUpload, MeshVertexFormat,
-    SamplerDescriptor, TextureMipLevel, TextureUpload, TextureUploadFormat, Transparency,
+    AssetId, AxisAlignedBox, ColorSpace, EnvironmentCubeMip, EnvironmentMapFormat,
+    EnvironmentMapUpload, IndexFormat, MaterialUpload, MeshUpload, MeshVertexFormat, MorphTarget,
+    MorphTargetSetUpload, SamplerDescriptor, TextureMipLevel, TextureUpload, TextureUploadFormat,
+    Transparency,
 };
 use engine_scene::registry::AssetTypeRegistry;
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
@@ -22,6 +25,8 @@ pub struct CookedAssetLoadReport {
     pub loaded_meshes: usize,
     pub loaded_textures: usize,
     pub loaded_materials: usize,
+    pub loaded_environment_maps: usize,
+    pub loaded_morph_target_sets: usize,
     pub loaded_extension_assets: BTreeMap<String, usize>,
     pub skipped_assets: Vec<String>,
     /// Additive installs only: assets whose ID was already present with an
@@ -32,7 +37,11 @@ pub struct CookedAssetLoadReport {
 
 impl CookedAssetLoadReport {
     pub fn loaded_render_assets(&self) -> usize {
-        self.loaded_meshes + self.loaded_textures + self.loaded_materials
+        self.loaded_meshes
+            + self.loaded_textures
+            + self.loaded_materials
+            + self.loaded_environment_maps
+            + self.loaded_morph_target_sets
     }
 
     pub fn loaded_extension_assets(&self) -> usize {
@@ -70,6 +79,8 @@ pub struct DecodedBatch {
     pub(crate) meshes: Vec<MeshUpload>,
     pub(crate) textures: Vec<TextureUpload>,
     pub(crate) materials: Vec<(PathBuf, MaterialUpload)>,
+    pub(crate) environment_maps: Vec<EnvironmentMapUpload>,
+    pub(crate) morph_target_sets: Vec<MorphTargetSetUpload>,
     pub(crate) extensions: Vec<DecodedExtensionAsset>,
 }
 
@@ -86,7 +97,12 @@ impl DecodedBatch {
 
     /// Number of runtime-installable assets in the batch.
     pub fn decoded_assets(&self) -> usize {
-        self.meshes.len() + self.textures.len() + self.materials.len() + self.extensions.len()
+        self.meshes.len()
+            + self.textures.len()
+            + self.materials.len()
+            + self.environment_maps.len()
+            + self.morph_target_sets.len()
+            + self.extensions.len()
     }
 
     /// Flatten into commit order: textures, materials, meshes, extensions.
@@ -95,6 +111,11 @@ impl DecodedBatch {
     /// across drains.
     pub(crate) fn into_commit_order(self) -> Vec<DecodedCookedAsset> {
         let mut items = Vec::with_capacity(self.decoded_assets());
+        items.extend(
+            self.environment_maps
+                .into_iter()
+                .map(DecodedCookedAsset::EnvironmentMap),
+        );
         items.extend(self.textures.into_iter().map(DecodedCookedAsset::Texture));
         items.extend(
             self.materials
@@ -102,6 +123,11 @@ impl DecodedBatch {
                 .map(|(path, upload)| DecodedCookedAsset::Material(path, upload)),
         );
         items.extend(self.meshes.into_iter().map(DecodedCookedAsset::Mesh));
+        items.extend(
+            self.morph_target_sets
+                .into_iter()
+                .map(DecodedCookedAsset::MorphTargetSet),
+        );
         items.extend(
             self.extensions
                 .into_iter()
@@ -150,6 +176,8 @@ pub fn decode_cooked_batch(
         meshes: Vec::new(),
         textures: Vec::new(),
         materials: Vec::new(),
+        environment_maps: Vec::new(),
+        morph_target_sets: Vec::new(),
         extensions: Vec::new(),
     };
     let mut diagnostics = Vec::new();
@@ -159,6 +187,12 @@ pub fn decode_cooked_batch(
             Ok(DecodedCookedAsset::Texture(upload)) => batch.textures.push(upload),
             Ok(DecodedCookedAsset::Material(path, upload)) => {
                 batch.materials.push((path, upload));
+            }
+            Ok(DecodedCookedAsset::EnvironmentMap(upload)) => {
+                batch.environment_maps.push(upload);
+            }
+            Ok(DecodedCookedAsset::MorphTargetSet(upload)) => {
+                batch.morph_target_sets.push(upload);
             }
             Ok(DecodedCookedAsset::Extension(asset)) => batch.extensions.push(asset),
             Ok(DecodedCookedAsset::Skipped(kind)) => {
@@ -191,6 +225,8 @@ pub(crate) enum InstalledItemKind {
     Mesh,
     Texture,
     Material,
+    EnvironmentMap,
+    MorphTargetSet,
     Extension(String),
 }
 
@@ -319,6 +355,18 @@ impl EngineRuntime {
                 .chain(batch.meshes.iter().map(|upload| (&upload.mesh_id, "mesh")))
                 .chain(
                     batch
+                        .environment_maps
+                        .iter()
+                        .map(|upload| (&upload.environment_id, "environment map")),
+                )
+                .chain(
+                    batch
+                        .morph_target_sets
+                        .iter()
+                        .map(|upload| (&upload.target_set_id, "morph target set")),
+                )
+                .chain(
+                    batch
                         .extensions
                         .iter()
                         .map(|asset| (&asset.id, asset.type_id.as_str())),
@@ -359,6 +407,24 @@ impl EngineRuntime {
                     &upload.mesh_id,
                     "mesh",
                     self.additive_typed_plan(&upload.mesh_id, upload),
+                );
+            }
+            for upload in &batch.environment_maps {
+                Self::classify_additive(
+                    &mut identical_ids,
+                    &mut diagnostics,
+                    &upload.environment_id,
+                    "environment map",
+                    self.additive_typed_plan(&upload.environment_id, upload),
+                );
+            }
+            for upload in &batch.morph_target_sets {
+                Self::classify_additive(
+                    &mut identical_ids,
+                    &mut diagnostics,
+                    &upload.target_set_id,
+                    "morph target set",
+                    self.additive_typed_plan(&upload.target_set_id, upload),
                 );
             }
             for asset in &batch.extensions {
@@ -430,6 +496,8 @@ impl EngineRuntime {
                 InstalledItemKind::Mesh => report.loaded_meshes += 1,
                 InstalledItemKind::Texture => report.loaded_textures += 1,
                 InstalledItemKind::Material => report.loaded_materials += 1,
+                InstalledItemKind::EnvironmentMap => report.loaded_environment_maps += 1,
+                InstalledItemKind::MorphTargetSet => report.loaded_morph_target_sets += 1,
                 InstalledItemKind::Extension(type_id) => {
                     *report.loaded_extension_assets.entry(type_id).or_default() += 1;
                 }
@@ -457,6 +525,18 @@ impl EngineRuntime {
                 self.loaded_cooked_asset_ids.insert(upload.mesh_id.clone());
                 self.register_mesh_asset(upload);
                 InstalledItemKind::Mesh
+            }
+            DecodedCookedAsset::EnvironmentMap(upload) => {
+                self.loaded_cooked_asset_ids
+                    .insert(upload.environment_id.clone());
+                self.register_environment_map_asset(upload);
+                InstalledItemKind::EnvironmentMap
+            }
+            DecodedCookedAsset::MorphTargetSet(upload) => {
+                self.loaded_cooked_asset_ids
+                    .insert(upload.target_set_id.clone());
+                self.register_morph_target_set_asset(upload);
+                InstalledItemKind::MorphTargetSet
             }
             DecodedCookedAsset::Extension(asset) => {
                 self.loaded_cooked_asset_ids.insert(asset.id.clone());
@@ -521,6 +601,8 @@ pub(crate) enum DecodedCookedAsset {
     Mesh(MeshUpload),
     Texture(TextureUpload),
     Material(PathBuf, MaterialUpload),
+    EnvironmentMap(EnvironmentMapUpload),
+    MorphTargetSet(MorphTargetSetUpload),
     Extension(DecodedExtensionAsset),
     Skipped(AssetType),
 }
@@ -531,6 +613,8 @@ impl DecodedCookedAsset {
             DecodedCookedAsset::Mesh(upload) => &upload.mesh_id,
             DecodedCookedAsset::Texture(upload) => &upload.texture_id,
             DecodedCookedAsset::Material(_, upload) => &upload.material_id,
+            DecodedCookedAsset::EnvironmentMap(upload) => &upload.environment_id,
+            DecodedCookedAsset::MorphTargetSet(upload) => &upload.target_set_id,
             DecodedCookedAsset::Extension(asset) => &asset.id,
             DecodedCookedAsset::Skipped(_) => {
                 unreachable!("skipped artifacts are never queued for commit")
@@ -675,6 +759,7 @@ fn decode_cooked_asset(
                     Transparency::Masked { cutoff }
                 }
                 engine_asset::cook::MaterialTransparency::Blend => Transparency::Blend,
+                engine_asset::cook::MaterialTransparency::Additive => Transparency::Additive,
             };
             Ok(DecodedCookedAsset::Material(
                 path.to_path_buf(),
@@ -690,11 +775,56 @@ fn decode_cooked_asset(
                     metallic_roughness_texture: material.metallic_roughness_texture,
                     occlusion_texture: material.occlusion_texture,
                     emissive_texture: material.emissive_texture,
+                    advanced: engine_renderer::AdvancedMaterialParameters {
+                        clearcoat: material.advanced.clearcoat,
+                        clearcoat_roughness: material.advanced.clearcoat_roughness,
+                        subsurface: material.advanced.subsurface,
+                        subsurface_color: material.advanced.subsurface_color,
+                        anisotropy: material.advanced.anisotropy,
+                        sheen_color: material.advanced.sheen_color,
+                        rim_color: material.advanced.rim_color,
+                        rim_power: material.advanced.rim_power,
+                    },
                     transparency,
                     double_sided: material.double_sided,
                     content_hash: artifact.header.content_hash,
                 },
             ))
+        }
+        AssetType::EnvironmentMap => {
+            let environment =
+                decode_cooked_environment_map(&artifact).map_err(|error| error.to_string())?;
+            Ok(DecodedCookedAsset::EnvironmentMap(EnvironmentMapUpload {
+                environment_id: id,
+                format: EnvironmentMapFormat::Rgba16Float,
+                mip_levels: environment
+                    .mip_levels
+                    .into_iter()
+                    .map(|mip| EnvironmentCubeMip {
+                        face_size: mip.face_size,
+                        faces: mip.faces,
+                    })
+                    .collect(),
+                content_hash: artifact.header.content_hash,
+            }))
+        }
+        AssetType::MorphTargetSet => {
+            let morph =
+                decode_cooked_morph_target_set(&artifact).map_err(|error| error.to_string())?;
+            Ok(DecodedCookedAsset::MorphTargetSet(MorphTargetSetUpload {
+                target_set_id: id,
+                vertex_count: morph.vertex_count,
+                targets: morph
+                    .targets
+                    .into_iter()
+                    .map(|target| MorphTarget {
+                        name: target.name,
+                        position_deltas: target.position_deltas,
+                        normal_deltas: target.normal_deltas,
+                    })
+                    .collect(),
+                content_hash: artifact.header.content_hash,
+            }))
         }
         kind @ (AssetType::Audio
         | AssetType::Animation
@@ -957,6 +1087,7 @@ pub(crate) mod tests {
             metallic_roughness_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            advanced: engine_renderer::AdvancedMaterialParameters::default(),
             transparency: Transparency::Opaque,
             double_sided: false,
             content_hash: [2; 32],
@@ -1472,14 +1603,14 @@ pub(crate) mod tests {
         assert_eq!(runtime.cooked_asset_stream_pending(), 0);
     }
 
-    #[cfg(not(feature = "runtime-subsystems"))]
+    #[cfg(not(feature = "subsystem-audio"))]
     fn test_extension_loader(cooked: &[u8]) -> Result<Box<dyn Any + Send + Sync>, String> {
         String::from_utf8(cooked.to_vec())
             .map(|value| Box::new(value) as Box<dyn Any + Send + Sync>)
             .map_err(|error| error.to_string())
     }
 
-    #[cfg(not(feature = "runtime-subsystems"))]
+    #[cfg(not(feature = "subsystem-audio"))]
     #[test]
     fn registered_extension_assets_share_the_typed_cache_and_reload_atomically() {
         use engine_scene::registry::{AssetTypeExtension, AssetTypeMeta};
@@ -1558,7 +1689,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(not(feature = "runtime-subsystems"))]
+    #[cfg(not(feature = "subsystem-audio"))]
     #[test]
     fn additive_extension_assets_noop_on_identical_payload_and_reject_conflicts() {
         use engine_scene::registry::{AssetTypeExtension, AssetTypeMeta};
@@ -1625,7 +1756,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(all(
+        feature = "subsystem-animation",
+        feature = "subsystem-audio",
+        feature = "subsystem-navigation"
+    ))]
     fn write_registered_extension_source(
         runtime: &EngineRuntime,
         dir: &Path,
@@ -1649,7 +1784,11 @@ pub(crate) mod tests {
         .unwrap();
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(all(
+        feature = "subsystem-animation",
+        feature = "subsystem-audio",
+        feature = "subsystem-navigation"
+    ))]
     fn minimal_pcm_wav() -> Vec<u8> {
         let samples = [0i16; 80];
         let data_size = u32::try_from(samples.len() * 2).unwrap();
@@ -1672,7 +1811,11 @@ pub(crate) mod tests {
         wav
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(all(
+        feature = "subsystem-animation",
+        feature = "subsystem-audio",
+        feature = "subsystem-navigation"
+    ))]
     #[test]
     fn runtime_subsystem_cookers_and_loaders_roundtrip_all_mapped_asset_kinds() {
         use engine_animation::{AnimationClip, Joint, JointTransform, Skeleton};

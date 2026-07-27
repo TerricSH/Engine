@@ -97,6 +97,20 @@ pub(crate) fn serialize_skeleton_component(
     if let Some(asset) = &skeleton.skeleton_asset {
         fields.insert("skeleton_asset".into(), Value::Asset(AssetId::new(asset)));
     }
+    if let Some(asset) = &skeleton.morph_target_set {
+        fields.insert("morph_target_set".into(), Value::Asset(AssetId::new(asset)));
+    }
+    fields.insert(
+        "morph_weights".into(),
+        Value::List(
+            skeleton
+                .morph_weights
+                .iter()
+                .copied()
+                .map(Value::Float32)
+                .collect(),
+        ),
+    );
     fields.insert("bind_shape".into(), Value::Vec3(skeleton.bind_shape));
     fields
 }
@@ -113,9 +127,27 @@ pub(crate) fn deserialize_skeleton_component(
         Some(Value::Vec3(shape)) if shape.iter().all(|value| value.is_finite()) => *shape,
         _ => [0.5; 3],
     };
+    let morph_target_set = match fields.get("morph_target_set") {
+        Some(Value::Asset(asset)) => Some(asset.id.clone()),
+        Some(Value::Str(asset)) => Some(asset.clone()),
+        _ => None,
+    };
+    let morph_weights = match fields.get("morph_weights") {
+        Some(Value::List(weights)) => weights
+            .iter()
+            .filter_map(|weight| match weight {
+                Value::Float32(weight) if weight.is_finite() => Some(weight.clamp(-1.0, 1.0)),
+                _ => None,
+            })
+            .take(engine_renderer::MAX_MORPH_TARGETS)
+            .collect(),
+        _ => Vec::new(),
+    };
     Box::new(SkeletonComponent {
         skeleton_asset,
         bind_shape,
+        morph_target_set,
+        morph_weights,
     })
 }
 
@@ -173,6 +205,8 @@ mod tests {
         let skeleton = SkeletonComponent {
             skeleton_asset: Some("hero.skeleton".into()),
             bind_shape: [0.4, 1.0, 0.3],
+            morph_target_set: Some("hero.morphs".into()),
+            morph_weights: vec![0.25, 0.75],
         };
         let fields = serialize_skeleton_component(&skeleton);
         assert_eq!(
@@ -183,6 +217,8 @@ mod tests {
         let restored = restored.downcast_ref::<SkeletonComponent>().unwrap();
         assert_eq!(restored.skeleton_asset, skeleton.skeleton_asset);
         assert_eq!(restored.bind_shape, skeleton.bind_shape);
+        assert_eq!(restored.morph_target_set, skeleton.morph_target_set);
+        assert_eq!(restored.morph_weights, skeleton.morph_weights);
     }
 
     #[test]

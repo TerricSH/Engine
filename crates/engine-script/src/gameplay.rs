@@ -88,6 +88,15 @@ pub const MAX_SCRIPT_SAVE_STATE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PENDING_SAVE_REQUESTS: usize = 8;
 pub const MAX_PENDING_LOGIC_ASSET_QUERIES: usize = 256;
 pub const MAX_SCRIPT_LOGIC_ASSET_JSON_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_ANIMATION_SPEED: f32 = 16.0;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum GameplayAnimationParameterValue {
+    Float(f32),
+    Int(i32),
+    Bool(bool),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1368,6 +1377,38 @@ pub enum GameplayCommand {
         component_type: String,
         fields: BTreeMap<String, GameplayComponentValue>,
     },
+    /// Play a direct animation clip through the target's AnimationPlayer.
+    PlayAnimation {
+        entity_id: String,
+        clip_asset: String,
+        #[serde(default = "default_true")]
+        looping: bool,
+        #[serde(default = "default_animation_speed")]
+        speed: f32,
+        #[serde(default = "default_true")]
+        restart: bool,
+    },
+    /// Set a parameter on an authored animation state-machine instance.
+    SetAnimationParameter {
+        entity_id: String,
+        name: String,
+        value: GameplayAnimationParameterValue,
+    },
+    /// Force an authored animation state machine to a named state.
+    TransitionAnimationState {
+        entity_id: String,
+        state: String,
+    },
+    /// Pause or resume the target AnimationPlayer without changing its clip.
+    SetAnimationPlaying {
+        entity_id: String,
+        playing: bool,
+    },
+    /// Update the bounded morph target weights on the target Skeleton.
+    SetMorphWeights {
+        entity_id: String,
+        weights: Vec<f32>,
+    },
     /// Capture the live engine state plus one project-owned JSON document.
     SaveCheckpoint {
         slot: String,
@@ -1510,6 +1551,53 @@ impl GameplayCommand {
                 validate_component_type_key(component_type)?;
                 validate_component_fields(fields)
             }
+            Self::PlayAnimation {
+                entity_id,
+                clip_asset,
+                speed,
+                ..
+            } => {
+                validate_entity_id(entity_id)?;
+                validate_entity_id(clip_asset)?;
+                if !speed.is_finite() || *speed <= 0.0 || *speed > MAX_ANIMATION_SPEED {
+                    return Err(format!(
+                        "animation speed must be finite, greater than zero, and at most {MAX_ANIMATION_SPEED}"
+                    ));
+                }
+                Ok(())
+            }
+            Self::SetAnimationParameter {
+                entity_id,
+                name,
+                value,
+            } => {
+                validate_entity_id(entity_id)?;
+                validate_component_type_key(name)?;
+                if matches!(value, GameplayAnimationParameterValue::Float(value) if !value.is_finite())
+                {
+                    return Err("animation float parameter must be finite".into());
+                }
+                Ok(())
+            }
+            Self::TransitionAnimationState { entity_id, state } => {
+                validate_entity_id(entity_id)?;
+                validate_component_type_key(state)
+            }
+            Self::SetAnimationPlaying { entity_id, .. } => validate_entity_id(entity_id),
+            Self::SetMorphWeights { entity_id, weights } => {
+                validate_entity_id(entity_id)?;
+                if weights.is_empty()
+                    || weights.len() > 8
+                    || weights
+                        .iter()
+                        .any(|weight| !weight.is_finite() || !(-1.0..=1.0).contains(weight))
+                {
+                    return Err(
+                        "morph weights require 1 to 8 finite values in the range [-1, 1]".into(),
+                    );
+                }
+                Ok(())
+            }
             Self::SaveCheckpoint { slot, state_json } => {
                 validate_save_slot(slot)?;
                 if state_json.len() > MAX_SCRIPT_SAVE_STATE_BYTES {
@@ -1525,6 +1613,14 @@ impl GameplayCommand {
             Self::QueryLogicAsset { asset_id, .. } => validate_entity_id(asset_id),
         }
     }
+}
+
+fn default_animation_speed() -> f32 {
+    1.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn validate_save_slot(slot: &str) -> Result<(), String> {
@@ -3257,5 +3353,75 @@ mod tests {
             serde_json::to_string(&query).unwrap(),
             r#"{"type":"query_logic_asset","query_id":9,"asset_id":"soldier-abilities"}"#
         );
+    }
+
+    #[test]
+    fn animation_commands_have_a_typed_bounded_contract() {
+        let play = GameplayCommand::PlayAnimation {
+            entity_id: "hero".into(),
+            clip_asset: "battle.attack".into(),
+            looping: false,
+            speed: 1.25,
+            restart: true,
+        };
+        assert!(play.validate().is_ok());
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(&serde_json::to_string(&play).unwrap())
+                .unwrap(),
+            play
+        );
+        assert!(GameplayCommand::PlayAnimation {
+            entity_id: "hero".into(),
+            clip_asset: "../attack".into(),
+            looping: false,
+            speed: 1.0,
+            restart: true,
+        }
+        .validate()
+        .is_err());
+        assert!(GameplayCommand::PlayAnimation {
+            entity_id: "hero".into(),
+            clip_asset: "attack".into(),
+            looping: false,
+            speed: f32::NAN,
+            restart: true,
+        }
+        .validate()
+        .is_err());
+
+        let parameter = GameplayCommand::SetAnimationParameter {
+            entity_id: "hero".into(),
+            name: "battle.phase".into(),
+            value: GameplayAnimationParameterValue::Int(2),
+        };
+        assert!(parameter.validate().is_ok());
+        assert_eq!(
+            serde_json::to_string(&parameter).unwrap(),
+            r#"{"type":"set_animation_parameter","entity_id":"hero","name":"battle.phase","value":{"type":"int","value":2}}"#
+        );
+        assert!(GameplayCommand::SetAnimationParameter {
+            entity_id: "hero".into(),
+            name: "speed".into(),
+            value: GameplayAnimationParameterValue::Float(f32::INFINITY),
+        }
+        .validate()
+        .is_err());
+
+        let morph = GameplayCommand::SetMorphWeights {
+            entity_id: "hero".into(),
+            weights: vec![0.0, 0.5, 1.0],
+        };
+        assert!(morph.validate().is_ok());
+        assert_eq!(
+            serde_json::from_str::<GameplayCommand>(&serde_json::to_string(&morph).unwrap())
+                .unwrap(),
+            morph
+        );
+        assert!(GameplayCommand::SetMorphWeights {
+            entity_id: "hero".into(),
+            weights: vec![2.0],
+        }
+        .validate()
+        .is_err());
     }
 }

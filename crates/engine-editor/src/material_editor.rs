@@ -3,7 +3,7 @@
 //! This module provides the UI-toolkit-independent data model exposed to the
 //! React editor through the typed editor protocol.
 
-use engine_asset::cook::{MaterialSource, MATERIAL_SOURCE_SCHEMA};
+use engine_asset::cook::{AdvancedMaterialSource, MaterialSource, MATERIAL_SOURCE_SCHEMA};
 use engine_asset::AssetRegistry;
 use engine_renderer::MaterialUpload;
 use engine_serialize::AssetId;
@@ -229,6 +229,23 @@ impl MaterialEditorPanel {
         let ambient_occlusion = self.float_parameter("Ambient Occlusion")?;
         let emissive_color = self.color_parameter("Emissive")?;
         let emissive = [emissive_color[0], emissive_color[1], emissive_color[2]];
+        let subsurface_color = self.color_parameter("Subsurface Color")?;
+        let sheen_color = self.color_parameter("Sheen Color")?;
+        let rim_color = self.color_parameter("Rim Color")?;
+        let advanced = AdvancedMaterialSource {
+            clearcoat: self.float_parameter("Clearcoat")?,
+            clearcoat_roughness: self.float_parameter("Clearcoat Roughness")?,
+            subsurface: self.float_parameter("Subsurface")?,
+            subsurface_color: [
+                subsurface_color[0],
+                subsurface_color[1],
+                subsurface_color[2],
+            ],
+            anisotropy: self.float_parameter("Anisotropy")?,
+            sheen_color: [sheen_color[0], sheen_color[1], sheen_color[2]],
+            rim_color: [rim_color[0], rim_color[1], rim_color[2]],
+            rim_power: self.float_parameter("Rim Power")?,
+        };
         let transparency = self.choice_parameter("Alpha Mode")?;
         let alpha_cutoff = self.float_parameter("Alpha Cutoff")?;
         let double_sided = self.bool_parameter("Double Sided")?;
@@ -243,6 +260,18 @@ impl MaterialEditorPanel {
             ("emissive[0]", emissive[0]),
             ("emissive[1]", emissive[1]),
             ("emissive[2]", emissive[2]),
+            ("advanced.clearcoat", advanced.clearcoat),
+            ("advanced.clearcoat_roughness", advanced.clearcoat_roughness),
+            ("advanced.subsurface", advanced.subsurface),
+            ("advanced.subsurface_color[0]", advanced.subsurface_color[0]),
+            ("advanced.subsurface_color[1]", advanced.subsurface_color[1]),
+            ("advanced.subsurface_color[2]", advanced.subsurface_color[2]),
+            ("advanced.sheen_color[0]", advanced.sheen_color[0]),
+            ("advanced.sheen_color[1]", advanced.sheen_color[1]),
+            ("advanced.sheen_color[2]", advanced.sheen_color[2]),
+            ("advanced.rim_color[0]", advanced.rim_color[0]),
+            ("advanced.rim_color[1]", advanced.rim_color[1]),
+            ("advanced.rim_color[2]", advanced.rim_color[2]),
             ("alpha_cutoff", alpha_cutoff),
         ] {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
@@ -250,6 +279,16 @@ impl MaterialEditorPanel {
                     "material parameter '{field}' must be finite and in the range 0..=1"
                 ));
             }
+        }
+        if !advanced.anisotropy.is_finite() || !(-1.0..=1.0).contains(&advanced.anisotropy) {
+            return Err(
+                "material parameter 'advanced.anisotropy' must be finite and in -1..=1".into(),
+            );
+        }
+        if !advanced.rim_power.is_finite() || !(0.01..=32.0).contains(&advanced.rim_power) {
+            return Err(
+                "material parameter 'advanced.rim_power' must be finite and in 0.01..=32".into(),
+            );
         }
 
         Ok(Some(MaterialSaveRequest {
@@ -266,6 +305,7 @@ impl MaterialEditorPanel {
                 metallic_roughness_texture: self.texture_parameter("MetallicRoughnessMap"),
                 occlusion_texture: self.texture_parameter("OcclusionMap"),
                 emissive_texture: self.texture_parameter("EmissiveMap"),
+                advanced,
                 transparency,
                 alpha_cutoff,
                 double_sided,
@@ -393,6 +433,53 @@ pub fn load_material(
                 1.0,
             ],
         ));
+        panel.shader_params.push(ShaderParam::new_float(
+            "Clearcoat",
+            material.advanced.clearcoat,
+        ));
+        panel.shader_params.push(ShaderParam::new_float(
+            "Clearcoat Roughness",
+            material.advanced.clearcoat_roughness,
+        ));
+        panel.shader_params.push(ShaderParam::new_float(
+            "Subsurface",
+            material.advanced.subsurface,
+        ));
+        panel.shader_params.push(ShaderParam::new_color(
+            "Subsurface Color",
+            [
+                material.advanced.subsurface_color[0],
+                material.advanced.subsurface_color[1],
+                material.advanced.subsurface_color[2],
+                1.0,
+            ],
+        ));
+        panel.shader_params.push(ShaderParam::new_float(
+            "Anisotropy",
+            material.advanced.anisotropy,
+        ));
+        panel.shader_params.push(ShaderParam::new_color(
+            "Sheen Color",
+            [
+                material.advanced.sheen_color[0],
+                material.advanced.sheen_color[1],
+                material.advanced.sheen_color[2],
+                1.0,
+            ],
+        ));
+        panel.shader_params.push(ShaderParam::new_color(
+            "Rim Color",
+            [
+                material.advanced.rim_color[0],
+                material.advanced.rim_color[1],
+                material.advanced.rim_color[2],
+                1.0,
+            ],
+        ));
+        panel.shader_params.push(ShaderParam::new_float(
+            "Rim Power",
+            material.advanced.rim_power,
+        ));
         let mut base_color_texture = ShaderParam::new_texture("AlbedoMap");
         base_color_texture.texture_value = material
             .base_color_texture
@@ -416,11 +503,12 @@ pub fn load_material(
             engine_renderer::Transparency::Opaque => ("Opaque", 0.5),
             engine_renderer::Transparency::Masked { cutoff } => ("Masked", *cutoff),
             engine_renderer::Transparency::Blend => ("Blend", 0.5),
+            engine_renderer::Transparency::Additive => ("Additive", 0.5),
         };
         panel.shader_params.push(ShaderParam::new_choice(
             "Alpha Mode",
             alpha_mode,
-            ["Opaque", "Masked", "Blend"],
+            ["Opaque", "Masked", "Blend", "Additive"],
         ));
         panel
             .shader_params
@@ -460,6 +548,7 @@ mod tests {
                 metallic_roughness_texture: None,
                 occlusion_texture: None,
                 emissive_texture: None,
+                advanced: engine_renderer::AdvancedMaterialParameters::default(),
                 transparency: Transparency::Opaque,
                 double_sided: false,
                 content_hash: [9; 32],
@@ -531,10 +620,14 @@ mod tests {
 
     #[test]
     fn shader_param_surface_constructors_are_typed() {
-        let choice = ShaderParam::new_choice("Alpha Mode", "Masked", ["Opaque", "Masked", "Blend"]);
+        let choice = ShaderParam::new_choice(
+            "Alpha Mode",
+            "Masked",
+            ["Opaque", "Masked", "Blend", "Additive"],
+        );
         assert_eq!(choice.param_type, ShaderParamType::Choice);
         assert_eq!(choice.choice_value, "Masked");
-        assert_eq!(choice.choice_options.len(), 3);
+        assert_eq!(choice.choice_options.len(), 4);
 
         let toggle = ShaderParam::new_bool("Double Sided", true);
         assert_eq!(toggle.param_type, ShaderParamType::Bool);
@@ -604,6 +697,7 @@ mod tests {
                 metallic_roughness_texture: Some(AssetId::new("tex-metallic-roughness")),
                 occlusion_texture: Some(AssetId::new("tex-occlusion")),
                 emissive_texture: Some(AssetId::new("tex-emissive")),
+                advanced: engine_renderer::AdvancedMaterialParameters::default(),
                 transparency: Transparency::Opaque,
                 double_sided: false,
                 content_hash: [7; 32],
@@ -700,6 +794,7 @@ mod tests {
                 metallic_roughness_texture: None,
                 occlusion_texture: None,
                 emissive_texture: None,
+                advanced: engine_renderer::AdvancedMaterialParameters::default(),
                 transparency: Transparency::Masked { cutoff: 0.36 },
                 double_sided: true,
                 content_hash: [8; 32],

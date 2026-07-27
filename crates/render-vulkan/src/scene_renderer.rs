@@ -17,10 +17,11 @@ use ash::vk;
 use glam::{Mat4, Vec3};
 
 use engine_renderer::{
-    render_graph2, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, FrameStats, LightItem,
-    LightKind, MaterialBinding, MaterialUpload, MeshUpload, MeshVertexFormat, ParamBlock,
-    PassRegistry, RenderFrameInput, RenderPass, ResourceKind, ResourceRemoval, SamplerAddressMode,
-    SamplerFilter, ShadowMode, TextureSlot, TextureUpload, UiBatch, UploadReceipt,
+    render_graph2, AssetId, BackendRenderer, Diagnostic, DiagnosticSeverity, EnvironmentMapUpload,
+    FrameStats, LightKind, MaterialBinding, MaterialUpload, MeshUpload, MeshVertexFormat,
+    ParamBlock, PassRegistry, RenderFrameInput, RenderPass, ResourceKind, ResourceRemoval,
+    SamplerAddressMode, SamplerFilter, ShadowMode, TextureSlot, TextureUpload, UiBatch,
+    UploadReceipt,
 };
 use render_core::{
     self, BufferDescriptor, BufferHandle, CommandEncoder, Device, FramebufferHandle, IndexFormat,
@@ -30,12 +31,18 @@ use render_core::{
 };
 
 #[cfg(test)]
+use engine_renderer::ParticleBatch;
+#[cfg(test)]
 use render_core::PipelineDescriptor;
 
 use crate::device_impl::VulkanDevice;
+use crate::instance_data::*;
 use crate::shaders_embedded::{
-    FORWARD_FRAG_SPV, FORWARD_VERT_SPV, SKINNED_VERT_SPV, SKYBOX_FRAG_SPV, SKYBOX_VERT_SPV,
+    FORWARD_FRAG_SPV, FORWARD_VERT_SPV, GPU_VFX_BILLBOARD_VERT_SPV, INSTANCED_VERT_SPV,
+    SKINNED_VERT_SPV, SKYBOX_FRAG_SPV, SKYBOX_VERT_SPV, VFX_BILLBOARD_FRAG_SPV,
+    VFX_BILLBOARD_VERT_SPV,
 };
+use engine_renderer::{build_clustered_light_frame, normalize_direction};
 
 // ============================================================================
 // GpuMesh
@@ -48,6 +55,7 @@ pub struct GpuMesh {
     pub vertex_buffer: BufferHandle,
     pub index_buffer: BufferHandle,
     pub index_count: u32,
+    pub vertex_count: u32,
     pub index_format: IndexFormat,
     pub vertex_format: MeshVertexFormat,
     pub content_hash: [u8; 32],
@@ -228,7 +236,9 @@ fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
         upload.ambient_occlusion,
         match upload.transparency {
             engine_renderer::Transparency::Masked { cutoff } => cutoff,
-            engine_renderer::Transparency::Opaque | engine_renderer::Transparency::Blend => -1.0,
+            engine_renderer::Transparency::Opaque
+            | engine_renderer::Transparency::Blend
+            | engine_renderer::Transparency::Additive => -1.0,
         },
     ] {
         bytes.extend_from_slice(&value.to_ne_bytes());
@@ -240,6 +250,36 @@ fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
         texture_flags as f32,
     ] {
         bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    for vector in [
+        [
+            upload.advanced.clearcoat,
+            upload.advanced.clearcoat_roughness,
+            upload.advanced.subsurface,
+            upload.advanced.anisotropy,
+        ],
+        [
+            upload.advanced.subsurface_color[0],
+            upload.advanced.subsurface_color[1],
+            upload.advanced.subsurface_color[2],
+            0.0,
+        ],
+        [
+            upload.advanced.sheen_color[0],
+            upload.advanced.sheen_color[1],
+            upload.advanced.sheen_color[2],
+            0.0,
+        ],
+        [
+            upload.advanced.rim_color[0],
+            upload.advanced.rim_color[1],
+            upload.advanced.rim_color[2],
+            upload.advanced.rim_power,
+        ],
+    ] {
+        for value in vector {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
     }
     let textures = texture_references
         .into_iter()
@@ -274,7 +314,7 @@ fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
     }
 }
 
-/// CPU-side material UBO layout (48 bytes total).
+/// CPU-side material UBO layout (112 bytes total).
 ///
 /// Field layout (std140):
 /// | offset | field       | type      | bytes |
@@ -285,7 +325,11 @@ fn uploaded_material_binding(upload: &MaterialUpload) -> MaterialBinding {
 /// |     24 | ao          | float    |     4 |
 /// |     28 | alpha_cutoff| float    |     4 |
 /// |     32 | emissive     | vec4     |    16 |
-/// Total: 48 bytes.
+/// |     48 | advanced0    | vec4     |    16 |
+/// |     64 | subsurface   | vec4     |    16 |
+/// |     80 | sheen        | vec4     |    16 |
+/// |     96 | rim          | vec4     |    16 |
+/// Total: 112 bytes.
 #[repr(C)]
 struct MaterialUBO {
     base_color: [f32; 4],
@@ -294,6 +338,10 @@ struct MaterialUBO {
     ao: f32,
     alpha_cutoff: f32,
     emissive: [f32; 4],
+    advanced0: [f32; 4],
+    subsurface_color: [f32; 4],
+    sheen_color: [f32; 4],
+    rim_color_power: [f32; 4],
 }
 
 const MATERIAL_UBO_SIZE: usize = std::mem::size_of::<MaterialUBO>();
@@ -325,68 +373,14 @@ struct CachedBoneBuffer {
 
 const MAX_BONE_PALETTES: usize = 64;
 
-// ============================================================================
-// Light GPU data packing
-// ============================================================================
-
-/// Pack a single [`LightItem`] into the 64-byte GPU Light struct format.
-///
-/// GPU layout (std430):
-///   position[4]    锟?xyz = world position, w = type flag (0=dir, 1=point, 2=spot)
-///   direction[4]   锟?xyz = normalized direction, w = unused
-///   color[4]       锟?rgb = color, a = intensity
-///   attenuation[4] 锟?x = range, y = linear, z = quadratic, w = spot_cutoff_cos
-///
-/// Total: 64 bytes per light.
-fn pack_light_gpu_bytes(light: &LightItem, dir: [f32; 3], kind_w: f32) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64);
-
-    // position (xyz + kind_w)
-    for &v in &light.position {
-        buf.extend_from_slice(&v.to_ne_bytes());
-    }
-    buf.extend_from_slice(&kind_w.to_ne_bytes());
-
-    // direction (xyz + 0.0)
-    for &v in &dir {
-        buf.extend_from_slice(&v.to_ne_bytes());
-    }
-    buf.extend_from_slice(&0.0f32.to_ne_bytes());
-
-    // color (rgb + intensity)
-    for &v in &light.color {
-        buf.extend_from_slice(&v.to_ne_bytes());
-    }
-    buf.extend_from_slice(&light.intensity.to_ne_bytes());
-
-    // attenuation (range, linear, quadratic, spot_cutoff_cos)
-    let range = light.range.max(0.0);
-    let quadratic = if range > 0.0 {
-        1.0 / (range * range)
-    } else {
-        0.0
-    };
-    let spot_cutoff = match (&light.kind, &light.spot_angles) {
-        (LightKind::Spot, Some(angles)) => angles.outer.cos(),
-        _ => 0.0,
-    };
-    buf.extend_from_slice(&range.to_ne_bytes());
-    buf.extend_from_slice(&0.0f32.to_ne_bytes()); // linear factor
-    buf.extend_from_slice(&quadratic.to_ne_bytes());
-    buf.extend_from_slice(&spot_cutoff.to_ne_bytes());
-
-    buf
-}
-
-/// Normalize a 3-component direction vector. Returns `[0, -1, 0]` for zero length.
-fn normalize_dir(d: &[f32; 3]) -> [f32; 3] {
-    let len_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    if len_sq > 0.0 {
-        let inv = 1.0 / len_sq.sqrt();
-        [d[0] * inv, d[1] * inv, d[2] * inv]
-    } else {
-        [0.0, -1.0, 0.0]
-    }
+#[derive(Clone, Debug)]
+struct GpuMorphTargetSet {
+    handle: BufferHandle,
+    buffer: vk::Buffer,
+    vertex_count: u32,
+    target_count: u32,
+    content_hash: [u8; 32],
+    revision: u64,
 }
 
 // ============================================================================
@@ -569,18 +563,42 @@ struct ToneMapPushConstants {
     mode: u32,
     exposure: f32,
     output_is_srgb: u32,
-    padding: u32,
+    effect_flags: u32,
+    bloom: [f32; 4],
+    color_filter_saturation: [f32; 4],
+    contrast: [f32; 4],
+    lift: [f32; 4],
+    gamma: [f32; 4],
+    gain: [f32; 4],
+    vignette: [f32; 4],
 }
 
 impl ToneMapPushConstants {
-    const SIZE: usize = 16;
+    const SIZE: usize = 128;
 
     fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0; Self::SIZE];
         bytes[0..4].copy_from_slice(&self.mode.to_ne_bytes());
         bytes[4..8].copy_from_slice(&self.exposure.to_ne_bytes());
         bytes[8..12].copy_from_slice(&self.output_is_srgb.to_ne_bytes());
-        bytes[12..16].copy_from_slice(&self.padding.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.effect_flags.to_ne_bytes());
+        for (vector_index, vector) in [
+            self.bloom,
+            self.color_filter_saturation,
+            self.contrast,
+            self.lift,
+            self.gamma,
+            self.gain,
+            self.vignette,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (component_index, component) in vector.into_iter().enumerate() {
+                let start = 16 + vector_index * 16 + component_index * 4;
+                bytes[start..start + 4].copy_from_slice(&component.to_ne_bytes());
+            }
+        }
         bytes
     }
 }
@@ -595,6 +613,7 @@ fn swapchain_format_is_srgb(format: vk::Format) -> bool {
 fn tone_map_push_constants(
     tone_mapping: engine_renderer::ToneMapping,
     exposure_ev100: Option<f32>,
+    post_process: engine_renderer::PostProcessSettings,
     swapchain_format: vk::Format,
 ) -> Result<ToneMapPushConstants, String> {
     let mode = match tone_mapping {
@@ -618,12 +637,67 @@ fn tone_map_push_constants(
         ));
     }
 
+    let master_enabled = post_process.enabled;
+    let effect_flags = u32::from(master_enabled && post_process.bloom.enabled)
+        | (u32::from(master_enabled && post_process.color_grading.enabled) << 1)
+        | (u32::from(master_enabled && post_process.vignette.enabled) << 2);
+    let grading = post_process.color_grading;
+    let vignette = post_process.vignette;
     Ok(ToneMapPushConstants {
         mode,
         exposure,
         output_is_srgb: u32::from(swapchain_format_is_srgb(swapchain_format)),
-        padding: 0,
+        effect_flags,
+        bloom: [
+            post_process.bloom.threshold,
+            post_process.bloom.intensity,
+            post_process.bloom.radius,
+            0.0,
+        ],
+        color_filter_saturation: [
+            grading.color_filter[0],
+            grading.color_filter[1],
+            grading.color_filter[2],
+            grading.saturation,
+        ],
+        contrast: [grading.contrast, 0.0, 0.0, 0.0],
+        lift: [grading.lift[0], grading.lift[1], grading.lift[2], 0.0],
+        gamma: [grading.gamma[0], grading.gamma[1], grading.gamma[2], 0.0],
+        gain: [grading.gain[0], grading.gain[1], grading.gain[2], 0.0],
+        vignette: [
+            vignette.intensity,
+            vignette.smoothness,
+            vignette.roundness,
+            0.0,
+        ],
     })
+}
+
+fn select_environment_map(
+    settings: &engine_renderer::EnvironmentSettings,
+    camera_position: Vec3,
+) -> Option<&AssetId> {
+    settings
+        .reflection_probes
+        .iter()
+        .filter_map(|probe| {
+            let position = Vec3::from_array(probe.position);
+            let extents =
+                Vec3::from_array(probe.half_extents) + Vec3::splat(probe.blend_distance.max(0.0));
+            let offset = (camera_position - position).abs();
+            (offset.cmple(extents).all()).then(|| {
+                let normalized_distance =
+                    (offset / extents.max(Vec3::splat(0.0001))).length_squared();
+                (probe, normalized_distance)
+            })
+        })
+        .max_by(|(left, left_distance), (right, right_distance)| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| right_distance.total_cmp(left_distance))
+        })
+        .map(|(probe, _)| &probe.environment_map)
+        .or(settings.environment_map.as_ref())
 }
 
 fn ui_scissor(
@@ -749,6 +823,11 @@ pub struct SceneRenderer {
     /// Cache of loaded meshes indexed by their [`AssetId`](engine_serialize::AssetId) string.
     meshes: BTreeMap<String, GpuMesh>,
     texture_uploads: HashMap<String, UploadedResourceState>,
+    environment_uploads: HashMap<String, EnvironmentMapUpload>,
+    environment_revisions: HashMap<String, UploadedResourceState>,
+    active_environment_id: Option<String>,
+    morph_target_sets: HashMap<String, GpuMorphTargetSet>,
+    fallback_morph_buffer: Option<(BufferHandle, vk::Buffer)>,
     uploaded_materials: HashMap<String, UploadedMaterialState>,
 
     /// Cache of material descriptor sets + buffers, keyed by material_id.
@@ -796,6 +875,12 @@ pub struct SceneRenderer {
     /// buffer would race the other frame slot while the GPU is reading it.
     ui_vbs: [Option<BufferHandle>; 2],
     ui_vb_capacities: [u64; 2],
+    /// Per-frame GPU particle instance streams. They are isolated by
+    /// in-flight frame slot for the same reason as the UI stream.
+    particle_instance_vbs: [Option<BufferHandle>; 2],
+    particle_instance_capacities: [u64; 2],
+    static_instance_vbs: [Option<BufferHandle>; 2],
+    static_instance_capacities: [u64; 2],
 
     /// Per-pass GPU timestamp state machine (ENG-04). Async read-back lands
     /// frames-in-flight frames after recording; unavailable/disabled states
@@ -820,6 +905,11 @@ impl SceneRenderer {
             initialized: false,
             meshes: BTreeMap::new(),
             texture_uploads: HashMap::new(),
+            environment_uploads: HashMap::new(),
+            environment_revisions: HashMap::new(),
+            active_environment_id: None,
+            morph_target_sets: HashMap::new(),
+            fallback_morph_buffer: None,
             uploaded_materials: HashMap::new(),
             material_cache: HashMap::new(),
             material_cache_order: Vec::new(),
@@ -833,6 +923,10 @@ impl SceneRenderer {
             skinned_shader_modules: Vec::new(),
             ui_vbs: [None; 2],
             ui_vb_capacities: [0; 2],
+            particle_instance_vbs: [None; 2],
+            particle_instance_capacities: [0; 2],
+            static_instance_vbs: [None; 2],
+            static_instance_capacities: [0; 2],
             framebuffers: Vec::new(),
             cur_fb_index: 0,
             cur_sc: None,
@@ -892,19 +986,37 @@ impl SceneRenderer {
         if !SKINNED_VERT_SPV.is_empty() {
             self.device.set_skinned_vertex_shader(SKINNED_VERT_SPV);
         }
+        if !VFX_BILLBOARD_VERT_SPV.is_empty()
+            && !GPU_VFX_BILLBOARD_VERT_SPV.is_empty()
+            && !VFX_BILLBOARD_FRAG_SPV.is_empty()
+        {
+            self.device.set_vfx_billboard_shaders(
+                VFX_BILLBOARD_VERT_SPV,
+                GPU_VFX_BILLBOARD_VERT_SPV,
+                VFX_BILLBOARD_FRAG_SPV,
+            );
+        }
+        if !INSTANCED_VERT_SPV.is_empty() {
+            self.device.set_instanced_vertex_shader(INSTANCED_VERT_SPV);
+        }
     }
 
     fn create_scene_shader_modules(&mut self) -> Result<(), Vec<Diagnostic>> {
         if !self.forward_shader_modules.is_empty() && !self.skinned_shader_modules.is_empty() {
             return Ok(());
         }
-        if FORWARD_VERT_SPV.is_empty() || FORWARD_FRAG_SPV.is_empty() || SKINNED_VERT_SPV.is_empty()
+        if FORWARD_VERT_SPV.is_empty()
+            || FORWARD_FRAG_SPV.is_empty()
+            || SKINNED_VERT_SPV.is_empty()
+            || VFX_BILLBOARD_VERT_SPV.is_empty()
+            || VFX_BILLBOARD_FRAG_SPV.is_empty()
+            || INSTANCED_VERT_SPV.is_empty()
         {
             return Err(vec![Diagnostic::new(
                 "RV0293",
                 DiagnosticSeverity::Error,
                 "scene_renderer",
-                "embedded forward or skinned SPIR-V is unavailable",
+                "embedded forward, skinned, instanced, or VFX SPIR-V is unavailable",
             )]);
         }
 
@@ -1071,14 +1183,16 @@ impl SceneRenderer {
         })?;
 
         // 鈹€鈹€ Light SSBO (set=1 binding=2) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-        self.device.create_light_ssbo().map_err(|e| {
-            vec![Diagnostic::new(
-                "RV0222",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("create_light_ssbo: {e:?}"),
-            )]
-        })?;
+        self.device
+            .create_clustered_lighting_buffers()
+            .map_err(|e| {
+                vec![Diagnostic::new(
+                    "RV0222",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create_clustered_lighting_buffers: {e:?}"),
+                )]
+            })?;
 
         // 鈹€鈹€ Indirect draw buffers (Phase 5.1) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         self.device
@@ -1457,6 +1571,54 @@ impl SceneRenderer {
         Ok(vk_buf)
     }
 
+    fn ensure_fallback_morph_buffer(&mut self) -> Result<vk::Buffer, Vec<Diagnostic>> {
+        if let Some((_, buffer)) = self.fallback_morph_buffer {
+            return Ok(buffer);
+        }
+        let handle = self
+            .device
+            .create_buffer(&BufferDescriptor {
+                size_bytes: 32,
+                usage_flags: render_core::BufferUsage::STORAGE,
+                memory_hint: MemoryHint::CpuToGpu,
+                debug_label: Some("morph-target-fallback".to_string()),
+            })
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0324",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create fallback morph buffer: {error}"),
+                )]
+            })?;
+        if let Err(error) = self.device.write_buffer(handle, &[0; 32], 0) {
+            self.device.destroy_buffer(handle);
+            return Err(vec![Diagnostic::new(
+                "RV0325",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("initialize fallback morph buffer: {error}"),
+            )]);
+        }
+        let buffer = self
+            .device
+            .buffers
+            .get(handle.index, handle.generation)
+            .map(|entry| entry.buffer)
+            .unwrap_or(vk::Buffer::null());
+        if buffer == vk::Buffer::null() {
+            self.device.destroy_buffer(handle);
+            return Err(vec![Diagnostic::new(
+                "RV0325",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "fallback morph buffer has no Vulkan handle",
+            )]);
+        }
+        self.fallback_morph_buffer = Some((handle, buffer));
+        Ok(buffer)
+    }
+
     /// Get or create a combined material + bone descriptor set for a skinned drawable.
     /// The descriptor set has:
     ///   binding=0: material UBO
@@ -1466,11 +1628,16 @@ impl SceneRenderer {
         &mut self,
         material_id: &str,
         skeleton_id: &str,
+        morph_target_set_id: Option<&str>,
         _mat_desc_set: vk::DescriptorSet,
         mat_buffer: vk::Buffer,
         bone_buffer: vk::Buffer,
+        morph_buffer: vk::Buffer,
     ) -> Result<vk::DescriptorSet, Vec<Diagnostic>> {
-        let cache_key = format!("{material_id}:{skeleton_id}");
+        let cache_key = format!(
+            "{material_id}:{skeleton_id}:{}",
+            morph_target_set_id.unwrap_or("<none>")
+        );
 
         // Check cache
         if let Some(entry) = self.skinned_desc_cache.get(&cache_key) {
@@ -1503,6 +1670,7 @@ impl SceneRenderer {
                 MATERIAL_UBO_SIZE as u64,
                 bone_buffer,
                 4096,
+                morph_buffer,
             )
             .map_err(|e| {
                 vec![Diagnostic::new(
@@ -1573,6 +1741,10 @@ impl SceneRenderer {
             ao: read_f32(24, 1.0).clamp(0.0, 1.0),
             alpha_cutoff: read_f32(28, -1.0),
             emissive: read_vec4(32, [0.0; 4]),
+            advanced0: read_vec4(48, [0.0, 0.2, 0.0, 0.0]),
+            subsurface_color: read_vec4(64, [1.0, 0.35, 0.25, 0.0]),
+            sheen_color: read_vec4(80, [0.0; 4]),
+            rim_color_power: read_vec4(96, [0.0, 0.0, 0.0, 3.0]),
         }
     }
 
@@ -1973,11 +2145,11 @@ impl SceneRenderer {
                 format!("cannot evict in-flight skeleton '{skeleton_id}': {error:?}"),
             )]
         })?;
-        let suffix = format!(":{skeleton_id}");
+        let skeleton_marker = format!(":{skeleton_id}:");
         let descriptor_keys: Vec<String> = self
             .skinned_desc_cache
             .keys()
-            .filter(|key| key.ends_with(&suffix))
+            .filter(|key| key.contains(&skeleton_marker))
             .cloned()
             .collect();
         for key in descriptor_keys {
@@ -2111,6 +2283,60 @@ impl SceneRenderer {
         self.init_once()?;
         self.ensure_scene_framebuffers()?;
 
+        let camera_world = view.inverse().w_axis;
+        let camera_position_vec = camera_world.truncate();
+        let requested_environment =
+            select_environment_map(&input.render_options.environment, camera_position_vec)
+                .map(|asset| asset.id.clone());
+        if requested_environment != self.active_environment_id {
+            self.device.wait_idle_checked().map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0321",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("wait before environment-map switch: {error}"),
+                )]
+            })?;
+            if let Some(environment_id) = &requested_environment {
+                let upload = self
+                    .environment_uploads
+                    .get(environment_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0322",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!(
+                                "frame references environment map '{environment_id}' before upload"
+                            ),
+                        )]
+                    })?;
+                self.device
+                    .upload_environment_map(&upload)
+                    .map_err(|error| {
+                        vec![Diagnostic::new(
+                            "RV0323",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!("activate environment map '{environment_id}': {error}"),
+                        )]
+                    })?;
+            } else {
+                self.device
+                    .restore_procedural_environment()
+                    .map_err(|error| {
+                        vec![Diagnostic::new(
+                            "RV0323",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!("restore procedural environment: {error}"),
+                        )]
+                    })?;
+            }
+            self.active_environment_id = requested_environment;
+        }
+
         let (ii, encoder) = self.device.begin_frame(sc_h).map_err(|e| {
             vec![Diagnostic::new(
                 "RV0208",
@@ -2132,13 +2358,24 @@ impl SceneRenderer {
         }
         self.device.write_ubo_current(&view_projection_bytes, 64);
 
-        let camera_world = view.inverse().w_axis;
         let camera_position = [camera_world.x, camera_world.y, camera_world.z, 1.0f32];
         let mut camera_bytes = Vec::with_capacity(16);
         for value in camera_position {
             camera_bytes.extend_from_slice(&value.to_ne_bytes());
         }
         self.device.write_ubo_current(&camera_bytes, 160);
+        let environment = &input.render_options.environment;
+        let environment_parameters = [
+            environment.intensity,
+            environment.rotation_radians.sin(),
+            environment.rotation_radians.cos(),
+            0.0f32,
+        ];
+        let mut environment_bytes = Vec::with_capacity(16);
+        for value in environment_parameters {
+            environment_bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        self.device.write_ubo_current(&environment_bytes, 384);
 
         Ok((sc_h, ii, encoder))
     }
@@ -2146,6 +2383,150 @@ impl SceneRenderer {
     // ------------------------------------------------------------------
     // Extracted pass-execution helpers (called by registered passes)
     // ------------------------------------------------------------------
+
+    fn upload_particle_instance_stream(
+        &mut self,
+        prepared: &PreparedParticleInstances,
+    ) -> Result<Option<vk::Buffer>, Vec<Diagnostic>> {
+        if prepared.instance_bytes.is_empty() {
+            return Ok(None);
+        }
+        let frame_index = self.device.current_frame;
+        let required_bytes = u64::try_from(prepared.instance_bytes.len()).map_err(|_| {
+            vec![Diagnostic::new(
+                "RV0332",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "particle instance data exceeds the Vulkan buffer size contract",
+            )]
+        })?;
+        if self.particle_instance_capacities[frame_index] < required_bytes {
+            if let Some(old) = self.particle_instance_vbs[frame_index].take() {
+                self.device.destroy_buffer(old);
+            }
+            let capacity = required_bytes.next_power_of_two();
+            let buffer = self
+                .device
+                .create_buffer(&BufferDescriptor {
+                    size_bytes: capacity,
+                    usage_flags: render_core::BufferUsage::VERTEX,
+                    memory_hint: MemoryHint::CpuToGpu,
+                    debug_label: Some(format!("vfx-instances-{frame_index}")),
+                })
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0333",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("create VFX instance buffer: {error:?}"),
+                    )]
+                })?;
+            self.particle_instance_vbs[frame_index] = Some(buffer);
+            self.particle_instance_capacities[frame_index] = capacity;
+        }
+        let handle = self.particle_instance_vbs[frame_index].ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0334",
+                DiagnosticSeverity::Fatal,
+                "scene_renderer",
+                "VFX instance buffer was not retained after creation",
+            )]
+        })?;
+        self.device
+            .write_buffer(handle, &prepared.instance_bytes, 0)
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0335",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("write VFX instance buffer: {error:?}"),
+                )]
+            })?;
+        self.device
+            .buffers
+            .get(handle.index, handle.generation)
+            .map(|entry| Some(entry.buffer))
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0336",
+                    DiagnosticSeverity::Fatal,
+                    "scene_renderer",
+                    "VFX instance buffer handle became invalid before recording",
+                )]
+            })
+    }
+
+    fn upload_static_instance_stream(
+        &mut self,
+        prepared: &PreparedStaticInstances,
+    ) -> Result<Option<vk::Buffer>, Vec<Diagnostic>> {
+        if prepared.instance_bytes.is_empty() {
+            return Ok(None);
+        }
+        let frame_index = self.device.current_frame;
+        let required_bytes = u64::try_from(prepared.instance_bytes.len()).map_err(|_| {
+            vec![Diagnostic::new(
+                "RV0343",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                "static instance data exceeds the Vulkan buffer size contract",
+            )]
+        })?;
+        if self.static_instance_capacities[frame_index] < required_bytes {
+            if let Some(old) = self.static_instance_vbs[frame_index].take() {
+                self.device.destroy_buffer(old);
+            }
+            let capacity = required_bytes.next_power_of_two();
+            let buffer = self
+                .device
+                .create_buffer(&BufferDescriptor {
+                    size_bytes: capacity,
+                    usage_flags: render_core::BufferUsage::VERTEX,
+                    memory_hint: MemoryHint::CpuToGpu,
+                    debug_label: Some(format!("static-instances-{frame_index}")),
+                })
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        "RV0344",
+                        DiagnosticSeverity::Error,
+                        "scene_renderer",
+                        format!("create static instance buffer: {error:?}"),
+                    )]
+                })?;
+            self.static_instance_vbs[frame_index] = Some(buffer);
+            self.static_instance_capacities[frame_index] = capacity;
+        }
+        let handle = self.static_instance_vbs[frame_index].ok_or_else(|| {
+            vec![Diagnostic::new(
+                "RV0345",
+                DiagnosticSeverity::Fatal,
+                "scene_renderer",
+                "static instance buffer was not retained after creation",
+            )]
+        })?;
+        self.device
+            .write_buffer(handle, &prepared.instance_bytes, 0)
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0346",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("write static instance buffer: {error:?}"),
+                )]
+            })?;
+        self.device
+            .buffers
+            .get(handle.index, handle.generation)
+            .map(|entry| Some(entry.buffer))
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0347",
+                    DiagnosticSeverity::Fatal,
+                    "scene_renderer",
+                    "static instance buffer handle became invalid before recording",
+                )]
+            })
+    }
 
     /// Execute the opaque PBR forward pass (HDR offscreen).
     pub(crate) fn execute_hdr_forward_pass(
@@ -2178,54 +2559,13 @@ impl SceneRenderer {
                 "HDR forward pass resources are incomplete",
             )]);
         }
+        let weighted_oit = input.render_options.transparency_mode
+            == engine_renderer::TransparencyMode::WeightedBlendedOit;
 
         // Clone device + cmd handles to avoid borrow-checker conflicts
         let d = self.device.logical_device.device.clone();
         let fi = self.device.current_frame;
         let cmd = self.device.frame_sync[fi].command_buffer;
-
-        // Light setup: first directional -> UBO, rest -> SSBO
-        let mut light_ssbo_data: Vec<u8> = Vec::new();
-        let mut first_directional = true;
-
-        for light in &input.lights {
-            match light.kind {
-                LightKind::Directional => {
-                    let dir = normalize_dir(&light.direction);
-                    if first_directional {
-                        let mut dir_bytes = [0u8; 16];
-                        for (j, &v) in dir.iter().enumerate() {
-                            dir_bytes[j * 4..(j + 1) * 4].copy_from_slice(&v.to_ne_bytes());
-                        }
-                        dir_bytes[12..16].copy_from_slice(&0.0f32.to_ne_bytes());
-                        self.device.write_ubo(fi, &dir_bytes, 128);
-
-                        let mut col_bytes = [0u8; 16];
-                        for (j, &v) in light.color.iter().enumerate() {
-                            col_bytes[j * 4..(j + 1) * 4].copy_from_slice(&v.to_ne_bytes());
-                        }
-                        col_bytes[12..16].copy_from_slice(&light.intensity.to_ne_bytes());
-                        self.device.write_ubo(fi, &col_bytes, 144);
-
-                        first_directional = false;
-                    } else {
-                        light_ssbo_data.extend_from_slice(&pack_light_gpu_bytes(light, dir, 0.0));
-                    }
-                }
-                LightKind::Point => {
-                    let dir = [0.0f32; 3];
-                    light_ssbo_data.extend_from_slice(&pack_light_gpu_bytes(light, dir, 1.0));
-                }
-                LightKind::Spot => {
-                    let dir = normalize_dir(&light.direction);
-                    light_ssbo_data.extend_from_slice(&pack_light_gpu_bytes(light, dir, 2.0));
-                }
-            }
-        }
-
-        if !light_ssbo_data.is_empty() {
-            self.device.write_light_ssbo(&light_ssbo_data, 0);
-        }
 
         let render_view = input.views.first().ok_or_else(|| {
             vec![Diagnostic::new(
@@ -2235,6 +2575,64 @@ impl SceneRenderer {
                 "HDR forward pass requires a RenderView",
             )]
         })?;
+
+        // The primary directional light remains in the compact frame UBO.
+        // Every other light is assigned to conservative screen/depth clusters.
+        let primary_directional = input
+            .lights
+            .iter()
+            .find(|light| matches!(light.kind, LightKind::Directional));
+        let additional_lights = input
+            .lights
+            .iter()
+            .filter(|light| {
+                primary_directional.is_none_or(|primary| !std::ptr::eq(*light, primary))
+            })
+            .collect::<Vec<_>>();
+        let (direction, color, intensity) =
+            primary_directional.map_or(([0.0, -1.0, 0.0], [0.0; 3], 0.0), |light| {
+                (
+                    normalize_direction(light.direction),
+                    light.color,
+                    light.intensity,
+                )
+            });
+        let mut direction_bytes = [0; 16];
+        let mut color_bytes = [0; 16];
+        for (index, value) in direction.into_iter().enumerate() {
+            direction_bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        for (index, value) in color.into_iter().enumerate() {
+            color_bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+        color_bytes[12..16].copy_from_slice(&intensity.to_ne_bytes());
+        self.device.write_ubo(fi, &direction_bytes, 128);
+        self.device.write_ubo(fi, &color_bytes, 144);
+
+        let clustered =
+            build_clustered_light_frame(&additional_lights, render_view, self.width, self.height);
+        self.device.write_clustered_lighting_buffers(
+            &clustered.light_bytes,
+            &clustered.cluster_grid_bytes,
+            &clustered.cluster_index_bytes,
+        );
+        let _cluster_metrics = (
+            clustered.light_count,
+            clustered.cluster_count,
+            clustered.index_count,
+            clustered.overflowed_assignments,
+        );
+        let prepared_particles =
+            prepare_particle_instances(&input.particle_batches).map_err(|message| {
+                vec![Diagnostic::new(
+                    "RV0337",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    message,
+                )]
+            })?;
+        let particle_instance_buffer = self.upload_particle_instance_stream(&prepared_particles)?;
+
         let scene_viewport = vulkan_viewport_rect(
             render_view.viewport_rect_normalized,
             self.width,
@@ -2257,6 +2655,12 @@ impl SceneRenderer {
                 color: vk::ClearColorValue {
                     float32: clear_color,
                 },
+            },
+            vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.0; 4] },
+            },
+            vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.0; 4] },
             },
             vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
@@ -2372,90 +2776,457 @@ impl SceneRenderer {
             .inverse()
             .w_axis
             .truncate();
-        let mut ordered_drawables = Vec::with_capacity(input.drawables.len());
-        let mut blended_drawables = Vec::new();
-        for drawable in &input.drawables {
-            let material = self.material_binding_for_drawable(input, &drawable.material)?;
-            if matches!(material.transparency, engine_renderer::Transparency::Blend) {
-                let translation = Vec3::new(
-                    drawable.world_transform[12],
-                    drawable.world_transform[13],
-                    drawable.world_transform[14],
+        for transparent_phase in [false, true] {
+            let mut ordered_drawables = Vec::with_capacity(input.drawables.len());
+            let mut blended_drawables = Vec::new();
+            for drawable in &input.drawables {
+                let material = self.material_binding_for_drawable(input, &drawable.material)?;
+                let transparent = matches!(
+                    material.transparency,
+                    engine_renderer::Transparency::Blend | engine_renderer::Transparency::Additive
                 );
-                blended_drawables
-                    .push(((translation - camera_position).length_squared(), drawable));
-            } else {
-                ordered_drawables.push(drawable);
-            }
-        }
-        blended_drawables.sort_by(|left, right| right.0.total_cmp(&left.0));
-        ordered_drawables.extend(blended_drawables.into_iter().map(|(_, drawable)| drawable));
-
-        // Draw calls with dynamic batching.
-        let mut last_material_id: Option<&str> = None;
-        let mut last_mesh_id: Option<&str> = None;
-        let mut current_material_pipeline = hdr_pl;
-        #[allow(unused_assignments)]
-        let mut cached_vb = vk::Buffer::null();
-        #[allow(unused_assignments)]
-        let mut cached_ib = vk::Buffer::null();
-        #[allow(unused_assignments)]
-        let mut cached_idx_ty = vk::IndexType::UINT32;
-        let mut cached_index_count = 0u32;
-        for drawable in ordered_drawables {
-            let mesh_id = &drawable.mesh.id;
-            let material_id = &drawable.material.id;
-
-            // Look up mesh buffers; cache across consecutive same-mesh drawables
-            if Some(mesh_id.as_str()) != last_mesh_id {
-                if let Some(m) = self.meshes.get(mesh_id).cloned() {
-                    let vk_vb = self
-                        .device
-                        .buffers
-                        .get(m.vertex_buffer.index, m.vertex_buffer.generation)
-                        .map(|e| e.buffer)
-                        .unwrap_or(vk::Buffer::null());
-                    let vk_ib = self
-                        .device
-                        .buffers
-                        .get(m.index_buffer.index, m.index_buffer.generation)
-                        .map(|e| e.buffer)
-                        .unwrap_or(vk::Buffer::null());
-                    if vk_vb == vk::Buffer::null() {
-                        last_material_id = None;
-                        last_mesh_id = None;
-                        cached_index_count = 0;
-                        continue;
-                    }
-                    cached_vb = vk_vb;
-                    cached_ib = vk_ib;
-                    cached_idx_ty = vulkan_index_type(m.index_format);
-                    cached_index_count = m.index_count;
-                    last_mesh_id = Some(mesh_id.as_str());
-                    // Bind VB/IB
-                    let vbs = [cached_vb];
-                    let offsets = [0u64];
-                    unsafe {
-                        d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
-                        d.cmd_bind_index_buffer(cmd, cached_ib, 0, cached_idx_ty);
-                    }
-                } else {
-                    tracing::trace!(
-                        target: "scene_renderer",
-                        mesh = mesh_id,
-                        "skipping un-cached mesh in HDR forward pass"
-                    );
-                    last_material_id = None;
-                    last_mesh_id = None;
+                if transparent != transparent_phase {
                     continue;
                 }
+                if transparent {
+                    let translation = Vec3::new(
+                        drawable.world_transform[12],
+                        drawable.world_transform[13],
+                        drawable.world_transform[14],
+                    );
+                    blended_drawables
+                        .push(((translation - camera_position).length_squared(), drawable));
+                } else {
+                    ordered_drawables.push(drawable);
+                }
             }
-            // When the mesh is unchanged, the vertex and index buffers remain bound.
+            let opaque_drawable_count = ordered_drawables.len();
+            if !weighted_oit {
+                blended_drawables.sort_by(|left, right| right.0.total_cmp(&left.0));
+            }
+            ordered_drawables.extend(blended_drawables.into_iter().map(|(_, drawable)| drawable));
+            let prepared_static = prepare_static_instances(
+                &ordered_drawables[..opaque_drawable_count],
+            )
+            .map_err(|message| {
+                vec![Diagnostic::new(
+                    "RV0348",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    message,
+                )]
+            })?;
+            let static_instance_buffer = self.upload_static_instance_stream(&prepared_static)?;
+            let static_draws_by_start = prepared_static
+                .draws
+                .iter()
+                .copied()
+                .map(|draw| (draw.first_drawable, draw))
+                .collect::<BTreeMap<_, _>>();
 
-            // Skip material descriptor rebind when same as last drawable
-            if Some(material_id.as_str()) != last_material_id {
-                let material = self.material_binding_for_drawable(input, &drawable.material)?;
+            // Draw calls with dynamic batching.
+            let mut last_material_id: Option<&str> = None;
+            let mut last_mesh_id: Option<&str> = None;
+            let mut current_material_pipeline = hdr_pl;
+            #[allow(unused_assignments)]
+            let mut cached_vb = vk::Buffer::null();
+            #[allow(unused_assignments)]
+            let mut cached_ib = vk::Buffer::null();
+            #[allow(unused_assignments)]
+            let mut cached_idx_ty = vk::IndexType::UINT32;
+            let mut cached_index_count = 0u32;
+            let mut drawable_index = 0_usize;
+            while drawable_index < ordered_drawables.len() {
+                if let (Some(instance_buffer), Some(instance_draw)) = (
+                    static_instance_buffer,
+                    static_draws_by_start.get(&drawable_index).copied(),
+                ) {
+                    let drawable = ordered_drawables[drawable_index];
+                    let mesh = self.meshes.get(&drawable.mesh.id).cloned().ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0349",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!(
+                                "instanced drawable references mesh '{}' before upload",
+                                drawable.mesh.id
+                            ),
+                        )]
+                    })?;
+                    if mesh.vertex_format != MeshVertexFormat::Pbr32 {
+                        return Err(vec![Diagnostic::new(
+                            "RV0350",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!(
+                                "instanced mesh '{}' must use the Pbr32 vertex format",
+                                drawable.mesh.id
+                            ),
+                        )]);
+                    }
+                    let vertex_buffer = self
+                        .device
+                        .buffers
+                        .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
+                        .map(|entry| entry.buffer)
+                        .ok_or_else(|| {
+                            vec![Diagnostic::new(
+                                "RV0351",
+                                DiagnosticSeverity::Fatal,
+                                "scene_renderer",
+                                "instanced mesh vertex buffer became invalid",
+                            )]
+                        })?;
+                    let index_buffer = self
+                        .device
+                        .buffers
+                        .get(mesh.index_buffer.index, mesh.index_buffer.generation)
+                        .map(|entry| entry.buffer)
+                        .ok_or_else(|| {
+                            vec![Diagnostic::new(
+                                "RV0352",
+                                DiagnosticSeverity::Fatal,
+                                "scene_renderer",
+                                "instanced mesh index buffer became invalid",
+                            )]
+                        })?;
+                    let material = self.material_binding_for_drawable(input, &drawable.material)?;
+                    let instance_pipeline = if material.double_sided {
+                        self.device.hdr_instanced_double_sided_pipeline
+                    } else {
+                        self.device.hdr_instanced_pipeline
+                    }
+                    .ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0353",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            "static instancing pipeline is unavailable",
+                        )]
+                    })?;
+                    let mut material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+                    material_ubo.emissive[3] = Self::material_texture_flags(&material);
+                    let material_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            &material_ubo as *const _ as *const u8,
+                            std::mem::size_of::<MaterialUBO>(),
+                        )
+                    };
+                    let (material_set, _) = self
+                        .get_or_create_material_desc_set(&drawable.material.id, material_bytes)?;
+                    self.bind_material_texture_if_changed(
+                        &drawable.material.id,
+                        &material,
+                        material_set,
+                    )?;
+                    unsafe {
+                        d.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            instance_pipeline,
+                        );
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            hdr_pll,
+                            2,
+                            &[material_set],
+                            &[],
+                        );
+                        d.cmd_bind_vertex_buffers(
+                            cmd,
+                            0,
+                            &[vertex_buffer, instance_buffer],
+                            &[0, 0],
+                        );
+                        d.cmd_bind_index_buffer(
+                            cmd,
+                            index_buffer,
+                            0,
+                            vulkan_index_type(mesh.index_format),
+                        );
+                        d.cmd_draw_indexed(
+                            cmd,
+                            mesh.index_count,
+                            instance_draw.instance_count,
+                            0,
+                            0,
+                            instance_draw.first_instance,
+                        );
+                    }
+                    stats.draw_calls += 1;
+                    stats.triangles +=
+                        u64::from(mesh.index_count / 3) * u64::from(instance_draw.instance_count);
+                    drawable_index += instance_draw.drawable_count;
+                    last_material_id = None;
+                    last_mesh_id = None;
+                    current_material_pipeline = instance_pipeline;
+                    continue;
+                }
+
+                let drawable = ordered_drawables[drawable_index];
+                let mesh_id = &drawable.mesh.id;
+                let material_id = &drawable.material.id;
+
+                // Look up mesh buffers; cache across consecutive same-mesh drawables
+                if Some(mesh_id.as_str()) != last_mesh_id {
+                    if let Some(m) = self.meshes.get(mesh_id).cloned() {
+                        let vk_vb = self
+                            .device
+                            .buffers
+                            .get(m.vertex_buffer.index, m.vertex_buffer.generation)
+                            .map(|e| e.buffer)
+                            .unwrap_or(vk::Buffer::null());
+                        let vk_ib = self
+                            .device
+                            .buffers
+                            .get(m.index_buffer.index, m.index_buffer.generation)
+                            .map(|e| e.buffer)
+                            .unwrap_or(vk::Buffer::null());
+                        if vk_vb == vk::Buffer::null() {
+                            last_material_id = None;
+                            last_mesh_id = None;
+                            cached_index_count = 0;
+                            drawable_index += 1;
+                            continue;
+                        }
+                        cached_vb = vk_vb;
+                        cached_ib = vk_ib;
+                        cached_idx_ty = vulkan_index_type(m.index_format);
+                        cached_index_count = m.index_count;
+                        last_mesh_id = Some(mesh_id.as_str());
+                        // Bind VB/IB
+                        let vbs = [cached_vb];
+                        let offsets = [0u64];
+                        unsafe {
+                            d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
+                            d.cmd_bind_index_buffer(cmd, cached_ib, 0, cached_idx_ty);
+                        }
+                    } else {
+                        tracing::trace!(
+                            target: "scene_renderer",
+                            mesh = mesh_id,
+                            "skipping un-cached mesh in HDR forward pass"
+                        );
+                        last_material_id = None;
+                        last_mesh_id = None;
+                        drawable_index += 1;
+                        continue;
+                    }
+                }
+                // When the mesh is unchanged, the vertex and index buffers remain bound.
+
+                // Skip material descriptor rebind when same as last drawable
+                if Some(material_id.as_str()) != last_material_id {
+                    let material = self.material_binding_for_drawable(input, &drawable.material)?;
+                    let next_pipeline = match (&material.transparency, material.double_sided) {
+                        (engine_renderer::Transparency::Blend, true) if weighted_oit => self
+                            .device
+                            .hdr_forward_oit_double_sided_pipeline
+                            .unwrap_or(vk::Pipeline::null()),
+                        (engine_renderer::Transparency::Blend, false) if weighted_oit => self
+                            .device
+                            .hdr_forward_oit_pipeline
+                            .unwrap_or(vk::Pipeline::null()),
+                        (engine_renderer::Transparency::Blend, true) => self
+                            .device
+                            .hdr_forward_blend_double_sided_pipeline
+                            .unwrap_or(vk::Pipeline::null()),
+                        (engine_renderer::Transparency::Blend, false) => self
+                            .device
+                            .hdr_forward_blend_pipeline
+                            .unwrap_or(vk::Pipeline::null()),
+                        (engine_renderer::Transparency::Additive, true) => self
+                            .device
+                            .hdr_forward_additive_double_sided_pipeline
+                            .unwrap_or(vk::Pipeline::null()),
+                        (engine_renderer::Transparency::Additive, false) => self
+                            .device
+                            .hdr_forward_additive_pipeline
+                            .unwrap_or(vk::Pipeline::null()),
+                        (_, true) => self
+                            .device
+                            .hdr_forward_double_sided_pipeline
+                            .unwrap_or(vk::Pipeline::null()),
+                        (_, false) => hdr_pl,
+                    };
+                    if next_pipeline == vk::Pipeline::null() {
+                        return Err(vec![Diagnostic::new(
+                            "RV0322",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!(
+                                "material '{}' requires an unavailable surface pipeline",
+                                material.material_id.id
+                            ),
+                        )]);
+                    }
+                    if next_pipeline != current_material_pipeline {
+                        unsafe {
+                            d.cmd_bind_pipeline(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                next_pipeline,
+                            );
+                        }
+                        current_material_pipeline = next_pipeline;
+                    }
+                    let mut material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+                    if weighted_oit && material.transparency == engine_renderer::Transparency::Blend
+                    {
+                        material_ubo.alpha_cutoff = -2.0;
+                    }
+                    material_ubo.emissive[3] = Self::material_texture_flags(&material);
+                    let ubo_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            &material_ubo as *const _ as *const u8,
+                            std::mem::size_of::<MaterialUBO>(),
+                        )
+                    };
+                    let (mat_desc_set, _mat_buf) =
+                        self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
+                    self.bind_material_texture_if_changed(material_id, &material, mat_desc_set)?;
+                    let sets = [mat_desc_set];
+                    unsafe {
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            hdr_pll,
+                            2,
+                            &sets,
+                            &[],
+                        );
+                    }
+                    last_material_id = Some(material_id.as_str());
+                }
+
+                // Push constants: world transform (128 B)
+                let world = &drawable.world_transform;
+                let mut pc_bytes = [0u8; 128];
+                for (i, v) in world.iter().enumerate() {
+                    let bytes = v.to_ne_bytes();
+                    let offset = i * 4;
+                    if offset + 4 <= 128 {
+                        pc_bytes[offset..offset + 4].copy_from_slice(&bytes);
+                    }
+                }
+                unsafe {
+                    d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
+                }
+
+                // Draw indexed
+                unsafe {
+                    d.cmd_draw_indexed(cmd, cached_index_count, 1, 0, 0, 0);
+                }
+
+                stats.draw_calls += 1;
+                stats.triangles += cached_index_count as u64 / 3;
+                drawable_index += 1;
+            }
+
+            // Skinned items use the same surface variants and transparent ordering.
+            let mut ordered_skinned = Vec::with_capacity(input.skinned_items.len());
+            let mut blended_skinned = Vec::new();
+            for item in &input.skinned_items {
+                let material = self.material_binding_for_drawable(input, &item.material)?;
+                let transparent = matches!(
+                    material.transparency,
+                    engine_renderer::Transparency::Blend | engine_renderer::Transparency::Additive
+                );
+                if transparent != transparent_phase {
+                    continue;
+                }
+                if transparent {
+                    let translation = Vec3::new(
+                        item.world_transform[12],
+                        item.world_transform[13],
+                        item.world_transform[14],
+                    );
+                    blended_skinned.push(((translation - camera_position).length_squared(), item));
+                } else {
+                    ordered_skinned.push(item);
+                }
+            }
+            if !weighted_oit {
+                blended_skinned.sort_by(|left, right| right.0.total_cmp(&left.0));
+            }
+            ordered_skinned.extend(blended_skinned.into_iter().map(|(_, item)| item));
+
+            // Skinned items (less batching opportunity due to unique per-item bone data)
+            let mut last_skinned_mesh: Option<&str> = None;
+            #[allow(unused_assignments)]
+            let mut skinned_cached_vb = vk::Buffer::null();
+            #[allow(unused_assignments)]
+            let mut skinned_cached_ib = vk::Buffer::null();
+            #[allow(unused_assignments)]
+            let mut skinned_cached_idx_ty = vk::IndexType::UINT32;
+            let mut skinned_cached_index_count = 0u32;
+            let mut skinned_cached_vertex_count = 0u32;
+            for skinned in ordered_skinned {
+                let mesh_id = &skinned.mesh.id;
+                let material_id = &skinned.material.id;
+
+                // Cache VB/IB, skip on missing mesh
+                if Some(mesh_id.as_str()) != last_skinned_mesh {
+                    match self.meshes.get(mesh_id).cloned() {
+                        Some(m) => {
+                            let vk_vb = self
+                                .device
+                                .buffers
+                                .get(m.vertex_buffer.index, m.vertex_buffer.generation)
+                                .map(|e| e.buffer)
+                                .unwrap_or(vk::Buffer::null());
+                            let vk_ib = self
+                                .device
+                                .buffers
+                                .get(m.index_buffer.index, m.index_buffer.generation)
+                                .map(|e| e.buffer)
+                                .unwrap_or(vk::Buffer::null());
+                            if vk_vb == vk::Buffer::null() {
+                                last_skinned_mesh = None;
+                                continue;
+                            }
+                            skinned_cached_vb = vk_vb;
+                            skinned_cached_ib = vk_ib;
+                            skinned_cached_index_count = m.index_count;
+                            skinned_cached_vertex_count = m.vertex_count;
+                            skinned_cached_idx_ty = vulkan_index_type(m.index_format);
+                            last_skinned_mesh = Some(mesh_id.as_str());
+                            let vbs = [skinned_cached_vb];
+                            let offsets = [0u64];
+                            unsafe {
+                                d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
+                                d.cmd_bind_index_buffer(
+                                    cmd,
+                                    skinned_cached_ib,
+                                    0,
+                                    skinned_cached_idx_ty,
+                                );
+                            }
+                        }
+                        None => {
+                            tracing::trace!(
+                                target: "scene_renderer",
+                                mesh = mesh_id,
+                                "skipping un-cached skinned mesh in HDR forward pass"
+                            );
+                            last_skinned_mesh = None;
+                            continue;
+                        }
+                    }
+                }
+
+                // Per-item: material descriptor, bone buffer, skinned descriptor set
+                let material = self.material_binding_for_drawable(input, &skinned.material)?;
                 let next_pipeline = match (&material.transparency, material.double_sided) {
+                    (engine_renderer::Transparency::Blend, true) if weighted_oit => self
+                        .device
+                        .hdr_forward_oit_double_sided_pipeline
+                        .unwrap_or(vk::Pipeline::null()),
+                    (engine_renderer::Transparency::Blend, false) if weighted_oit => self
+                        .device
+                        .hdr_forward_oit_pipeline
+                        .unwrap_or(vk::Pipeline::null()),
                     (engine_renderer::Transparency::Blend, true) => self
                         .device
                         .hdr_forward_blend_double_sided_pipeline
@@ -2463,6 +3234,14 @@ impl SceneRenderer {
                     (engine_renderer::Transparency::Blend, false) => self
                         .device
                         .hdr_forward_blend_pipeline
+                        .unwrap_or(vk::Pipeline::null()),
+                    (engine_renderer::Transparency::Additive, true) => self
+                        .device
+                        .hdr_forward_additive_double_sided_pipeline
+                        .unwrap_or(vk::Pipeline::null()),
+                    (engine_renderer::Transparency::Additive, false) => self
+                        .device
+                        .hdr_forward_additive_pipeline
                         .unwrap_or(vk::Pipeline::null()),
                     (_, true) => self
                         .device
@@ -2488,6 +3267,9 @@ impl SceneRenderer {
                     current_material_pipeline = next_pipeline;
                 }
                 let mut material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+                if weighted_oit && material.transparency == engine_renderer::Transparency::Blend {
+                    material_ubo.alpha_cutoff = -2.0;
+                }
                 material_ubo.emissive[3] = Self::material_texture_flags(&material);
                 let ubo_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
@@ -2495,10 +3277,72 @@ impl SceneRenderer {
                         std::mem::size_of::<MaterialUBO>(),
                     )
                 };
-                let (mat_desc_set, _mat_buf) =
+                let (mat_desc_set, mat_buf) =
                     self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
-                self.bind_material_texture_if_changed(material_id, &material, mat_desc_set)?;
-                let sets = [mat_desc_set];
+
+                let skeleton_id = &skinned.skeleton.id;
+                let bone_buf =
+                    self.get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette)?;
+                let (morph_target_set_id, morph_buffer, morph_target_count, morph_vertex_count) =
+                    if let Some(target_set_id) = &skinned.morph_target_set {
+                        let target_set = self
+                            .morph_target_sets
+                            .get(&target_set_id.id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                vec![Diagnostic::new(
+                                    "RV0330",
+                                    DiagnosticSeverity::Error,
+                                    "scene_renderer",
+                                    format!(
+                                    "skinned item references morph target set '{}' before upload",
+                                    target_set_id.id
+                                ),
+                                )]
+                            })?;
+                        if target_set.vertex_count != skinned_cached_vertex_count
+                            || skinned.morph_weights.len() > target_set.target_count as usize
+                        {
+                            return Err(vec![Diagnostic::new(
+                            "RV0331",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!(
+                                "morph target set '{}' is incompatible with mesh '{}' or its weights",
+                                target_set_id.id, mesh_id
+                            ),
+                        )]);
+                        }
+                        (
+                            Some(target_set_id.id.as_str()),
+                            target_set.buffer,
+                            target_set.target_count,
+                            target_set.vertex_count,
+                        )
+                    } else {
+                        (None, self.ensure_fallback_morph_buffer()?, 0, 0)
+                    };
+
+                let skinned_desc_set = self.get_or_create_skinned_desc_set(
+                    material_id,
+                    skeleton_id,
+                    morph_target_set_id,
+                    mat_desc_set,
+                    mat_buf,
+                    bone_buf,
+                    morph_buffer,
+                )?;
+
+                let skinned_cache_key = format!(
+                    "{material_id}:{skeleton_id}:{}",
+                    morph_target_set_id.unwrap_or("<none>")
+                );
+                self.bind_skinned_texture_if_changed(
+                    &skinned_cache_key,
+                    &material,
+                    skinned_desc_set,
+                )?;
+                let sets = [skinned_desc_set];
                 unsafe {
                     d.cmd_bind_descriptor_sets(
                         cmd,
@@ -2509,200 +3353,295 @@ impl SceneRenderer {
                         &[],
                     );
                 }
-                last_material_id = Some(material_id.as_str());
-            }
 
-            // Push constants: world transform (128 B)
-            let world = &drawable.world_transform;
-            let mut pc_bytes = [0u8; 128];
-            for (i, v) in world.iter().enumerate() {
-                let bytes = v.to_ne_bytes();
-                let offset = i * 4;
-                if offset + 4 <= 128 {
-                    pc_bytes[offset..offset + 4].copy_from_slice(&bytes);
+                let mut pc_bytes = Vec::with_capacity(128);
+                for value in &skinned.world_transform {
+                    pc_bytes.extend_from_slice(&value.to_ne_bytes());
                 }
-            }
-            unsafe {
-                d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
+                let mut morph_weights = [0.0f32; engine_renderer::MAX_MORPH_TARGETS];
+                morph_weights[..skinned.morph_weights.len()]
+                    .copy_from_slice(&skinned.morph_weights);
+                for value in morph_weights {
+                    pc_bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+                for value in [morph_target_count, morph_vertex_count, 0, 0] {
+                    pc_bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+                pc_bytes.resize(128, 0);
+                unsafe {
+                    d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
+                    d.cmd_draw_indexed(cmd, skinned_cached_index_count, 1, 0, 0, 0);
+                }
+
+                stats.draw_calls += 1;
+                stats.triangles += skinned_cached_index_count as u64 / 3;
             }
 
-            // Draw indexed
-            unsafe {
-                d.cmd_draw_indexed(cmd, cached_index_count, 1, 0, 0, 0);
-            }
+            // Particle emitters use a compact per-frame instance stream and one
+            // draw per mesh/material batch. This replaces the former one-drawable
+            // per-particle path while keeping authored materials in set=2.
+            if transparent_phase && !input.particle_batches.is_empty() {
+                let particle_pipeline =
+                    self.device.hdr_vfx_billboard_pipeline.ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0338",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            "VFX billboard pipeline is unavailable",
+                        )]
+                    })?;
+                let particle_additive_pipeline = self
+                    .device
+                    .hdr_vfx_billboard_additive_pipeline
+                    .ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0338",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            "additive VFX billboard pipeline is unavailable",
+                        )]
+                    })?;
+                let particle_oit_pipeline =
+                    self.device.hdr_vfx_billboard_oit_pipeline.ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0338",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            "weighted-OIT VFX billboard pipeline is unavailable",
+                        )]
+                    })?;
+                let gpu_particle_pipeline =
+                    self.device.hdr_gpu_vfx_billboard_pipeline.ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0338",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            "GPU VFX billboard pipeline is unavailable",
+                        )]
+                    })?;
+                let gpu_particle_additive_pipeline = self
+                    .device
+                    .hdr_gpu_vfx_billboard_additive_pipeline
+                    .ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0338",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            "additive GPU VFX billboard pipeline is unavailable",
+                        )]
+                    })?;
+                let gpu_particle_oit_pipeline = self
+                    .device
+                    .hdr_gpu_vfx_billboard_oit_pipeline
+                    .ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0338",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            "weighted-OIT GPU VFX billboard pipeline is unavailable",
+                        )]
+                    })?;
+                let mut current_particle_pipeline = vk::Pipeline::null();
 
-            stats.draw_calls += 1;
-            stats.triangles += cached_index_count as u64 / 3;
-        }
-
-        // Skinned items use the same surface variants and transparent ordering.
-        let mut ordered_skinned = Vec::with_capacity(input.skinned_items.len());
-        let mut blended_skinned = Vec::new();
-        for item in &input.skinned_items {
-            let material = self.material_binding_for_drawable(input, &item.material)?;
-            if matches!(material.transparency, engine_renderer::Transparency::Blend) {
-                let translation = Vec3::new(
-                    item.world_transform[12],
-                    item.world_transform[13],
-                    item.world_transform[14],
+                let camera_world = Mat4::from_cols_array(&render_view.view_matrix).inverse();
+                let camera_right = camera_world.x_axis.truncate().normalize_or_zero();
+                let camera_up = camera_world.y_axis.truncate().normalize_or_zero();
+                let mut billboard_push = [0_u8; 128];
+                for (index, value) in [
+                    camera_right.x,
+                    camera_right.y,
+                    camera_right.z,
+                    0.0,
+                    camera_up.x,
+                    camera_up.y,
+                    camera_up.z,
+                    0.0,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    billboard_push[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+                }
+                let mut particle_draws = prepared_particles.draws.clone();
+                particle_draws.extend(
+                    input
+                        .particle_batches
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(batch_index, batch)| {
+                            batch.gpu_simulation.map(|simulation| PreparedParticleDraw {
+                                batch_index,
+                                first_instance: 0,
+                                instance_count: simulation.draw_range().1,
+                            })
+                        })
+                        .filter(|draw| draw.instance_count > 0),
                 );
-                blended_skinned.push(((translation - camera_position).length_squared(), item));
-            } else {
-                ordered_skinned.push(item);
-            }
-        }
-        blended_skinned.sort_by(|left, right| right.0.total_cmp(&left.0));
-        ordered_skinned.extend(blended_skinned.into_iter().map(|(_, item)| item));
+                if !weighted_oit {
+                    particle_draws.sort_by(|left, right| {
+                        let distance_squared = |draw: &PreparedParticleDraw| {
+                            let bounds = input.particle_batches[draw.batch_index].bounds;
+                            let center = Vec3::new(
+                                (bounds.min[0] + bounds.max[0]) * 0.5,
+                                (bounds.min[1] + bounds.max[1]) * 0.5,
+                                (bounds.min[2] + bounds.max[2]) * 0.5,
+                            );
+                            (center - camera_position).length_squared()
+                        };
+                        distance_squared(right).total_cmp(&distance_squared(left))
+                    });
+                }
 
-        // Skinned items (less batching opportunity due to unique per-item bone data)
-        let mut last_skinned_mesh: Option<&str> = None;
-        #[allow(unused_assignments)]
-        let mut skinned_cached_vb = vk::Buffer::null();
-        #[allow(unused_assignments)]
-        let mut skinned_cached_ib = vk::Buffer::null();
-        #[allow(unused_assignments)]
-        let mut skinned_cached_idx_ty = vk::IndexType::UINT32;
-        let mut skinned_cached_index_count = 0u32;
-        for skinned in ordered_skinned {
-            let mesh_id = &skinned.mesh.id;
-            let material_id = &skinned.material.id;
-
-            // Cache VB/IB, skip on missing mesh
-            if Some(mesh_id.as_str()) != last_skinned_mesh {
-                match self.meshes.get(mesh_id).cloned() {
-                    Some(m) => {
-                        let vk_vb = self
-                            .device
-                            .buffers
-                            .get(m.vertex_buffer.index, m.vertex_buffer.generation)
-                            .map(|e| e.buffer)
-                            .unwrap_or(vk::Buffer::null());
-                        let vk_ib = self
-                            .device
-                            .buffers
-                            .get(m.index_buffer.index, m.index_buffer.generation)
-                            .map(|e| e.buffer)
-                            .unwrap_or(vk::Buffer::null());
-                        if vk_vb == vk::Buffer::null() {
-                            last_skinned_mesh = None;
-                            continue;
-                        }
-                        skinned_cached_vb = vk_vb;
-                        skinned_cached_ib = vk_ib;
-                        skinned_cached_index_count = m.index_count;
-                        skinned_cached_idx_ty = vulkan_index_type(m.index_format);
-                        last_skinned_mesh = Some(mesh_id.as_str());
-                        let vbs = [skinned_cached_vb];
-                        let offsets = [0u64];
+                for draw in particle_draws {
+                    let batch = &input.particle_batches[draw.batch_index];
+                    let mesh = self.meshes.get(&batch.mesh.id).cloned().ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "RV0339",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!(
+                                "particle batch references mesh '{}' before upload",
+                                batch.mesh.id
+                            ),
+                        )]
+                    })?;
+                    if mesh.vertex_format != MeshVertexFormat::Pbr32 {
+                        return Err(vec![Diagnostic::new(
+                            "RV0340",
+                            DiagnosticSeverity::Error,
+                            "scene_renderer",
+                            format!(
+                                "particle mesh '{}' must use the Pbr32 vertex format",
+                                batch.mesh.id
+                            ),
+                        )]);
+                    }
+                    let vertex_buffer = self
+                        .device
+                        .buffers
+                        .get(mesh.vertex_buffer.index, mesh.vertex_buffer.generation)
+                        .map(|entry| entry.buffer)
+                        .ok_or_else(|| {
+                            vec![Diagnostic::new(
+                                "RV0341",
+                                DiagnosticSeverity::Fatal,
+                                "scene_renderer",
+                                "particle mesh vertex buffer became invalid",
+                            )]
+                        })?;
+                    let index_buffer = self
+                        .device
+                        .buffers
+                        .get(mesh.index_buffer.index, mesh.index_buffer.generation)
+                        .map(|entry| entry.buffer)
+                        .ok_or_else(|| {
+                            vec![Diagnostic::new(
+                                "RV0342",
+                                DiagnosticSeverity::Fatal,
+                                "scene_renderer",
+                                "particle mesh index buffer became invalid",
+                            )]
+                        })?;
+                    let material = self.material_binding_for_drawable(input, &batch.material)?;
+                    let gpu_simulation = batch.gpu_simulation;
+                    let additive = material.transparency == engine_renderer::Transparency::Additive;
+                    let weighted_batch = weighted_oit
+                        && material.transparency == engine_renderer::Transparency::Blend;
+                    let next_particle_pipeline =
+                        match (gpu_simulation.is_some(), additive, weighted_batch) {
+                            (false, true, _) => particle_additive_pipeline,
+                            (false, false, true) => particle_oit_pipeline,
+                            (false, false, false) => particle_pipeline,
+                            (true, true, _) => gpu_particle_additive_pipeline,
+                            (true, false, true) => gpu_particle_oit_pipeline,
+                            (true, false, false) => gpu_particle_pipeline,
+                        };
+                    if next_particle_pipeline != current_particle_pipeline {
                         unsafe {
-                            d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
-                            d.cmd_bind_index_buffer(
+                            d.cmd_bind_pipeline(
                                 cmd,
-                                skinned_cached_ib,
-                                0,
-                                skinned_cached_idx_ty,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                next_particle_pipeline,
                             );
                         }
+                        current_particle_pipeline = next_particle_pipeline;
                     }
-                    None => {
-                        tracing::trace!(
-                            target: "scene_renderer",
-                            mesh = mesh_id,
-                            "skipping un-cached skinned mesh in HDR forward pass"
+                    let mut material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
+                    if weighted_batch {
+                        material_ubo.alpha_cutoff = -2.0;
+                    }
+                    material_ubo.emissive[3] = Self::material_texture_flags(&material);
+                    let material_bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            &material_ubo as *const _ as *const u8,
+                            std::mem::size_of::<MaterialUBO>(),
+                        )
+                    };
+                    let (material_set, _) =
+                        self.get_or_create_material_desc_set(&batch.material.id, material_bytes)?;
+                    self.bind_material_texture_if_changed(
+                        &batch.material.id,
+                        &material,
+                        material_set,
+                    )?;
+                    unsafe {
+                        let particle_push = gpu_simulation
+                            .map(engine_renderer::GpuParticleSimulation::parameter_bytes)
+                            .unwrap_or(billboard_push);
+                        d.cmd_push_constants(
+                            cmd,
+                            hdr_pll,
+                            vk::ShaderStageFlags::VERTEX,
+                            0,
+                            &particle_push,
                         );
-                        last_skinned_mesh = None;
-                        continue;
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            hdr_pll,
+                            2,
+                            &[material_set],
+                            &[],
+                        );
+                        if gpu_simulation.is_some() {
+                            d.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
+                        } else {
+                            let instance_buffer = particle_instance_buffer.ok_or_else(|| {
+                                vec![Diagnostic::new(
+                                    "RV0343",
+                                    DiagnosticSeverity::Fatal,
+                                    "scene_renderer",
+                                    "CPU particle draw has no prepared instance buffer",
+                                )]
+                            })?;
+                            d.cmd_bind_vertex_buffers(
+                                cmd,
+                                0,
+                                &[vertex_buffer, instance_buffer],
+                                &[0, 0],
+                            );
+                        }
+                        d.cmd_bind_index_buffer(
+                            cmd,
+                            index_buffer,
+                            0,
+                            vulkan_index_type(mesh.index_format),
+                        );
+                        d.cmd_draw_indexed(
+                            cmd,
+                            mesh.index_count,
+                            draw.instance_count,
+                            0,
+                            0,
+                            draw.first_instance,
+                        );
                     }
+                    stats.draw_calls += 1;
+                    stats.triangles +=
+                        u64::from(mesh.index_count / 3) * u64::from(draw.instance_count);
                 }
             }
-
-            // Per-item: material descriptor, bone buffer, skinned descriptor set
-            let material = self.material_binding_for_drawable(input, &skinned.material)?;
-            let next_pipeline = match (&material.transparency, material.double_sided) {
-                (engine_renderer::Transparency::Blend, true) => self
-                    .device
-                    .hdr_forward_blend_double_sided_pipeline
-                    .unwrap_or(vk::Pipeline::null()),
-                (engine_renderer::Transparency::Blend, false) => self
-                    .device
-                    .hdr_forward_blend_pipeline
-                    .unwrap_or(vk::Pipeline::null()),
-                (_, true) => self
-                    .device
-                    .hdr_forward_double_sided_pipeline
-                    .unwrap_or(vk::Pipeline::null()),
-                (_, false) => hdr_pl,
-            };
-            if next_pipeline == vk::Pipeline::null() {
-                return Err(vec![Diagnostic::new(
-                    "RV0322",
-                    DiagnosticSeverity::Error,
-                    "scene_renderer",
-                    format!(
-                        "material '{}' requires an unavailable surface pipeline",
-                        material.material_id.id
-                    ),
-                )]);
-            }
-            if next_pipeline != current_material_pipeline {
-                unsafe {
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, next_pipeline);
-                }
-                current_material_pipeline = next_pipeline;
-            }
-            let mut material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
-            material_ubo.emissive[3] = Self::material_texture_flags(&material);
-            let ubo_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    &material_ubo as *const _ as *const u8,
-                    std::mem::size_of::<MaterialUBO>(),
-                )
-            };
-            let (mat_desc_set, mat_buf) =
-                self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
-
-            let skeleton_id = &skinned.skeleton.id;
-            let bone_buf = self.get_or_create_bone_buffer(skeleton_id, &skinned.bone_palette)?;
-
-            let skinned_desc_set = self.get_or_create_skinned_desc_set(
-                material_id,
-                skeleton_id,
-                mat_desc_set,
-                mat_buf,
-                bone_buf,
-            )?;
-
-            let skinned_cache_key = format!("{material_id}:{skeleton_id}");
-            self.bind_skinned_texture_if_changed(&skinned_cache_key, &material, skinned_desc_set)?;
-            let sets = [skinned_desc_set];
-            unsafe {
-                d.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    hdr_pll,
-                    2,
-                    &sets,
-                    &[],
-                );
-            }
-
-            let mut pc_bytes = Vec::with_capacity(128);
-            for value in &skinned.world_transform {
-                pc_bytes.extend_from_slice(&value.to_ne_bytes());
-            }
-            pc_bytes.resize(128, 0);
-            unsafe {
-                d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
-                d.cmd_draw_indexed(cmd, skinned_cached_index_count, 1, 0, 0, 0);
-            }
-
-            stats.draw_calls += 1;
-            stats.triangles += skinned_cached_index_count as u64 / 3;
         }
-
-        // Scene extraction owns frustum culling. RenderFrameInput contains the
-        // visible working set, so issuing a second indirect pass here would
-        // draw every visible static object twice.
 
         // End HDR render pass
         unsafe {
@@ -2878,7 +3817,7 @@ impl SceneRenderer {
                 if matches!(
                     self.material_binding_for_drawable(input, &drawable.material)?
                         .transparency,
-                    engine_renderer::Transparency::Blend
+                    engine_renderer::Transparency::Blend | engine_renderer::Transparency::Additive
                 ) {
                     last_shadow_mesh = None;
                     continue;
@@ -3015,9 +3954,10 @@ impl SceneRenderer {
                     "tone-map pass requires an active swapchain format",
                 )]
             })?;
-        let tone_map_push = tone_map_push_constants(
+        let mut tone_map_push = tone_map_push_constants(
             input.render_options.tone_mapping,
             input.render_options.exposure_ev100,
+            input.render_options.post_process,
             swapchain_format,
         )
         .map_err(|message| {
@@ -3029,6 +3969,11 @@ impl SceneRenderer {
             )
             .path("render_options.exposure_ev100")]
         })?;
+        if input.render_options.transparency_mode
+            == engine_renderer::TransparencyMode::WeightedBlendedOit
+        {
+            tone_map_push.effect_flags |= 8;
+        }
         let tone_map_push_bytes = tone_map_push.to_bytes();
         let d = &self.device.logical_device.device;
         let fi = self.device.current_frame;
@@ -3490,6 +4435,14 @@ impl SceneRenderer {
 // ============================================================================
 
 impl BackendRenderer for SceneRenderer {
+    fn supports_weighted_blended_oit(&self) -> bool {
+        true
+    }
+
+    fn supports_gpu_particle_simulation(&self) -> bool {
+        true
+    }
+
     fn configure_render_graph(
         &mut self,
         _input: &RenderFrameInput,
@@ -3762,6 +4715,7 @@ impl BackendRenderer for SceneRenderer {
             vertex_buffer: vb,
             index_buffer: ib,
             index_count: upload.index_count,
+            vertex_count: upload.vertex_count,
             index_format,
             vertex_format: upload.vertex_format,
             content_hash: upload.content_hash,
@@ -3990,6 +4944,147 @@ impl BackendRenderer for SceneRenderer {
         Ok(UploadReceipt::new(revision))
     }
 
+    fn upload_environment_map(
+        &mut self,
+        upload: EnvironmentMapUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        let environment_id = upload.environment_id.id.clone();
+        if let Some(existing) = self.environment_revisions.get(&environment_id) {
+            if existing.content_hash == upload.content_hash {
+                return Ok(UploadReceipt::new(existing.revision));
+            }
+        }
+        let revision = self
+            .environment_revisions
+            .get(&environment_id)
+            .map_or(1, |existing| existing.revision.saturating_add(1));
+        self.environment_revisions.insert(
+            environment_id.clone(),
+            UploadedResourceState {
+                content_hash: upload.content_hash,
+                revision,
+            },
+        );
+        self.environment_uploads
+            .insert(environment_id.clone(), upload);
+        if self.active_environment_id.as_deref() == Some(environment_id.as_str()) {
+            self.active_environment_id = None;
+        }
+        Ok(UploadReceipt::new(revision))
+    }
+
+    fn upload_morph_target_set(
+        &mut self,
+        upload: engine_renderer::MorphTargetSetUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        let target_set_id = upload.target_set_id.id.clone();
+        if let Some(existing) = self.morph_target_sets.get(&target_set_id) {
+            if existing.content_hash == upload.content_hash {
+                return Ok(UploadReceipt::new(existing.revision));
+            }
+        }
+        let revision = self
+            .morph_target_sets
+            .get(&target_set_id)
+            .map_or(1, |existing| existing.revision.saturating_add(1));
+        let byte_count = upload
+            .targets
+            .len()
+            .checked_mul(upload.vertex_count as usize)
+            .and_then(|vertices| vertices.checked_mul(32))
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "RV0326",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    "morph target buffer size overflow",
+                )]
+            })?;
+        let mut bytes = Vec::with_capacity(byte_count);
+        for target in &upload.targets {
+            for (position, normal) in target.position_deltas.iter().zip(&target.normal_deltas) {
+                for value in [position[0], position[1], position[2], 0.0] {
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+                for value in [normal[0], normal[1], normal[2], 0.0] {
+                    bytes.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+        }
+        let handle = self
+            .device
+            .create_buffer(&BufferDescriptor {
+                size_bytes: byte_count as u64,
+                usage_flags: render_core::BufferUsage::STORAGE,
+                memory_hint: MemoryHint::GpuOnly,
+                debug_label: Some(format!("morph-{target_set_id}")),
+            })
+            .map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0327",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("create morph target buffer '{target_set_id}': {error}"),
+                )]
+            })?;
+        if let Err(error) = self.device.write_buffer(handle, &bytes, 0) {
+            self.device.destroy_buffer(handle);
+            return Err(vec![Diagnostic::new(
+                "RV0328",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("upload morph target buffer '{target_set_id}': {error}"),
+            )]);
+        }
+        let buffer = self
+            .device
+            .buffers
+            .get(handle.index, handle.generation)
+            .map(|entry| entry.buffer)
+            .unwrap_or(vk::Buffer::null());
+        if buffer == vk::Buffer::null() {
+            self.device.destroy_buffer(handle);
+            return Err(vec![Diagnostic::new(
+                "RV0328",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!("morph target buffer '{target_set_id}' has no Vulkan handle"),
+            )]);
+        }
+        if self.morph_target_sets.contains_key(&target_set_id) {
+            self.device.wait_idle_checked().map_err(|error| {
+                vec![Diagnostic::new(
+                    "RV0329",
+                    DiagnosticSeverity::Error,
+                    "scene_renderer",
+                    format!("wait before replacing morph target set '{target_set_id}': {error}"),
+                )]
+            })?;
+            let suffix = format!(":{target_set_id}");
+            let descriptor_keys = self
+                .skinned_desc_cache
+                .keys()
+                .filter(|key| key.ends_with(&suffix))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in descriptor_keys {
+                self.evict_skinned_descriptor_by_key(&key)?;
+            }
+        }
+        let replacement = GpuMorphTargetSet {
+            handle,
+            buffer,
+            vertex_count: upload.vertex_count,
+            target_count: upload.targets.len() as u32,
+            content_hash: upload.content_hash,
+            revision,
+        };
+        if let Some(old) = self.morph_target_sets.insert(target_set_id, replacement) {
+            self.device.destroy_buffer(old.handle);
+        }
+        Ok(UploadReceipt::new(revision))
+    }
+
     fn upload_material(
         &mut self,
         upload: MaterialUpload,
@@ -4193,6 +5288,28 @@ impl BackendRenderer for SceneRenderer {
                 self.evict_material_by_id(&resource_id)?;
                 self.uploaded_materials.remove(&resource_id);
             }
+            ResourceKind::EnvironmentMap => {
+                self.environment_uploads.remove(&resource_id);
+                self.environment_revisions.remove(&resource_id);
+                if self.active_environment_id.as_deref() == Some(resource_id.as_str()) {
+                    self.active_environment_id = None;
+                }
+            }
+            ResourceKind::MorphTargetSet => {
+                let suffix = format!(":{resource_id}");
+                let descriptor_keys = self
+                    .skinned_desc_cache
+                    .keys()
+                    .filter(|key| key.ends_with(&suffix))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in descriptor_keys {
+                    self.evict_skinned_descriptor_by_key(&key)?;
+                }
+                if let Some(target_set) = self.morph_target_sets.remove(&resource_id) {
+                    self.device.destroy_buffer(target_set.handle);
+                }
+            }
         }
         Ok(())
     }
@@ -4286,6 +5403,7 @@ mod tests {
             metallic_roughness_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            advanced: engine_renderer::AdvancedMaterialParameters::default(),
             transparency,
             double_sided,
             content_hash: [7; 32],
@@ -4319,6 +5437,103 @@ mod tests {
             SceneRenderer::parse_material_ubo(&blended.uniforms.bytes).alpha_cutoff,
             -1.0
         );
+    }
+
+    #[test]
+    fn particle_batches_pack_one_fixed_stride_instance_stream() {
+        let batch = ParticleBatch {
+            emitter: None,
+            mesh: AssetId::new("mesh.quad"),
+            material: AssetId::new("material.particle"),
+            instances: vec![
+                engine_renderer::ParticleInstance {
+                    position: [1.0, 2.0, 3.0],
+                    size: 4.0,
+                    rotation_radians: 0.5,
+                    normalized_age: 0.25,
+                    color: [255, 128, 64, 32],
+                },
+                engine_renderer::ParticleInstance {
+                    position: [-1.0, -2.0, -3.0],
+                    size: 2.0,
+                    rotation_radians: 1.0,
+                    normalized_age: 0.75,
+                    color: [10, 20, 30, 40],
+                },
+            ],
+            gpu_simulation: None,
+            bounds: engine_renderer::AxisAlignedBox::UNIT,
+            render_layer: "Transparent".into(),
+            sort_key: 0,
+        };
+        let prepared = prepare_particle_instances(&[batch]).unwrap();
+        assert_eq!(
+            prepared.instance_bytes.len(),
+            2 * VFX_INSTANCE_STRIDE as usize
+        );
+        assert_eq!(
+            prepared.draws,
+            vec![PreparedParticleDraw {
+                batch_index: 0,
+                first_instance: 0,
+                instance_count: 2,
+            }]
+        );
+        assert_eq!(&prepared.instance_bytes[24..28], &[255, 128, 64, 32]);
+        assert_eq!(&prepared.instance_bytes[56..60], &[10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn particle_vertex_shader_uses_instance_rate_billboards() {
+        let source = include_str!("../shaders/vfx_billboard.vert");
+        assert!(source.contains("i_position_size"));
+        assert!(source.contains("unpackUnorm4x8"));
+        assert!(source.contains("camera_right"));
+        assert!(source.contains("gl_Position = ubo.view_proj"));
+    }
+
+    #[test]
+    fn consecutive_static_surfaces_are_packed_into_one_instance_batch() {
+        let make_drawable = |x: f32, material: &str| {
+            let mut world = engine_renderer::IDENTITY_MAT4;
+            world[12] = x;
+            RenderableItem {
+                entity: None,
+                mesh: AssetId::new("mesh.tree"),
+                material: AssetId::new(material),
+                world_transform: world,
+                bounds: engine_renderer::AxisAlignedBox::UNIT,
+                render_layer: "Default".into(),
+                cast_shadows: true,
+                sort_key: 0,
+            }
+        };
+        let first = make_drawable(1.0, "material.leaves");
+        let second = make_drawable(2.0, "material.leaves");
+        let single = make_drawable(3.0, "material.other");
+        let prepared = prepare_static_instances(&[&first, &second, &single]).unwrap();
+        assert_eq!(
+            prepared.instance_bytes.len(),
+            2 * STATIC_INSTANCE_STRIDE as usize
+        );
+        assert_eq!(
+            prepared.draws,
+            vec![PreparedStaticDraw {
+                first_drawable: 0,
+                drawable_count: 2,
+                first_instance: 0,
+                instance_count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn instanced_vertex_shader_consumes_four_model_columns() {
+        let source = include_str!("../shaders/instanced.vert");
+        for column in ["i_model_0", "i_model_1", "i_model_2", "i_model_3"] {
+            assert!(source.contains(column));
+        }
+        assert!(source.contains("mat4 model = mat4"));
     }
 
     #[test]
@@ -4846,6 +6061,8 @@ mod tests {
             skeleton: AssetId::new("skeleton"),
             bone_palette: Vec::new(),
             bone_palette_layout: engine_renderer::BonePaletteLayout::Full4x4 { count: 0 },
+            morph_target_set: None,
+            morph_weights: Vec::new(),
             world_transform: [0.0; 16],
             bounds: engine_renderer::AxisAlignedBox::UNIT,
             render_layer: "default".to_string(),
@@ -5097,10 +6314,49 @@ mod tests {
     }
 
     #[test]
+    fn reflection_probe_selection_prefers_priority_then_distance() {
+        let global = AssetId::new("environment.global");
+        let near = AssetId::new("environment.near");
+        let priority = AssetId::new("environment.priority");
+        let settings = engine_renderer::EnvironmentSettings {
+            environment_map: Some(global.clone()),
+            reflection_probes: vec![
+                engine_renderer::ReflectionProbe {
+                    entity: None,
+                    environment_map: near.clone(),
+                    position: [0.0; 3],
+                    half_extents: [5.0; 3],
+                    blend_distance: 1.0,
+                    priority: 0,
+                },
+                engine_renderer::ReflectionProbe {
+                    entity: None,
+                    environment_map: priority.clone(),
+                    position: [2.0, 0.0, 0.0],
+                    half_extents: [5.0; 3],
+                    blend_distance: 0.0,
+                    priority: 10,
+                },
+            ],
+            ..engine_renderer::EnvironmentSettings::default()
+        };
+
+        assert_eq!(
+            select_environment_map(&settings, Vec3::ZERO),
+            Some(&priority)
+        );
+        assert_eq!(
+            select_environment_map(&settings, Vec3::splat(100.0)),
+            Some(&global)
+        );
+    }
+
+    #[test]
     fn tone_map_push_constants_cover_modes_exposure_and_target_encoding() {
         let aces = tone_map_push_constants(
             engine_renderer::ToneMapping::Aces,
             None,
+            engine_renderer::PostProcessSettings::default(),
             vk::Format::B8G8R8A8_SRGB,
         )
         .unwrap();
@@ -5111,6 +6367,7 @@ mod tests {
         let reinhard = tone_map_push_constants(
             engine_renderer::ToneMapping::Reinhard,
             Some(2.0),
+            engine_renderer::PostProcessSettings::default(),
             vk::Format::B8G8R8A8_UNORM,
         )
         .unwrap();
@@ -5121,6 +6378,7 @@ mod tests {
         let identity = tone_map_push_constants(
             engine_renderer::ToneMapping::None,
             Some(-1.0),
+            engine_renderer::PostProcessSettings::default(),
             vk::Format::R8G8B8A8_SRGB,
         )
         .unwrap();
@@ -5137,6 +6395,21 @@ mod tests {
         assert_eq!(f32::from_ne_bytes(bytes[4..8].try_into().unwrap()), 2.0);
         assert_eq!(u32::from_ne_bytes(bytes[8..12].try_into().unwrap()), 1);
         assert_eq!(u32::from_ne_bytes(bytes[12..16].try_into().unwrap()), 0);
+
+        let mut effects = engine_renderer::PostProcessSettings::default();
+        effects.bloom.enabled = true;
+        effects.color_grading.enabled = true;
+        effects.vignette.enabled = true;
+        let configured = tone_map_push_constants(
+            engine_renderer::ToneMapping::Aces,
+            None,
+            effects,
+            vk::Format::B8G8R8A8_SRGB,
+        )
+        .unwrap();
+        assert_eq!(configured.effect_flags, 0b111);
+        assert_eq!(configured.bloom[0], effects.bloom.threshold);
+        assert_eq!(configured.vignette[0], effects.vignette.intensity);
     }
 
     #[test]
@@ -5145,6 +6418,7 @@ mod tests {
             let error = tone_map_push_constants(
                 engine_renderer::ToneMapping::Aces,
                 Some(exposure),
+                engine_renderer::PostProcessSettings::default(),
                 vk::Format::B8G8R8A8_SRGB,
             )
             .unwrap_err();
@@ -5154,6 +6428,7 @@ mod tests {
         let overflow = tone_map_push_constants(
             engine_renderer::ToneMapping::Aces,
             Some(-1000.0),
+            engine_renderer::PostProcessSettings::default(),
             vk::Format::B8G8R8A8_SRGB,
         )
         .unwrap_err();
@@ -5168,5 +6443,11 @@ mod tests {
         assert!(source.contains("TONE_MAP_REINHARD"));
         assert!(source.contains("TONE_MAP_NONE"));
         assert!(source.contains("tone_map.output_is_srgb == 0u"));
+        assert!(source.contains("EFFECT_WEIGHTED_OIT"));
+        assert!(source.contains("oit_accumulation"));
+        assert!(source.contains("oit_optical_depth"));
+        let forward = include_str!("../shaders/forward.frag");
+        assert!(forward.contains("out_oit_accumulation"));
+        assert!(forward.contains("out_oit_optical_depth"));
     }
 }

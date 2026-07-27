@@ -158,8 +158,17 @@ pub fn extract_renderer_input_from_world_with_viewport(
     viewport_context: RenderViewportContext,
 ) -> Result<RenderFrameInput, Vec<Diagnostic>> {
     let mut input = RenderFrameInput::empty(frame_index);
-    input.render_options.tone_mapping = world.scene_settings().tone_mapping;
-    input.render_options.pass_graph_config = world.scene_settings().pass_graph_config.clone();
+    let scene_settings = world.scene_settings();
+    input.render_options.tone_mapping = scene_settings.tone_mapping;
+    input.render_options.transparency_mode = scene_settings.transparency_mode;
+    input.render_options.pass_graph_config = scene_settings.pass_graph_config.clone();
+    input.render_options.environment = engine_renderer::EnvironmentSettings {
+        environment_map: scene_settings.environment_map.clone(),
+        intensity: scene_settings.environment_intensity,
+        rotation_radians: scene_settings.environment_rotation_radians,
+        reflection_probes: scene_settings.reflection_probes.clone(),
+    };
+    input.render_options.post_process = scene_settings.post_process;
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
     // Resolve every Transform once up front. Hierarchy corruption is fatal:
@@ -447,6 +456,35 @@ pub fn extract_renderer_input_from_world_with_viewport(
 
     let mut visible_drawables: u32 = 0;
     let mut culled_drawables: u32 = 0;
+    let base_camera_position = cameras[0].3.transform_point3(glam::Vec3::ZERO);
+    let mut active_hlod_clusters = HashSet::new();
+    let mut culled_hlod_clusters = HashSet::new();
+    for (entity, cluster) in world.query::<components::HlodCluster>() {
+        if cluster.role != components::HlodRole::Proxy {
+            continue;
+        }
+        let Some(renderable) = world.get::<components::Renderable>(entity) else {
+            continue;
+        };
+        if !renderable.visible {
+            continue;
+        }
+        let absolute_world = world_matrices
+            .get(&entity)
+            .copied()
+            .unwrap_or(glam::Mat4::IDENTITY);
+        let (center, _, _) =
+            transform_bounds_to_world(world.get::<components::Bounds>(entity), absolute_world);
+        let distance = glam::Vec3::from_array(center).distance(base_camera_position);
+        if cluster.proxy_is_active(distance) {
+            active_hlod_clusters.insert(cluster.cluster_id.clone());
+        } else if cluster.cull_distance > 0.0 && distance >= cluster.cull_distance {
+            culled_hlod_clusters.insert(cluster.cluster_id.clone());
+        }
+    }
+    for active in &active_hlod_clusters {
+        culled_hlod_clusters.remove(active);
+    }
 
     for (entity, renderable) in world.query::<components::Renderable>() {
         if !renderable.visible {
@@ -456,6 +494,18 @@ pub fn extract_renderer_input_from_world_with_viewport(
         // Skip if mesh or material asset is empty.
         if renderable.mesh_asset.is_empty() || renderable.material_asset.is_empty() {
             continue;
+        }
+        if let Some(cluster) = world.get::<components::HlodCluster>(entity) {
+            let cluster_active = active_hlod_clusters.contains(&cluster.cluster_id);
+            let cluster_culled = culled_hlod_clusters.contains(&cluster.cluster_id);
+            let visible_for_role = match cluster.role {
+                components::HlodRole::Source => !cluster_active && !cluster_culled,
+                components::HlodRole::Proxy => cluster_active,
+            };
+            if !visible_for_role {
+                culled_drawables = culled_drawables.saturating_add(1);
+                continue;
+            }
         }
 
         let pid = world.persistent_id(entity).map(|s| s.to_string());
@@ -470,6 +520,23 @@ pub fn extract_renderer_input_from_world_with_viewport(
         // transforms and bounds are then translated into camera-relative
         // space when the flag is enabled.
         let (center, half_extents, _) = transform_bounds_to_world(bounds, absolute_world);
+        let selected_assets = world.get::<components::LodGroup>(entity).map_or(
+            Some((
+                renderable.mesh_asset.as_str(),
+                renderable.material_asset.as_str(),
+            )),
+            |group| {
+                group.select_assets(
+                    glam::Vec3::from_array(center).distance(base_camera_position),
+                    &renderable.mesh_asset,
+                    &renderable.material_asset,
+                )
+            },
+        );
+        let Some((selected_mesh, selected_material)) = selected_assets else {
+            culled_drawables += 1;
+            continue;
+        };
         let render_world = relative_shift
             .map(|shift| shift * absolute_world)
             .unwrap_or(absolute_world);
@@ -500,8 +567,8 @@ pub fn extract_renderer_input_from_world_with_viewport(
             continue;
         }
 
-        let mesh = engine_serialize::AssetId::new(&renderable.mesh_asset);
-        let material = engine_serialize::AssetId::new(&renderable.material_asset);
+        let mesh = engine_serialize::AssetId::new(selected_mesh);
+        let material = engine_serialize::AssetId::new(selected_material);
         let sk = batch_sort_key(&material, &mesh);
 
         input.drawables.push(RenderableItem {
@@ -1496,6 +1563,20 @@ mod tests {
         let mut world = World::new();
         world.scene_settings.tone_mapping = engine_renderer::ToneMapping::Reinhard;
         world.scene_settings.pass_graph_config.enabled = false;
+        world.scene_settings.environment_map =
+            Some(engine_serialize::AssetId::new("sunset-environment"));
+        world.scene_settings.environment_intensity = 1.75;
+        world.scene_settings.environment_rotation_radians = 0.5;
+        world.scene_settings.reflection_probes = vec![engine_renderer::ReflectionProbe {
+            entity: Some("probe-lobby".into()),
+            environment_map: engine_serialize::AssetId::new("lobby-environment"),
+            position: [1.0, 2.0, 3.0],
+            half_extents: [4.0, 5.0, 6.0],
+            blend_distance: 2.0,
+            priority: 3,
+        }];
+        world.scene_settings.post_process.bloom.enabled = true;
+        world.scene_settings.post_process.bloom.intensity = 0.4;
         let camera = world.create_entity();
         world.add_component(
             camera,
@@ -1517,6 +1598,20 @@ mod tests {
             engine_renderer::ToneMapping::Reinhard
         );
         assert!(!input.render_options.pass_graph_config.enabled);
+        assert_eq!(
+            input
+                .render_options
+                .environment
+                .environment_map
+                .as_ref()
+                .map(|asset| asset.id.as_str()),
+            Some("sunset-environment")
+        );
+        assert_eq!(input.render_options.environment.intensity, 1.75);
+        assert_eq!(input.render_options.environment.rotation_radians, 0.5);
+        assert_eq!(input.render_options.environment.reflection_probes.len(), 1);
+        assert!(input.render_options.post_process.bloom.enabled);
+        assert_eq!(input.render_options.post_process.bloom.intensity, 0.4);
         assert_eq!(input.render_options.msaa_samples, 4);
         assert_eq!(input.views[0].msaa_samples, 4);
         assert!((input.render_options.exposure_ev100.unwrap() - 3.0).abs() < 1.0e-6);
@@ -1764,6 +1859,132 @@ mod tests {
                 culled_lights: 0,
             })
         );
+    }
+
+    #[test]
+    fn extraction_selects_regular_object_lod_before_batching() {
+        let mut world = World::new();
+        let camera = world.create_entity();
+        world.add_component(camera, components::Camera::default());
+        world.add_component(camera, components::Transform::default());
+
+        let object = world.create_entity();
+        world.add_component(
+            object,
+            components::Renderable {
+                mesh_asset: "mesh.hero-lod0".into(),
+                material_asset: "material.hero".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            object,
+            components::Transform {
+                translation: glam::Vec3::new(0.0, 0.0, -20.0),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            object,
+            components::LodGroup {
+                minimum_distance: 0.0,
+                cull_distance: 100.0,
+                levels: vec![components::LodLevel {
+                    distance: 10.0,
+                    mesh_asset: "mesh.hero-lod1".into(),
+                    material_asset: None,
+                }],
+            },
+        );
+
+        let input = extract_renderer_input_from_world(&world, 3).unwrap();
+        assert_eq!(input.drawables.len(), 1);
+        assert_eq!(input.drawables[0].mesh.id, "mesh.hero-lod1");
+        assert_eq!(input.drawables[0].material.id, "material.hero");
+    }
+
+    #[test]
+    fn hlod_cluster_automatically_switches_sources_and_proxy() {
+        let mut world = World::new();
+        let camera = world.create_entity();
+        world.add_component(camera, components::Camera::default());
+        world.add_component(camera, components::Transform::default());
+
+        let source = world.create_entity();
+        world.add_component(
+            source,
+            components::Renderable {
+                mesh_asset: "mesh.building-detail".into(),
+                material_asset: "material.city".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            source,
+            components::Transform {
+                translation: glam::Vec3::new(0.0, 0.0, -20.0),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            source,
+            components::HlodCluster {
+                cluster_id: "city-block-a".into(),
+                role: components::HlodRole::Source,
+                activation_distance: 0.0,
+                cull_distance: 0.0,
+            },
+        );
+
+        let proxy = world.create_entity();
+        world.add_component(
+            proxy,
+            components::Renderable {
+                mesh_asset: "mesh.city-block-proxy".into(),
+                material_asset: "material.city-proxy".into(),
+                visible: true,
+                cast_shadows: true,
+                render_layer: "Default".into(),
+            },
+        );
+        world.add_component(
+            proxy,
+            components::Transform {
+                translation: glam::Vec3::new(0.0, 0.0, -20.0),
+                ..Default::default()
+            },
+        );
+        world.add_component(
+            proxy,
+            components::HlodCluster {
+                cluster_id: "city-block-a".into(),
+                role: components::HlodRole::Proxy,
+                activation_distance: 10.0,
+                cull_distance: 100.0,
+            },
+        );
+
+        let distant = extract_renderer_input_from_world(&world, 4).unwrap();
+        assert_eq!(distant.drawables.len(), 1);
+        assert_eq!(distant.drawables[0].mesh.id, "mesh.city-block-proxy");
+
+        world
+            .get_mut::<components::Transform>(source)
+            .unwrap()
+            .translation
+            .z = -5.0;
+        world
+            .get_mut::<components::Transform>(proxy)
+            .unwrap()
+            .translation
+            .z = -5.0;
+        let near = extract_renderer_input_from_world(&world, 5).unwrap();
+        assert_eq!(near.drawables.len(), 1);
+        assert_eq!(near.drawables[0].mesh.id, "mesh.building-detail");
     }
 
     #[test]

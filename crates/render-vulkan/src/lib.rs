@@ -10,6 +10,7 @@ mod device;
 pub mod device_impl;
 mod error;
 mod instance;
+mod instance_data;
 pub mod scene_renderer;
 mod surface;
 mod swapchain;

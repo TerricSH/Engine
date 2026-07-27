@@ -104,7 +104,7 @@ impl Drop for VulkanDevice {
             }
         }
 
-        self.destroy_light_ssbo();
+        self.destroy_clustered_lighting_buffers();
         self.destroy_indirect_buffers();
         self.destroy_material_textures();
 

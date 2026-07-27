@@ -2043,7 +2043,7 @@ mod tests {
 
     // ── Physics (gameplay feature) ──────────────────────────────────────────
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-physics")]
     #[test]
     fn physics_bodies_follow_cell_merge_and_unload() {
         let rigid_body = component(BTreeMap::from([

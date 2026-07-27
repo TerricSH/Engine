@@ -20,6 +20,11 @@ pub(crate) struct Dx12CommandEncoder {
     main_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
     main_dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
     active_depth_attachment: Option<ID3D12Resource>,
+    active_color_attachments: Vec<(
+        ID3D12Resource,
+        std::sync::Arc<std::sync::Mutex<D3D12_RESOURCE_STATES>>,
+        bool,
+    )>,
     pub(crate) draws: u32,
     pub(crate) triangles: u64,
 }
@@ -45,6 +50,7 @@ impl Dx12CommandEncoder {
             main_rtv,
             main_dsv,
             active_depth_attachment: None,
+            active_color_attachments: Vec::new(),
             draws: 0,
             triangles: 0,
         }
@@ -61,12 +67,49 @@ impl CommandEncoder for Dx12CommandEncoder {
         clear_color: [f32; 4],
         clear_depth: Option<f32>,
     ) {
+        self.begin_render_pass_with_color_clears(
+            _render_pass,
+            framebuffer,
+            area,
+            &[clear_color],
+            clear_depth,
+        );
+    }
+
+    fn begin_render_pass_with_color_clears(
+        &mut self,
+        _render_pass: RenderPassHandle,
+        framebuffer: FramebufferHandle,
+        area: (u32, u32, u32, u32),
+        color_clears: &[[f32; 4]],
+        clear_depth: Option<f32>,
+    ) {
         unsafe {
             let device = &*self.device;
             let (_, framebuffer_index) = Dx12Device::decode_handle(framebuffer.index);
             let Some(framebuffer) = device.framebuffers.get(framebuffer_index) else {
                 return;
             };
+            self.active_color_attachments.clear();
+            for ((resource, state), sampled) in framebuffer
+                .color_resources
+                .iter()
+                .zip(&framebuffer.color_states)
+                .zip(&framebuffer.color_is_sampled)
+            {
+                let Ok(mut current_state) = state.lock() else {
+                    return;
+                };
+                Dx12Device::transition_resource(
+                    &self.cmd_list,
+                    resource,
+                    *current_state,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                );
+                *current_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                self.active_color_attachments
+                    .push((resource.clone(), state.clone(), *sampled));
+            }
             if let Some(depth) = framebuffer.depth_resource.as_ref() {
                 if framebuffer.depth_is_sampled {
                     Dx12Device::transition_resource(
@@ -78,7 +121,12 @@ impl CommandEncoder for Dx12CommandEncoder {
                 }
                 self.active_depth_attachment = Some(depth.clone());
             }
-            for rtv in &framebuffer.rtv_descriptors {
+            for (index, rtv) in framebuffer.rtv_descriptors.iter().enumerate() {
+                let clear_color = color_clears
+                    .get(index)
+                    .or_else(|| color_clears.first())
+                    .copied()
+                    .unwrap_or([0.0; 4]);
                 self.cmd_list
                     .ClearRenderTargetView(*rtv, &clear_color, None);
             }
@@ -443,6 +491,144 @@ impl CommandEncoder for Dx12CommandEncoder {
         }
     }
 
+    fn bind_scene_resource_set(
+        &mut self,
+        pipeline_layout: PipelineLayoutHandle,
+        textures: &[TextureHandle],
+        storage_buffers: &[BufferHandle],
+    ) -> bool {
+        if textures.len() != 7 || storage_buffers.len() != 4 {
+            return false;
+        }
+        unsafe {
+            let device = &*self.device;
+            let (_, layout_index) = Dx12Device::decode_handle(pipeline_layout.index);
+            let Some(layout) = device.pipeline_layouts.get(layout_index) else {
+                return false;
+            };
+            let (Some(srv_parameter), Some(sampler_parameter)) =
+                (layout.sampled_texture_parameter, layout.sampler_parameter)
+            else {
+                return false;
+            };
+            let mut texture_sources = Vec::with_capacity(textures.len());
+            for handle in textures {
+                let (_, index) = Dx12Device::decode_handle(handle.index);
+                let Some(texture) = device.textures.get(index) else {
+                    return false;
+                };
+                let (Some(srv), Some(sampler)) = (
+                    texture.sampled_srv_heap.as_ref(),
+                    texture.sampled_sampler_heap.as_ref(),
+                ) else {
+                    return false;
+                };
+                texture_sources.push((srv, sampler));
+            }
+            let mut buffers = Vec::with_capacity(storage_buffers.len());
+            for handle in storage_buffers {
+                let (_, index) = Dx12Device::decode_handle(handle.index);
+                let Some(buffer) = device.buffers.get(index) else {
+                    return false;
+                };
+                if buffer.size < 4 || !buffer.size.is_multiple_of(4) {
+                    return false;
+                }
+                buffers.push(buffer);
+            }
+            let srv_heap: ID3D12DescriptorHeap =
+                match device
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 11,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    }) {
+                    Ok(heap) => heap,
+                    Err(_) => return false,
+                };
+            let sampler_heap: ID3D12DescriptorHeap =
+                match device
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                        NumDescriptors: 7,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    }) {
+                    Ok(heap) => heap,
+                    Err(_) => return false,
+                };
+            let srv_size = device
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let sampler_size = device
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+                as usize;
+            let srv_start = srv_heap.GetCPUDescriptorHandleForHeapStart();
+            let sampler_start = sampler_heap.GetCPUDescriptorHandleForHeapStart();
+            for (index, (srv, sampler)) in texture_sources.into_iter().enumerate() {
+                device.device.CopyDescriptorsSimple(
+                    1,
+                    D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: srv_start.ptr + index * srv_size,
+                    },
+                    srv.GetCPUDescriptorHandleForHeapStart(),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+                device.device.CopyDescriptorsSimple(
+                    1,
+                    D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: sampler_start.ptr + index * sampler_size,
+                    },
+                    sampler.GetCPUDescriptorHandleForHeapStart(),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                );
+            }
+            for (index, buffer) in buffers.into_iter().enumerate() {
+                let destination = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: srv_start.ptr + (7 + index) * srv_size,
+                };
+                device.device.CreateShaderResourceView(
+                    &buffer.resource,
+                    Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                FirstElement: 0,
+                                NumElements: (buffer.size / 4) as u32,
+                                StructureByteStride: 0,
+                                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                            },
+                        },
+                    }),
+                    destination,
+                );
+            }
+            self.cmd_list
+                .SetDescriptorHeaps(&[Some(srv_heap.clone()), Some(sampler_heap.clone())]);
+            self.cmd_list.SetGraphicsRootDescriptorTable(
+                srv_parameter,
+                srv_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            self.cmd_list.SetGraphicsRootDescriptorTable(
+                sampler_parameter,
+                sampler_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            let Ok(mut in_flight) = device.descriptor_heaps_in_flight.lock() else {
+                return false;
+            };
+            in_flight.push(srv_heap);
+            in_flight.push(sampler_heap);
+            true
+        }
+    }
+
     fn bind_uniform_buffer(
         &mut self,
         pipeline_layout: PipelineLayoutHandle,
@@ -533,6 +719,19 @@ impl CommandEncoder for Dx12CommandEncoder {
 
     fn end_render_pass(&mut self) {
         unsafe {
+            for (resource, state, sampled) in self.active_color_attachments.drain(..) {
+                if sampled {
+                    Dx12Device::transition_resource(
+                        &self.cmd_list,
+                        &resource,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    );
+                    if let Ok(mut current_state) = state.lock() {
+                        *current_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    }
+                }
+            }
             if let Some(depth) = self.active_depth_attachment.take() {
                 Dx12Device::transition_resource(
                     &self.cmd_list,
@@ -540,13 +739,13 @@ impl CommandEncoder for Dx12CommandEncoder {
                     D3D12_RESOURCE_STATE_DEPTH_WRITE,
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 );
-                self.cmd_list.OMSetRenderTargets(
-                    1,
-                    Some(&self.main_rtv as *const _ as *const _),
-                    false,
-                    Some(&self.main_dsv),
-                );
             }
+            self.cmd_list.OMSetRenderTargets(
+                1,
+                Some(&self.main_rtv as *const _ as *const _),
+                false,
+                Some(&self.main_dsv),
+            );
         }
     }
 

@@ -5,19 +5,19 @@ use engine_scene::{RenderViewportContext, Scene};
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
 use glam::Vec3;
 
-#[cfg(feature = "runtime-subsystems")]
+#[cfg(any(feature = "subsystem-ui", feature = "runtime-audio-output"))]
 use std::collections::BTreeMap;
 
 #[cfg(feature = "runtime-audio-output")]
 use std::collections::BTreeSet;
 
-#[cfg(feature = "gameplay")]
+#[cfg(feature = "subsystem-gameplay")]
 use engine_gameplay::{GameStateManager, InputActionMap};
 
-#[cfg(feature = "gameplay")]
+#[cfg(feature = "subsystem-physics")]
 use engine_physics::{PhysicsEvents, PhysicsWorld};
 
-#[cfg(feature = "runtime-subsystems")]
+#[cfg(feature = "subsystem-ui")]
 fn embed_scene_ui_batches(
     batches: &mut [engine_renderer::UiBatch],
     viewport: RenderViewportContext,
@@ -53,14 +53,14 @@ fn embed_scene_ui_batches(
 /// This native event mirrors [`engine_script::GameplayUiEvent`] when the
 /// scripting feature is enabled, while remaining available to non-scripted
 /// runtime hosts through [`GameLoop::take_ui_events`].
-#[cfg(feature = "runtime-subsystems")]
+#[cfg(feature = "subsystem-ui")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RuntimeUiValue {
     Bool(bool),
     Float(f32),
 }
 
-#[cfg(all(test, feature = "runtime-subsystems"))]
+#[cfg(all(test, feature = "subsystem-ui"))]
 mod runtime_ui_tests {
     use super::*;
 
@@ -230,7 +230,7 @@ mod runtime_ui_tests {
     }
 }
 
-#[cfg(feature = "runtime-subsystems")]
+#[cfg(feature = "subsystem-ui")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeUiEvent {
     pub canvas_id: String,
@@ -472,30 +472,30 @@ pub struct WorldOriginShift {
 pub struct GameLoop {
     pub runtime: EngineRuntime,
 
-    #[cfg(feature = "terrain")]
+    #[cfg(feature = "subsystem-terrain")]
     pub terrain: crate::TerrainSystem,
 
     /// Cumulative count and details of executed world-origin shifts.
     world_origin_shift_count: u64,
     last_world_origin_shift: Option<WorldOriginShift>,
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-physics")]
     pub physics: Option<PhysicsWorld>,
 
     /// Collision and trigger events produced by the most recent update.
     ///
     /// The loop drains the physics backend after every frame so events cannot
     /// accumulate indefinitely when a game does not explicitly consume them.
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-physics")]
     physics_events: PhysicsEvents,
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-gameplay")]
     pub state_manager: GameStateManager,
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-gameplay")]
     pub input_map: InputActionMap,
 
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-gameplay"))]
     previous_script_input_actions:
         std::collections::BTreeMap<String, engine_script::GameplayInputValue>,
 
@@ -507,7 +507,7 @@ pub struct GameLoop {
     /// Physics query results computed after the previous update's script
     /// drain. They are delivered to scripts with exactly one frame snapshot
     /// and then discarded, mirroring the frame-local physics events.
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-physics"))]
     script_physics_query_results:
         std::collections::BTreeMap<String, Vec<engine_script::GameplayPhysicsQueryResult>>,
 
@@ -517,15 +517,15 @@ pub struct GameLoop {
     /// Entity whose Transform is synced from the character controller's position.
     pub character_entity: Option<engine_scene::Entity>,
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     runtime_ui_input_states: BTreeMap<String, engine_ui::UiInputState>,
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     runtime_ui_pointer: [f32; 2],
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     runtime_ui_viewport: [f32; 2],
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     runtime_ui_captured_canvas: Option<String>,
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     runtime_ui_events: Vec<RuntimeUiEvent>,
 
     #[cfg(feature = "runtime-audio-output")]
@@ -536,21 +536,21 @@ impl GameLoop {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             runtime: EngineRuntime::new(config),
-            #[cfg(feature = "terrain")]
+            #[cfg(feature = "subsystem-terrain")]
             terrain: crate::TerrainSystem::default(),
             world_origin_shift_count: 0,
             last_world_origin_shift: None,
-            #[cfg(feature = "gameplay")]
+            #[cfg(feature = "subsystem-physics")]
             physics: None,
-            #[cfg(feature = "gameplay")]
+            #[cfg(feature = "subsystem-physics")]
             physics_events: PhysicsEvents::default(),
-            #[cfg(feature = "gameplay")]
+            #[cfg(feature = "subsystem-gameplay")]
             state_manager: GameStateManager::with_default_transitions(
                 engine_gameplay::GameState::Boot,
             ),
-            #[cfg(feature = "gameplay")]
+            #[cfg(feature = "subsystem-gameplay")]
             input_map: InputActionMap::new("player".to_string(), "gameplay".to_string()),
-            #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+            #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-gameplay"))]
             previous_script_input_actions: std::collections::BTreeMap::new(),
             #[cfg(feature = "subsystem-scripting-csharp")]
             script_pointer: engine_script::GameplayPointerSnapshot {
@@ -559,19 +559,19 @@ impl GameLoop {
             },
             #[cfg(feature = "subsystem-scripting-csharp")]
             script_save_directory: None,
-            #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+            #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-physics"))]
             script_physics_query_results: std::collections::BTreeMap::new(),
             character: None,
             character_entity: None,
-            #[cfg(feature = "runtime-subsystems")]
+            #[cfg(feature = "subsystem-ui")]
             runtime_ui_input_states: BTreeMap::new(),
-            #[cfg(feature = "runtime-subsystems")]
+            #[cfg(feature = "subsystem-ui")]
             runtime_ui_pointer: [0.0, 0.0],
-            #[cfg(feature = "runtime-subsystems")]
+            #[cfg(feature = "subsystem-ui")]
             runtime_ui_viewport: [0.0, 0.0],
-            #[cfg(feature = "runtime-subsystems")]
+            #[cfg(feature = "subsystem-ui")]
             runtime_ui_captured_canvas: None,
-            #[cfg(feature = "runtime-subsystems")]
+            #[cfg(feature = "subsystem-ui")]
             runtime_ui_events: Vec::new(),
             #[cfg(feature = "runtime-audio-output")]
             audio_output: RuntimeAudioOutput::default(),
@@ -589,16 +589,19 @@ impl GameLoop {
     /// restoration fails, the previous World and its gameplay bindings remain
     /// active.
     pub fn load_scene(&mut self, scene: Scene) -> Result<(), Vec<Diagnostic>> {
-        #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+        #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-gameplay"))]
         {
             let input_actions = self.resolved_script_input_actions();
             self.runtime.set_script_input_actions(input_actions);
+        }
+        #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-physics"))]
+        {
             self.script_physics_query_results.clear();
         }
         self.runtime.load_scene(scene)?;
-        #[cfg(feature = "terrain")]
+        #[cfg(feature = "subsystem-terrain")]
         self.terrain.reset(&mut self.runtime);
-        #[cfg(feature = "runtime-subsystems")]
+        #[cfg(feature = "subsystem-ui")]
         self.reset_runtime_ui_input();
         #[cfg(feature = "runtime-audio-output")]
         self.reset_runtime_audio_scene();
@@ -625,7 +628,7 @@ impl GameLoop {
             .with_world(|world| world.world_origin())
             .ok_or(crate::SaveGameError::NoWorld)?;
 
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         let physics_bodies = if let Some(physics) = &self.physics {
             let states = physics.runtime_body_states();
             self.runtime
@@ -648,12 +651,12 @@ impl GameLoop {
         } else {
             Vec::new()
         };
-        #[cfg(not(feature = "gameplay"))]
+        #[cfg(not(feature = "subsystem-physics"))]
         let physics_bodies = Vec::new();
 
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-gameplay")]
         let game_state = Some(self.state_manager.current().to_u32());
-        #[cfg(not(feature = "gameplay"))]
+        #[cfg(not(feature = "subsystem-gameplay"))]
         let game_state = None;
 
         let mut snapshot = crate::SaveGameSnapshot {
@@ -708,12 +711,14 @@ impl GameLoop {
         self.world_origin_shift_count = world_origin_shift_count;
         self.last_world_origin_shift = None;
 
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-gameplay")]
         if let Some(state) = game_state.and_then(engine_gameplay::GameState::from_u32) {
             self.state_manager.force_transition(state);
         }
+        #[cfg(not(feature = "subsystem-gameplay"))]
+        let _ = game_state;
 
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         let (restored_physics_bodies, skipped_physics_bodies) = {
             let mut restored = 0;
             let mut skipped = Vec::new();
@@ -751,9 +756,8 @@ impl GameLoop {
             }
             (restored, skipped)
         };
-        #[cfg(not(feature = "gameplay"))]
+        #[cfg(not(feature = "subsystem-physics"))]
         let (restored_physics_bodies, skipped_physics_bodies) = {
-            let _ = game_state;
             let skipped = physics_bodies
                 .into_iter()
                 .map(|body| body.entity_id)
@@ -804,9 +808,9 @@ impl GameLoop {
     /// (or a default of (0, -9.81, 0)) and sync any RigidBody/Collider
     /// components already in the ECS world.
     ///
-    /// No-op when the `gameplay` feature is not enabled.
+    /// No-op when the `subsystem-physics` feature is not enabled.
     pub fn init_physics(&mut self) {
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         {
             let gravity = self
                 .runtime
@@ -825,7 +829,7 @@ impl GameLoop {
     ///
     /// This snapshot is replaced on the next call to [`Self::update`]. Use
     /// [`Self::take_physics_events`] when the caller wants to take ownership.
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-physics")]
     pub fn physics_events(&self) -> &PhysicsEvents {
         &self.physics_events
     }
@@ -834,15 +838,15 @@ impl GameLoop {
     /// that bypass [`load_scene`](Self::load_scene) — world-partition cell
     /// streaming merges/unloads commit at the frame boundary and call this.
     ///
-    /// With the `gameplay` feature this runs the incremental
+    /// With the `subsystem-physics` feature this runs the incremental
     /// `PhysicsWorld::sync_from_ecs`: bodies and colliders are created for
     /// newly merged entities and removed for unloaded ones, while every
     /// untouched entity keeps its exact simulation state. Scene-level
     /// physics settings (gravity) cannot change through cell merges because
     /// merges preserve world scene metadata, so no full rebuild is needed.
-    /// Without the `gameplay` feature this is a no-op.
+    /// Without the `subsystem-physics` feature this is a no-op.
     pub fn resync_physics_from_world(&mut self) {
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         if let Some(ref mut physics) = self.physics {
             self.runtime
                 .with_world(|world| physics.sync_from_ecs(world));
@@ -927,12 +931,12 @@ impl GameLoop {
     /// - every root `Transform` in the ECS (children follow via the
     ///   hierarchy; disabled entities included),
     /// - every physics body, teleported in place with velocities, forces,
-    ///   joints, and sleep state preserved (`gameplay` feature),
+    ///   joints, and sleep state preserved (`subsystem-physics` feature),
     /// - every `CharacterController` position, including the primary mirror
     ///   used by [`update_character`](Self::update_character),
     /// - every navigation agent's target and in-progress path
-    ///   (`runtime-subsystems` feature),
-    /// - every point `GravitySource` center (`gameplay` feature).
+    ///   (`subsystem-navigation` feature),
+    /// - every point `GravitySource` center (`subsystem-physics` feature).
     /// - every live world-space CPU particle.
     ///
     /// Audio needs no sweep: emitter/listener snapshots are rebuilt from ECS
@@ -955,7 +959,7 @@ impl GameLoop {
                     characters += 1;
                 }
 
-                #[cfg(feature = "runtime-subsystems")]
+                #[cfg(feature = "subsystem-navigation")]
                 let nav_agents = {
                     let mut count = 0usize;
                     for (_, agent) in world.query_all_mut::<engine_nav::AiAgent>() {
@@ -964,12 +968,12 @@ impl GameLoop {
                     }
                     count
                 };
-                #[cfg(not(feature = "runtime-subsystems"))]
+                #[cfg(not(feature = "subsystem-navigation"))]
                 let nav_agents = 0usize;
 
-                #[cfg(feature = "gameplay")]
+                #[cfg(feature = "subsystem-physics")]
                 let gravity_sources = engine_physics::shift_gravity_source_centers(world, -offset);
-                #[cfg(not(feature = "gameplay"))]
+                #[cfg(not(feature = "subsystem-physics"))]
                 let gravity_sources = 0usize;
 
                 let vfx_particles = engine_vfx::shift_world_positions(world, -offset);
@@ -983,13 +987,13 @@ impl GameLoop {
                 )
             })?;
 
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         let physics_bodies = self
             .physics
             .as_mut()
             .map(|physics| physics.translate_bodies(-offset))
             .unwrap_or(0);
-        #[cfg(not(feature = "gameplay"))]
+        #[cfg(not(feature = "subsystem-physics"))]
         let physics_bodies = 0usize;
 
         // The primary character mirror is a clone of the component refreshed
@@ -1028,7 +1032,7 @@ impl GameLoop {
     }
 
     /// Take the most recent physics event snapshot, leaving it empty.
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-physics")]
     pub fn take_physics_events(&mut self) -> PhysicsEvents {
         std::mem::take(&mut self.physics_events)
     }
@@ -1036,7 +1040,7 @@ impl GameLoop {
     /// Switch a scene-authored ragdoll between animation and physics
     /// ownership. Activation impulse is distributed across generated bodies;
     /// deactivation blends back over `recovery_duration` seconds.
-    #[cfg(all(feature = "runtime-subsystems", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-animation", feature = "subsystem-physics"))]
     pub fn set_ragdoll_active(
         &mut self,
         entity_id: &str,
@@ -1132,12 +1136,12 @@ impl GameLoop {
 
         // Drive the controller.  Physics world is optional — without it the
         // controller still moves but won't do ground collision.
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         {
             let physics: Option<&PhysicsWorld> = self.physics.as_ref();
             ctrl.update(&input, physics);
         }
-        #[cfg(not(feature = "gameplay"))]
+        #[cfg(not(feature = "subsystem-physics"))]
         ctrl.update(&input, None);
 
         // Write controller position back to the ECS entity's Transform.
@@ -1174,8 +1178,8 @@ impl GameLoop {
 
     /// Advance the simulation by `dt` seconds.
     ///
-    /// Handles physics stepping and ECS ↔ physics sync when the `gameplay`
-    /// feature is enabled.  Script ticking runs when the
+    /// Handles physics stepping and ECS ↔ physics sync when
+    /// `subsystem-physics` is enabled. Script ticking runs when the
     /// `subsystem-scripting-csharp` feature is active.
     ///
     /// Typical per-frame orchestration:
@@ -1191,12 +1195,12 @@ impl GameLoop {
     }
 
     fn update_inner(&mut self, dt: f32) {
-        #[cfg(feature = "terrain")]
+        #[cfg(feature = "subsystem-terrain")]
         self.tick_terrain(None);
-        #[cfg(all(feature = "runtime-subsystems", feature = "gameplay"))]
+        #[cfg(all(feature = "subsystem-animation", feature = "subsystem-physics"))]
         crate::ragdoll_runtime::reconcile_before_physics(self);
-        // Tick physics (ECS → physics → ECS sync) — gameplay feature
-        #[cfg(feature = "gameplay")]
+        // Tick physics (ECS → physics → ECS sync).
+        #[cfg(feature = "subsystem-physics")]
         {
             self.physics_events.clear();
             if let Some(ref mut physics) = self.physics {
@@ -1207,18 +1211,18 @@ impl GameLoop {
             }
         }
 
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-gameplay")]
         let (character_direction, character_jump) = self.resolved_character_input();
-        #[cfg(not(feature = "gameplay"))]
+        #[cfg(not(feature = "subsystem-gameplay"))]
         let (character_direction, character_jump) = (Vec3::ZERO, false);
-        #[cfg(feature = "runtime-subsystems")]
+        #[cfg(feature = "subsystem-navigation")]
         self.queue_runtime_navigation(dt);
         self.update_character(character_direction, character_jump, dt);
         self.update_additional_characters(dt);
 
         #[cfg(feature = "subsystem-scripting-csharp")]
         let script_ui_events = {
-            #[cfg(feature = "runtime-subsystems")]
+            #[cfg(feature = "subsystem-ui")]
             {
                 std::mem::take(&mut self.runtime_ui_events)
                     .into_iter()
@@ -1237,7 +1241,7 @@ impl GameLoop {
                     })
                     .collect::<Vec<_>>()
             }
-            #[cfg(not(feature = "runtime-subsystems"))]
+            #[cfg(not(feature = "subsystem-ui"))]
             {
                 Vec::<engine_script::GameplayUiEvent>::new()
             }
@@ -1246,15 +1250,28 @@ impl GameLoop {
         #[cfg(feature = "subsystem-scripting-csharp")]
         self.refresh_script_view_context();
 
-        // Tick scripts (OnUpdate) with the same resolved input snapshot used
-        // by the player/editor GameLoop.
-        #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+        // Build each optional input independently so scripting no longer
+        // drags the gameplay, physics, animation, or UI subsystems with it.
+        #[cfg(feature = "subsystem-scripting-csharp")]
         {
             self.runtime.frame_timing_begin_stage("script_tick");
+            #[cfg(feature = "subsystem-gameplay")]
             let input_actions = self.resolved_script_input_actions();
+            #[cfg(not(feature = "subsystem-gameplay"))]
+            let input_actions = std::collections::BTreeMap::new();
+            #[cfg(feature = "subsystem-gameplay")]
             let input_transitions = self.resolved_script_input_transitions(&input_actions);
+            #[cfg(not(feature = "subsystem-gameplay"))]
+            let input_transitions = engine_script::GameplayInputTransitions::default();
+            #[cfg(feature = "subsystem-physics")]
             let physics_events = self.resolved_script_physics_events();
+            #[cfg(not(feature = "subsystem-physics"))]
+            let physics_events = std::collections::BTreeMap::new();
+            #[cfg(feature = "subsystem-physics")]
             let physics_query_results = std::mem::take(&mut self.script_physics_query_results);
+            #[cfg(not(feature = "subsystem-physics"))]
+            let physics_query_results = std::collections::BTreeMap::new();
+
             self.runtime
                 .tick_scripts_with_frame_input_ui_and_physics_queries(
                     dt,
@@ -1264,36 +1281,26 @@ impl GameLoop {
                     &script_ui_events,
                     &physics_query_results,
                 );
-            self.previous_script_input_actions = input_actions;
-            // Queries drained from this tick execute against the freshly
-            // stepped physics world; scripts observe the results with the
-            // next frame snapshot.
-            self.execute_script_physics_queries();
-            // Forces and impulses are queued after queries and execute safely
-            // at the start of the next physics step.
-            self.queue_script_physics_mutations();
-            self.process_script_damage_requests();
-            #[cfg(feature = "runtime-subsystems")]
+
+            #[cfg(feature = "subsystem-gameplay")]
+            {
+                self.previous_script_input_actions = input_actions;
+            }
+            #[cfg(feature = "subsystem-physics")]
+            {
+                self.execute_script_physics_queries();
+                self.queue_script_physics_mutations();
+                self.process_script_damage_requests();
+            }
+            #[cfg(not(feature = "subsystem-physics"))]
+            {
+                let _ = self.runtime.take_pending_physics_queries();
+                let _ = self.runtime.take_pending_physics_mutations();
+                let _ = self.runtime.take_pending_damage_requests();
+            }
+            #[cfg(all(feature = "subsystem-animation", feature = "subsystem-physics"))]
             self.process_script_ragdoll_requests();
-            #[cfg(not(feature = "runtime-subsystems"))]
-            let _ = self.runtime.take_pending_ragdoll_requests();
-            self.runtime.frame_timing_end_stage("script_tick");
-        }
-        #[cfg(all(feature = "subsystem-scripting-csharp", not(feature = "gameplay")))]
-        {
-            self.runtime.frame_timing_begin_stage("script_tick");
-            self.runtime.tick_scripts_with_frame_input_and_ui(
-                dt,
-                &std::collections::BTreeMap::new(),
-                &engine_script::GameplayInputTransitions::default(),
-                &std::collections::BTreeMap::new(),
-                &script_ui_events,
-            );
-            // Without a physics world no query can be answered; drop drained
-            // work so the runtime queues cannot accumulate.
-            let _ = self.runtime.take_pending_physics_queries();
-            let _ = self.runtime.take_pending_physics_mutations();
-            let _ = self.runtime.take_pending_damage_requests();
+            #[cfg(not(all(feature = "subsystem-animation", feature = "subsystem-physics")))]
             let _ = self.runtime.take_pending_ragdoll_requests();
             self.runtime.frame_timing_end_stage("script_tick");
         }
@@ -1304,13 +1311,12 @@ impl GameLoop {
         #[cfg(feature = "subsystem-scripting-csharp")]
         self.finish_script_pointer_frame();
 
-        #[cfg(feature = "runtime-subsystems")]
+        #[cfg(all(feature = "subsystem-animation", feature = "subsystem-physics"))]
         {
-            #[cfg(feature = "gameplay")]
             crate::ragdoll_runtime::reconcile_after_physics(self, dt);
         }
 
-        #[cfg(feature = "runtime-subsystems")]
+        #[cfg(feature = "subsystem-animation")]
         self.update_runtime_animation(dt);
         self.runtime
             .with_world_mut(|world| engine_vfx::update_vfx(world, dt));
@@ -1321,7 +1327,7 @@ impl GameLoop {
     /// Tick the optional terrain component at the frame boundary. Normal
     /// [`update`](Self::update) calls this with the active camera; editor and
     /// server hosts may supply an absolute/logical focus explicitly.
-    #[cfg(feature = "terrain")]
+    #[cfg(feature = "subsystem-terrain")]
     pub fn tick_terrain(&mut self, focus_logical: Option<[f64; 3]>) {
         self.runtime.frame_timing_begin_stage("terrain_stream");
         let physics_changed = self.terrain.tick(&mut self.runtime, focus_logical);
@@ -1332,19 +1338,19 @@ impl GameLoop {
     }
 
     /// Snapshot used by the ENG-70 editor panel and headless diagnostics.
-    #[cfg(feature = "terrain")]
+    #[cfg(feature = "subsystem-terrain")]
     pub fn terrain_debug_snapshot(&self) -> engine_terrain::TerrainDebugSnapshot {
         self.terrain.debug_snapshot()
     }
 
     /// Regenerate resident and in-flight chunks without changing authored
     /// terrain parameters.
-    #[cfg(feature = "terrain")]
+    #[cfg(feature = "subsystem-terrain")]
     pub fn terrain_force_regenerate(&mut self) {
         self.terrain.force_regenerate();
     }
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-gameplay")]
     fn resolved_character_input(&self) -> (Vec3, bool) {
         use engine_gameplay::InputValue;
 
@@ -1587,12 +1593,12 @@ impl GameLoop {
 
     /// Produce a single rendered frame.
     pub fn render(&mut self, frame_index: u64) -> Result<FrameStats, Vec<Diagnostic>> {
-        #[cfg(feature = "runtime-subsystems")]
+        #[cfg(feature = "subsystem-ui")]
         {
             let ui_batches = self.runtime_ui_batches();
             self.runtime.render_frame_with_ui(frame_index, ui_batches)
         }
-        #[cfg(not(feature = "runtime-subsystems"))]
+        #[cfg(not(feature = "subsystem-ui"))]
         {
             self.runtime.render_frame(frame_index)
         }
@@ -1607,7 +1613,7 @@ impl GameLoop {
         engine_overlay_batches: Vec<engine_renderer::UiBatch>,
         viewport: RenderViewportContext,
     ) -> Result<FrameStats, Vec<Diagnostic>> {
-        #[cfg(feature = "runtime-subsystems")]
+        #[cfg(feature = "subsystem-ui")]
         let ui_batches = {
             let surface_size = viewport.surface_size();
             let output = viewport.output_rect();
@@ -1621,7 +1627,7 @@ impl GameLoop {
             scene_ui_batches.extend(engine_overlay_batches);
             scene_ui_batches
         };
-        #[cfg(not(feature = "runtime-subsystems"))]
+        #[cfg(not(feature = "subsystem-ui"))]
         let ui_batches = engine_overlay_batches;
 
         self.runtime
@@ -1633,19 +1639,19 @@ impl GameLoop {
     /// Script-enabled [`update`](Self::update) consumes the same queue once
     /// when building gameplay contexts. Native hosts that want ownership must
     /// therefore call this before that update.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     pub fn take_ui_events(&mut self) -> Vec<RuntimeUiEvent> {
         std::mem::take(&mut self.runtime_ui_events)
     }
 
     /// Whether a scene Canvas currently owns the primary pointer gesture.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     pub fn ui_has_pointer_capture(&self) -> bool {
         self.runtime_ui_captured_canvas.is_some()
     }
 
     /// Update the screen viewport used by retained UI scaling and hit tests.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     pub fn set_ui_viewport_size(&mut self, width: u32, height: u32) {
         self.runtime_ui_viewport = [width.max(1) as f32, height.max(1) as f32];
     }
@@ -1655,7 +1661,7 @@ impl GameLoop {
     /// While a Canvas owns capture, movement is delivered only to that
     /// Canvas. Otherwise the topmost interactive Canvas under the pointer is
     /// selected using the same persistent-ID order as UI rendering.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     pub fn ui_pointer_move(&mut self, x: f32, y: f32) {
         if !x.is_finite() || !y.is_finite() {
             self.cancel_ui_pointer();
@@ -1735,7 +1741,7 @@ impl GameLoop {
     ///
     /// Exactly one topmost Canvas can capture a press. Presses outside all
     /// interactive elements leave the UI uncaptured.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     pub fn ui_pointer_left_press(&mut self) {
         self.cancel_ui_pointer_state();
         let [x, y] = self.runtime_ui_pointer;
@@ -1780,7 +1786,7 @@ impl GameLoop {
     ///
     /// A click is queued only when the Canvas and element captured by press
     /// still exist and the release remains inside that enabled element.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     pub fn ui_pointer_left_release(&mut self) {
         let [x, y] = self.runtime_ui_pointer;
         let Some(canvas_id) = self.runtime_ui_captured_canvas.take() else {
@@ -1824,7 +1830,7 @@ impl GameLoop {
     ///
     /// Window focus loss, suspension, or an editor release over chrome must
     /// use this path so a later release cannot resurrect an old press.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     pub fn cancel_ui_pointer(&mut self) {
         let mut canvases = self.runtime_ui_canvases();
         for (canvas_id, canvas) in &mut canvases {
@@ -1835,20 +1841,20 @@ impl GameLoop {
         self.cancel_ui_pointer_state();
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     fn cancel_ui_pointer_state(&mut self) {
         self.runtime_ui_input_states.clear();
         self.runtime_ui_captured_canvas = None;
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     fn reset_runtime_ui_input(&mut self) {
         self.cancel_ui_pointer_state();
         self.runtime_ui_events.clear();
     }
 
     /// Snapshot and lay out all retained scene canvases in renderer order.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     fn runtime_ui_canvases(&mut self) -> Vec<(String, engine_ui::Canvas)> {
         self.runtime
             .with_world_mut(|world| {
@@ -1873,7 +1879,7 @@ impl GameLoop {
             .unwrap_or_default()
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     fn runtime_ui_canvas_point(&self, canvas: &engine_ui::Canvas, x: f32, y: f32) -> [f32; 2] {
         let viewport_width = if self.runtime_ui_viewport[0] > 0.0 {
             self.runtime_ui_viewport[0]
@@ -1893,7 +1899,7 @@ impl GameLoop {
         }
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     fn commit_runtime_ui_canvas(&mut self, canvas_id: &str, canvas: engine_ui::Canvas) {
         self.runtime.with_world_mut(|world| {
             let Some(entity) = world.entity_by_persistent_id(canvas_id) else {
@@ -1908,7 +1914,7 @@ impl GameLoop {
     /// Resolve retained-mode scene canvases into renderer batches for the
     /// current frame. Canvas order is based on persistent entity IDs so the
     /// result is stable even when ECS storage order changes.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     fn runtime_ui_batches(&mut self) -> Vec<engine_renderer::UiBatch> {
         let input_states = self.runtime_ui_input_states.clone();
         let viewport = self.runtime_ui_viewport;
@@ -1961,7 +1967,7 @@ impl GameLoop {
 
     /// Advance scene animation players and replace their static renderer
     /// extraction with skinned items backed by the loaded extension assets.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-animation")]
     fn update_runtime_animation(&mut self, dt: f32) {
         let asset_ids = self.runtime.asset_registry().cached_ids();
         let skeletons = asset_ids
@@ -2081,7 +2087,7 @@ impl GameLoop {
     /// Evaluate navigation agents and queue their movement intent on the
     /// CharacterController attached to the same entity. The primary player
     /// mirror is refreshed so its normal update consumes the queued command.
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-navigation")]
     fn queue_runtime_navigation(&mut self, dt: f32) {
         let navmeshes = self
             .runtime
@@ -2158,7 +2164,7 @@ impl GameLoop {
     /// ambient pawns are not frozen merely because they are not player-bound.
     fn update_additional_characters(&mut self, dt: f32) {
         let primary = self.character_entity;
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         let physics = self.physics.as_ref();
         let _ = self.runtime.with_world_mut(|world| {
             let entities = world
@@ -2175,9 +2181,9 @@ impl GameLoop {
                     wish_jump: false,
                     delta_time: dt.min(0.1),
                 };
-                #[cfg(feature = "gameplay")]
+                #[cfg(feature = "subsystem-physics")]
                 controller.update(&input, physics);
-                #[cfg(not(feature = "gameplay"))]
+                #[cfg(not(feature = "subsystem-physics"))]
                 controller.update(&input, None);
                 if let Some(transform) =
                     world.get_mut::<engine_scene::components::Transform>(entity)
@@ -2191,7 +2197,7 @@ impl GameLoop {
         });
     }
 
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-gameplay"))]
     fn resolved_script_input_actions(
         &self,
     ) -> std::collections::BTreeMap<String, engine_script::GameplayInputValue> {
@@ -2215,7 +2221,7 @@ impl GameLoop {
             .collect()
     }
 
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-physics"))]
     fn resolved_script_physics_events(
         &self,
     ) -> std::collections::BTreeMap<String, Vec<engine_script::GameplayPhysicsEvent>> {
@@ -2307,7 +2313,7 @@ impl GameLoop {
     /// sync, so answers are consistent with the physics events delivered in
     /// the same update. Results are frame-local: they replace the previous
     /// staging map and are consumed by the next script tick.
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-physics"))]
     fn execute_script_physics_queries(&mut self) {
         let pending = self.runtime.take_pending_physics_queries();
         if pending.is_empty() {
@@ -2326,7 +2332,7 @@ impl GameLoop {
 
     /// Resolve validated script forces/impulses by persistent id and queue
     /// them for the next safe physics step.
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-physics"))]
     fn queue_script_physics_mutations(&mut self) {
         let pending = self.runtime.take_pending_physics_mutations();
         if self.physics.is_none() {
@@ -2469,7 +2475,7 @@ impl GameLoop {
         }
     }
 
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-physics"))]
     fn process_script_damage_requests(&mut self) {
         let pending = self.runtime.take_pending_damage_requests();
         for request in pending {
@@ -2666,8 +2672,8 @@ impl GameLoop {
 
     #[cfg(all(
         feature = "subsystem-scripting-csharp",
-        feature = "gameplay",
-        feature = "runtime-subsystems"
+        feature = "subsystem-physics",
+        feature = "subsystem-animation"
     ))]
     fn process_script_ragdoll_requests(&mut self) {
         let pending = self.runtime.take_pending_ragdoll_requests();
@@ -2714,7 +2720,7 @@ impl GameLoop {
     /// Run one validated script physics query against the physics world,
     /// translating backend hits into persistent entity ids so scripts never
     /// observe raw ECS handles.
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-physics"))]
     fn execute_script_physics_query(
         &self,
         query: &engine_script::GameplayPhysicsQuery,
@@ -2910,7 +2916,7 @@ impl GameLoop {
         }
     }
 
-    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+    #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-gameplay"))]
     fn resolved_script_input_transitions(
         &self,
         current: &std::collections::BTreeMap<String, engine_script::GameplayInputValue>,
@@ -3169,7 +3175,7 @@ impl RuntimeAudioOutput {
     }
 }
 
-#[cfg(all(feature = "subsystem-scripting-csharp", feature = "gameplay"))]
+#[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-gameplay"))]
 fn script_input_value_is_active(value: &engine_script::GameplayInputValue) -> bool {
     match value {
         engine_script::GameplayInputValue::Bool(value) => *value,
@@ -3425,7 +3431,7 @@ mod runtime_audio_reconcile_tests {
     }
 }
 
-#[cfg(all(test, feature = "gameplay"))]
+#[cfg(all(test, feature = "subsystem-physics", feature = "subsystem-gameplay"))]
 mod character_scene_tests {
     use std::collections::BTreeMap;
 
@@ -3498,7 +3504,12 @@ mod character_scene_tests {
         assert_eq!(component_position, transform_position);
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(all(
+        feature = "subsystem-animation",
+        feature = "subsystem-audio",
+        feature = "subsystem-navigation",
+        feature = "subsystem-ui"
+    ))]
     #[test]
     fn game_loop_extracts_scene_canvases_in_stable_order_for_rendering() {
         let mut game_loop = GameLoop::new(EngineConfig::default());
@@ -3533,7 +3544,12 @@ mod character_scene_tests {
             .all(|batch| batch.clip_rect.max == [320.0, 180.0]));
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(all(
+        feature = "subsystem-animation",
+        feature = "subsystem-audio",
+        feature = "subsystem-navigation",
+        feature = "subsystem-ui"
+    ))]
     #[test]
     fn game_loop_advances_loaded_animation_assets_and_keeps_only_the_latest_pose() {
         use engine_animation::{
@@ -3646,7 +3662,12 @@ mod character_scene_tests {
         let _ = std::fs::remove_dir_all(cooked);
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(all(
+        feature = "subsystem-animation",
+        feature = "subsystem-audio",
+        feature = "subsystem-navigation",
+        feature = "subsystem-ui"
+    ))]
     #[test]
     fn ragdoll_generates_physics_graph_switches_pose_ownership_and_recovers() {
         use engine_animation::{
@@ -3912,7 +3933,12 @@ mod character_scene_tests {
         );
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(all(
+        feature = "subsystem-animation",
+        feature = "subsystem-audio",
+        feature = "subsystem-navigation",
+        feature = "subsystem-ui"
+    ))]
     #[test]
     fn loaded_navmesh_drives_a_scene_character_through_the_standard_game_loop() {
         use engine_asset::cook::{registered_asset_type_id, AssetType};
@@ -4105,7 +4131,12 @@ mod character_scene_tests {
     }
 }
 
-#[cfg(all(test, feature = "gameplay", feature = "subsystem-scripting-csharp"))]
+#[cfg(all(
+    test,
+    feature = "subsystem-physics",
+    feature = "subsystem-gameplay",
+    feature = "subsystem-scripting-csharp"
+))]
 mod gameplay_script_bridge_tests {
     use std::collections::BTreeMap;
     use std::sync::{
@@ -6236,7 +6267,7 @@ mod world_origin_tests {
         );
     }
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(all(feature = "subsystem-physics", feature = "subsystem-gameplay"))]
     #[test]
     fn origin_shift_teleports_physics_bodies_and_sweeps_gravity_sources() {
         use engine_physics::{Collider, GravityMode, GravitySource, RigidBody};
@@ -6296,7 +6327,12 @@ mod world_origin_tests {
         assert_eq!(logical_position(&game_loop, "cube-01")[0], 300.0);
     }
 
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(all(
+        feature = "subsystem-animation",
+        feature = "subsystem-audio",
+        feature = "subsystem-navigation",
+        feature = "subsystem-ui"
+    ))]
     #[test]
     fn origin_shift_moves_nav_agent_targets() {
         let mut game_loop = shiftable_game_loop(100.0);
@@ -6426,7 +6462,7 @@ mod savegame_tests {
         assert_eq!(report.custom_state["suit"], Value::Bool(true));
     }
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(all(feature = "subsystem-physics", feature = "subsystem-gameplay"))]
     #[test]
     fn checkpoint_restores_transient_rigid_body_state_by_persistent_id() {
         let mut game_loop = GameLoop::new(EngineConfig::default());
@@ -6479,7 +6515,7 @@ mod savegame_tests {
         assert_eq!(restored.position, expected.position);
     }
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(all(feature = "subsystem-physics", feature = "subsystem-gameplay"))]
     #[test]
     fn checkpoint_rebuilds_persistent_joint_without_serializing_backend_handles() {
         use engine_physics::{BodyType, PhysicsJoint, RigidBody};
@@ -6541,7 +6577,7 @@ mod savegame_tests {
             .unwrap();
     }
 
-    #[cfg(feature = "gameplay")]
+    #[cfg(all(feature = "subsystem-physics", feature = "subsystem-gameplay"))]
     #[test]
     fn checkpoint_restores_destructible_health_and_break_state() {
         let mut game_loop = GameLoop::new(EngineConfig::default());

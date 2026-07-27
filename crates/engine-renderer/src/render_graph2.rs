@@ -777,6 +777,27 @@ fn opaque_pbr_forward_pass(view_id: u32, output_mode: PassGraphOutputMode) -> Pa
             access: ResourceAccess::Write,
         },
     };
+    let mut color_outputs = vec![color_output];
+    if output_mode == PassGraphOutputMode::HdrThenToneMap {
+        color_outputs.extend([
+            PassAttachment {
+                name: "oit_accumulation".into(),
+                format: Some("RGBA16F".into()),
+                clear: true,
+                load_op: "clear".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Write,
+            },
+            PassAttachment {
+                name: "oit_optical_depth".into(),
+                format: Some("RGBA16F".into()),
+                clear: true,
+                load_op: "clear".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Write,
+            },
+        ]);
+    }
 
     PassNode {
         kind: PassKind::OpaquePbrForward,
@@ -790,7 +811,7 @@ fn opaque_pbr_forward_pass(view_id: u32, output_mode: PassGraphOutputMode) -> Pa
             size_source: SizeSource::Swapchain,
             access: ResourceAccess::Read,
         }],
-        outputs: vec![color_output],
+        outputs: color_outputs,
         depth_stencil: Some(PassAttachment {
             name: "depth_stencil".into(),
             format: Some("D24S8".into()),
@@ -807,14 +828,17 @@ fn tone_map_pass(view_id: u32) -> PassNode {
         kind: PassKind::ToneMap,
         name: "tone_map_pass",
         view_id,
-        inputs: vec![PassAttachment {
-            name: "hdr_color".into(),
-            format: Some("RGBA16F".into()),
-            clear: false,
-            load_op: "load".into(),
-            size_source: SizeSource::Swapchain,
-            access: ResourceAccess::Read,
-        }],
+        inputs: ["hdr_color", "oit_accumulation", "oit_optical_depth"]
+            .into_iter()
+            .map(|name| PassAttachment {
+                name: name.into(),
+                format: Some("RGBA16F".into()),
+                clear: false,
+                load_op: "load".into(),
+                size_source: SizeSource::Swapchain,
+                access: ResourceAccess::Read,
+            })
+            .collect(),
         outputs: vec![PassAttachment {
             name: "swapchain".into(),
             format: None,
@@ -1269,6 +1293,14 @@ mod tests {
             .iter()
             .find(|pass| matches!(pass.kind, PassKind::Present))
             .expect("present pass");
+        assert_eq!(
+            tone_map
+                .inputs
+                .iter()
+                .map(|attachment| attachment.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hdr_color", "oit_accumulation", "oit_optical_depth"]
+        );
         assert_eq!(tone_map.outputs[0].name, "swapchain");
         assert_eq!(present.inputs[0].name, "swapchain");
         assert!(present.outputs.is_empty());
@@ -1287,6 +1319,15 @@ mod tests {
                     && barrier.src_stage == PipeStage::ColorAttachmentOutput
                     && barrier.dst_stage == PipeStage::FragmentShader
             }));
+        for resource_name in ["oit_accumulation", "oit_optical_depth"] {
+            assert!(compiled.barriers_per_pass[tone_map_position]
+                .iter()
+                .any(|barrier| {
+                    barrier.resource_name == resource_name
+                        && barrier.old_state == ResourceState::ColorAttachmentOptimal
+                        && barrier.new_state == ResourceState::ShaderReadOnlyOptimal
+                }));
+        }
     }
 
     #[test]

@@ -4,20 +4,24 @@ mod components;
 mod serde;
 
 pub use components::{
-    Decal, Particle, ParticleEmitter, BUILTIN_VFX_MATERIAL_ID, BUILTIN_VFX_QUAD_MESH_ID,
+    Decal, Particle, ParticleEmitter, ParticleSimulationMode, BUILTIN_VFX_MATERIAL_ID,
+    BUILTIN_VFX_QUAD_MESH_ID,
 };
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use engine_renderer::{AxisAlignedBox, RenderFrameInput, RenderableItem};
+use engine_renderer::{
+    AxisAlignedBox, GpuParticleSimulation, ParticleBatch, ParticleInstance, RenderFrameInput,
+    RenderableItem,
+};
 use engine_scene::{
     camera_relative_render_origin, entity_world_position, entity_world_transform, Component,
     ComponentExtension, ComponentMeta, ComponentRegistry, ComponentStorageDyn, ScriptAccess,
     SparseSet, World,
 };
 use engine_serialize::AssetId;
-use glam::{Mat3, Mat4, Vec3};
+use glam::{Mat4, Vec3};
 
 /// Register scene-serializable particle-emitter and decal components.
 pub fn register_vfx_extensions(component_registry: &mut ComponentRegistry) {
@@ -25,7 +29,7 @@ pub fn register_vfx_extensions(component_registry: &mut ComponentRegistry) {
         meta: ComponentMeta {
             type_id: ParticleEmitter::TYPE_ID,
             display_name: "Particle Emitter",
-            schema_version: (0, 1, 0),
+            schema_version: (0, 2, 0),
             has_editor: true,
             script_access: ScriptAccess::ReadWrite,
         },
@@ -74,13 +78,28 @@ pub fn update_vfx(world: &mut World, dt: f32) {
         .collect::<HashMap<_, _>>();
 
     for (entity, emitter) in world.query_mut::<ParticleEmitter>() {
+        if emitter.simulation_mode == ParticleSimulationMode::Gpu {
+            emitter.advance_gpu(dt);
+            continue;
+        }
         let acceleration = emitter.acceleration;
+        let drag = emitter.drag;
+        let turbulence_strength = emitter.turbulence_strength;
+        let turbulence_frequency = emitter.turbulence_frequency;
         emitter.particles_mut().retain_mut(|particle| {
             particle.age += dt;
             if particle.age >= particle.lifetime {
                 return false;
             }
-            particle.velocity += acceleration * dt;
+            let phase = particle.position * turbulence_frequency
+                + Vec3::splat(particle.age * turbulence_frequency);
+            let turbulence = Vec3::new(
+                (phase.y + phase.z * 1.37).sin(),
+                (phase.z + phase.x * 1.79).sin(),
+                (phase.x + phase.y * 2.11).sin(),
+            ) * turbulence_strength;
+            particle.velocity += (acceleration + turbulence) * dt;
+            particle.velocity *= (-drag * dt).exp();
             particle.position += particle.velocity * dt;
             particle.rotation += particle.angular_velocity * dt;
             true
@@ -131,15 +150,6 @@ fn random_direction_in_cone(emitter: &mut ParticleEmitter) -> Vec3 {
 /// Append visible particle billboards and mesh decals to a scene frame.
 pub fn extract_vfx(world: &World, input: &mut RenderFrameInput) {
     let relative_origin = camera_relative_render_origin(world).unwrap_or(Vec3::ZERO);
-    let camera_world = input
-        .views
-        .first()
-        .map(|view| Mat4::from_cols_array(&view.view_matrix).inverse())
-        .unwrap_or(Mat4::IDENTITY);
-    let camera_rotation = Mat3::from_mat4(camera_world);
-    let camera_right = camera_rotation.x_axis.normalize_or_zero();
-    let camera_up = camera_rotation.y_axis.normalize_or_zero();
-    let camera_back = camera_rotation.z_axis.normalize_or_zero();
 
     let mut visible = 0_u32;
     let mut culled = 0_u32;
@@ -148,7 +158,37 @@ pub fn extract_vfx(world: &World, input: &mut RenderFrameInput) {
             continue;
         }
         let entity_id = world.persistent_id(entity).map(str::to_owned);
-        for (particle_index, particle) in emitter.particles().iter().enumerate() {
+        if emitter.simulation_mode == ParticleSimulationMode::Gpu {
+            let origin =
+                entity_world_position(world, entity).unwrap_or(Vec3::ZERO) - relative_origin;
+            let simulation = gpu_simulation(emitter, origin);
+            let (_, draw_count) = simulation.draw_range();
+            if draw_count == 0 {
+                continue;
+            }
+            let bounds = gpu_emitter_bounds(emitter, origin);
+            if !visible_in_any_view(input, &emitter.render_layer, &bounds) {
+                culled = culled.saturating_add(draw_count);
+                continue;
+            }
+            let mesh = AssetId::new(&emitter.mesh_asset);
+            let material = AssetId::new(&emitter.material_asset);
+            input.particle_batches.push(ParticleBatch {
+                emitter: entity_id,
+                sort_key: batch_sort_key(&material, &mesh),
+                mesh,
+                material,
+                instances: Vec::new(),
+                gpu_simulation: Some(simulation),
+                bounds,
+                render_layer: emitter.render_layer.clone(),
+            });
+            visible = visible.saturating_add(draw_count);
+            continue;
+        }
+        let mut instances = Vec::with_capacity(emitter.particles().len());
+        let mut batch_bounds: Option<AxisAlignedBox> = None;
+        for particle in emitter.particles() {
             let progress = (particle.age / particle.lifetime).clamp(0.0, 1.0);
             let size = emitter.start_size + (emitter.end_size - emitter.start_size) * progress;
             if size <= 0.0 {
@@ -160,30 +200,36 @@ pub fn extract_vfx(world: &World, input: &mut RenderFrameInput) {
                 culled += 1;
                 continue;
             }
-            let (sin, cos) = particle.rotation.sin_cos();
-            let right = (camera_right * cos + camera_up * sin) * size;
-            let up = (-camera_right * sin + camera_up * cos) * size;
-            let world_matrix = Mat4::from_cols(
-                right.extend(0.0),
-                up.extend(0.0),
-                camera_back.extend(0.0),
-                position.extend(1.0),
-            );
+            batch_bounds = Some(match batch_bounds {
+                Some(current) => union_bounds(current, bounds),
+                None => bounds,
+            });
+            instances.push(ParticleInstance {
+                position: position.to_array(),
+                size,
+                rotation_radians: particle.rotation,
+                normalized_age: progress,
+                color: std::array::from_fn(|channel| {
+                    let start = f32::from(emitter.start_color[channel]);
+                    let end = f32::from(emitter.end_color[channel]);
+                    (start + (end - start) * progress).round().clamp(0.0, 255.0) as u8
+                }),
+            });
+            visible += 1;
+        }
+        if !instances.is_empty() {
             let mesh = AssetId::new(&emitter.mesh_asset);
             let material = AssetId::new(&emitter.material_asset);
-            input.drawables.push(RenderableItem {
-                entity: entity_id
-                    .as_ref()
-                    .map(|id| format!("{id}#particle-{particle_index}")),
+            input.particle_batches.push(ParticleBatch {
+                emitter: entity_id,
                 sort_key: batch_sort_key(&material, &mesh),
                 mesh,
                 material,
-                world_transform: world_matrix.to_cols_array(),
-                bounds,
+                instances,
+                gpu_simulation: None,
+                bounds: batch_bounds.expect("non-empty instance batch has bounds"),
                 render_layer: emitter.render_layer.clone(),
-                cast_shadows: false,
             });
-            visible += 1;
         }
     }
 
@@ -225,6 +271,50 @@ pub fn extract_vfx(world: &World, input: &mut RenderFrameInput) {
         stats.culled_drawables = stats.culled_drawables.saturating_add(culled);
     }
     input.drawables.sort_by_key(|item| item.sort_key);
+    input.particle_batches.sort_by_key(|batch| batch.sort_key);
+}
+
+fn gpu_simulation(emitter: &ParticleEmitter, origin: Vec3) -> GpuParticleSimulation {
+    GpuParticleSimulation {
+        origin: origin.to_array(),
+        elapsed: emitter.elapsed(),
+        emission_duration: if emitter.looping {
+            0.0
+        } else {
+            emitter.duration
+        },
+        emission_rate: emitter.emission_rate,
+        burst_count: emitter.burst_count,
+        max_particles: emitter.max_particles,
+        lifetime_min: emitter.lifetime_min,
+        lifetime_max: emitter.lifetime_max,
+        speed_min: emitter.speed_min,
+        speed_max: emitter.speed_max,
+        start_size: emitter.start_size,
+        end_size: emitter.end_size,
+        start_color: emitter.start_color,
+        end_color: emitter.end_color,
+        direction: emitter.direction.to_array(),
+        spread_angle_radians: emitter.spread_angle_radians,
+        acceleration: emitter.acceleration.to_array(),
+        drag: emitter.drag,
+        turbulence_strength: emitter.turbulence_strength,
+        turbulence_frequency: emitter.turbulence_frequency,
+        angular_velocity_min: emitter.angular_velocity_min,
+        angular_velocity_max: emitter.angular_velocity_max,
+        seed: emitter.simulation_seed(),
+    }
+}
+
+fn gpu_emitter_bounds(emitter: &ParticleEmitter, origin: Vec3) -> AxisAlignedBox {
+    let lifetime = f64::from(emitter.lifetime_max);
+    let speed = f64::from(emitter.speed_min.abs().max(emitter.speed_max.abs()));
+    let acceleration = f64::from(emitter.acceleration.length());
+    let turbulence = f64::from(emitter.turbulence_strength);
+    let size = f64::from(emitter.start_size.max(emitter.end_size));
+    let extent = (speed * lifetime + 0.5 * (acceleration + turbulence) * lifetime * lifetime + size)
+        .clamp(0.001, 1.0e12) as f32;
+    centered_bounds(origin, Vec3::splat(extent))
 }
 
 fn visible_in_any_view(
@@ -259,6 +349,21 @@ fn centered_bounds(center: Vec3, half_extents: Vec3) -> AxisAlignedBox {
     AxisAlignedBox {
         min: (center - half_extents).to_array(),
         max: (center + half_extents).to_array(),
+    }
+}
+
+fn union_bounds(left: AxisAlignedBox, right: AxisAlignedBox) -> AxisAlignedBox {
+    AxisAlignedBox {
+        min: [
+            left.min[0].min(right.min[0]),
+            left.min[1].min(right.min[1]),
+            left.min[2].min(right.min[2]),
+        ],
+        max: [
+            left.max[0].max(right.max[0]),
+            left.max[1].max(right.max[1]),
+            left.max[2].max(right.max[2]),
+        ],
     }
 }
 
@@ -368,12 +473,52 @@ mod tests {
 
         let mut input = test_input();
         extract_vfx(&world, &mut input);
-        assert_eq!(input.drawables.len(), 2);
+        assert_eq!(input.drawables.len(), 1);
+        assert_eq!(input.particle_batches.len(), 1);
+        assert_eq!(input.particle_batches[0].instances.len(), 1);
         assert!(input.drawables.iter().all(|item| !item.cast_shadows));
-        assert!(input
-            .drawables
-            .iter()
-            .all(|item| item.mesh.id == BUILTIN_VFX_QUAD_MESH_ID));
+        assert_eq!(input.particle_batches[0].mesh.id, BUILTIN_VFX_QUAD_MESH_ID);
+    }
+
+    #[test]
+    fn drag_and_lifetime_color_reach_the_render_instance_deterministically() {
+        let mut world = World::new();
+        let entity = world.create_entity();
+        world.add_component(entity, Transform::default());
+        let mut emitter = ParticleEmitter {
+            enabled: false,
+            acceleration: Vec3::ZERO,
+            drag: 1.0,
+            start_size: 1.0,
+            end_size: 1.0,
+            start_color: [0, 20, 40, 255],
+            end_color: [200, 220, 240, 55],
+            ..ParticleEmitter::default()
+        };
+        emitter.particles_mut().push(Particle {
+            position: Vec3::ZERO,
+            velocity: Vec3::new(10.0, 0.0, 0.0),
+            age: 0.4,
+            lifetime: 1.0,
+            rotation: 0.0,
+            angular_velocity: 0.0,
+        });
+        world.add_component(entity, emitter);
+
+        update_vfx(&mut world, 0.1);
+        let expected_velocity = 10.0 * (-0.1_f32).exp();
+        let particle = &world.get::<ParticleEmitter>(entity).unwrap().particles()[0];
+        assert!((particle.velocity.x - expected_velocity).abs() < 1.0e-5);
+        assert!((particle.position.x - expected_velocity * 0.1).abs() < 1.0e-5);
+
+        // Disabled emitters keep simulating existing particles but do not
+        // extract or spawn. Re-enable to inspect the same deterministic state.
+        world.get_mut::<ParticleEmitter>(entity).unwrap().enabled = true;
+        let mut input = test_input();
+        extract_vfx(&world, &mut input);
+        let instance = &input.particle_batches[0].instances[0];
+        assert_eq!(instance.color, [100, 120, 140, 155]);
+        assert!((instance.normalized_age - 0.5).abs() < 1.0e-6);
     }
 
     #[test]
@@ -390,12 +535,54 @@ mod tests {
         update_vfx(&mut world, 0.01);
         emitter = world.get::<ParticleEmitter>(entity).unwrap().clone();
         assert_eq!(emitter.particles().len(), 1);
+        emitter.simulation_mode = ParticleSimulationMode::Gpu;
 
         let fields = serde::serialize_particle_emitter(&emitter);
         let decoded = serde::deserialize_particle_emitter(&fields);
         let decoded = decoded.downcast_ref::<ParticleEmitter>().unwrap();
         assert!(decoded.particles().is_empty());
         assert_eq!(decoded.burst_count, 1);
+        assert_eq!(decoded.simulation_mode, ParticleSimulationMode::Gpu);
+    }
+
+    #[test]
+    fn gpu_emitters_extract_analytic_batches_without_cpu_particles() {
+        let mut world = World::new();
+        let entity = world.create_entity();
+        world.add_component(
+            entity,
+            Transform {
+                translation: Vec3::new(2.0, 3.0, 4.0),
+                ..Transform::default()
+            },
+        );
+        world.add_component(
+            entity,
+            ParticleEmitter {
+                simulation_mode: ParticleSimulationMode::Gpu,
+                burst_count: 2,
+                emission_rate: 10.0,
+                lifetime_min: 2.0,
+                lifetime_max: 2.0,
+                ..ParticleEmitter::default()
+            },
+        );
+
+        update_vfx(&mut world, 0.1);
+        assert!(world
+            .get::<ParticleEmitter>(entity)
+            .unwrap()
+            .particles()
+            .is_empty());
+
+        let mut input = test_input();
+        extract_vfx(&world, &mut input);
+        assert_eq!(input.particle_batches.len(), 1);
+        let batch = &input.particle_batches[0];
+        assert!(batch.instances.is_empty());
+        let simulation = batch.gpu_simulation.expect("GPU simulation contract");
+        assert_eq!(simulation.origin, [2.0, 3.0, 4.0]);
+        assert_eq!(simulation.draw_range().1, 3);
     }
 
     #[test]

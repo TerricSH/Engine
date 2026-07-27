@@ -1,5 +1,10 @@
 # Engine
 
+Architecture boundaries and feature-gating rules are documented in
+[`docs/ENGINE_CORE_ARCHITECTURE.md`](docs/ENGINE_CORE_ARCHITECTURE.md).
+The JRPG rendering baseline and backend parity limits are documented in
+[`docs/RENDERING_ARCHITECTURE.md`](docs/RENDERING_ARCHITECTURE.md).
+
 This repository contains a Rust game engine, project player, editor, asset cooker, and Windows release pipeline. The supported workflow starts from a `game.project.json` and uses the `project`, `game`, or `editor` command families.
 
 ## Create and run a game
@@ -49,6 +54,10 @@ Turn-based tactical games additionally get a deterministic grid/cover/visibility
 domain, turn command queues, combat and utility-AI strategies, renderer-consistent
 pointer rays, data-driven Logic assets, and script checkpoint slots. See
 [`docs/TACTICAL_GAME_PLATFORM.md`](docs/TACTICAL_GAME_PLATFORM.md).
+Party-based JRPG projects additionally get progression, roster/inventory,
+ATB/command combat, status effects, encounters, quests, dialogue, localization,
+cutscene sequences, and typed script audio/animation helpers. See
+[`docs/JRPG_GAME_PLATFORM.md`](docs/JRPG_GAME_PLATFORM.md).
 
 The desktop/editor/scripting feature sets also enable the registered runtime
 UI, audio, animation, and navigation component and asset extensions. The normal
@@ -71,7 +80,7 @@ documented in
 [`docs/PHYSICS_DESTRUCTION.md`](docs/PHYSICS_DESTRUCTION.md).
 Skeletal ragdoll authoring, pose ownership, recovery, and persistence are
 documented in [`docs/RAGDOLLS.md`](docs/RAGDOLLS.md).
-Portable opaque, masked, blended, and double-sided material surfaces are
+Portable opaque, masked, alpha-blended, additive, and double-sided material surfaces are
 documented in [`docs/MATERIAL_SURFACES.md`](docs/MATERIAL_SURFACES.md).
 CPU particle emitters and mesh-based lifetime decals are documented in
 [`docs/VFX.md`](docs/VFX.md).
@@ -98,6 +107,8 @@ See [`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md),
 [`docs/VFX.md`](docs/VFX.md),
 [`docs/INTERACTION.md`](docs/INTERACTION.md),
 [`docs/TACTICAL_GAME_PLATFORM.md`](docs/TACTICAL_GAME_PLATFORM.md),
+[`docs/JRPG_GAME_PLATFORM.md`](docs/JRPG_GAME_PLATFORM.md),
+[`docs/RENDERING_ARCHITECTURE.md`](docs/RENDERING_ARCHITECTURE.md),
 [`docs/HL2_READINESS.md`](docs/HL2_READINESS.md),
 [`docs/CI_RELEASE_GATES.md`](docs/CI_RELEASE_GATES.md), and
 [`docs/RELEASE_PACKAGING.md`](docs/RELEASE_PACKAGING.md) for details.

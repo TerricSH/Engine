@@ -16,10 +16,40 @@ use super::{write_cooked_artifact, AssetType, CookResult, CookedArtifact};
 pub const MATERIAL_SOURCE_SCHEMA: &str = "MaterialSource-v0";
 
 /// Payload schema written into every cooked material artifact.
-pub const COOKED_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 4, 0);
+pub const COOKED_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 6, 0);
 const LEGACY_COOKED_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 1, 0);
 const LEGACY_SURFACE_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 2, 0);
 const LEGACY_EMISSIVE_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 3, 0);
+const LEGACY_TEXTURE_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 4, 0);
+const LEGACY_ADVANCED_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 5, 0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdvancedMaterialSource {
+    pub clearcoat: f32,
+    pub clearcoat_roughness: f32,
+    pub subsurface: f32,
+    pub subsurface_color: [f32; 3],
+    pub anisotropy: f32,
+    pub sheen_color: [f32; 3],
+    pub rim_color: [f32; 3],
+    pub rim_power: f32,
+}
+
+impl Default for AdvancedMaterialSource {
+    fn default() -> Self {
+        Self {
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.2,
+            subsurface: 0.0,
+            subsurface_color: [1.0, 0.35, 0.25],
+            anisotropy: 0.0,
+            sheen_color: [0.0; 3],
+            rim_color: [0.0; 3],
+            rim_power: 3.0,
+        }
+    }
+}
 
 /// Human-readable source representation of a portable material.
 ///
@@ -45,6 +75,8 @@ pub struct MaterialSource {
     pub occlusion_texture: Option<String>,
     #[serde(default)]
     pub emissive_texture: Option<String>,
+    #[serde(default)]
+    pub advanced: AdvancedMaterialSource,
     pub transparency: String,
     #[serde(default = "default_alpha_cutoff")]
     pub alpha_cutoff: f32,
@@ -60,6 +92,7 @@ pub enum MaterialTransparency {
     Opaque,
     Masked { cutoff: f32 },
     Blend,
+    Additive,
 }
 
 /// Validated, authoring-independent material payload used at runtime.
@@ -75,6 +108,7 @@ pub struct CookedMaterial {
     pub metallic_roughness_texture: Option<AssetId>,
     pub occlusion_texture: Option<AssetId>,
     pub emissive_texture: Option<AssetId>,
+    pub advanced: AdvancedMaterialSource,
     pub transparency: MaterialTransparency,
     pub double_sided: bool,
 }
@@ -98,6 +132,22 @@ struct LegacyEmissiveCookedMaterial {
     ambient_occlusion: f32,
     emissive: [f32; 3],
     base_color_texture: Option<AssetId>,
+    transparency: MaterialTransparency,
+    double_sided: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+struct LegacyTextureCookedMaterial {
+    base_color: [f32; 4],
+    metallic: f32,
+    roughness: f32,
+    ambient_occlusion: f32,
+    emissive: [f32; 3],
+    base_color_texture: Option<AssetId>,
+    normal_texture: Option<AssetId>,
+    metallic_roughness_texture: Option<AssetId>,
+    occlusion_texture: Option<AssetId>,
+    emissive_texture: Option<AssetId>,
     transparency: MaterialTransparency,
     double_sided: bool,
 }
@@ -141,6 +191,40 @@ impl MaterialSource {
         for (index, value) in self.emissive.iter().copied().enumerate() {
             validate_unit_value(&format!("emissive[{index}]"), value)?;
         }
+        for (field, value) in [
+            ("advanced.clearcoat", self.advanced.clearcoat),
+            (
+                "advanced.clearcoat_roughness",
+                self.advanced.clearcoat_roughness,
+            ),
+            ("advanced.subsurface", self.advanced.subsurface),
+        ] {
+            validate_unit_value(field, value)?;
+        }
+        for (field, values) in [
+            ("advanced.subsurface_color", self.advanced.subsurface_color),
+            ("advanced.sheen_color", self.advanced.sheen_color),
+            ("advanced.rim_color", self.advanced.rim_color),
+        ] {
+            for (index, value) in values.into_iter().enumerate() {
+                validate_unit_value(&format!("{field}[{index}]"), value)?;
+            }
+        }
+        if !self.advanced.anisotropy.is_finite()
+            || !(-1.0..=1.0).contains(&self.advanced.anisotropy)
+        {
+            return Err(CookError::InvalidAsset(
+                "material field 'advanced.anisotropy' must be finite and in the range -1..=1"
+                    .into(),
+            ));
+        }
+        if !self.advanced.rim_power.is_finite() || !(0.01..=32.0).contains(&self.advanced.rim_power)
+        {
+            return Err(CookError::InvalidAsset(
+                "material field 'advanced.rim_power' must be finite and in the range 0.01..=32"
+                    .into(),
+            ));
+        }
 
         validate_unit_value("alpha_cutoff", self.alpha_cutoff)?;
         let transparency = match self.transparency.as_str() {
@@ -149,9 +233,10 @@ impl MaterialSource {
                 cutoff: self.alpha_cutoff,
             },
             "Blend" => MaterialTransparency::Blend,
+            "Additive" => MaterialTransparency::Additive,
             value => {
                 return Err(CookError::UnsupportedFormat(format!(
-                    "material transparency '{value}' is not supported; expected 'Opaque', 'Masked', or 'Blend'"
+                    "material transparency '{value}' is not supported; expected 'Opaque', 'Masked', 'Blend', or 'Additive'"
                 )));
             }
         };
@@ -185,6 +270,7 @@ impl MaterialSource {
             metallic_roughness_texture,
             occlusion_texture,
             emissive_texture,
+            advanced: self.advanced,
             transparency,
             double_sided: self.double_sided,
         })
@@ -240,11 +326,13 @@ pub fn decode_cooked_material(artifact: &CookedArtifact) -> Result<CookedMateria
     if artifact.header.schema_version != COOKED_MATERIAL_SCHEMA_VERSION
         && artifact.header.schema_version != LEGACY_SURFACE_MATERIAL_SCHEMA_VERSION
         && artifact.header.schema_version != LEGACY_EMISSIVE_MATERIAL_SCHEMA_VERSION
+        && artifact.header.schema_version != LEGACY_TEXTURE_MATERIAL_SCHEMA_VERSION
+        && artifact.header.schema_version != LEGACY_ADVANCED_MATERIAL_SCHEMA_VERSION
         && artifact.header.schema_version != LEGACY_COOKED_MATERIAL_SCHEMA_VERSION
     {
         let actual = artifact.header.schema_version;
         return Err(CookError::UnsupportedFormat(format!(
-            "cooked material schema {}.{}.{} is not supported; expected {}.{}.{} or legacy 0.1.0/0.2.0/0.3.0",
+            "cooked material schema {}.{}.{} is not supported; expected {}.{}.{} or legacy 0.1.0/0.2.0/0.3.0/0.4.0/0.5.0",
             actual.major,
             actual.minor,
             actual.patch,
@@ -254,9 +342,31 @@ pub fn decode_cooked_material(artifact: &CookedArtifact) -> Result<CookedMateria
         )));
     }
 
-    if artifact.header.schema_version == COOKED_MATERIAL_SCHEMA_VERSION {
+    if artifact.header.schema_version == COOKED_MATERIAL_SCHEMA_VERSION
+        || artifact.header.schema_version == LEGACY_ADVANCED_MATERIAL_SCHEMA_VERSION
+    {
         bincode::deserialize(&artifact.payload).map_err(|error| {
             CookError::InvalidAsset(format!("invalid cooked material payload: {error}"))
+        })
+    } else if artifact.header.schema_version == LEGACY_TEXTURE_MATERIAL_SCHEMA_VERSION {
+        let legacy: LegacyTextureCookedMaterial =
+            bincode::deserialize(&artifact.payload).map_err(|error| {
+                CookError::InvalidAsset(format!("invalid legacy texture material payload: {error}"))
+            })?;
+        Ok(CookedMaterial {
+            base_color: legacy.base_color,
+            metallic: legacy.metallic,
+            roughness: legacy.roughness,
+            ambient_occlusion: legacy.ambient_occlusion,
+            emissive: legacy.emissive,
+            base_color_texture: legacy.base_color_texture,
+            normal_texture: legacy.normal_texture,
+            metallic_roughness_texture: legacy.metallic_roughness_texture,
+            occlusion_texture: legacy.occlusion_texture,
+            emissive_texture: legacy.emissive_texture,
+            advanced: AdvancedMaterialSource::default(),
+            transparency: legacy.transparency,
+            double_sided: legacy.double_sided,
         })
     } else if artifact.header.schema_version == LEGACY_EMISSIVE_MATERIAL_SCHEMA_VERSION {
         let legacy: LegacyEmissiveCookedMaterial = bincode::deserialize(&artifact.payload)
@@ -274,6 +384,7 @@ pub fn decode_cooked_material(artifact: &CookedArtifact) -> Result<CookedMateria
             metallic_roughness_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            advanced: AdvancedMaterialSource::default(),
             transparency: legacy.transparency,
             double_sided: legacy.double_sided,
         })
@@ -293,6 +404,7 @@ pub fn decode_cooked_material(artifact: &CookedArtifact) -> Result<CookedMateria
             metallic_roughness_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            advanced: AdvancedMaterialSource::default(),
             transparency: legacy.transparency,
             double_sided: legacy.double_sided,
         })
@@ -349,7 +461,7 @@ mod tests {
         let material = decode_cooked_material(&artifact).unwrap();
 
         assert_eq!(artifact.header.asset_kind, 5);
-        assert_eq!(artifact.header.schema_version, SchemaVersion::new(0, 4, 0));
+        assert_eq!(artifact.header.schema_version, SchemaVersion::new(0, 6, 0));
         assert_eq!(material.base_color, [0.8, 0.7, 0.6, 1.0]);
         assert_eq!(
             material.base_color_texture,
@@ -430,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn cooks_masked_blended_and_double_sided_sources() {
+    fn cooks_masked_blended_additive_and_double_sided_sources() {
         let masked: MaterialSource = serde_json::from_value(source_json(
             serde_json::json!({"transparency": "Masked", "alpha_cutoff": 0.37}),
         ))
@@ -447,12 +559,20 @@ mod tests {
         let blended = blended.into_cooked().unwrap();
         assert_eq!(blended.transparency, MaterialTransparency::Blend);
         assert!(blended.double_sided);
+
+        let additive: MaterialSource =
+            serde_json::from_value(source_json(serde_json::json!({"transparency": "Additive"})))
+                .unwrap();
+        assert_eq!(
+            additive.into_cooked().unwrap().transparency,
+            MaterialTransparency::Additive
+        );
     }
 
     #[test]
     fn rejects_unknown_transparency_and_invalid_cutoff() {
         let unknown: MaterialSource =
-            serde_json::from_value(source_json(serde_json::json!({"transparency": "Additive"})))
+            serde_json::from_value(source_json(serde_json::json!({"transparency": "Refract"})))
                 .unwrap();
         assert!(matches!(
             unknown.into_cooked(),
@@ -530,10 +650,25 @@ mod tests {
             metallic_roughness_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            advanced: AdvancedMaterialSource::default(),
             transparency: MaterialTransparency::Opaque,
             double_sided: false,
         };
         let payload = bincode::serialize(&material).unwrap();
+        let advanced_legacy = dir.join("legacy-advanced.cooked");
+        write_cooked_artifact(
+            &advanced_legacy,
+            AssetType::Material.kind_code(),
+            &payload,
+            LEGACY_ADVANCED_MATERIAL_SCHEMA_VERSION,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_cooked_material(&read_cooked_artifact(&advanced_legacy).unwrap())
+                .unwrap()
+                .advanced,
+            AdvancedMaterialSource::default()
+        );
 
         let wrong_kind = dir.join("wrong-kind.cooked");
         write_cooked_artifact(

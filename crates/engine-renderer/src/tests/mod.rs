@@ -1,16 +1,18 @@
 use super::{
     validate_frame_input, AssetId, AxisAlignedBox, BackendRenderer, BlendMode, BonePaletteLayout,
-    ClearFlags, Diagnostic, DiagnosticSeverity, FrameStats, IndexFormat, LightItem, LightKind,
-    MaterialUpload, MeshUpload, MeshVertexFormat, PassGraphOutputMode, RenderFrameInput,
-    RenderView, Renderer, ResourceKind, ResourceRemoval, SamplerDescriptor, ShadowMode,
-    SkinnedItem, TextureMipLevel, TextureUpload, TextureUploadFormat, ToneMapping, Transparency,
-    UploadReceipt, ViewCompose, DIAG_ABORT_UNSUPPORTED, DIAG_BACKEND_MISSING,
-    DIAG_BARRIERS_UNSUPPORTED, DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED, DIAG_INVALID_MATERIAL_VALUES,
-    DIAG_INVALID_MESH_VERTICES, DIAG_INVALID_TEXTURE_MIPS, DIAG_MATERIAL_UPLOAD_UNSUPPORTED,
-    DIAG_MESH_UPLOAD_UNSUPPORTED, DIAG_TEXTURE_UPLOAD_UNSUPPORTED, IDENTITY_MAT4,
+    ClearFlags, Diagnostic, DiagnosticSeverity, EnvironmentCubeMip, EnvironmentMapFormat,
+    EnvironmentMapUpload, FrameStats, IndexFormat, LightItem, LightKind, MaterialUpload,
+    MeshUpload, MeshVertexFormat, PassGraphOutputMode, RenderFrameInput, RenderView, Renderer,
+    ResourceKind, ResourceRemoval, SamplerDescriptor, ShadowMode, SkinnedItem, TextureMipLevel,
+    TextureUpload, TextureUploadFormat, ToneMapping, Transparency, UploadReceipt, ViewCompose,
+    DIAG_ABORT_UNSUPPORTED, DIAG_BACKEND_MISSING, DIAG_BARRIERS_UNSUPPORTED,
+    DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED, DIAG_INVALID_ENVIRONMENT_MAP,
+    DIAG_INVALID_MATERIAL_VALUES, DIAG_INVALID_MESH_VERTICES, DIAG_INVALID_MORPH_TARGET_SET,
+    DIAG_INVALID_TEXTURE_MIPS, DIAG_MATERIAL_UPLOAD_UNSUPPORTED, DIAG_MESH_UPLOAD_UNSUPPORTED,
+    DIAG_TEXTURE_UPLOAD_UNSUPPORTED, IDENTITY_MAT4,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct NullBackend;
@@ -106,6 +108,18 @@ fn valid_frame_with_view_succeeds() {
     assert!(renderer.draw_scene(&input).is_ok());
 }
 
+#[test]
+fn weighted_oit_fails_closed_on_an_unsupported_backend() {
+    let mut input = valid_frame();
+    input.render_options.transparency_mode = crate::TransparencyMode::WeightedBlendedOit;
+    let diagnostics = Renderer::new_with_backend(Box::<NullBackend>::default())
+        .draw_scene(&input)
+        .unwrap_err();
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "RV0144"));
+}
+
 struct GraphCountingBackend {
     begin_calls: Arc<AtomicUsize>,
     pass_calls: Arc<AtomicUsize>,
@@ -183,6 +197,38 @@ fn non_finite_exposure_override_is_rejected_before_backend_execution() {
         diagnostic.code == "RV0022"
             && diagnostic.path.as_deref() == Some("render_options.exposure_ev100")
     }));
+}
+
+#[test]
+fn invalid_post_process_parameters_are_rejected_before_backend_execution() {
+    let mut input = valid_frame();
+    input.render_options.post_process.bloom.radius = f32::NAN;
+
+    let diagnostics = validate_frame_input(&input);
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "RV0025"
+            && diagnostic.path.as_deref() == Some("render_options.post_process")
+    }));
+}
+
+#[test]
+fn malformed_environment_cubemap_is_rejected_before_backend_execution() {
+    let upload = EnvironmentMapUpload {
+        environment_id: AssetId::new("environment.test"),
+        format: EnvironmentMapFormat::Rgba16Float,
+        mip_levels: vec![EnvironmentCubeMip {
+            face_size: 2,
+            faces: vec![vec![0; 2 * 2 * 8]; 5],
+        }],
+        content_hash: [0; 32],
+    };
+
+    let diagnostics = Renderer::new().upload_environment_map(upload).unwrap_err();
+
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == DIAG_INVALID_ENVIRONMENT_MAP));
 }
 
 #[test]
@@ -308,6 +354,8 @@ fn validate_invalid_bone_palette_produces_rv0020() {
         skeleton: AssetId::new("skeleton.humanoid"),
         bone_palette: vec![IDENTITY_MAT4],
         bone_palette_layout: BonePaletteLayout::Full4x4 { count: 2 },
+        morph_target_set: None,
+        morph_weights: Vec::new(),
         world_transform: IDENTITY_MAT4,
         bounds: AxisAlignedBox::UNIT,
         render_layer: "default".into(),
@@ -638,6 +686,116 @@ fn valid_frame() -> RenderFrameInput {
 }
 
 #[test]
+fn malformed_particle_batch_is_rejected() {
+    let mut input = valid_frame();
+    input.particle_batches.push(super::ParticleBatch {
+        emitter: None,
+        mesh: AssetId::new("mesh-vfx-quad"),
+        material: AssetId::new("material-vfx"),
+        instances: vec![super::ParticleInstance {
+            position: [0.0, f32::NAN, 0.0],
+            size: 1.0,
+            rotation_radians: 0.0,
+            normalized_age: 0.5,
+            color: [255; 4],
+        }],
+        gpu_simulation: None,
+        bounds: AxisAlignedBox::UNIT,
+        render_layer: "Transparent".into(),
+        sort_key: 0,
+    });
+
+    assert!(validate_frame_input(&input)
+        .iter()
+        .any(|diagnostic| diagnostic.code == "RV0028"));
+}
+
+struct ParticleFallbackCapture {
+    observation: Arc<Mutex<Option<(usize, bool)>>>,
+}
+
+impl BackendRenderer for ParticleFallbackCapture {
+    fn begin_frame(&mut self, input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        let batch = &input.particle_batches[0];
+        *self.observation.lock().unwrap() =
+            Some((batch.instances.len(), batch.gpu_simulation.is_some()));
+        Ok(())
+    }
+
+    fn apply_pass_barriers(
+        &mut self,
+        _input: &RenderFrameInput,
+        _pass: &super::render_graph2::PassNode,
+        _barriers: &[super::render_graph2::CompiledBarrier],
+    ) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+
+    fn execute_pass(
+        &mut self,
+        _input: &RenderFrameInput,
+        _pass: &super::render_graph2::PassNode,
+        _frame_stats: &mut FrameStats,
+    ) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+
+    fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+
+    fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
+        Ok(())
+    }
+}
+
+#[test]
+fn unsupported_backends_receive_deterministic_cpu_particle_fallback() {
+    let observation = Arc::new(Mutex::new(None));
+    let mut renderer = Renderer::new_with_backend(Box::new(ParticleFallbackCapture {
+        observation: Arc::clone(&observation),
+    }));
+    let mut input = valid_frame();
+    input.particle_batches.push(super::ParticleBatch {
+        emitter: None,
+        mesh: AssetId::new("mesh-vfx-quad"),
+        material: AssetId::new("material-vfx"),
+        instances: Vec::new(),
+        gpu_simulation: Some(super::GpuParticleSimulation {
+            origin: [0.0; 3],
+            elapsed: 1.0,
+            emission_duration: 0.0,
+            emission_rate: 4.0,
+            burst_count: 2,
+            max_particles: 32,
+            lifetime_min: 2.0,
+            lifetime_max: 2.0,
+            speed_min: 1.0,
+            speed_max: 1.0,
+            start_size: 1.0,
+            end_size: 0.0,
+            start_color: [255; 4],
+            end_color: [255, 255, 255, 0],
+            direction: [0.0, 1.0, 0.0],
+            spread_angle_radians: 0.2,
+            acceleration: [0.0, -1.0, 0.0],
+            drag: 0.1,
+            turbulence_strength: 0.0,
+            turbulence_frequency: 1.0,
+            angular_velocity_min: 0.0,
+            angular_velocity_max: 0.0,
+            seed: 7,
+        }),
+        bounds: AxisAlignedBox::UNIT,
+        render_layer: "Transparent".into(),
+        sort_key: 0,
+    });
+
+    renderer.draw_scene(&input).unwrap();
+    assert_eq!(*observation.lock().unwrap(), Some((6, false)));
+}
+
+#[test]
 fn render_graph_requires_all_terminal_passes() {
     let mut input = valid_frame();
     input
@@ -674,6 +832,25 @@ fn render_graph_allows_direct_to_swapchain_without_tone_map() {
         )),
         "direct-to-swapchain graph should be valid when tone mapping is disabled: {diagnostics:?}"
     );
+}
+
+#[test]
+fn direct_to_swapchain_rejects_weighted_oit_without_resolve_pass() {
+    let mut input = valid_frame();
+    input.render_options.tone_mapping = ToneMapping::None;
+    input.render_options.transparency_mode = crate::TransparencyMode::WeightedBlendedOit;
+    input.render_options.pass_graph_config.output_mode = PassGraphOutputMode::DirectToSwapchain;
+    input
+        .render_options
+        .pass_graph_config
+        .passes
+        .retain(|pass| pass.kind != "ToneMap");
+
+    let diagnostics = validate_frame_input(&input);
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "RV0061"
+            && diagnostic.path.as_deref() == Some("render_options.transparency_mode")
+    }));
 }
 
 #[test]
@@ -808,6 +985,7 @@ fn valid_material_upload() -> MaterialUpload {
         metallic_roughness_texture: None,
         occlusion_texture: None,
         emissive_texture: None,
+        advanced: super::AdvancedMaterialParameters::default(),
         transparency: Transparency::Opaque,
         double_sided: false,
         content_hash: [3; 32],
@@ -977,6 +1155,30 @@ fn invalid_uploads_never_enter_the_backend() {
     assert!(emissive_errors
         .iter()
         .any(|diagnostic| diagnostic.code == DIAG_INVALID_MATERIAL_VALUES));
+
+    let mut advanced_material = valid_material_upload();
+    advanced_material.advanced.anisotropy = 1.1;
+    let advanced_errors = renderer.upload_material(advanced_material).unwrap_err();
+    assert!(advanced_errors
+        .iter()
+        .any(|diagnostic| diagnostic.code == DIAG_INVALID_MATERIAL_VALUES));
+
+    let malformed_morph = super::MorphTargetSetUpload {
+        target_set_id: AssetId::new("morph.face"),
+        vertex_count: 2,
+        targets: vec![super::MorphTarget {
+            name: "smile".into(),
+            position_deltas: vec![[0.0; 3]],
+            normal_deltas: vec![[0.0; 3]],
+        }],
+        content_hash: [9; 32],
+    };
+    let morph_errors = renderer
+        .upload_morph_target_set(malformed_morph)
+        .unwrap_err();
+    assert!(morph_errors
+        .iter()
+        .any(|diagnostic| diagnostic.code == DIAG_INVALID_MORPH_TARGET_SET));
 
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

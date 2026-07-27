@@ -2,8 +2,10 @@
 
 mod bounds;
 mod camera;
+mod hlod_cluster;
 mod interactable;
 mod light;
+mod lod_group;
 mod name;
 mod renderable;
 mod transform;
@@ -13,6 +15,10 @@ pub use camera::{
     deserialize_camera, deserialize_camera_fields, serialize_camera, serialize_camera_fields,
     Camera, CameraProjection,
 };
+pub use hlod_cluster::{
+    deserialize_hlod_cluster, deserialize_hlod_cluster_fields, serialize_hlod_cluster,
+    serialize_hlod_cluster_fields, validate_hlod_cluster_fields, HlodCluster, HlodRole,
+};
 pub use interactable::{
     deserialize_interactable, deserialize_interactable_fields, serialize_interactable,
     serialize_interactable_fields, validate_interactable_fields, Interactable,
@@ -20,6 +26,10 @@ pub use interactable::{
 pub use light::{
     deserialize_light, deserialize_light_fields, serialize_light, serialize_light_fields, Light,
     LightKind,
+};
+pub use lod_group::{
+    deserialize_lod_group, deserialize_lod_group_fields, serialize_lod_group,
+    serialize_lod_group_fields, validate_lod_group_fields, LodGroup, LodLevel,
 };
 pub use name::Name;
 pub use renderable::Renderable;

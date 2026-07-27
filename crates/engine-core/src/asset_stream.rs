@@ -385,6 +385,16 @@ impl EngineRuntime {
                 "mesh",
                 self.additive_typed_plan(&upload.mesh_id, upload),
             ),
+            DecodedCookedAsset::EnvironmentMap(upload) => (
+                &upload.environment_id,
+                "environment map",
+                self.additive_typed_plan(&upload.environment_id, upload),
+            ),
+            DecodedCookedAsset::MorphTargetSet(upload) => (
+                &upload.target_set_id,
+                "morph target set",
+                self.additive_typed_plan(&upload.target_set_id, upload),
+            ),
             DecodedCookedAsset::Extension(extension) => (
                 &extension.id,
                 extension.type_id.as_str(),

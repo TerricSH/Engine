@@ -10,7 +10,19 @@ default = []
 backend-vulkan = ["dep:render-vulkan", "engine-core/backend-vulkan"]
 backend-opengl = ["dep:render-opengl"]
 backend-dx12 = ["dep:render-dx12"]
-runtime-subsystems = ["engine-core/runtime-subsystems", "dep:engine-ui"]
+subsystem-animation = ["engine-core/subsystem-animation"]
+subsystem-audio = ["engine-core/subsystem-audio"]
+subsystem-navigation = ["engine-core/subsystem-navigation"]
+subsystem-ui = ["engine-core/subsystem-ui", "dep:engine-ui"]
+subsystem-physics = ["engine-core/subsystem-physics"]
+subsystem-gameplay = ["engine-core/subsystem-gameplay"]
+subsystem-terrain = ["engine-core/subsystem-terrain", "dep:engine-terrain"]
+runtime-subsystems = [
+    "subsystem-animation",
+    "subsystem-audio",
+    "subsystem-navigation",
+    "subsystem-ui",
+]
 runtime-audio-output = ["engine-core/runtime-audio-output"]
 tooling-editor = [
     "engine-editor/tooling-editor",
@@ -20,18 +32,18 @@ tooling-editor = [
     "runtime-subsystems",
     "terrain",
 ]
-terrain = ["engine-core/terrain", "dep:engine-terrain"]
+terrain = ["subsystem-terrain"]
 target-desktop = [
-    "engine-core/gameplay",
+    "subsystem-physics",
+    "subsystem-gameplay",
     "runtime-subsystems",
     "runtime-audio-output",
 ]
 target-mobile = []
 subsystem-scripting-csharp = [
     "engine-core/subsystem-scripting-csharp",
-    "engine-core/gameplay",
+    "subsystem-gameplay",
     "dep:engine-script",
-    "runtime-subsystems",
 ]
 
 [dependencies]

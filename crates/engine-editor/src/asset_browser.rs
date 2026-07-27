@@ -11,7 +11,9 @@ use crate::commands::SetComponentField;
 use engine_asset::cook::manifest::CURRENT_MANIFEST_VERSION;
 use engine_asset::cook::{AssetType, SourceManifest};
 use engine_asset::{validate_asset_id, AssetRegistry};
-use engine_renderer::{MaterialUpload, MeshUpload, TextureUpload};
+use engine_renderer::{
+    EnvironmentMapUpload, MaterialUpload, MeshUpload, MorphTargetSetUpload, TextureUpload,
+};
 use engine_serialize::{AssetId, PersistentId, SchemaVersion, Value};
 use thiserror::Error;
 
@@ -35,6 +37,8 @@ pub enum AssetKind {
     NavMesh,
     Logic,
     Prefab,
+    EnvironmentMap,
+    MorphTargetSet,
     Unknown,
 }
 
@@ -55,6 +59,8 @@ impl AssetKind {
             Self::NavMesh => "NavMesh",
             Self::Logic => "Logic",
             Self::Prefab => "Prefab",
+            Self::EnvironmentMap => "Environment Map",
+            Self::MorphTargetSet => "Morph Targets",
             Self::Unknown => "Unknown",
         }
     }
@@ -77,6 +83,8 @@ impl From<&AssetType> for AssetKind {
             AssetType::NavMesh => Self::NavMesh,
             AssetType::Logic => Self::Logic,
             AssetType::Prefab => Self::Prefab,
+            AssetType::EnvironmentMap => Self::EnvironmentMap,
+            AssetType::MorphTargetSet => Self::MorphTargetSet,
             AssetType::Unknown => Self::Unknown,
         }
     }
@@ -101,12 +109,14 @@ pub enum AssetKindFilter {
     NavMesh,
     Logic,
     Prefab,
+    EnvironmentMap,
+    MorphTargetSet,
     Unknown,
 }
 
 impl AssetKindFilter {
     /// Every concrete filter in stable editor-menu order.
-    pub const ALL_KINDS: [Self; 15] = [
+    pub const ALL_KINDS: [Self; 17] = [
         Self::Mesh,
         Self::Texture,
         Self::Shader,
@@ -121,6 +131,8 @@ impl AssetKindFilter {
         Self::NavMesh,
         Self::Logic,
         Self::Prefab,
+        Self::EnvironmentMap,
+        Self::MorphTargetSet,
         Self::Unknown,
     ];
 
@@ -141,6 +153,8 @@ impl AssetKindFilter {
             Self::NavMesh => "NavMesh",
             Self::Logic => "Logic",
             Self::Prefab => "Prefab",
+            Self::EnvironmentMap => "Environment Map",
+            Self::MorphTargetSet => "Morph Targets",
             Self::Unknown => "Unknown",
         }
     }
@@ -162,6 +176,8 @@ impl AssetKindFilter {
             Self::NavMesh => matches!(kind, AssetKind::NavMesh),
             Self::Logic => matches!(kind, AssetKind::Logic),
             Self::Prefab => matches!(kind, AssetKind::Prefab),
+            Self::EnvironmentMap => matches!(kind, AssetKind::EnvironmentMap),
+            Self::MorphTargetSet => matches!(kind, AssetKind::MorphTargetSet),
             Self::Unknown => matches!(kind, AssetKind::Unknown),
         }
     }
@@ -843,6 +859,10 @@ fn registry_asset_kind(registry: &AssetRegistry, id: &AssetId) -> AssetKind {
         AssetKind::Material
     } else if registry.get::<TextureUpload>(id).is_some() {
         AssetKind::Texture
+    } else if registry.get::<EnvironmentMapUpload>(id).is_some() {
+        AssetKind::EnvironmentMap
+    } else if registry.get::<MorphTargetSetUpload>(id).is_some() {
+        AssetKind::MorphTargetSet
     } else {
         AssetKind::Unknown
     }
@@ -900,6 +920,8 @@ pub fn assignment_command(
         | AssetKind::NavMesh
         | AssetKind::Logic
         | AssetKind::Prefab
+        | AssetKind::EnvironmentMap
+        | AssetKind::MorphTargetSet
         | AssetKind::Unknown => return None,
     };
     Some(SetComponentField::new(
@@ -1030,6 +1052,7 @@ mod tests {
             metallic_roughness_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            advanced: engine_renderer::AdvancedMaterialParameters::default(),
             transparency: Transparency::Opaque,
             double_sided: false,
             content_hash: [3; 32],
@@ -1137,6 +1160,16 @@ mod tests {
                 AssetKindFilter::Prefab,
             ),
             (
+                AssetType::EnvironmentMap,
+                AssetKind::EnvironmentMap,
+                AssetKindFilter::EnvironmentMap,
+            ),
+            (
+                AssetType::MorphTargetSet,
+                AssetKind::MorphTargetSet,
+                AssetKindFilter::MorphTargetSet,
+            ),
+            (
                 AssetType::Unknown,
                 AssetKind::Unknown,
                 AssetKindFilter::Unknown,
@@ -1200,7 +1233,7 @@ mod tests {
         assert_eq!(panel.assets().len(), 1);
         assert_eq!(panel.assets()[0].kind, AssetKind::Audio);
         panel.set_current_folder("/");
-        panel.set_search_query("14.SOURCE");
+        panel.set_search_query("16.SOURCE");
         assert_eq!(panel.assets().len(), 1);
         assert_eq!(panel.assets()[0].kind, AssetKind::Unknown);
     }

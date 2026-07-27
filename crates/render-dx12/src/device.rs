@@ -635,7 +635,285 @@ impl Dx12Device {
                 format: TextureFormat::Rgba8Unorm,
                 width,
                 height,
-                state: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                state: std::sync::Arc::new(std::sync::Mutex::new(
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )),
+                sampled_srv_heap: Some(srv_heap),
+                sampled_sampler_heap: Some(sampler_heap),
+            });
+            let handle = Self::make_handle(&mut self.gen_texture, index);
+            Ok(TextureHandle::new(handle, self.gen_texture))
+        }
+    }
+
+    pub(crate) fn upload_sampled_rgba16f_cube(
+        &mut self,
+        mip_levels: &[engine_renderer::EnvironmentCubeMip],
+    ) -> Result<TextureHandle, RhiError> {
+        use std::mem::ManuallyDrop;
+
+        unsafe {
+            self.wait_idle();
+            let face_size = mip_levels.first().map(|mip| mip.face_size).ok_or_else(|| {
+                RhiError::InvalidDescriptor {
+                    field: "environment.mip_levels".into(),
+                    reason: "cubemap requires at least one mip".into(),
+                }
+            })?;
+            let mip_count = mip_levels.len() as u32;
+            let subresource_count = mip_count * 6;
+            let resource_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: face_size.into(),
+                Height: face_size,
+                DepthOrArraySize: 6,
+                MipLevels: mip_count as u16,
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAGS(0),
+            };
+            let default_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+                CreationNodeMask: 0,
+                VisibleNodeMask: 0,
+            };
+            let mut texture = None;
+            self.device
+                .CreateCommittedResource(
+                    &default_heap,
+                    D3D12_HEAP_FLAGS(0),
+                    &resource_desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: create HDR cubemap failed: {error}"),
+                })?;
+            let texture: ID3D12Resource = texture.ok_or_else(|| RhiError::Backend {
+                detail: "DX12: HDR cubemap creation returned null".into(),
+            })?;
+
+            let count = subresource_count as usize;
+            let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count];
+            let mut row_counts = vec![0_u32; count];
+            let mut row_sizes = vec![0_u64; count];
+            let mut upload_size = 0_u64;
+            self.device.GetCopyableFootprints(
+                &resource_desc,
+                0,
+                subresource_count,
+                0,
+                Some(layouts.as_mut_ptr()),
+                Some(row_counts.as_mut_ptr()),
+                Some(row_sizes.as_mut_ptr()),
+                Some(&mut upload_size),
+            );
+            let upload_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Alignment: 0,
+                Width: upload_size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAGS(0),
+            };
+            let upload_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+                CreationNodeMask: 0,
+                VisibleNodeMask: 0,
+            };
+            let mut upload = None;
+            self.device
+                .CreateCommittedResource(
+                    &upload_heap,
+                    D3D12_HEAP_FLAGS(0),
+                    &upload_desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut upload,
+                )
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: create HDR cubemap upload buffer failed: {error}"),
+                })?;
+            let upload: ID3D12Resource = upload.ok_or_else(|| RhiError::Backend {
+                detail: "DX12: HDR cubemap upload buffer creation returned null".into(),
+            })?;
+            let mut mapped = std::ptr::null_mut();
+            upload
+                .Map(0, None, Some(&mut mapped))
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: map HDR cubemap upload buffer failed: {error}"),
+                })?;
+            // D3D12 subresources are array-major: mip + face * mip_count.
+            for face_index in 0..6_usize {
+                for (mip_index, mip) in mip_levels.iter().enumerate() {
+                    let subresource = face_index * mip_levels.len() + mip_index;
+                    let layout = layouts[subresource];
+                    let face = &mip.faces[face_index];
+                    let source_row_bytes = mip.face_size as usize * 8;
+                    for row in 0..mip.face_size as usize {
+                        std::ptr::copy_nonoverlapping(
+                            face.as_ptr().add(row * source_row_bytes),
+                            (mapped as *mut u8).add(
+                                layout.Offset as usize + row * layout.Footprint.RowPitch as usize,
+                            ),
+                            source_row_bytes,
+                        );
+                    }
+                }
+            }
+            upload.Unmap(0, None);
+
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: create HDR upload allocator failed: {error}"),
+                })?;
+            let command_list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: create HDR upload command list failed: {error}"),
+                })?;
+            Self::transition_resource(
+                &command_list,
+                &texture,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            for (subresource, layout) in layouts.iter().copied().enumerate() {
+                let mut destination = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(texture.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: subresource as u32,
+                    },
+                };
+                let mut source = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: ManuallyDrop::new(Some(upload.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: layout,
+                    },
+                };
+                command_list.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+                ManuallyDrop::drop(&mut destination.pResource);
+                ManuallyDrop::drop(&mut source.pResource);
+            }
+            Self::transition_resource(
+                &command_list,
+                &texture,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            );
+            command_list.Close().map_err(|error| RhiError::Backend {
+                detail: format!("DX12: close HDR upload command list failed: {error}"),
+            })?;
+            let executable: ID3D12CommandList =
+                command_list.cast().map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: cast HDR upload command list failed: {error}"),
+                })?;
+            self.queue.ExecuteCommandLists(&[Some(executable)]);
+            let signal_value =
+                self.fence_value
+                    .checked_add(1)
+                    .ok_or_else(|| RhiError::Backend {
+                        detail: "DX12: fence value overflow during HDR cubemap upload".into(),
+                    })?;
+            self.queue
+                .Signal(&self.fence, signal_value)
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: signal HDR cubemap upload failed: {error}"),
+                })?;
+            self.fence_value = signal_value;
+            if self.fence.GetCompletedValue() < signal_value {
+                self.fence
+                    .SetEventOnCompletion(signal_value, self.fence_event)
+                    .map_err(|error| RhiError::Backend {
+                        detail: format!("DX12: wait for HDR cubemap upload failed: {error}"),
+                    })?;
+                WaitForSingleObject(self.fence_event, u32::MAX);
+            }
+
+            let srv_heap: ID3D12DescriptorHeap = self
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: create HDR cubemap SRV heap failed: {error}"),
+                })?;
+            let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    TextureCube: D3D12_TEXCUBE_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: mip_count,
+                        ResourceMinLODClamp: 0.0,
+                    },
+                },
+            };
+            self.device.CreateShaderResourceView(
+                &texture,
+                Some(&srv_desc),
+                srv_heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            let sampler_heap: ID3D12DescriptorHeap = self
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .map_err(|error| RhiError::Backend {
+                    detail: format!("DX12: create HDR cubemap sampler heap failed: {error}"),
+                })?;
+            self.device.CreateSampler(
+                &D3D12_SAMPLER_DESC {
+                    Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                    AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                    MipLODBias: 0.0,
+                    MaxAnisotropy: 1,
+                    ComparisonFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                    BorderColor: [0.0; 4],
+                    MinLOD: 0.0,
+                    MaxLOD: f32::MAX,
+                },
+                sampler_heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            let index = self.textures.insert(Dx12TextureInner {
+                resource: texture,
+                format: TextureFormat::Rgba16Float,
+                width: face_size,
+                height: face_size,
+                state: std::sync::Arc::new(std::sync::Mutex::new(
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )),
                 sampled_srv_heap: Some(srv_heap),
                 sampled_sampler_heap: Some(sampler_heap),
             });
@@ -1201,7 +1479,7 @@ impl Device for Dx12Device {
                 format: descriptor.format,
                 width: descriptor.width,
                 height: descriptor.height,
-                state,
+                state: std::sync::Arc::new(std::sync::Mutex::new(state)),
                 sampled_srv_heap,
                 sampled_sampler_heap,
             });
@@ -1289,6 +1567,8 @@ impl Device for Dx12Device {
             }
 
             let mut color_resources = Vec::with_capacity(descriptor.color_attachments.len());
+            let mut color_states = Vec::with_capacity(descriptor.color_attachments.len());
+            let mut color_is_sampled = Vec::with_capacity(descriptor.color_attachments.len());
             for attachment in &descriptor.color_attachments {
                 let (_, texture_index) = Self::decode_handle(attachment.index);
                 let texture = self
@@ -1296,6 +1576,8 @@ impl Device for Dx12Device {
                     .get(texture_index)
                     .ok_or(RhiError::InvalidHandle)?;
                 color_resources.push(texture.resource.clone());
+                color_states.push(texture.state.clone());
+                color_is_sampled.push(texture.sampled_srv_heap.is_some());
             }
             let rtv_heap: Option<ID3D12DescriptorHeap> = if color_resources.is_empty() {
                 None
@@ -1383,6 +1665,8 @@ impl Device for Dx12Device {
                 rtv_descriptors,
                 dsv_descriptor,
                 color_resources,
+                color_states,
+                color_is_sampled,
                 depth_resource,
                 depth_is_sampled,
                 width: descriptor.width,
@@ -1447,10 +1731,15 @@ impl Device for Dx12Device {
                             (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1)
                         }
                         "sampled_texture_pair" => (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2),
+                        "sampled_texture_triple" => (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3),
                         "sampled_texture_set" => (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6),
+                        "sampled_texture_set7" => (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7),
+                        "scene_resource_set" => (D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 11),
                         "sampler" => (D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1),
                         "sampler_pair" => (D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 2),
+                        "sampler_triple" => (D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 3),
                         "sampler_set" => (D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 6),
+                        "sampler_set7" => (D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 7),
                         "uniform_buffer" => {
                             uniform_bindings.push((binding.binding, u32::from(layout.set_index)));
                             continue;
@@ -1515,7 +1804,11 @@ impl Device for Dx12Device {
                             pDescriptorRanges: descriptor_ranges.as_ptr().add(range_index),
                         },
                     },
-                    ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                    ShaderVisibility: if range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV {
+                        D3D12_SHADER_VISIBILITY_ALL
+                    } else {
+                        D3D12_SHADER_VISIBILITY_PIXEL
+                    },
                 });
             }
             for (shader_register, register_space) in uniform_bindings {
@@ -1628,16 +1921,21 @@ impl Device for Dx12Device {
                 .zip(&semantic_names)
                 .map(|(attr, semantic)| {
                     let fmt = Self::attribute_format_to_dxgi(&attr.format);
+                    let per_instance = attr.semantic.starts_with("INSTANCE_");
                     D3D12_INPUT_ELEMENT_DESC {
                         SemanticName: windows::core::PCSTR::from_raw(
                             semantic.as_ptr().cast::<u8>(),
                         ),
                         SemanticIndex: 0,
                         Format: fmt,
-                        InputSlot: 0,
+                        InputSlot: u32::from(per_instance),
                         AlignedByteOffset: attr.offset_bytes,
-                        InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                        InstanceDataStepRate: 0,
+                        InputSlotClass: if per_instance {
+                            D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                        } else {
+                            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+                        },
+                        InstanceDataStepRate: u32::from(per_instance),
                     }
                 })
                 .collect();
@@ -1721,15 +2019,14 @@ impl Device for Dx12Device {
             };
 
             // Build PSO description
+            let blend_mode = descriptor
+                .blend_state
+                .mode
+                .as_deref()
+                .unwrap_or("opaque")
+                .to_ascii_lowercase();
             let (blend_enabled, source_color, destination_color, source_alpha, destination_alpha) =
-                match descriptor
-                    .blend_state
-                    .mode
-                    .as_deref()
-                    .unwrap_or("opaque")
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
+                match blend_mode.as_str() {
                     "alpha" => (
                         true,
                         D3D12_BLEND_SRC_ALPHA,
@@ -1771,6 +2068,31 @@ impl Device for Dx12Device {
                 LogicOp: D3D12_LOGIC_OP_NOOP,
                 RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
             };
+            let disabled_blend_target = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: FALSE,
+                LogicOpEnable: FALSE,
+                SrcBlend: D3D12_BLEND_ONE,
+                DestBlend: D3D12_BLEND_ZERO,
+                BlendOp: D3D12_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D12_BLEND_ONE,
+                DestBlendAlpha: D3D12_BLEND_ZERO,
+                BlendOpAlpha: D3D12_BLEND_OP_ADD,
+                LogicOp: D3D12_LOGIC_OP_NOOP,
+                RenderTargetWriteMask: 0,
+            };
+            let additive_blend_target = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: TRUE,
+                LogicOpEnable: FALSE,
+                SrcBlend: D3D12_BLEND_ONE,
+                DestBlend: D3D12_BLEND_ONE,
+                BlendOp: D3D12_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D12_BLEND_ONE,
+                DestBlendAlpha: D3D12_BLEND_ONE,
+                BlendOpAlpha: D3D12_BLEND_OP_ADD,
+                LogicOp: D3D12_LOGIC_OP_NOOP,
+                RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            let weighted_oit = blend_mode == "weighted_oit";
             let pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::ManuallyDrop::new(Some(root_sig)),
                 VS: if !vs_bytecode.is_empty() {
@@ -1810,10 +2132,19 @@ impl Device for Dx12Device {
                 StreamOutput: D3D12_STREAM_OUTPUT_DESC::default(),
                 BlendState: D3D12_BLEND_DESC {
                     AlphaToCoverageEnable: FALSE,
-                    IndependentBlendEnable: FALSE,
+                    IndependentBlendEnable: BOOL::from(weighted_oit || rt_formats.len() > 1),
                     RenderTarget: {
                         let mut arr: [D3D12_RENDER_TARGET_BLEND_DESC; 8] = std::mem::zeroed();
-                        arr[0] = blend_target;
+                        if weighted_oit {
+                            arr[0] = disabled_blend_target;
+                            arr[1] = additive_blend_target;
+                            arr[2] = additive_blend_target;
+                        } else {
+                            arr[0] = blend_target;
+                            for target in arr.iter_mut().take(rt_formats.len()).skip(1) {
+                                *target = disabled_blend_target;
+                            }
+                        }
                         arr
                     },
                 },
@@ -2206,6 +2537,7 @@ impl Dx12Device {
             "float2" | "float32x2" => DXGI_FORMAT_R32G32_FLOAT,
             "float4" | "float32x4" => DXGI_FORMAT_R32G32B32A32_FLOAT,
             "uint4" | "uint32x4" => DXGI_FORMAT_R32G32B32A32_UINT,
+            "uint" | "uint32" => DXGI_FORMAT_R32_UINT,
             "float" | "float32" => DXGI_FORMAT_R32_FLOAT,
             "unorm8x4" | "rgba8" => DXGI_FORMAT_R8G8B8A8_UNORM,
             "unorm8x3" | "rgb8" => DXGI_FORMAT_R8G8B8A8_UNORM,

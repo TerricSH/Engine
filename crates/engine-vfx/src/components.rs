@@ -17,10 +17,22 @@ pub struct Particle {
     pub angular_velocity: f32,
 }
 
-/// Scene-authored CPU particle emitter rendered as camera-facing quads.
+/// Selects where particle positions are evaluated. GPU mode is analytic and
+/// automatically expands through the same deterministic CPU model on a
+/// backend that does not support GPU particle simulation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticleSimulationMode {
+    #[default]
+    Cpu,
+    Gpu,
+}
+
+/// Scene-authored particle emitter rendered as camera-facing quads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParticleEmitter {
     pub enabled: bool,
+    pub simulation_mode: ParticleSimulationMode,
     pub looping: bool,
     pub duration: f32,
     pub emission_rate: f32,
@@ -32,9 +44,16 @@ pub struct ParticleEmitter {
     pub speed_max: f32,
     pub start_size: f32,
     pub end_size: f32,
+    pub start_color: [u8; 4],
+    pub end_color: [u8; 4],
     pub direction: Vec3,
     pub spread_angle_radians: f32,
     pub acceleration: Vec3,
+    /// Exponential velocity damping per second.
+    pub drag: f32,
+    /// Deterministic world-space turbulence acceleration.
+    pub turbulence_strength: f32,
+    pub turbulence_frequency: f32,
     pub angular_velocity_min: f32,
     pub angular_velocity_max: f32,
     pub mesh_asset: String,
@@ -51,6 +70,7 @@ impl Default for ParticleEmitter {
     fn default() -> Self {
         Self {
             enabled: true,
+            simulation_mode: ParticleSimulationMode::Cpu,
             looping: true,
             duration: 5.0,
             emission_rate: 12.0,
@@ -62,9 +82,14 @@ impl Default for ParticleEmitter {
             speed_max: 2.0,
             start_size: 0.25,
             end_size: 0.0,
+            start_color: [255; 4],
+            end_color: [255, 255, 255, 0],
             direction: Vec3::Y,
             spread_angle_radians: 0.35,
             acceleration: Vec3::new(0.0, -1.5, 0.0),
+            drag: 0.0,
+            turbulence_strength: 0.0,
+            turbulence_frequency: 1.0,
             angular_velocity_min: -1.0,
             angular_velocity_max: 1.0,
             mesh_asset: BUILTIN_VFX_QUAD_MESH_ID.to_string(),
@@ -96,6 +121,20 @@ impl ParticleEmitter {
         self.random_state = 0x4d59_5df4_d0f3_3173;
     }
 
+    pub(crate) fn advance_gpu(&mut self, dt: f32) {
+        if self.enabled {
+            self.elapsed += dt;
+        }
+    }
+
+    pub(crate) fn elapsed(&self) -> f32 {
+        self.elapsed
+    }
+
+    pub(crate) fn simulation_seed(&self) -> u64 {
+        self.random_state
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let finite = [
             self.duration,
@@ -107,6 +146,9 @@ impl ParticleEmitter {
             self.start_size,
             self.end_size,
             self.spread_angle_radians,
+            self.drag,
+            self.turbulence_strength,
+            self.turbulence_frequency,
             self.angular_velocity_min,
             self.angular_velocity_max,
         ]
@@ -125,6 +167,9 @@ impl ParticleEmitter {
             || self.speed_max < self.speed_min
             || self.start_size < 0.0
             || self.end_size < 0.0
+            || self.drag < 0.0
+            || self.turbulence_strength < 0.0
+            || self.turbulence_frequency <= 0.0
             || !(0.0..=std::f32::consts::PI).contains(&self.spread_angle_radians)
             || self.angular_velocity_max < self.angular_velocity_min
         {

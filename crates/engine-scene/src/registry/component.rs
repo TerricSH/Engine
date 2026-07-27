@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use engine_serialize::Value;
 
 use crate::component::{Component, ComponentStorageDyn, SparseSet};
-use crate::components::{Bounds, Camera, Interactable, Light, Name, Renderable, Transform};
+use crate::components::{
+    Bounds, Camera, HlodCluster, Interactable, Light, LodGroup, Name, Renderable, Transform,
+};
 use crate::prefab_instance::PrefabInstanceRef;
 
 // ---------------------------------------------------------------------------
@@ -285,6 +287,32 @@ impl ComponentRegistry {
         self.register_fields_validator(
             Interactable::TYPE_ID,
             crate::components::validate_interactable_fields,
+        )
+        .ok();
+        core_ext!(
+            LodGroup,
+            "LOD Group",
+            true,
+            ScriptAccess::ReadWrite,
+            crate::components::serialize_lod_group,
+            crate::components::deserialize_lod_group
+        );
+        self.register_fields_validator(
+            LodGroup::TYPE_ID,
+            crate::components::validate_lod_group_fields,
+        )
+        .ok();
+        core_ext!(
+            HlodCluster,
+            "HLOD Cluster",
+            true,
+            ScriptAccess::ReadWrite,
+            crate::components::serialize_hlod_cluster,
+            crate::components::deserialize_hlod_cluster
+        );
+        self.register_fields_validator(
+            HlodCluster::TYPE_ID,
+            crate::components::validate_hlod_cluster_fields,
         )
         .ok();
         core_ext!(Bounds, "Bounds", true, ScriptAccess::None);

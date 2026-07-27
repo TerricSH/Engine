@@ -8,6 +8,10 @@ this file; compile each stage with `glslc` from the Vulkan SDK (or
 ```powershell
 glslc shaders/forward.vert -o shaders/forward.vert.spv
 glslc shaders/forward.frag -o shaders/forward.frag.spv
+glslc shaders/skinned.vert -o shaders/skinned.vert.spv
+glslc shaders/vfx_billboard.vert -o shaders/vfx_billboard.vert.spv
+glslc -DVFX_PARTICLE=1 -fshader-stage=frag shaders/forward.frag -o shaders/vfx_billboard.frag.spv
+glslc shaders/instanced.vert -o shaders/instanced.vert.spv
 glslc shaders/skybox.vert -o shaders/skybox.vert.spv
 glslc shaders/skybox.frag -o shaders/skybox.frag.spv
 glslc shaders/shadow.vert -o shaders/shadow.vert.spv
@@ -34,6 +38,10 @@ naga --input-kind glsl --shader-stage frag --entry-point main shaders/tonemap.fr
 naga --input-kind glsl --shader-stage vert --entry-point main shaders/ui_overlay.vert shaders/ui_overlay.vert.spv
 naga --input-kind glsl --shader-stage frag --entry-point main shaders/ui_overlay.frag shaders/ui_overlay.frag.spv
 ```
+
+The particle fragment artifact is a compile-time variant of `forward.frag`;
+`VFX_PARTICLE=1` adds the interpolated RGBA instance input. Regenerate that
+variant with `glslc`; the shown `naga-cli` fallback does not define the macro.
 
 `build.rs` picks the artifacts up automatically. When any `.spv` is
 missing the renderer compiles but refuses to start the selected scene

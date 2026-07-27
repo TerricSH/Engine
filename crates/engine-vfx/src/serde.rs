@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use engine_serialize::{AssetId, Value};
 
-use crate::{Decal, ParticleEmitter};
+use crate::{Decal, ParticleEmitter, ParticleSimulationMode};
 
 fn bool_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<bool> {
     match fields.get(key) {
@@ -44,12 +44,31 @@ fn vec3_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<glam::Vec3>
     }
 }
 
+fn color_field(fields: &BTreeMap<String, Value>, key: &str) -> Option<[u8; 4]> {
+    match fields.get(key) {
+        Some(Value::Color(value)) if value.iter().all(|channel| channel.is_finite()) => {
+            Some(value.map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8))
+        }
+        _ => None,
+    }
+}
+
 pub fn serialize_particle_emitter(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
     let emitter = component
         .downcast_ref::<ParticleEmitter>()
         .expect("ParticleEmitter expected");
     BTreeMap::from([
         ("enabled".into(), Value::Bool(emitter.enabled)),
+        (
+            "simulation_mode".into(),
+            Value::Enum(
+                match emitter.simulation_mode {
+                    ParticleSimulationMode::Cpu => "cpu",
+                    ParticleSimulationMode::Gpu => "gpu",
+                }
+                .to_string(),
+            ),
+        ),
         ("looping".into(), Value::Bool(emitter.looping)),
         ("duration".into(), Value::Float32(emitter.duration)),
         (
@@ -71,6 +90,18 @@ pub fn serialize_particle_emitter(component: &dyn std::any::Any) -> BTreeMap<Str
         ("start_size".into(), Value::Float32(emitter.start_size)),
         ("end_size".into(), Value::Float32(emitter.end_size)),
         (
+            "start_color".into(),
+            Value::Color(
+                emitter
+                    .start_color
+                    .map(|channel| f32::from(channel) / 255.0),
+            ),
+        ),
+        (
+            "end_color".into(),
+            Value::Color(emitter.end_color.map(|channel| f32::from(channel) / 255.0)),
+        ),
+        (
             "direction".into(),
             Value::Vec3(emitter.direction.to_array()),
         ),
@@ -81,6 +112,15 @@ pub fn serialize_particle_emitter(component: &dyn std::any::Any) -> BTreeMap<Str
         (
             "acceleration".into(),
             Value::Vec3(emitter.acceleration.to_array()),
+        ),
+        ("drag".into(), Value::Float32(emitter.drag)),
+        (
+            "turbulence_strength".into(),
+            Value::Float32(emitter.turbulence_strength),
+        ),
+        (
+            "turbulence_frequency".into(),
+            Value::Float32(emitter.turbulence_frequency),
         ),
         (
             "angular_velocity_min".into(),
@@ -110,6 +150,12 @@ pub fn deserialize_particle_emitter(fields: &BTreeMap<String, Value>) -> Box<dyn
     if let Some(value) = bool_field(fields, "enabled") {
         emitter.enabled = value;
     }
+    if let Some(value) = string_field(fields, "simulation_mode") {
+        emitter.simulation_mode = match value.as_str() {
+            "gpu" => ParticleSimulationMode::Gpu,
+            _ => ParticleSimulationMode::Cpu,
+        };
+    }
     if let Some(value) = bool_field(fields, "looping") {
         emitter.looping = value;
     }
@@ -122,6 +168,9 @@ pub fn deserialize_particle_emitter(fields: &BTreeMap<String, Value>) -> Box<dyn
         ("speed_max", &mut emitter.speed_max),
         ("start_size", &mut emitter.start_size),
         ("end_size", &mut emitter.end_size),
+        ("drag", &mut emitter.drag),
+        ("turbulence_strength", &mut emitter.turbulence_strength),
+        ("turbulence_frequency", &mut emitter.turbulence_frequency),
         ("spread_angle_radians", &mut emitter.spread_angle_radians),
         ("angular_velocity_min", &mut emitter.angular_velocity_min),
         ("angular_velocity_max", &mut emitter.angular_velocity_max),
@@ -141,6 +190,12 @@ pub fn deserialize_particle_emitter(fields: &BTreeMap<String, Value>) -> Box<dyn
     }
     if let Some(value) = vec3_field(fields, "acceleration") {
         emitter.acceleration = value;
+    }
+    if let Some(value) = color_field(fields, "start_color") {
+        emitter.start_color = value;
+    }
+    if let Some(value) = color_field(fields, "end_color") {
+        emitter.end_color = value;
     }
     if let Some(value) = string_field(fields, "mesh_asset") {
         emitter.mesh_asset = value;

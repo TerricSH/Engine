@@ -12,6 +12,7 @@ layout(set = 0, binding = 0) uniform UBO {
     vec4 camera_pos;
     vec4 cascade_splits;
     mat4 light_vp[3];
+    vec4 environment_params;
 } ubo;
 
 layout(location = 0) out vec3 v_direction;

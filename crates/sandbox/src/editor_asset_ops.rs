@@ -335,6 +335,7 @@ fn create_material_asset_impl(
         metallic_roughness_texture: template.metallic_roughness_texture.clone(),
         occlusion_texture: template.occlusion_texture.clone(),
         emissive_texture: template.emissive_texture.clone(),
+        advanced: Default::default(),
         transparency: template.transparency.clone(),
         alpha_cutoff: template.alpha_cutoff,
         double_sided: template.double_sided,
@@ -1301,6 +1302,7 @@ fn rewrite_duplicated_source_identity(
         // same assets after duplication.
         AssetType::Mesh
         | AssetType::Texture
+        | AssetType::EnvironmentMap
         | AssetType::Shader
         | AssetType::Material
         | AssetType::Audio
@@ -1310,7 +1312,11 @@ fn rewrite_duplicated_source_identity(
         // Do not silently create a second identity path for formats whose
         // source identity contract is not defined. Adding support requires an
         // explicit arm above, which keeps future enum additions fail-closed.
-        AssetType::Pipeline | AssetType::Script | AssetType::Font | AssetType::Unknown => Err(
+        AssetType::MorphTargetSet
+        | AssetType::Pipeline
+        | AssetType::Script
+        | AssetType::Font
+        | AssetType::Unknown => Err(
             format!(
                 "asset type {asset_type:?} has no declared duplicate identity policy; duplication is refused"
             ),
@@ -1343,9 +1349,6 @@ fn collect_scene_asset_dependencies(
 ) {
     dependencies.extend(scene.collect_asset_dependencies());
     dependencies.extend(scene.dependencies.iter().cloned());
-    if let Some(environment_map) = &scene.scene_settings.environment_map {
-        dependencies.insert(environment_map.clone());
-    }
 }
 
 fn collect_logic_value_dependency(value: &LogicValue, dependencies: &mut BTreeSet<AssetId>) {
@@ -1474,6 +1477,8 @@ fn source_asset_dependencies(
         }
         AssetType::Mesh
         | AssetType::Texture
+        | AssetType::EnvironmentMap
+        | AssetType::MorphTargetSet
         | AssetType::Shader
         | AssetType::Pipeline
         | AssetType::Script
@@ -2611,6 +2616,7 @@ mod tests {
             metallic_roughness_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            advanced: Default::default(),
             transparency: "Opaque".into(),
             alpha_cutoff: 0.5,
             double_sided: false,
@@ -2719,6 +2725,7 @@ mod tests {
             metallic_roughness_texture: None,
             occlusion_texture: None,
             emissive_texture: None,
+            advanced: Default::default(),
             transparency: "Opaque".into(),
             alpha_cutoff: 0.5,
             double_sided: false,

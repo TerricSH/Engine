@@ -32,6 +32,8 @@ pub mod error;
 mod handle;
 mod pipeline;
 mod resources;
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+mod scene_data;
 pub mod scene_renderer;
 mod swapchain;
 

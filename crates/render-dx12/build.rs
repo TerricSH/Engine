@@ -14,6 +14,7 @@ use windows::{
 
 fn main() {
     println!("cargo:rerun-if-changed=src/shaders.hlsl");
+    println!("cargo:rerun-if-changed=src/tone_map.hlsl");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -25,6 +26,34 @@ fn main() {
         compile("ps_5_1", "PSMain", "scene_ps.dxil");
         compile("vs_5_1", "ShadowVSMain", "shadow_vs.dxil");
         compile("vs_5_1", "SkinnedShadowVSMain", "shadow_skinned_vs.dxil");
+        compile("vs_5_1", "ParticleVSMain", "particle_vs.dxil");
+        compile("vs_5_1", "GpuParticleVSMain", "gpu_particle_vs.dxil");
+        compile_source(
+            "src/tone_map.hlsl",
+            "vs_5_1",
+            "ToneMapVSMain",
+            "tone_map_vs.dxil",
+        );
+        compile_source(
+            "src/tone_map.hlsl",
+            "ps_5_1",
+            "ToneMapPSMain",
+            "tone_map_ps.dxil",
+        );
+        compile_source("src/ui.hlsl", "vs_5_1", "UiVSMain", "ui_vs.dxil");
+        compile_source("src/ui.hlsl", "ps_5_1", "UiPSMain", "ui_ps.dxil");
+        compile_source(
+            "src/skybox.hlsl",
+            "vs_5_1",
+            "SkyboxVSMain",
+            "skybox_vs.dxil",
+        );
+        compile_source(
+            "src/skybox.hlsl",
+            "ps_5_1",
+            "SkyboxPSMain",
+            "skybox_ps.dxil",
+        );
     }
     #[cfg(not(windows))]
     panic!("cross-compiling the DX12 backend requires precompiled Windows shader objects");
@@ -32,7 +61,13 @@ fn main() {
 
 #[cfg(windows)]
 fn compile(profile: &str, entry: &str, output: &str) {
-    let source = std::fs::read("src/shaders.hlsl").expect("read DX12 HLSL source");
+    compile_source("src/shaders.hlsl", profile, entry, output);
+}
+
+#[cfg(windows)]
+fn compile_source(source_path: &str, profile: &str, entry: &str, output: &str) {
+    let source = std::fs::read(source_path).expect("read DX12 HLSL source");
+    let source_name = CString::new(source_path).expect("shader source path contains no NUL");
     let entry = CString::new(entry).expect("shader entry point contains no NUL");
     let profile = CString::new(profile).expect("shader profile contains no NUL");
     let mut bytecode: Option<ID3DBlob> = None;
@@ -41,7 +76,7 @@ fn compile(profile: &str, entry: &str, output: &str) {
         D3DCompile(
             source.as_ptr().cast(),
             source.len(),
-            PCSTR(c"shaders.hlsl".as_ptr().cast()),
+            PCSTR(source_name.as_ptr().cast()),
             None,
             None::<&ID3DInclude>,
             PCSTR(entry.as_ptr().cast()),

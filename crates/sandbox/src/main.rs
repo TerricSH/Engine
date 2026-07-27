@@ -22,7 +22,7 @@ mod release_diagnostics;
 #[path = "../tests/common/mod.rs"]
 mod test_capability;
 
-#[cfg(feature = "backend-vulkan")]
+#[cfg(all(feature = "tooling-editor", feature = "backend-vulkan"))]
 fn log_renderer_diagnostics(operation: &str, diagnostics: &[engine_renderer::Diagnostic]) {
     for diagnostic in diagnostics {
         tracing::error!(

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use engine_scene::components::{Bounds, Renderable, Transform};
-#[cfg(feature = "gameplay")]
+#[cfg(feature = "subsystem-physics")]
 use engine_terrain::TerrainCollisionData;
 use engine_terrain::{
     chunk_span, desired_chunks_hysteretic, HeightfieldGenerator, TerrainChunkData, TerrainChunkId,
@@ -17,20 +17,20 @@ struct ChunkBinding {
     mesh: RuntimeMeshHandle,
     entity: engine_scene::Entity,
     region: ChunkRegion,
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-physics")]
     collision: Option<TerrainCollisionData>,
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-physics")]
     collision_span: f32,
     active: bool,
 }
 
 impl ChunkBinding {
-    #[cfg(feature = "gameplay")]
+    #[cfg(feature = "subsystem-physics")]
     fn release_staged_collision(&mut self) {
         self.collision = None;
     }
 
-    #[cfg(not(feature = "gameplay"))]
+    #[cfg(not(feature = "subsystem-physics"))]
     fn release_staged_collision(&mut self) {}
 }
 
@@ -442,7 +442,7 @@ impl TerrainSystem {
                     half_extents: ((max - min) * 0.5).to_array(),
                 },
             );
-            #[cfg(feature = "gameplay")]
+            #[cfg(feature = "subsystem-physics")]
             if active {
                 if let Some(collision) = &data.collision {
                     world.add_component(
@@ -485,9 +485,9 @@ impl TerrainSystem {
                 max_x: data.origin[0] + span,
                 max_z: data.origin[2] + span,
             },
-            #[cfg(feature = "gameplay")]
+            #[cfg(feature = "subsystem-physics")]
             collision: if active { None } else { data.collision.clone() },
-            #[cfg(feature = "gameplay")]
+            #[cfg(feature = "subsystem-physics")]
             collision_span,
             active,
         })
@@ -501,9 +501,9 @@ impl TerrainSystem {
             return false;
         }
         let entity = binding.entity;
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         let collision = binding.collision.clone();
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         let collision_span = binding.collision_span;
         let activated = engine
             .with_world_mut(|world| {
@@ -511,7 +511,7 @@ impl TerrainSystem {
                     return false;
                 };
                 renderable.visible = true;
-                #[cfg(feature = "gameplay")]
+                #[cfg(feature = "subsystem-physics")]
                 if let Some(collision) = collision {
                     world.add_component(
                         entity,
@@ -665,7 +665,7 @@ mod tests {
                 .unwrap()
                 > 0
         );
-        #[cfg(feature = "gameplay")]
+        #[cfg(feature = "subsystem-physics")]
         assert!(runtime
             .with_world(|world| world
                 .query::<engine_physics::Collider>()

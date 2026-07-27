@@ -12,10 +12,11 @@ mod turns;
 mod types;
 mod visibility;
 
+pub use crate::random::DeterministicRng;
 pub use ai::{FactCurve, ScoredOption, UtilityBrain, UtilityConsideration, UtilityOption};
 pub use combat::{
     AbilitySpec, AttackContext, CombatOutcome, CombatResolver, Combatant, CombatantStats,
-    DefaultHitChancePolicy, DeterministicRng, HitChancePolicy, StatusEffect, WeaponProfile,
+    DefaultHitChancePolicy, HitChancePolicy, StatusEffect, WeaponProfile,
 };
 pub use grid::{
     BoardError, CardinalDirection, CoverEdges, CoverKind, GridCoord, TacticalBoard, TacticalCell,

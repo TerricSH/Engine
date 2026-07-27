@@ -386,6 +386,26 @@ pub fn validate_scene(scene: &Scene) -> Vec<Diagnostic> {
             .path("scene_settings.environment_map"),
         );
     }
+    let environment = engine_renderer::EnvironmentSettings {
+        environment_map: settings.environment_map.clone(),
+        intensity: settings.environment_intensity,
+        rotation_radians: settings.environment_rotation_radians,
+        reflection_probes: settings.reflection_probes.clone(),
+    };
+    if let Some(message) = engine_renderer::validate_environment_settings(&environment) {
+        diagnostics.push(
+            Diagnostic::new("SC0023", DiagnosticSeverity::Error, "engine-scene", message)
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .path("scene_settings.environment"),
+        );
+    }
+    if let Some(message) = engine_renderer::validate_post_process_settings(&settings.post_process) {
+        diagnostics.push(
+            Diagnostic::new("SC0024", DiagnosticSeverity::Error, "engine-scene", message)
+                .contract("ECSScene-v0", ECS_SCENE_CONTRACT)
+                .path("scene_settings.post_process"),
+        );
+    }
     diagnostics.extend(engine_renderer::validate_pass_graph_settings(
         &settings.pass_graph_config,
         settings.tone_mapping,

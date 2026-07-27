@@ -8,16 +8,25 @@ license.workspace = true
 [features]
 default = []
 subsystem-scripting-csharp = ["dep:engine-script", "dep:serde_json"]
-gameplay = ["dep:engine-physics", "dep:engine-gameplay"]
+subsystem-animation = ["dep:engine-animation"]
+subsystem-audio = ["dep:engine-audio"]
+subsystem-navigation = ["dep:engine-nav"]
+subsystem-ui = ["dep:engine-ui"]
+subsystem-physics = ["dep:engine-physics"]
+subsystem-gameplay = ["dep:engine-gameplay"]
+subsystem-terrain = ["dep:engine-terrain"]
 backend-vulkan = ["dep:render-vulkan", "dep:raw-window-handle"]
+# Compatibility profiles. New runtime code should gate against the leaf
+# subsystem features above instead of these aggregate aliases.
 runtime-subsystems = [
-    "dep:engine-animation",
-    "dep:engine-audio",
-    "dep:engine-nav",
-    "dep:engine-ui",
+    "subsystem-animation",
+    "subsystem-audio",
+    "subsystem-navigation",
+    "subsystem-ui",
 ]
-runtime-audio-output = ["runtime-subsystems", "engine-audio/subsystem-audio-cpal"]
-terrain = ["dep:engine-terrain"]
+gameplay = ["subsystem-physics", "subsystem-gameplay"]
+runtime-audio-output = ["subsystem-audio", "engine-audio/subsystem-audio-cpal"]
+terrain = ["subsystem-terrain"]
 
 [dependencies]
 engine-asset = { path = "../engine-asset" }

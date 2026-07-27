@@ -10,6 +10,8 @@ pub const RENDERABLE_COMPONENT: &str = "engine.renderable";
 pub const CAMERA_COMPONENT: &str = "engine.camera";
 pub const LIGHT_COMPONENT: &str = "engine.light";
 pub const BOUNDS_COMPONENT: &str = "engine.bounds";
+pub const LOD_GROUP_COMPONENT: &str = "engine.lod_group";
+pub const HLOD_CLUSTER_COMPONENT: &str = "engine.hlod_cluster";
 pub const RIGID_BODY_COMPONENT: &str = "engine.physics.rigid_body";
 pub const COLLIDER_COMPONENT: &str = "engine.physics.collider";
 pub const PHYSICS_MATERIAL_COMPONENT: &str = "engine.physics.physics_material";
@@ -176,6 +178,24 @@ fn bounds(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
         ("center".into(), Value::Vec3([0.0, 0.0, 0.0])),
         ("half_extents".into(), Value::Vec3([0.5, 0.5, 0.5])),
     ])))
+}
+
+fn lod_group(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
+    Ok(record(
+        engine_scene::components::serialize_lod_group_fields(
+            &engine_scene::components::LodGroup::default(),
+        ),
+    ))
+}
+
+fn hlod_cluster(entity: &EntityRecord) -> Result<ComponentRecord, EditorError> {
+    let cluster = engine_scene::components::HlodCluster {
+        cluster_id: format!("hlod-{}", entity.persistent_id),
+        ..Default::default()
+    };
+    Ok(record(
+        engine_scene::components::serialize_hlod_cluster_fields(&cluster),
+    ))
 }
 
 fn interactable(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
@@ -363,7 +383,7 @@ fn terrain_volume(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
     ])))
 }
 
-const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 18] = [
+const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 20] = [
     ComponentDescriptor {
         type_id: TRANSFORM_COMPONENT,
         display_name: "Transform",
@@ -403,6 +423,22 @@ const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 18] = [
         removable: true,
         required_components: &[TRANSFORM_COMPONENT],
         factory: bounds,
+    },
+    ComponentDescriptor {
+        type_id: LOD_GROUP_COMPONENT,
+        display_name: "LOD Group",
+        category: "Rendering",
+        removable: true,
+        required_components: &[TRANSFORM_COMPONENT, RENDERABLE_COMPONENT],
+        factory: lod_group,
+    },
+    ComponentDescriptor {
+        type_id: HLOD_CLUSTER_COMPONENT,
+        display_name: "HLOD Cluster",
+        category: "Rendering",
+        removable: true,
+        required_components: &[TRANSFORM_COMPONENT, RENDERABLE_COMPONENT],
+        factory: hlod_cluster,
     },
     ComponentDescriptor {
         type_id: RIGID_BODY_COMPONENT,

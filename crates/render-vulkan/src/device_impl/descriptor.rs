@@ -3,6 +3,9 @@
 use ash::vk;
 
 use crate::error::{VkResult, VulkanError};
+use engine_renderer::{
+    LIGHT_GPU_SIZE, LIGHT_HEADER_SIZE, MAX_CLUSTERS, MAX_CLUSTER_LIGHT_INDICES, MAX_LIGHTS,
+};
 
 use super::{texture::FALLBACK_MATERIAL_TEXTURE_ID, VulkanDevice};
 
@@ -117,11 +120,12 @@ impl VulkanDevice {
     /// |    192 | light_vp[0]    | mat4   |    64 |
     /// |    256 | light_vp[1]    | mat4   |    64 |
     /// |    320 | light_vp[2]    | mat4   |    64 |
+    /// |    384 | environment    | vec4   |    16 |
     ///
-    /// Total: 384 bytes (fits in 512 B UBO).
+    /// Total: 400 bytes (fits in 512 B UBO).
     pub fn write_default_ubo(&mut self) {
         let fi = self.current_frame;
-        let mut data = Vec::with_capacity(384);
+        let mut data = Vec::with_capacity(400);
         // Model matrix (identity for clip-space rendering)
         for i in 0usize..16 {
             let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
@@ -161,6 +165,10 @@ impl VulkanDevice {
         // Light VP[2] (identity)
         for i in 0usize..16 {
             let v = if i.is_multiple_of(5) { 1.0f32 } else { 0.0f32 };
+            data.extend_from_slice(&v.to_ne_bytes());
+        }
+        // Environment intensity=1, rotation sin=0/cos=1.
+        for v in [1.0f32, 0.0, 1.0, 0.0] {
             data.extend_from_slice(&v.to_ne_bytes());
         }
         self.write_ubo(fi, &data, 0);
@@ -236,6 +244,11 @@ impl VulkanDevice {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX),
         ];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let ds_layout = unsafe { d.create_descriptor_set_layout(&layout_info, None) }
@@ -251,6 +264,10 @@ impl VulkanDevice {
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 descriptor_count: 1_600,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 64,
             },
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
@@ -382,6 +399,7 @@ impl VulkanDevice {
         material_ubo_size: vk::DeviceSize,
         bone_buffer: vk::Buffer,
         bone_ubo_size: vk::DeviceSize,
+        morph_buffer: vk::Buffer,
     ) -> VkResult<vk::DescriptorSet> {
         let d = &self.logical_device.device;
         let layout = self
@@ -411,6 +429,10 @@ impl VulkanDevice {
                 .buffer(bone_buffer)
                 .offset(0)
                 .range(bone_ubo_size),
+            vk::DescriptorBufferInfo::default()
+                .buffer(morph_buffer)
+                .offset(0)
+                .range(vk::WHOLE_SIZE),
         ];
         let fallback = self
             .textures
@@ -458,6 +480,11 @@ impl VulkanDevice {
                 .dst_binding(6)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(7)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&buf_info[2..3]),
         ];
         // SAFETY: `d` is a valid AshDevice; descriptor set and buffers are valid.
         unsafe {
@@ -470,96 +497,192 @@ impl VulkanDevice {
     // ======================================================================
     // Light SSBO (set=1, binding=2) — clustered lighting for Phase 4.3
     // ======================================================================
+    // Clustered lighting buffers (set=1, bindings 2..=4)
+    // ======================================================================
 
-    /// Create the storage buffer for additional lights (up to max_lights).
+    /// Create the light, cluster-grid, and cluster-index storage buffers.
     ///
-    /// Must be called AFTER `ensure_shadow()` so that the set=1 descriptor set
-    /// exists. Idempotent: returns `Ok(())` if already created.
-    pub(crate) fn create_light_ssbo(&mut self) -> VkResult<()> {
-        if self.light_ssbo.is_some() {
+    /// The three buffers are installed as one transaction so the descriptor
+    /// set never exposes a partially initialized clustered-lighting ABI.
+    pub(crate) fn create_clustered_lighting_buffers(&mut self) -> VkResult<()> {
+        if self.light_ssbo.is_some()
+            && self.cluster_grid_ssbo.is_some()
+            && self.cluster_index_ssbo.is_some()
+        {
             return Ok(());
         }
-        let d = &self.logical_device.device;
-        let allocator = self.logical_device.allocator();
+        self.destroy_clustered_lighting_buffers();
 
-        // 80 bytes per light (per the Light GPU struct: 4 × vec4 = 64 B plus
-        // padding; actual GLSL struct is 64 B, but we allocate 80 for safety)
-        let buffer_size = self.max_lights as u64 * 64;
+        let light_size = (LIGHT_HEADER_SIZE + MAX_LIGHTS * LIGHT_GPU_SIZE) as u64;
+        let grid_size = (MAX_CLUSTERS * 8) as u64;
+        let index_size = (MAX_CLUSTER_LIGHT_INDICES * 4) as u64;
+        let (light_buffer, light_allocation) =
+            self.create_host_storage_buffer(light_size, "clustered-lights")?;
+        let (grid_buffer, grid_allocation) =
+            match self.create_host_storage_buffer(grid_size, "cluster-grid") {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    self.destroy_host_storage_buffer(light_buffer, light_allocation);
+                    return Err(error);
+                }
+            };
+        let (index_buffer, index_allocation) =
+            match self.create_host_storage_buffer(index_size, "cluster-light-indices") {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    self.destroy_host_storage_buffer(grid_buffer, grid_allocation);
+                    self.destroy_host_storage_buffer(light_buffer, light_allocation);
+                    return Err(error);
+                }
+            };
 
-        // Create the storage buffer
-        let bi = vk::BufferCreateInfo::default()
-            .size(buffer_size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // SAFETY: `d` is a valid AshDevice; `bi` describes a valid buffer.
-        let buf = unsafe { d.create_buffer(&bi, None) }
-            .map_err(|r| VulkanError::vk("create_light_ssbo", r))?;
-        let req = unsafe { d.get_buffer_memory_requirements(buf) };
-        let allocation = allocator
-            .lock()
-            .map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
-            .allocate(&crate::allocator::AllocationCreateDesc {
-                name: "light-ssbo",
-                requirements: req,
-                location: crate::allocator::MemoryLocation::CpuToGpu,
-            })
-            .map_err(|e| VulkanError::Allocation(e.to_string()))?;
-        // SAFETY: `buf` was created by this device; `allocation` is compatible.
-        unsafe { d.bind_buffer_memory(buf, allocation.memory(), allocation.offset()) }
-            .map_err(|r| VulkanError::vk("bind_light_ssbo", r))?;
-
-        // Update set=1 descriptor at binding=2 to point to the SSBO
-        if let Some(ds) = self.shadow_desc_set {
-            let buf_info = [vk::DescriptorBufferInfo::default()
-                .buffer(buf)
+        let descriptor_set = match self.shadow_desc_set {
+            Some(descriptor_set) => descriptor_set,
+            None => {
+                self.destroy_host_storage_buffer(index_buffer, index_allocation);
+                self.destroy_host_storage_buffer(grid_buffer, grid_allocation);
+                self.destroy_host_storage_buffer(light_buffer, light_allocation);
+                return Err(VulkanError::Loader(
+                    "shadow descriptor set must exist before clustered lighting buffers".into(),
+                ));
+            }
+        };
+        let buffer_infos = [
+            vk::DescriptorBufferInfo::default()
+                .buffer(light_buffer)
                 .offset(0)
-                .range(buffer_size)];
-            let writes = [vk::WriteDescriptorSet::default()
-                .dst_set(ds)
+                .range(light_size),
+            vk::DescriptorBufferInfo::default()
+                .buffer(grid_buffer)
+                .offset(0)
+                .range(grid_size),
+            vk::DescriptorBufferInfo::default()
+                .buffer(index_buffer)
+                .offset(0)
+                .range(index_size),
+        ];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&buf_info)];
-            // SAFETY: `d` is a valid AshDevice; descriptor set and buffer are
-            // valid; binding=2 exists in the set=1 layout.
-            unsafe {
-                d.update_descriptor_sets(&writes, &[]);
-            }
+                .buffer_info(&buffer_infos[0..1]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&buffer_infos[1..2]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&buffer_infos[2..3]),
+        ];
+        unsafe {
+            self.logical_device
+                .device
+                .update_descriptor_sets(&writes, &[]);
         }
 
-        self.light_ssbo = Some(buf);
-        self.light_ssbo_allocation = Some(allocation);
-        self.light_ssbo_size = buffer_size;
-
+        self.light_ssbo = Some(light_buffer);
+        self.light_ssbo_allocation = Some(light_allocation);
+        self.light_ssbo_size = light_size;
+        self.cluster_grid_ssbo = Some(grid_buffer);
+        self.cluster_grid_ssbo_allocation = Some(grid_allocation);
+        self.cluster_index_ssbo = Some(index_buffer);
+        self.cluster_index_ssbo_allocation = Some(index_allocation);
         Ok(())
     }
 
-    /// Write data into the light SSBO at the given byte offset.
-    ///
-    /// Silently returns if the SSBO has not been created yet.
-    pub(crate) fn write_light_ssbo(&mut self, data: &[u8], offset: u64) {
-        if let Some(allocation) = &mut self.light_ssbo_allocation {
-            if let Some(slice) = allocation.mapped_slice_mut() {
-                let start = offset as usize;
-                let end = (start + data.len()).min(slice.len());
-                slice[start..end].copy_from_slice(&data[..end - start]);
+    fn create_host_storage_buffer(
+        &self,
+        size: vk::DeviceSize,
+        name: &'static str,
+    ) -> VkResult<(vk::Buffer, crate::allocator::Allocation)> {
+        let device = &self.logical_device.device;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }
+            .map_err(|result| VulkanError::vk("create_cluster_storage_buffer", result))?;
+        let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let allocation = match self
+            .logical_device
+            .allocator()
+            .lock()
+            .map_err(|error| VulkanError::Loader(format!("allocator lock: {error}")))?
+            .allocate(&crate::allocator::AllocationCreateDesc {
+                name,
+                requirements,
+                location: crate::allocator::MemoryLocation::CpuToGpu,
+            }) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                unsafe { device.destroy_buffer(buffer, None) };
+                return Err(VulkanError::Allocation(error.to_string()));
             }
+        };
+        if let Err(result) =
+            unsafe { device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset()) }
+        {
+            self.destroy_host_storage_buffer(buffer, allocation);
+            return Err(VulkanError::vk("bind_cluster_storage_buffer", result));
+        }
+        Ok((buffer, allocation))
+    }
+
+    fn destroy_host_storage_buffer(
+        &self,
+        buffer: vk::Buffer,
+        mut allocation: crate::allocator::Allocation,
+    ) {
+        unsafe {
+            self.logical_device.device.destroy_buffer(buffer, None);
+        }
+        if let Ok(mut allocator) = self.logical_device.allocator().lock() {
+            allocator.free(&mut allocation);
         }
     }
 
-    /// Destroy the light SSBO buffer and free its allocation.
-    pub(crate) fn destroy_light_ssbo(&mut self) {
-        let d = &self.logical_device.device;
-        if let Some(buf) = self.light_ssbo.take() {
-            // SAFETY: `buf` was created by this device and is no longer referenced.
-            unsafe {
-                d.destroy_buffer(buf, None);
+    pub(crate) fn write_clustered_lighting_buffers(
+        &mut self,
+        light_data: &[u8],
+        cluster_grid_data: &[u8],
+        cluster_index_data: &[u8],
+    ) {
+        Self::write_mapped_buffer(&mut self.light_ssbo_allocation, light_data);
+        Self::write_mapped_buffer(&mut self.cluster_grid_ssbo_allocation, cluster_grid_data);
+        Self::write_mapped_buffer(&mut self.cluster_index_ssbo_allocation, cluster_index_data);
+    }
+
+    fn write_mapped_buffer(allocation: &mut Option<crate::allocator::Allocation>, data: &[u8]) {
+        if let Some(slice) = allocation
+            .as_mut()
+            .and_then(crate::allocator::Allocation::mapped_slice_mut)
+        {
+            let count = data.len().min(slice.len());
+            slice[..count].copy_from_slice(&data[..count]);
+        }
+    }
+
+    pub(crate) fn destroy_clustered_lighting_buffers(&mut self) {
+        for (buffer, allocation) in [
+            (
+                self.cluster_index_ssbo.take(),
+                self.cluster_index_ssbo_allocation.take(),
+            ),
+            (
+                self.cluster_grid_ssbo.take(),
+                self.cluster_grid_ssbo_allocation.take(),
+            ),
+            (self.light_ssbo.take(), self.light_ssbo_allocation.take()),
+        ] {
+            if let (Some(buffer), Some(allocation)) = (buffer, allocation) {
+                self.destroy_host_storage_buffer(buffer, allocation);
             }
         }
-        if let Some(mut a) = self.light_ssbo_allocation.take() {
-            if let Ok(mut guard) = self.logical_device.allocator().lock() {
-                guard.free(&mut a);
-            }
-        }
+        self.light_ssbo_size = 0;
     }
 
     pub(crate) fn destroy_descriptor_infra(&mut self) {

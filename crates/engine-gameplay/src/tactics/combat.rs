@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::random::DeterministicRng;
+
 use super::grid::CoverKind;
 use super::types::TacticalEntityId;
 
@@ -133,29 +135,6 @@ pub struct CombatOutcome {
     pub damage: i32,
     pub target_health: i32,
     pub target_killed: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeterministicRng {
-    state: u64,
-}
-
-impl DeterministicRng {
-    pub fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    pub fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = self.state;
-        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        value ^ (value >> 31)
-    }
-
-    pub fn roll_basis_points(&mut self) -> u16 {
-        (self.next_u64() % 10_000) as u16
-    }
 }
 
 pub struct CombatResolver<P = DefaultHitChancePolicy> {

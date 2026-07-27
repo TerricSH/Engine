@@ -110,6 +110,78 @@ impl VulkanDevice {
         Ok(())
     }
 
+    fn create_oit_color_target(
+        &self,
+        allocation_name: &'static str,
+    ) -> VkResult<(vk::Image, vk::ImageView, crate::allocator::Allocation)> {
+        let d = &self.logical_device.device;
+        let extent = self.swapchain_extent;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R16G16B16A16_SFLOAT)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let image = unsafe { d.create_image(&image_info, None) }
+            .map_err(|result| VulkanError::vk("create_oit_image", result))?;
+        let requirements = unsafe { d.get_image_memory_requirements(image) };
+        let mut allocation = match self
+            .logical_device
+            .allocator()
+            .lock()
+            .map_err(|error| VulkanError::Loader(format!("allocator lock: {error}")))?
+            .allocate(&crate::allocator::AllocationCreateDesc {
+                name: allocation_name,
+                requirements,
+                location: crate::allocator::MemoryLocation::GpuOnly,
+            }) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                unsafe { d.destroy_image(image, None) };
+                return Err(VulkanError::Allocation(error.to_string()));
+            }
+        };
+        if let Err(result) =
+            unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
+        {
+            unsafe { d.destroy_image(image, None) };
+            if let Ok(mut allocator) = self.logical_device.allocator().lock() {
+                allocator.free(&mut allocation);
+            }
+            return Err(VulkanError::vk("bind_oit_image", result));
+        }
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R16G16B16A16_SFLOAT)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let image_view = match unsafe { d.create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(result) => {
+                unsafe { d.destroy_image(image, None) };
+                if let Ok(mut allocator) = self.logical_device.allocator().lock() {
+                    allocator.free(&mut allocation);
+                }
+                return Err(VulkanError::vk("create_oit_image_view", result));
+            }
+        };
+        Ok((image, image_view, allocation))
+    }
+
     // ======================================================================
     // Forward HDR render pass + pipeline (RGBA16F color + D32 depth)
     // ======================================================================
@@ -123,6 +195,18 @@ impl VulkanDevice {
         }
         // Ensure the HDR color texture exists.
         self.create_hdr_color_texture()?;
+        if self.oit_accum_image.is_none() {
+            let (image, view, allocation) = self.create_oit_color_target("oit-accumulation")?;
+            self.oit_accum_image = Some(image);
+            self.oit_accum_view = Some(view);
+            self.oit_accum_allocation = Some(allocation);
+        }
+        if self.oit_optical_depth_image.is_none() {
+            let (image, view, allocation) = self.create_oit_color_target("oit-optical-depth")?;
+            self.oit_optical_depth_image = Some(image);
+            self.oit_optical_depth_view = Some(view);
+            self.oit_optical_depth_allocation = Some(allocation);
+        }
 
         let d = &self.logical_device.device;
         let sc = self
@@ -136,6 +220,12 @@ impl VulkanDevice {
         let hdr_view = self
             .hdr_color_view
             .ok_or(VulkanError::Loader("no HDR texture".into()))?;
+        let oit_accum_view = self
+            .oit_accum_view
+            .ok_or(VulkanError::Loader("no OIT accumulation texture".into()))?;
+        let oit_optical_depth_view = self
+            .oit_optical_depth_view
+            .ok_or(VulkanError::Loader("no OIT optical-depth texture".into()))?;
         let vert = self
             .forward_vert_spv
             .clone()
@@ -152,6 +242,22 @@ impl VulkanDevice {
             .skybox_frag_spv
             .clone()
             .ok_or(VulkanError::MissingShader("skybox.frag"))?;
+        let vfx_billboard_vert = self
+            .vfx_billboard_vert_spv
+            .clone()
+            .ok_or(VulkanError::MissingShader("vfx_billboard.vert"))?;
+        let gpu_vfx_billboard_vert = self
+            .gpu_vfx_billboard_vert_spv
+            .clone()
+            .ok_or(VulkanError::MissingShader("gpu_vfx_billboard.vert"))?;
+        let vfx_billboard_frag = self
+            .vfx_billboard_frag_spv
+            .clone()
+            .ok_or(VulkanError::MissingShader("vfx_billboard.frag"))?;
+        let instanced_vert = self
+            .instanced_vert_spv
+            .clone()
+            .ok_or(VulkanError::MissingShader("instanced.vert"))?;
 
         // ---- Render pass: color(RGBA16F) + depth(D32) ----
         let color_at = vk::AttachmentDescription::default()
@@ -172,11 +278,19 @@ impl VulkanDevice {
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-        let color_ref = [vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let color_ref = [
+            vk::AttachmentReference::default()
+                .attachment(0)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            vk::AttachmentReference::default()
+                .attachment(1)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            vk::AttachmentReference::default()
+                .attachment(2)
+                .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+        ];
         let depth_ref = vk::AttachmentReference::default()
-            .attachment(1)
+            .attachment(3)
             .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         let subpass = vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
@@ -197,7 +311,7 @@ impl VulkanDevice {
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             );
-        let atts = [color_at, depth_at];
+        let atts = [color_at, color_at, color_at, depth_at];
         let subpasses = [subpass];
         let deps = [dep];
         let rp_info = vk::RenderPassCreateInfo::default()
@@ -286,19 +400,23 @@ impl VulkanDevice {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let dyns = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let ds2 = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyns);
-        let mut material_pipelines = Vec::with_capacity(4);
+        let mut material_pipelines = Vec::with_capacity(8);
         for (cull_mode, blend_mode, depth_write) in [
             (vk::CullModeFlags::BACK, "Opaque", true),
             (vk::CullModeFlags::NONE, "Opaque", true),
             (vk::CullModeFlags::BACK, "Alpha", false),
             (vk::CullModeFlags::NONE, "Alpha", false),
+            (vk::CullModeFlags::BACK, "Additive", false),
+            (vk::CullModeFlags::NONE, "Additive", false),
+            (vk::CullModeFlags::BACK, "WeightedOit", false),
+            (vk::CullModeFlags::NONE, "WeightedOit", false),
         ] {
             let raster = vk::PipelineRasterizationStateCreateInfo::default()
                 .polygon_mode(vk::PolygonMode::FILL)
                 .cull_mode(cull_mode)
                 .front_face(vk::FrontFace::CLOCKWISE)
                 .line_width(1.0);
-            let blend_attachments = [super::blend_attachment_from_mode(blend_mode)];
+            let blend_attachments = super::mrt_blend_attachments(blend_mode);
             let blend = vk::PipelineColorBlendStateCreateInfo::default()
                 .logic_op_enable(false)
                 .attachments(&blend_attachments);
@@ -343,6 +461,10 @@ impl VulkanDevice {
         let double_sided_pipeline = material_pipelines[1];
         let blend_pipeline = material_pipelines[2];
         let blend_double_sided_pipeline = material_pipelines[3];
+        let additive_pipeline = material_pipelines[4];
+        let additive_double_sided_pipeline = material_pipelines[5];
+        let oit_pipeline = material_pipelines[6];
+        let oit_double_sided_pipeline = material_pipelines[7];
 
         // SAFETY: shader modules are no longer needed after pipeline creation.
         unsafe {
@@ -379,7 +501,7 @@ impl VulkanDevice {
         let sky_depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(false)
             .depth_write_enable(false);
-        let sky_blend_attachments = [super::blend_attachment_from_mode("Opaque")];
+        let sky_blend_attachments = super::mrt_blend_attachments("Opaque");
         let sky_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(&sky_blend_attachments);
@@ -411,8 +533,349 @@ impl VulkanDevice {
         let skybox_pipeline =
             sky_pipeline_result.map_err(|(_, r)| VulkanError::vk("cgp_hdr_skybox", r))?[0];
 
+        // ---- Instanced particle billboard pipeline ----
+        // Binding zero retains the authored quad mesh; binding one advances
+        // once per particle and carries position/size plus rotation/age.
+        let vfx_vm = unsafe { mk_sm(d, &vfx_billboard_vert)? };
+        let vfx_fm = match unsafe { mk_sm(d, &vfx_billboard_frag) } {
+            Ok(module) => module,
+            Err(error) => {
+                unsafe {
+                    d.destroy_shader_module(vfx_vm, None);
+                }
+                return Err(error);
+            }
+        };
+        let gpu_vfx_vm = match unsafe { mk_sm(d, &gpu_vfx_billboard_vert) } {
+            Ok(module) => module,
+            Err(error) => {
+                unsafe {
+                    d.destroy_shader_module(vfx_vm, None);
+                    d.destroy_shader_module(vfx_fm, None);
+                }
+                return Err(error);
+            }
+        };
+        let vfx_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vfx_vm)
+                .name(main),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(vfx_fm)
+                .name(main),
+        ];
+        let vfx_bindings = [
+            vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(32)
+                .input_rate(vk::VertexInputRate::VERTEX),
+            vk::VertexInputBindingDescription::default()
+                .binding(1)
+                .stride(32)
+                .input_rate(vk::VertexInputRate::INSTANCE),
+        ];
+        let vfx_attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 12,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 24,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 1,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 4,
+                binding: 1,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 16,
+            },
+        ];
+        let vfx_vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&vfx_bindings)
+            .vertex_attribute_descriptions(&vfx_attributes);
+        let vfx_raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .line_width(1.0);
+        let vfx_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(false)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let vfx_alpha_attachments = super::mrt_blend_attachments("Alpha");
+        let vfx_alpha_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&vfx_alpha_attachments);
+        let vfx_additive_attachments = super::mrt_blend_attachments("Additive");
+        let vfx_additive_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&vfx_additive_attachments);
+        let vfx_oit_attachments = super::mrt_blend_attachments("WeightedOit");
+        let vfx_oit_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&vfx_oit_attachments);
+        let vfx_pipeline_base = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&vfx_stages)
+            .vertex_input_state(&vfx_vertex_input)
+            .input_assembly_state(&ia)
+            .viewport_state(&vs)
+            .rasterization_state(&vfx_raster)
+            .multisample_state(&ms)
+            .depth_stencil_state(&vfx_depth)
+            .dynamic_state(&ds2)
+            .layout(pll)
+            .render_pass(rp)
+            .subpass(0);
+        let vfx_pipeline_infos = [
+            vfx_pipeline_base.color_blend_state(&vfx_alpha_blend),
+            vfx_pipeline_base.color_blend_state(&vfx_additive_blend),
+            vfx_pipeline_base.color_blend_state(&vfx_oit_blend),
+        ];
+        let vfx_pipeline_result = unsafe {
+            d.create_graphics_pipelines(vk::PipelineCache::null(), &vfx_pipeline_infos, None)
+        };
+        let vfx_billboard_pipelines = match vfx_pipeline_result {
+            Ok(pipelines) => pipelines,
+            Err((_, result)) => {
+                unsafe {
+                    d.destroy_shader_module(vfx_vm, None);
+                    d.destroy_shader_module(gpu_vfx_vm, None);
+                    d.destroy_shader_module(vfx_fm, None);
+                }
+                return Err(VulkanError::vk("cgp_hdr_vfx_billboard", result));
+            }
+        };
+        let vfx_billboard_pipeline = vfx_billboard_pipelines[0];
+        let vfx_billboard_additive_pipeline = vfx_billboard_pipelines[1];
+        let vfx_billboard_oit_pipeline = vfx_billboard_pipelines[2];
+
+        let gpu_vfx_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(gpu_vfx_vm)
+                .name(main),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(vfx_fm)
+                .name(main),
+        ];
+        let gpu_vfx_bindings = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let gpu_vfx_attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 12,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 24,
+            },
+        ];
+        let gpu_vfx_vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&gpu_vfx_bindings)
+            .vertex_attribute_descriptions(&gpu_vfx_attributes);
+        let gpu_vfx_pipeline_base = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&gpu_vfx_stages)
+            .vertex_input_state(&gpu_vfx_vertex_input)
+            .input_assembly_state(&ia)
+            .viewport_state(&vs)
+            .rasterization_state(&vfx_raster)
+            .multisample_state(&ms)
+            .depth_stencil_state(&vfx_depth)
+            .dynamic_state(&ds2)
+            .layout(pll)
+            .render_pass(rp)
+            .subpass(0);
+        let gpu_vfx_pipeline_infos = [
+            gpu_vfx_pipeline_base.color_blend_state(&vfx_alpha_blend),
+            gpu_vfx_pipeline_base.color_blend_state(&vfx_additive_blend),
+            gpu_vfx_pipeline_base.color_blend_state(&vfx_oit_blend),
+        ];
+        let gpu_vfx_pipeline_result = unsafe {
+            d.create_graphics_pipelines(vk::PipelineCache::null(), &gpu_vfx_pipeline_infos, None)
+        };
+        unsafe {
+            d.destroy_shader_module(vfx_vm, None);
+            d.destroy_shader_module(gpu_vfx_vm, None);
+            d.destroy_shader_module(vfx_fm, None);
+        }
+        let gpu_vfx_billboard_pipelines = match gpu_vfx_pipeline_result {
+            Ok(pipelines) => pipelines,
+            Err((_, result)) => {
+                unsafe {
+                    d.destroy_pipeline(vfx_billboard_pipeline, None);
+                    d.destroy_pipeline(vfx_billboard_additive_pipeline, None);
+                    d.destroy_pipeline(vfx_billboard_oit_pipeline, None);
+                }
+                return Err(VulkanError::vk("cgp_hdr_gpu_vfx_billboard", result));
+            }
+        };
+        let gpu_vfx_billboard_pipeline = gpu_vfx_billboard_pipelines[0];
+        let gpu_vfx_billboard_additive_pipeline = gpu_vfx_billboard_pipelines[1];
+        let gpu_vfx_billboard_oit_pipeline = gpu_vfx_billboard_pipelines[2];
+
+        // ---- Instanced opaque/masked surface pipelines ----
+        let instanced_vm = unsafe { mk_sm(d, &instanced_vert)? };
+        let instanced_fm = match unsafe { mk_sm(d, &frag) } {
+            Ok(module) => module,
+            Err(error) => {
+                unsafe {
+                    d.destroy_shader_module(instanced_vm, None);
+                }
+                return Err(error);
+            }
+        };
+        let instanced_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(instanced_vm)
+                .name(main),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(instanced_fm)
+                .name(main),
+        ];
+        let instanced_bindings = [
+            vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(32)
+                .input_rate(vk::VertexInputRate::VERTEX),
+            vk::VertexInputBindingDescription::default()
+                .binding(1)
+                .stride(64)
+                .input_rate(vk::VertexInputRate::INSTANCE),
+        ];
+        let instanced_attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 12,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 24,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 1,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 4,
+                binding: 1,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 16,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 5,
+                binding: 1,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 6,
+                binding: 1,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 48,
+            },
+        ];
+        let instanced_vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&instanced_bindings)
+            .vertex_attribute_descriptions(&instanced_attributes);
+        let instanced_depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
+        let instanced_blend_attachments = super::mrt_blend_attachments("Opaque");
+        let instanced_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&instanced_blend_attachments);
+        let mut instanced_pipelines = Vec::with_capacity(2);
+        for cull_mode in [vk::CullModeFlags::BACK, vk::CullModeFlags::NONE] {
+            let instanced_raster = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(cull_mode)
+                .front_face(vk::FrontFace::CLOCKWISE)
+                .line_width(1.0);
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&instanced_stages)
+                .vertex_input_state(&instanced_vertex_input)
+                .input_assembly_state(&ia)
+                .viewport_state(&vs)
+                .rasterization_state(&instanced_raster)
+                .multisample_state(&ms)
+                .depth_stencil_state(&instanced_depth)
+                .color_blend_state(&instanced_blend)
+                .dynamic_state(&ds2)
+                .layout(pll)
+                .render_pass(rp)
+                .subpass(0);
+            let result = unsafe {
+                d.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            };
+            match result {
+                Ok(pipelines) => instanced_pipelines.push(pipelines[0]),
+                Err((_, result)) => {
+                    unsafe {
+                        for pipeline in instanced_pipelines {
+                            d.destroy_pipeline(pipeline, None);
+                        }
+                        d.destroy_shader_module(instanced_vm, None);
+                        d.destroy_shader_module(instanced_fm, None);
+                    }
+                    return Err(VulkanError::vk("cgp_hdr_instanced", result));
+                }
+            }
+        }
+        unsafe {
+            d.destroy_shader_module(instanced_vm, None);
+            d.destroy_shader_module(instanced_fm, None);
+        }
+        let instanced_pipeline = instanced_pipelines[0];
+        let instanced_double_sided_pipeline = instanced_pipelines[1];
+
         // ---- Framebuffer (HDR color view + depth view) ----
-        let att_views = [hdr_view, depth_view];
+        let att_views = [hdr_view, oit_accum_view, oit_optical_depth_view, depth_view];
         // SAFETY: `d` is a valid AshDevice; framebuffer info references valid
         // image views and render pass; `None` means no custom allocator.
         let fb = unsafe {
@@ -434,7 +897,19 @@ impl VulkanDevice {
         self.hdr_forward_double_sided_pipeline = Some(double_sided_pipeline);
         self.hdr_forward_blend_pipeline = Some(blend_pipeline);
         self.hdr_forward_blend_double_sided_pipeline = Some(blend_double_sided_pipeline);
+        self.hdr_forward_oit_pipeline = Some(oit_pipeline);
+        self.hdr_forward_oit_double_sided_pipeline = Some(oit_double_sided_pipeline);
+        self.hdr_forward_additive_pipeline = Some(additive_pipeline);
+        self.hdr_forward_additive_double_sided_pipeline = Some(additive_double_sided_pipeline);
         self.hdr_skybox_pipeline = Some(skybox_pipeline);
+        self.hdr_vfx_billboard_pipeline = Some(vfx_billboard_pipeline);
+        self.hdr_vfx_billboard_additive_pipeline = Some(vfx_billboard_additive_pipeline);
+        self.hdr_vfx_billboard_oit_pipeline = Some(vfx_billboard_oit_pipeline);
+        self.hdr_gpu_vfx_billboard_pipeline = Some(gpu_vfx_billboard_pipeline);
+        self.hdr_gpu_vfx_billboard_additive_pipeline = Some(gpu_vfx_billboard_additive_pipeline);
+        self.hdr_gpu_vfx_billboard_oit_pipeline = Some(gpu_vfx_billboard_oit_pipeline);
+        self.hdr_instanced_pipeline = Some(instanced_pipeline);
+        self.hdr_instanced_double_sided_pipeline = Some(instanced_double_sided_pipeline);
         self.hdr_forward_fb = Some(fb);
 
         Ok(())
@@ -493,11 +968,13 @@ impl VulkanDevice {
             .map_err(|r| VulkanError::vk("crp_tone", r))?;
 
         // ---- Descriptor set layout (set=0, binding=0 = combined image sampler) ----
-        let ds_bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let ds_bindings = [0_u32, 1, 2].map(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        });
         let ds_layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&ds_bindings);
         // SAFETY: `d` is a valid AshDevice.
         let ds_layout = unsafe { d.create_descriptor_set_layout(&ds_layout_info, None) }
@@ -506,7 +983,7 @@ impl VulkanDevice {
         // ---- Descriptor pool + set ----
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: 1,
+            descriptor_count: 3,
         }];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
@@ -524,12 +1001,12 @@ impl VulkanDevice {
             .map_err(|r| VulkanError::vk("alloc_tone_ds", r))?;
         let desc_set = desc_sets[0];
 
-        // ---- Pipeline layout: set=0 (HDR sampler) + tone-map parameters ----
-        // GLSL layout: uint mode, float exposure, uint output_is_srgb, uint padding.
+        // ---- Pipeline layout: set=0 (HDR sampler) + post-process parameters ----
+        // The 128-byte block includes tone mapping, bloom, color grading, and vignette.
         let pc_range = [vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::FRAGMENT,
             offset: 0,
-            size: 16,
+            size: 128,
         }];
         let tone_set_layouts = [ds_layout];
         let pll_info = vk::PipelineLayoutCreateInfo::default()
@@ -667,17 +1144,40 @@ impl VulkanDevice {
         let Some(image_view) = self.hdr_color_view else {
             return;
         };
+        let Some(oit_accum_view) = self.oit_accum_view else {
+            return;
+        };
+        let Some(oit_optical_depth_view) = self.oit_optical_depth_view else {
+            return;
+        };
         let d = &self.logical_device.device;
 
-        let image_info = [vk::DescriptorImageInfo::default()
-            .sampler(sampler)
-            .image_view(image_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(ds)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_info)];
+        let image_infos = [image_view, oit_accum_view, oit_optical_depth_view].map(|view| {
+            vk::DescriptorImageInfo::default()
+                .sampler(sampler)
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        });
+        let image_info_0 = [image_infos[0]];
+        let image_info_1 = [image_infos[1]];
+        let image_info_2 = [image_infos[2]];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info_0),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info_1),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info_2),
+        ];
         // SAFETY: `d` is a valid AshDevice; descriptor set, sampler, and image
         // view are valid.
         unsafe {
@@ -691,7 +1191,11 @@ impl VulkanDevice {
 
     /// Create all HDR + tone-mapping resources (idempotent).
     pub(crate) fn ensure_hdr_resources(&mut self) -> VkResult<()> {
-        if self.hdr_color_image.is_some() && self.tone_rp.is_some() {
+        if self.hdr_color_image.is_some()
+            && self.oit_accum_image.is_some()
+            && self.oit_optical_depth_image.is_some()
+            && self.tone_rp.is_some()
+        {
             return Ok(());
         }
         self.create_hdr_color_texture()?;
@@ -756,6 +1260,46 @@ impl VulkanDevice {
                 d.destroy_pipeline(p, None);
             }
         }
+        if let Some(p) = self.hdr_vfx_billboard_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_vfx_billboard_additive_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_vfx_billboard_oit_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_gpu_vfx_billboard_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_gpu_vfx_billboard_additive_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_gpu_vfx_billboard_oit_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_instanced_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_instanced_double_sided_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
         if let Some(p) = self.hdr_forward_pipeline.take() {
             unsafe {
                 d.destroy_pipeline(p, None);
@@ -772,6 +1316,26 @@ impl VulkanDevice {
             }
         }
         if let Some(p) = self.hdr_forward_blend_double_sided_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_forward_oit_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_forward_oit_double_sided_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_forward_additive_pipeline.take() {
+            unsafe {
+                d.destroy_pipeline(p, None);
+            }
+        }
+        if let Some(p) = self.hdr_forward_additive_double_sided_pipeline.take() {
             unsafe {
                 d.destroy_pipeline(p, None);
             }
@@ -828,6 +1392,39 @@ impl VulkanDevice {
         if let Some(mut a) = self.hdr_color_allocation.take() {
             if let Ok(mut guard) = self.logical_device.allocator().lock() {
                 guard.free(&mut a);
+            }
+        }
+        for image_view in [
+            self.oit_accum_view.take(),
+            self.oit_optical_depth_view.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            unsafe {
+                d.destroy_image_view(image_view, None);
+            }
+        }
+        for image in [
+            self.oit_accum_image.take(),
+            self.oit_optical_depth_image.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            unsafe {
+                d.destroy_image(image, None);
+            }
+        }
+        for mut allocation in [
+            self.oit_accum_allocation.take(),
+            self.oit_optical_depth_allocation.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Ok(mut guard) = self.logical_device.allocator().lock() {
+                guard.free(&mut allocation);
             }
         }
     }

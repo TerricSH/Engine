@@ -22,6 +22,11 @@ pub struct RenderFrameInput {
     pub views: Vec<RenderView>,
     pub drawables: Vec<RenderableItem>,
     pub skinned_items: Vec<SkinnedItem>,
+    /// Camera-facing particle instances grouped by mesh/material. Backends
+    /// should render one instanced draw per batch instead of expanding each
+    /// particle into a regular drawable.
+    #[serde(default)]
+    pub particle_batches: Vec<ParticleBatch>,
     pub materials: Vec<MaterialBinding>,
     pub meshes: Vec<MeshBinding>,
     pub lights: Vec<LightItem>,
@@ -44,6 +49,7 @@ impl RenderFrameInput {
             views: Vec::new(),
             drawables: Vec::new(),
             skinned_items: Vec::new(),
+            particle_batches: Vec::new(),
             materials: Vec::new(),
             meshes: Vec::new(),
             lights: Vec::new(),
@@ -161,11 +167,79 @@ pub struct SkinnedItem {
     pub skeleton: AssetId,
     pub bone_palette: Vec<Mat4>,
     pub bone_palette_layout: BonePaletteLayout,
+    /// Optional GPU morph-target set applied before skeletal skinning.
+    #[serde(default)]
+    pub morph_target_set: Option<AssetId>,
+    /// Per-target weights in asset order (up to eight).
+    #[serde(default)]
+    pub morph_weights: Vec<f32>,
     pub world_transform: Mat4,
     pub bounds: AxisAlignedBox,
     pub render_layer: String,
     pub cast_shadows: bool,
     pub sort_key: u64,
+}
+
+/// One compact billboard instance. Position is already relative to the
+/// frame's render origin; size is the full authored billboard scale.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParticleInstance {
+    pub position: Vec3,
+    pub size: f32,
+    pub rotation_radians: f32,
+    pub normalized_age: f32,
+    /// Linear RGBA tint packed as authored 8-bit channels.
+    #[serde(default = "opaque_white_particle_color")]
+    pub color: [u8; 4],
+}
+
+fn opaque_white_particle_color() -> [u8; 4] {
+    [255; 4]
+}
+
+/// A single GPU-instanced particle submission.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParticleBatch {
+    pub emitter: Option<PersistentId>,
+    pub mesh: AssetId,
+    pub material: AssetId,
+    pub instances: Vec<ParticleInstance>,
+    /// Analytic emitter evaluated from `InstanceID` by capable GPU backends.
+    /// Other backends expand the same deterministic model on the CPU.
+    #[serde(default)]
+    pub gpu_simulation: Option<GpuParticleSimulation>,
+    pub bounds: AxisAlignedBox,
+    pub render_layer: String,
+    pub sort_key: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpuParticleSimulation {
+    pub origin: Vec3,
+    pub elapsed: f32,
+    /// Zero means unbounded emission; otherwise new particles stop at this
+    /// emitter-local time while already spawned particles continue aging.
+    pub emission_duration: f32,
+    pub emission_rate: f32,
+    pub burst_count: u32,
+    pub max_particles: u32,
+    pub lifetime_min: f32,
+    pub lifetime_max: f32,
+    pub speed_min: f32,
+    pub speed_max: f32,
+    pub start_size: f32,
+    pub end_size: f32,
+    pub start_color: [u8; 4],
+    pub end_color: [u8; 4],
+    pub direction: Vec3,
+    pub spread_angle_radians: f32,
+    pub acceleration: Vec3,
+    pub drag: f32,
+    pub turbulence_strength: f32,
+    pub turbulence_frequency: f32,
+    pub angular_velocity_min: f32,
+    pub angular_velocity_max: f32,
+    pub seed: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -258,6 +332,7 @@ pub enum Transparency {
     Opaque,
     Masked { cutoff: f32 },
     Blend,
+    Additive,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -367,6 +442,23 @@ pub struct MeshUpload {
     pub content_hash: HashDigest,
 }
 
+pub const MAX_MORPH_TARGETS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MorphTarget {
+    pub name: String,
+    pub position_deltas: Vec<Vec3>,
+    pub normal_deltas: Vec<Vec3>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MorphTargetSetUpload {
+    pub target_set_id: AssetId,
+    pub vertex_count: u32,
+    pub targets: Vec<MorphTarget>,
+    pub content_hash: HashDigest,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextureUploadFormat {
     /// Four tightly-packed 8-bit channels in RGBA order.
@@ -439,6 +531,39 @@ pub struct TextureUpload {
     pub content_hash: HashDigest,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnvironmentMapFormat {
+    /// Linear IEEE-754 half floats in tightly packed RGBA order.
+    Rgba16Float,
+}
+
+impl EnvironmentMapFormat {
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgba16Float => 8,
+        }
+    }
+}
+
+/// One prefiltered cubemap mip. Faces use Vulkan cube order:
+/// +X, -X, +Y, -Y, +Z, -Z.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentCubeMip {
+    pub face_size: u32,
+    pub faces: Vec<Vec<u8>>,
+}
+
+/// GPU-ready HDR environment map. Mips contain progressively rougher
+/// prefiltered radiance; the final mip is the diffuse irradiance
+/// approximation consumed by the portable PBR shader.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentMapUpload {
+    pub environment_id: AssetId,
+    pub format: EnvironmentMapFormat,
+    pub mip_levels: Vec<EnvironmentCubeMip>,
+    pub content_hash: HashDigest,
+}
+
 /// Owned parameters for the portable metallic-roughness material path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MaterialUpload {
@@ -453,9 +578,39 @@ pub struct MaterialUpload {
     pub metallic_roughness_texture: Option<AssetId>,
     pub occlusion_texture: Option<AssetId>,
     pub emissive_texture: Option<AssetId>,
+    #[serde(default)]
+    pub advanced: AdvancedMaterialParameters,
     pub transparency: Transparency,
     pub double_sided: bool,
     pub content_hash: HashDigest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdvancedMaterialParameters {
+    pub clearcoat: f32,
+    pub clearcoat_roughness: f32,
+    pub subsurface: f32,
+    pub subsurface_color: Vec3,
+    pub anisotropy: f32,
+    pub sheen_color: Vec3,
+    pub rim_color: Vec3,
+    pub rim_power: f32,
+}
+
+impl Default for AdvancedMaterialParameters {
+    fn default() -> Self {
+        Self {
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.2,
+            subsurface: 0.0,
+            subsurface_color: [1.0, 0.35, 0.25],
+            anisotropy: 0.0,
+            sheen_color: [0.0; 3],
+            rim_color: [0.0; 3],
+            rim_power: 3.0,
+        }
+    }
 }
 
 impl MaterialUpload {
@@ -477,6 +632,8 @@ pub enum ResourceKind {
     Mesh,
     Texture,
     Material,
+    EnvironmentMap,
+    MorphTargetSet,
 }
 
 /// Identifies one backend resource to remove. Ownership of the request is
@@ -571,6 +728,17 @@ pub struct UiVertex {
 pub struct RenderOptions {
     pub tone_mapping: ToneMapping,
     pub exposure_ev100: Option<f32>,
+    /// Strategy used for alpha-blended geometry. Weighted blended OIT avoids
+    /// per-object sorting and scales to dense transparent effects while the
+    /// sorted mode preserves the legacy forward-blend result.
+    #[serde(default)]
+    pub transparency_mode: TransparencyMode,
+    /// Environment lighting and local reflection-probe selection.
+    #[serde(default)]
+    pub environment: EnvironmentSettings,
+    /// Portable post-processing parameters consumed after HDR scene rendering.
+    #[serde(default)]
+    pub post_process: PostProcessSettings,
     /// Number of MSAA samples (1 = disabled, 2/4/8 = MSAA).
     pub msaa_samples: u8,
     /// Pass graph configuration — loadable from scene settings.
@@ -584,10 +752,23 @@ impl Default for RenderOptions {
         Self {
             tone_mapping: ToneMapping::Aces,
             exposure_ev100: None,
+            transparency_mode: TransparencyMode::default(),
+            environment: EnvironmentSettings::default(),
+            post_process: PostProcessSettings::default(),
             msaa_samples: 1,
             pass_graph_config: crate::render_graph2::PassGraphConfig::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransparencyMode {
+    /// Submit alpha-blended surfaces in the frontend-provided order.
+    #[default]
+    Sorted,
+    /// Accumulate alpha-blended surfaces into weighted color and optical-depth
+    /// targets, then resolve them during the HDR composite.
+    WeightedBlendedOit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +776,126 @@ pub enum ToneMapping {
     Aces,
     Reinhard,
     None,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvironmentSettings {
+    pub environment_map: Option<AssetId>,
+    pub intensity: f32,
+    pub rotation_radians: f32,
+    pub reflection_probes: Vec<ReflectionProbe>,
+}
+
+impl Default for EnvironmentSettings {
+    fn default() -> Self {
+        Self {
+            environment_map: None,
+            intensity: 1.0,
+            rotation_radians: 0.0,
+            reflection_probes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReflectionProbe {
+    pub entity: Option<PersistentId>,
+    pub environment_map: AssetId,
+    pub position: Vec3,
+    pub half_extents: Vec3,
+    pub blend_distance: f32,
+    pub priority: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PostProcessSettings {
+    pub enabled: bool,
+    pub bloom: BloomSettings,
+    pub color_grading: ColorGradingSettings,
+    pub vignette: VignetteSettings,
+}
+
+impl Default for PostProcessSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bloom: BloomSettings::default(),
+            color_grading: ColorGradingSettings::default(),
+            vignette: VignetteSettings::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BloomSettings {
+    pub enabled: bool,
+    /// HDR luminance threshold above which neighboring pixels contribute.
+    pub threshold: f32,
+    /// Additive bloom strength.
+    pub intensity: f32,
+    /// Sampling radius in pixels for the built-in quality tier.
+    pub radius: f32,
+}
+
+impl Default for BloomSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: 1.0,
+            intensity: 0.08,
+            radius: 2.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ColorGradingSettings {
+    pub enabled: bool,
+    pub color_filter: Vec3,
+    pub saturation: f32,
+    pub contrast: f32,
+    pub lift: Vec3,
+    pub gamma: Vec3,
+    pub gain: Vec3,
+}
+
+impl Default for ColorGradingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            color_filter: [1.0; 3],
+            saturation: 1.0,
+            contrast: 1.0,
+            lift: [0.0; 3],
+            gamma: [1.0; 3],
+            gain: [1.0; 3],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VignetteSettings {
+    pub enabled: bool,
+    pub intensity: f32,
+    pub smoothness: f32,
+    /// `0` produces a boxier vignette and `1` a circular vignette.
+    pub roundness: f32,
+}
+
+impl Default for VignetteSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            intensity: 0.3,
+            smoothness: 0.5,
+            roundness: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

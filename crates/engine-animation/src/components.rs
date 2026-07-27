@@ -105,6 +105,10 @@ impl Default for AnimationPlayer {
 pub struct SkeletonComponent {
     pub skeleton_asset: Option<String>,
     pub bind_shape: [f32; 3],
+    #[serde(default)]
+    pub morph_target_set: Option<String>,
+    #[serde(default)]
+    pub morph_weights: Vec<f32>,
 }
 
 impl Component for SkeletonComponent {
@@ -116,6 +120,8 @@ impl SkeletonComponent {
         Self {
             skeleton_asset: Some(skeleton_asset.into()),
             bind_shape: [0.5, 0.5, 0.5],
+            morph_target_set: None,
+            morph_weights: Vec::new(),
         }
     }
 }

@@ -23,6 +23,27 @@ pub trait CommandEncoder: Send {
         clear_color: [f32; 4],
         clear_depth: Option<f32>,
     );
+    /// Begin a render pass with one clear value per color attachment.
+    ///
+    /// The default keeps older backends source-compatible by applying the
+    /// first clear value to every attachment. MRT backends should override
+    /// this when attachments carry different semantic identities.
+    fn begin_render_pass_with_color_clears(
+        &mut self,
+        render_pass: RenderPassHandle,
+        framebuffer: FramebufferHandle,
+        area: (u32, u32, u32, u32),
+        color_clears: &[[f32; 4]],
+        clear_depth: Option<f32>,
+    ) {
+        self.begin_render_pass(
+            render_pass,
+            framebuffer,
+            area,
+            color_clears.first().copied().unwrap_or([0.0; 4]),
+            clear_depth,
+        );
+    }
     fn bind_pipeline(&mut self, pipeline: PipelineHandle);
     fn bind_vertex_buffers(&mut self, buffers: &[BufferHandle], offsets: &[u64]);
     fn bind_index_buffer(&mut self, buffer: BufferHandle, offset: u64, index_format: IndexFormat);
@@ -63,6 +84,18 @@ pub trait CommandEncoder: Send {
         &mut self,
         _pipeline_layout: PipelineLayoutHandle,
         _textures: &[TextureHandle],
+    ) -> bool {
+        false
+    }
+    /// Bind the forward scene's sampled textures followed by read-only storage
+    /// buffers in one contiguous SRV table. DX12 requires one shader-visible
+    /// CBV/SRV/UAV heap, so a single operation must assemble both resource
+    /// classes without invalidating the texture table.
+    fn bind_scene_resource_set(
+        &mut self,
+        _pipeline_layout: PipelineLayoutHandle,
+        _textures: &[TextureHandle],
+        _storage_buffers: &[BufferHandle],
     ) -> bool {
         false
     }

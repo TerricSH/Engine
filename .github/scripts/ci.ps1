@@ -68,6 +68,42 @@ function Invoke-Clippy {
 }
 
 function Invoke-FeatureCheck {
+    foreach ($leafFeature in @(
+        "subsystem-animation",
+        "subsystem-audio",
+        "subsystem-navigation",
+        "subsystem-ui",
+        "subsystem-physics",
+        "subsystem-gameplay",
+        "subsystem-terrain",
+        "subsystem-scripting-csharp"
+    )) {
+        Invoke-Native "engine-core leaf feature check: $leafFeature" "cargo" @(
+            "check",
+            "--locked",
+            "-p",
+            "engine-core",
+            "--no-default-features",
+            "--features",
+            $leafFeature
+        )
+    }
+    foreach ($integrationFeatures in @(
+        "subsystem-scripting-csharp,subsystem-gameplay",
+        "subsystem-scripting-csharp,subsystem-physics",
+        "subsystem-animation,subsystem-physics",
+        "subsystem-terrain,subsystem-physics"
+    )) {
+        Invoke-Native "engine-core integration feature check: $integrationFeatures" "cargo" @(
+            "check",
+            "--locked",
+            "-p",
+            "engine-core",
+            "--no-default-features",
+            "--features",
+            $integrationFeatures
+        )
+    }
     Invoke-Native "engine-core device-free runtime subsystem strict check" "cargo" @(
         "clippy",
         "--locked",

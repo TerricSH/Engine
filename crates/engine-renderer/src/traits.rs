@@ -1,7 +1,8 @@
 use crate::render_graph2::{CompiledBarrier, PassNode};
 use crate::{
-    validate_frame_input, AssetId, Diagnostic, DiagnosticSeverity, FrameStats, MaterialUpload,
-    MeshUpload, RenderFrameInput, ResourceRemoval, TextureUpload, Transparency, UploadReceipt,
+    validate_frame_input, AssetId, Diagnostic, DiagnosticSeverity, EnvironmentMapUpload,
+    FrameStats, MaterialUpload, MeshUpload, MorphTargetSetUpload, RenderFrameInput,
+    ResourceRemoval, TextureUpload, Transparency, UploadReceipt,
 };
 
 pub const DIAG_BACKEND_MISSING: &str = "RV0100";
@@ -17,15 +18,31 @@ pub const DIAG_INVALID_MESH_INDICES: &str = "RV0112";
 pub const DIAG_INVALID_MESH_BOUNDS: &str = "RV0113";
 pub const DIAG_INVALID_TEXTURE_DIMENSIONS: &str = "RV0120";
 pub const DIAG_INVALID_TEXTURE_MIPS: &str = "RV0121";
+pub const DIAG_INVALID_ENVIRONMENT_MAP: &str = "RV0122";
+pub const DIAG_INVALID_MORPH_TARGET_SET: &str = "RV0123";
 pub const DIAG_INVALID_MATERIAL_VALUES: &str = "RV0130";
 pub const DIAG_UNSUPPORTED_MATERIAL_STATE: &str = "RV0131";
 pub const DIAG_INVALID_RESIZE: &str = "RV0140";
 pub const DIAG_BARRIERS_UNSUPPORTED: &str = "RV0141";
 pub const DIAG_RENDER_GRAPH_UNSUPPORTED: &str = "RV0142";
 pub const DIAG_CUSTOM_RENDER_GRAPH_UNSUPPORTED: &str = "RV0143";
+pub const DIAG_WEIGHTED_OIT_UNSUPPORTED: &str = "RV0144";
 
 /// Backend renderer trait implemented by concrete GPU backends.
 pub trait BackendRenderer: Send {
+    /// Whether this backend owns the weighted accumulation targets, independent
+    /// MRT blend states, and HDR resolve required by weighted blended OIT.
+    fn supports_weighted_blended_oit(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend evaluates analytic particle batches directly from
+    /// `InstanceID`. The renderer expands them through the deterministic CPU
+    /// fallback when this returns `false`.
+    fn supports_gpu_particle_simulation(&self) -> bool {
+        false
+    }
+
     /// Let a graph-capable backend replace frontend placeholder declarations
     /// for its registered custom passes before dependency compilation.
     ///
@@ -128,6 +145,27 @@ pub trait BackendRenderer: Send {
         ))
     }
 
+    /// Upload one prefiltered HDR cubemap and make it available to frames.
+    fn upload_environment_map(
+        &mut self,
+        _upload: EnvironmentMapUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        Err(unsupported_backend_operation(
+            DIAG_TEXTURE_UPLOAD_UNSUPPORTED,
+            "environment-map upload",
+        ))
+    }
+
+    fn upload_morph_target_set(
+        &mut self,
+        _upload: MorphTargetSetUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        Err(unsupported_backend_operation(
+            DIAG_MESH_UPLOAD_UNSUPPORTED,
+            "morph-target-set upload",
+        ))
+    }
+
     /// Upload one owned metallic-roughness material.
     fn upload_material(
         &mut self,
@@ -226,6 +264,35 @@ impl Renderer {
             .upload_texture(upload)
     }
 
+    /// Validate and upload one prefiltered HDR environment cubemap.
+    pub fn upload_environment_map(
+        &mut self,
+        upload: EnvironmentMapUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        let diagnostics = validate_environment_map_upload(&upload);
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+        self.backend
+            .as_mut()
+            .ok_or_else(|| missing_backend("environment-map upload"))?
+            .upload_environment_map(upload)
+    }
+
+    pub fn upload_morph_target_set(
+        &mut self,
+        upload: MorphTargetSetUpload,
+    ) -> Result<UploadReceipt, Vec<Diagnostic>> {
+        let diagnostics = validate_morph_target_set_upload(&upload);
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+        self.backend
+            .as_mut()
+            .ok_or_else(|| missing_backend("morph-target-set upload"))?
+            .upload_morph_target_set(upload)
+    }
+
     /// Validate and upload one portable metallic-roughness material.
     pub fn upload_material(
         &mut self,
@@ -263,6 +330,30 @@ impl Renderer {
         }) {
             return Err(diagnostics);
         }
+
+        let backend_capabilities = self
+            .backend
+            .as_ref()
+            .ok_or_else(|| missing_backend("draw"))?;
+        if input.render_options.transparency_mode == crate::TransparencyMode::WeightedBlendedOit
+            && !backend_capabilities.supports_weighted_blended_oit()
+        {
+            return Err(vec![Diagnostic::new(
+                DIAG_WEIGHTED_OIT_UNSUPPORTED,
+                DiagnosticSeverity::Error,
+                "renderer.backend",
+                "active backend does not implement weighted blended OIT",
+            )
+            .path("render_options.transparency_mode")]);
+        }
+        let supports_gpu_particles = backend_capabilities.supports_gpu_particle_simulation();
+        let fallback_input;
+        let input = if supports_gpu_particles {
+            input
+        } else {
+            fallback_input = cpu_particle_fallback(input);
+            &fallback_input
+        };
 
         let backend = self
             .backend
@@ -319,6 +410,19 @@ impl Renderer {
 
         Ok(stats)
     }
+}
+
+fn cpu_particle_fallback(input: &RenderFrameInput) -> RenderFrameInput {
+    let mut fallback = input.clone();
+    for batch in &mut fallback.particle_batches {
+        if let Some(simulation) = batch.gpu_simulation.take() {
+            batch.instances = crate::expand_gpu_particle_simulation(simulation);
+        }
+    }
+    fallback
+        .particle_batches
+        .retain(|batch| !batch.instances.is_empty());
+    fallback
 }
 
 impl Default for Renderer {
@@ -509,6 +613,98 @@ fn validate_texture_upload(upload: &TextureUpload) -> Vec<Diagnostic> {
     diagnostics
 }
 
+fn validate_environment_map_upload(upload: &EnvironmentMapUpload) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Some(diagnostic) = validate_resource_id(&upload.environment_id, "environment map") {
+        diagnostics.push(diagnostic);
+    }
+    let Some(base) = upload.mip_levels.first() else {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_ENVIRONMENT_MAP,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            "environment map must contain at least one cubemap mip",
+        ));
+        return diagnostics;
+    };
+    if base.face_size == 0 {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_ENVIRONMENT_MAP,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            "environment-map face size must be non-zero",
+        ));
+        return diagnostics;
+    }
+    let maximum_mips = u32::BITS - base.face_size.leading_zeros();
+    if upload.mip_levels.len() > maximum_mips as usize {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_ENVIRONMENT_MAP,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            format!(
+                "{}x{} cubemap faces support at most {maximum_mips} mips",
+                base.face_size, base.face_size
+            ),
+        ));
+    }
+    let bytes_per_pixel = upload.format.bytes_per_pixel();
+    let mut expected_face_size = base.face_size;
+    for (mip_index, mip) in upload.mip_levels.iter().enumerate() {
+        let expected_face_bytes = (expected_face_size as usize)
+            .checked_mul(expected_face_size as usize)
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel));
+        if mip.face_size != expected_face_size
+            || mip.faces.len() != 6
+            || expected_face_bytes.is_none()
+            || mip
+                .faces
+                .iter()
+                .any(|face| Some(face.len()) != expected_face_bytes)
+        {
+            diagnostics.push(Diagnostic::new(
+                DIAG_INVALID_ENVIRONMENT_MAP,
+                DiagnosticSeverity::Error,
+                "renderer.contract",
+                format!(
+                    "environment mip {mip_index} must contain six {expected_face_size}x{expected_face_size} RGBA16F faces"
+                ),
+            ));
+        }
+        expected_face_size = (expected_face_size / 2).max(1);
+    }
+    diagnostics
+}
+
+fn validate_morph_target_set_upload(upload: &MorphTargetSetUpload) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Some(diagnostic) = validate_resource_id(&upload.target_set_id, "morph target set") {
+        diagnostics.push(diagnostic);
+    }
+    let targets_valid = upload.vertex_count > 0
+        && (1..=crate::MAX_MORPH_TARGETS).contains(&upload.targets.len())
+        && upload.targets.iter().all(|target| {
+            !target.name.trim().is_empty()
+                && target.position_deltas.len() == upload.vertex_count as usize
+                && target.normal_deltas.len() == upload.vertex_count as usize
+                && target
+                    .position_deltas
+                    .iter()
+                    .chain(&target.normal_deltas)
+                    .flatten()
+                    .all(|value| value.is_finite())
+        });
+    if !targets_valid {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_MORPH_TARGET_SET,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            "morph target sets require 1..=8 named targets with finite position/normal deltas matching vertex_count",
+        ));
+    }
+    diagnostics
+}
+
 fn validate_material_upload(upload: &MaterialUpload) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     if let Some(diagnostic) = validate_resource_id(&upload.material_id, "material") {
@@ -544,6 +740,32 @@ fn validate_material_upload(upload: &MaterialUpload) -> Vec<Diagnostic> {
             DiagnosticSeverity::Error,
             "renderer.contract",
             "material color, emissive, metallic, roughness, and ambient occlusion must be finite values in [0, 1]",
+        ));
+    }
+
+    let advanced = &upload.advanced;
+    let unit_interval_values = [
+        advanced.clearcoat,
+        advanced.clearcoat_roughness,
+        advanced.subsurface,
+    ]
+    .into_iter()
+    .chain(advanced.subsurface_color)
+    .chain(advanced.sheen_color)
+    .chain(advanced.rim_color);
+    let advanced_valid = unit_interval_values
+        .into_iter()
+        .all(|value| value.is_finite() && (0.0..=1.0).contains(&value))
+        && advanced.anisotropy.is_finite()
+        && (-1.0..=1.0).contains(&advanced.anisotropy)
+        && advanced.rim_power.is_finite()
+        && (0.01..=32.0).contains(&advanced.rim_power);
+    if !advanced_valid {
+        diagnostics.push(Diagnostic::new(
+            DIAG_INVALID_MATERIAL_VALUES,
+            DiagnosticSeverity::Error,
+            "renderer.contract",
+            "advanced material weights and colors must be finite values in [0, 1], anisotropy in [-1, 1], and rim power in [0.01, 32]",
         ));
     }
 

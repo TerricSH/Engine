@@ -77,6 +77,8 @@ mod tests {
                 skeleton: crate::AssetId::new("skeleton_dummy"),
                 bone_palette: vec![IDENTITY_MAT4; 4],
                 bone_palette_layout: crate::BonePaletteLayout::Full4x4 { count: 4 },
+                morph_target_set: None,
+                morph_weights: Vec::new(),
                 world_transform: IDENTITY_MAT4,
                 bounds: AxisAlignedBox {
                     min: [-1.0, -1.0, -1.0],

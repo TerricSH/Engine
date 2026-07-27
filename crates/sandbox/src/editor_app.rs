@@ -5309,6 +5309,7 @@ mod tests {
             transparency: "Opaque".to_string(),
             alpha_cutoff: 0.5,
             double_sided: false,
+            advanced: Default::default(),
         }
     }
 

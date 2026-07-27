@@ -44,6 +44,10 @@ pub enum AssetType {
     Animation,
     Skeleton,
     NavMesh,
+    /// Prefiltered HDR cubemap cooked from an equirectangular image.
+    EnvironmentMap,
+    /// Position/normal deltas associated with one mesh primitive.
+    MorphTargetSet,
     /// Logic asset (behavior graph / state machine / skill graph / quest dialogue).
     Logic,
     /// Reusable entity hierarchy authored as `*.prefab.ron`.
@@ -72,6 +76,8 @@ impl AssetType {
             AssetType::NavMesh => 12,
             AssetType::Logic => 13,
             AssetType::Prefab => 14,
+            AssetType::EnvironmentMap => 15,
+            AssetType::MorphTargetSet => 16,
             AssetType::Unknown => 0xFFFF,
         }
     }
@@ -93,6 +99,8 @@ impl AssetType {
             12 => AssetType::NavMesh,
             13 => AssetType::Logic,
             14 => AssetType::Prefab,
+            15 => AssetType::EnvironmentMap,
+            16 => AssetType::MorphTargetSet,
             _ => AssetType::Unknown,
         }
     }

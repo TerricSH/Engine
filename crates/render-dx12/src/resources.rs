@@ -3,6 +3,8 @@ use windows::{Win32::Graphics::Direct3D12::*, Win32::Graphics::Dxgi::Common::*};
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use render_core::{ShaderFormat, ShaderStage, TextureFormat};
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // Internal resource types
@@ -25,7 +27,7 @@ pub(crate) struct Dx12TextureInner {
     pub(crate) format: TextureFormat,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) state: D3D12_RESOURCE_STATES,
+    pub(crate) state: Arc<Mutex<D3D12_RESOURCE_STATES>>,
     pub(crate) sampled_srv_heap: Option<ID3D12DescriptorHeap>,
     pub(crate) sampled_sampler_heap: Option<ID3D12DescriptorHeap>,
 }
@@ -56,6 +58,8 @@ pub(crate) struct Dx12FramebufferInner {
     pub(crate) rtv_descriptors: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
     pub(crate) dsv_descriptor: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
     pub(crate) color_resources: Vec<ID3D12Resource>,
+    pub(crate) color_states: Vec<Arc<Mutex<D3D12_RESOURCE_STATES>>>,
+    pub(crate) color_is_sampled: Vec<bool>,
     pub(crate) depth_resource: Option<ID3D12Resource>,
     pub(crate) depth_is_sampled: bool,
     pub(crate) width: u32,

@@ -78,6 +78,10 @@ pub struct VulkanDevice {
     pub(crate) forward_vert_spv: Option<Vec<u8>>,
     pub(crate) forward_frag_spv: Option<Vec<u8>>,
     pub(crate) skinned_vert_spv: Option<Vec<u8>>,
+    pub(crate) vfx_billboard_vert_spv: Option<Vec<u8>>,
+    pub(crate) gpu_vfx_billboard_vert_spv: Option<Vec<u8>>,
+    pub(crate) vfx_billboard_frag_spv: Option<Vec<u8>>,
+    pub(crate) instanced_vert_spv: Option<Vec<u8>>,
     pub(crate) skybox_vert_spv: Option<Vec<u8>>,
     pub(crate) skybox_frag_spv: Option<Vec<u8>>,
 
@@ -143,7 +147,10 @@ pub struct VulkanDevice {
     pub(crate) light_ssbo: Option<vk::Buffer>,
     pub(crate) light_ssbo_allocation: Option<crate::allocator::Allocation>,
     pub(crate) light_ssbo_size: vk::DeviceSize,
-    pub(crate) max_lights: u32,
+    pub(crate) cluster_grid_ssbo: Option<vk::Buffer>,
+    pub(crate) cluster_grid_ssbo_allocation: Option<crate::allocator::Allocation>,
+    pub(crate) cluster_index_ssbo: Option<vk::Buffer>,
+    pub(crate) cluster_index_ssbo_allocation: Option<crate::allocator::Allocation>,
 
     // Phase 5.1: Indirect draw buffer (for GPU-driven culling)
     pub(crate) indirect_draw_buffer: Option<vk::Buffer>,
@@ -177,6 +184,12 @@ pub struct VulkanDevice {
     pub(crate) hdr_color_view: Option<vk::ImageView>,
     pub(crate) hdr_color_allocation: Option<crate::allocator::Allocation>,
     pub(crate) hdr_color_sampler: Option<vk::Sampler>,
+    pub(crate) oit_accum_image: Option<vk::Image>,
+    pub(crate) oit_accum_view: Option<vk::ImageView>,
+    pub(crate) oit_accum_allocation: Option<crate::allocator::Allocation>,
+    pub(crate) oit_optical_depth_image: Option<vk::Image>,
+    pub(crate) oit_optical_depth_view: Option<vk::ImageView>,
+    pub(crate) oit_optical_depth_allocation: Option<crate::allocator::Allocation>,
     pub(crate) tone_rp: Option<vk::RenderPass>,
     pub(crate) tone_pipeline: Option<vk::Pipeline>,
     pub(crate) tone_pipeline_layout: Option<vk::PipelineLayout>,
@@ -192,6 +205,20 @@ pub struct VulkanDevice {
     pub(crate) hdr_forward_double_sided_pipeline: Option<vk::Pipeline>,
     pub(crate) hdr_forward_blend_pipeline: Option<vk::Pipeline>,
     pub(crate) hdr_forward_blend_double_sided_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_forward_oit_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_forward_oit_double_sided_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_forward_additive_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_forward_additive_double_sided_pipeline: Option<vk::Pipeline>,
+    /// Instanced camera-facing particle pipeline. It shares the forward
+    /// fragment material/light path but disables depth writes.
+    pub(crate) hdr_vfx_billboard_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_vfx_billboard_additive_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_vfx_billboard_oit_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_gpu_vfx_billboard_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_gpu_vfx_billboard_additive_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_gpu_vfx_billboard_oit_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_instanced_pipeline: Option<vk::Pipeline>,
+    pub(crate) hdr_instanced_double_sided_pipeline: Option<vk::Pipeline>,
     /// Skybox pipeline rendered before opaque geometry in the HDR pass.
     pub(crate) hdr_skybox_pipeline: Option<vk::Pipeline>,
     pub(crate) hdr_forward_pipeline_layout: Option<vk::PipelineLayout>,
@@ -314,6 +341,10 @@ impl VulkanDevice {
             forward_vert_spv: None,
             forward_frag_spv: None,
             skinned_vert_spv: None,
+            vfx_billboard_vert_spv: None,
+            gpu_vfx_billboard_vert_spv: None,
+            vfx_billboard_frag_spv: None,
+            instanced_vert_spv: None,
             skybox_vert_spv: None,
             skybox_frag_spv: None,
             compute_queue: None,
@@ -378,6 +409,12 @@ impl VulkanDevice {
             hdr_color_view: None,
             hdr_color_allocation: None,
             hdr_color_sampler: None,
+            oit_accum_image: None,
+            oit_accum_view: None,
+            oit_accum_allocation: None,
+            oit_optical_depth_image: None,
+            oit_optical_depth_view: None,
+            oit_optical_depth_allocation: None,
             tone_rp: None,
             tone_pipeline: None,
             tone_pipeline_layout: None,
@@ -390,6 +427,18 @@ impl VulkanDevice {
             hdr_forward_double_sided_pipeline: None,
             hdr_forward_blend_pipeline: None,
             hdr_forward_blend_double_sided_pipeline: None,
+            hdr_forward_oit_pipeline: None,
+            hdr_forward_oit_double_sided_pipeline: None,
+            hdr_forward_additive_pipeline: None,
+            hdr_forward_additive_double_sided_pipeline: None,
+            hdr_vfx_billboard_pipeline: None,
+            hdr_vfx_billboard_additive_pipeline: None,
+            hdr_vfx_billboard_oit_pipeline: None,
+            hdr_gpu_vfx_billboard_pipeline: None,
+            hdr_gpu_vfx_billboard_additive_pipeline: None,
+            hdr_gpu_vfx_billboard_oit_pipeline: None,
+            hdr_instanced_pipeline: None,
+            hdr_instanced_double_sided_pipeline: None,
             hdr_skybox_pipeline: None,
             hdr_forward_pipeline_layout: None,
             hdr_forward_fb: None,
@@ -410,8 +459,11 @@ impl VulkanDevice {
             // Light SSBO (Phase 4.3)
             light_ssbo: None,
             light_ssbo_allocation: None,
-            light_ssbo_size: 16384, // 256 lights × 64 bytes each
-            max_lights: 256,
+            light_ssbo_size: 0,
+            cluster_grid_ssbo: None,
+            cluster_grid_ssbo_allocation: None,
+            cluster_index_ssbo: None,
+            cluster_index_ssbo_allocation: None,
 
             // Phase 5.1: Indirect draw buffers
             indirect_draw_buffer: None,
@@ -548,6 +600,16 @@ impl VulkanDevice {
 
     pub fn set_skinned_vertex_shader(&mut self, vert: &[u8]) {
         self.skinned_vert_spv = Some(vert.to_vec());
+    }
+
+    pub fn set_vfx_billboard_shaders(&mut self, vert: &[u8], gpu_vert: &[u8], frag: &[u8]) {
+        self.vfx_billboard_vert_spv = Some(vert.to_vec());
+        self.gpu_vfx_billboard_vert_spv = Some(gpu_vert.to_vec());
+        self.vfx_billboard_frag_spv = Some(frag.to_vec());
+    }
+
+    pub fn set_instanced_vertex_shader(&mut self, vert: &[u8]) {
+        self.instanced_vert_spv = Some(vert.to_vec());
     }
 
     pub fn set_skybox_shaders(&mut self, vert: &[u8], frag: &[u8]) {
@@ -844,6 +906,26 @@ fn blend_attachment_from_mode(mode: &str) -> vk::PipelineColorBlendAttachmentSta
         .dst_alpha_blend_factor(dst_alpha)
         .alpha_blend_op(vk::BlendOp::ADD)
         .color_write_mask(vk::ColorComponentFlags::RGBA)
+}
+
+fn mrt_blend_attachments(mode: &str) -> [vk::PipelineColorBlendAttachmentState; 3] {
+    let disabled = vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(false)
+        .color_write_mask(vk::ColorComponentFlags::empty());
+    if mode == "WeightedOit" {
+        let additive = vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA);
+        [disabled, additive, additive]
+    } else {
+        [blend_attachment_from_mode(mode), disabled, disabled]
+    }
 }
 
 fn default_dep() -> vk::SubpassDependency {

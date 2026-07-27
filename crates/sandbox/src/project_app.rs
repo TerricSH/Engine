@@ -143,7 +143,7 @@ fn create_game_loop(
     );
     #[cfg(feature = "subsystem-scripting-csharp")]
     game_loop.set_script_save_directory(project.root.join("savegames"));
-    #[cfg(feature = "runtime-subsystems")]
+    #[cfg(feature = "subsystem-ui")]
     game_loop.set_ui_viewport_size(
         project.manifest.window.width,
         project.manifest.window.height,
@@ -1215,7 +1215,7 @@ mod tests {
                 .map(|scene| scene.scene_id.as_str()),
             Some("level_two")
         );
-        #[cfg(any(feature = "target-desktop", feature = "subsystem-scripting-csharp"))]
+        #[cfg(feature = "subsystem-physics")]
         assert!(game_loop.physics.is_some());
     }
 

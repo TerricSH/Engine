@@ -6,11 +6,14 @@
 
 pub mod cooked_shader;
 pub mod dependency;
+pub mod environment;
 pub mod error;
+pub mod hlod;
 pub mod logic_asset;
 pub mod manifest;
 pub mod material;
 pub mod mesh;
+pub mod morph_target;
 pub mod prefab;
 pub mod scene;
 pub mod texture;
@@ -30,17 +33,29 @@ pub use cooked_shader::{
     cook_shader, CookedShader, DescriptorBinding, ShaderReflection, VertexInputReflection,
 };
 pub use dependency::{CookState, DependencyGraph, DependencyNode};
+pub use environment::{
+    cook_environment_map, decode_cooked_environment_map, CookedEnvironmentMap,
+    CookedEnvironmentMip, COOKED_ENVIRONMENT_SCHEMA_VERSION,
+};
 pub use error::CookError;
+pub use hlod::{
+    apply_hlod_bake_to_scene, bake_hlod_proxies, bake_hlod_scene, write_hlod_proxy_artifacts,
+    HlodBakeOutput, HlodBakeSettings, HlodBakeSource, HlodProxyBake, HLOD_PROXY_PREFIX,
+};
 pub use logic_asset::{
     cook_logic_asset, logic_asset_cooker, logic_asset_loader, register_logic_asset_type,
     LogicAsset, LOGIC_ASSET_TYPE_ID,
 };
 pub use manifest::{AssetType, CookRules, SourceAssetEntry, SourceManifest};
 pub use material::{
-    cook_material, decode_cooked_material, CookedMaterial, MaterialSource, MaterialTransparency,
-    COOKED_MATERIAL_SCHEMA_VERSION, MATERIAL_SOURCE_SCHEMA,
+    cook_material, decode_cooked_material, AdvancedMaterialSource, CookedMaterial, MaterialSource,
+    MaterialTransparency, COOKED_MATERIAL_SCHEMA_VERSION, MATERIAL_SOURCE_SCHEMA,
 };
 pub use mesh::cook_mesh;
+pub use morph_target::{
+    cook_morph_target_set, decode_cooked_morph_target_set, CookedMorphTarget, CookedMorphTargetSet,
+    COOKED_MORPH_TARGET_SCHEMA_VERSION,
+};
 pub use prefab::cook_prefab;
 pub use scene::cook_scene;
 pub use texture::{cook_texture, CookedTexture, TextureFormat};
@@ -699,7 +714,13 @@ fn dispatch_source_entry(
             mesh::cook_mesh_primitive(source_path, output_path, cook_rules.gltf_primitive_index)
         }
         AssetType::Texture => texture::cook_texture(source_path, output_path),
+        AssetType::EnvironmentMap => environment::cook_environment_map(source_path, output_path),
         AssetType::Material => material::cook_material(source_path, output_path),
+        AssetType::MorphTargetSet => morph_target::cook_morph_target_set(
+            source_path,
+            output_path,
+            cook_rules.gltf_primitive_index,
+        ),
         AssetType::Shader => {
             let stage = determine_shader_stage(source_path);
             cooked_shader::cook_shader(source_path, output_path, 0, &stage)

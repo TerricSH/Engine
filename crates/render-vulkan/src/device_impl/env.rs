@@ -6,6 +6,7 @@
 //! independent from external assets.
 
 use ash::{vk, Device as AshDevice};
+use engine_renderer::{EnvironmentMapFormat, EnvironmentMapUpload};
 
 use crate::allocator::{Allocation, SharedAllocator};
 use crate::error::{VkResult, VulkanError};
@@ -21,6 +22,82 @@ struct EnvironmentUploadPlan {
     face_bytes: u64,
     total_bytes: u64,
     face_offsets: [u64; ENV_FACE_COUNT as usize],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EnvironmentCopyRegion {
+    offset: u64,
+    mip_level: u32,
+    face: u32,
+    face_size: u32,
+}
+
+#[derive(Clone, Debug)]
+struct EnvironmentPayload {
+    format: vk::Format,
+    face_size: u32,
+    mip_count: u32,
+    pixels: Vec<u8>,
+    regions: Vec<EnvironmentCopyRegion>,
+}
+
+impl EnvironmentPayload {
+    fn procedural() -> Self {
+        let pixels = procedural_environment_rgba8(ENV_FACE_SIZE);
+        let plan = environment_upload_plan(ENV_FACE_SIZE)
+            .expect("the built-in environment dimensions are valid");
+        let regions = plan
+            .face_offsets
+            .into_iter()
+            .enumerate()
+            .map(|(face, offset)| EnvironmentCopyRegion {
+                offset,
+                mip_level: 0,
+                face: face as u32,
+                face_size: ENV_FACE_SIZE,
+            })
+            .collect();
+        Self {
+            format: vk::Format::R8G8B8A8_UNORM,
+            face_size: ENV_FACE_SIZE,
+            mip_count: 1,
+            pixels,
+            regions,
+        }
+    }
+
+    fn from_upload(upload: &EnvironmentMapUpload) -> VkResult<Self> {
+        let base = upload
+            .mip_levels
+            .first()
+            .ok_or_else(|| VulkanError::Loader("environment map has no mips".into()))?;
+        let format = match upload.format {
+            EnvironmentMapFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
+        };
+        let mut pixels = Vec::new();
+        let mut regions = Vec::with_capacity(upload.mip_levels.len() * ENV_FACE_COUNT as usize);
+        for (mip_level, mip) in upload.mip_levels.iter().enumerate() {
+            for (face, bytes) in mip.faces.iter().enumerate() {
+                let offset = u64::try_from(pixels.len()).map_err(|_| {
+                    VulkanError::Allocation("environment payload offset overflow".into())
+                })?;
+                pixels.extend_from_slice(bytes);
+                regions.push(EnvironmentCopyRegion {
+                    offset,
+                    mip_level: mip_level as u32,
+                    face: face as u32,
+                    face_size: mip.face_size,
+                });
+            }
+        }
+        Ok(Self {
+            format,
+            face_size: base.face_size,
+            mip_count: upload.mip_levels.len() as u32,
+            pixels,
+            regions,
+        })
+    }
 }
 
 fn environment_upload_plan(face_size: u32) -> Option<EnvironmentUploadPlan> {
@@ -122,6 +199,22 @@ struct EnvironmentResources {
     allocation: Allocation,
     image_view: vk::ImageView,
     sampler: vk::Sampler,
+}
+
+fn destroy_environment_resources(
+    device: &AshDevice,
+    allocator: &SharedAllocator,
+    mut resources: EnvironmentResources,
+) {
+    unsafe {
+        device.destroy_sampler(resources.sampler, None);
+        device.destroy_image_view(resources.image_view, None);
+        device.destroy_image(resources.image, None);
+    }
+    match allocator.lock() {
+        Ok(mut guard) => guard.free(&mut resources.allocation),
+        Err(poisoned) => poisoned.into_inner().free(&mut resources.allocation),
+    }
 }
 
 /// Owns all partially-created environment resources until they are committed
@@ -337,137 +430,169 @@ impl VulkanDevice {
         if self.env_cubemap.is_some() {
             return Ok(());
         }
-        let d = &self.logical_device.device;
+        self.install_environment_payload(EnvironmentPayload::procedural())
+    }
+
+    /// Replace the active environment with a validated, prefiltered HDR map.
+    pub(crate) fn upload_environment_map(&mut self, upload: &EnvironmentMapUpload) -> VkResult<()> {
+        self.install_environment_payload(EnvironmentPayload::from_upload(upload)?)
+    }
+
+    pub(crate) fn restore_procedural_environment(&mut self) -> VkResult<()> {
+        self.install_environment_payload(EnvironmentPayload::procedural())
+    }
+
+    fn install_environment_payload(&mut self, payload: EnvironmentPayload) -> VkResult<()> {
+        if payload.face_size == 0
+            || payload.mip_count == 0
+            || payload.pixels.is_empty()
+            || payload.regions.len() != payload.mip_count as usize * ENV_FACE_COUNT as usize
+        {
+            return Err(VulkanError::Loader(
+                "environment payload is incomplete".into(),
+            ));
+        }
+        let device = &self.logical_device.device;
         let allocator = self.logical_device.allocator();
         let mut pending =
-            PendingEnvironment::new(d.clone(), allocator.clone(), self.logical_device.queue);
+            PendingEnvironment::new(device.clone(), allocator.clone(), self.logical_device.queue);
 
-        // ---- 1. Create cubemap image (6 layers, CUBE_COMPATIBLE) ----
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(payload.format)
             .extent(vk::Extent3D {
-                width: ENV_FACE_SIZE,
-                height: ENV_FACE_SIZE,
+                width: payload.face_size,
+                height: payload.face_size,
                 depth: 1,
             })
-            .mip_levels(1)
-            .array_layers(6)
+            .mip_levels(payload.mip_count)
+            .array_layers(ENV_FACE_COUNT)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE);
-        // SAFETY: `d` is a valid AshDevice; `image_info` describes a valid
-        // 2D array image with CUBE_COMPATIBLE flag.
-        pending.image = unsafe { d.create_image(&image_info, None) }
-            .map_err(|r| VulkanError::vk("create_env_image", r))?;
+        pending.image = unsafe { device.create_image(&image_info, None) }
+            .map_err(|result| VulkanError::vk("create_env_image", result))?;
 
-        // SAFETY: `pending.image` was just created by this device.
-        let req = unsafe { d.get_image_memory_requirements(pending.image) };
-        let allocation = allocator
-            .lock()
-            .map_err(|e| VulkanError::Loader(format!("allocator lock: {e}")))?
-            .allocate(&crate::allocator::AllocationCreateDesc {
-                name: "env-cubemap",
-                requirements: req,
-                location: crate::allocator::MemoryLocation::GpuOnly,
-            })
-            .map_err(|e| VulkanError::Allocation(e.to_string()))?;
-        pending.image_allocation = Some(allocation);
+        let requirements = unsafe { device.get_image_memory_requirements(pending.image) };
+        pending.image_allocation = Some(
+            allocator
+                .lock()
+                .map_err(|error| VulkanError::Loader(format!("allocator lock: {error}")))?
+                .allocate(&crate::allocator::AllocationCreateDesc {
+                    name: "env-cubemap",
+                    requirements,
+                    location: crate::allocator::MemoryLocation::GpuOnly,
+                })
+                .map_err(|error| VulkanError::Allocation(error.to_string()))?,
+        );
         let allocation = pending.image_allocation.as_ref().ok_or_else(|| {
             VulkanError::Loader("environment image allocation disappeared".into())
         })?;
-        // SAFETY: `pending.image` was created by this device; `allocation` was
-        // created for this image's memory requirements.
-        unsafe { d.bind_image_memory(pending.image, allocation.memory(), allocation.offset()) }
-            .map_err(|r| VulkanError::vk("bind_env_image", r))?;
+        unsafe {
+            device.bind_image_memory(pending.image, allocation.memory(), allocation.offset())
+        }
+        .map_err(|result| VulkanError::vk("bind_env_image", result))?;
 
-        // ---- 2. Image view (CUBE, all 6 layers) ----
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(pending.image)
-            .view_type(vk::ImageViewType::CUBE)
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 6,
-            });
-        // SAFETY: `d` is a valid AshDevice; `view_info` references a valid
-        // image with CUBE view type; `None` means no custom allocator.
-        pending.image_view = unsafe { d.create_image_view(&view_info, None) }
-            .map_err(|r| VulkanError::vk("create_env_image_view", r))?;
+        pending.image_view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(pending.image)
+                    .view_type(vk::ImageViewType::CUBE)
+                    .format(payload.format)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: payload.mip_count,
+                        base_array_layer: 0,
+                        layer_count: ENV_FACE_COUNT,
+                    }),
+                None,
+            )
+        }
+        .map_err(|result| VulkanError::vk("create_env_image_view", result))?;
 
-        // ---- 3. Sampler (linear, clamp-to-edge) ----
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .min_lod(0.0)
-            .max_lod(0.0)
-            .mip_lod_bias(0.0)
-            .anisotropy_enable(false);
-        // SAFETY: `d` is a valid AshDevice; `sampler_info` describes a valid
-        // sampler; `None` means no custom allocator.
-        pending.sampler = unsafe { d.create_sampler(&sampler_info, None) }
-            .map_err(|r| VulkanError::vk("create_env_sampler", r))?;
+        pending.sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .min_lod(0.0)
+                    .max_lod(payload.mip_count.saturating_sub(1) as f32)
+                    .anisotropy_enable(false),
+                None,
+            )
+        }
+        .map_err(|result| VulkanError::vk("create_env_sampler", result))?;
 
-        // ---- 4. Upload the deterministic procedural environment ----
-        Self::upload_procedural_environment(&mut pending, self.adapter.queue_family_index)?;
+        Self::upload_environment_payload(&mut pending, self.adapter.queue_family_index, &payload)?;
+        let new_resources = pending.commit()?;
+        let old_resources = match (
+            self.env_cubemap.take(),
+            self.env_cubemap_allocation.take(),
+            self.env_cubemap_view.take(),
+            self.env_sampler.take(),
+        ) {
+            (Some(image), Some(allocation), Some(image_view), Some(sampler)) => {
+                Some(EnvironmentResources {
+                    image,
+                    allocation,
+                    image_view,
+                    sampler,
+                })
+            }
+            _ => None,
+        };
 
-        // ---- Commit, store, then update descriptor set binding=1 ----
-        // No Vulkan object escapes the guard before creation, upload,
-        // submission, and synchronization have all succeeded.
-        let EnvironmentResources {
-            image,
-            allocation,
-            image_view,
-            sampler,
-        } = pending.commit()?;
-        // `update_env_descriptor_set` reads these handles from `self`, so the
-        // resources must be visible there before the descriptor write.
-        self.env_cubemap = Some(image);
-        self.env_cubemap_view = Some(image_view);
-        self.env_cubemap_allocation = Some(allocation);
-        self.env_sampler = Some(sampler);
+        self.env_cubemap = Some(new_resources.image);
+        self.env_cubemap_view = Some(new_resources.image_view);
+        self.env_cubemap_allocation = Some(new_resources.allocation);
+        self.env_sampler = Some(new_resources.sampler);
         if let Err(error) = self.update_env_descriptor_set() {
-            self.destroy_env_resources();
+            let failed = EnvironmentResources {
+                image: self.env_cubemap.take().expect("new environment image"),
+                allocation: self
+                    .env_cubemap_allocation
+                    .take()
+                    .expect("new environment allocation"),
+                image_view: self.env_cubemap_view.take().expect("new environment view"),
+                sampler: self.env_sampler.take().expect("new environment sampler"),
+            };
+            destroy_environment_resources(device, &allocator, failed);
+            if let Some(old) = old_resources {
+                self.env_cubemap = Some(old.image);
+                self.env_cubemap_view = Some(old.image_view);
+                self.env_cubemap_allocation = Some(old.allocation);
+                self.env_sampler = Some(old.sampler);
+                let _ = self.update_env_descriptor_set();
+            }
             return Err(error);
         }
-
+        if let Some(old) = old_resources {
+            destroy_environment_resources(device, &allocator, old);
+        }
         Ok(())
     }
 
-    /// Upload the built-in sky/ground environment through a staging buffer.
-    fn upload_procedural_environment(
+    /// Upload all cubemap faces and prefiltered mips through a staging buffer.
+    fn upload_environment_payload(
         pending: &mut PendingEnvironment,
         queue_family_index: u32,
+        payload: &EnvironmentPayload,
     ) -> VkResult<()> {
         let d = &pending.device;
-        let pixels = procedural_environment_rgba8(ENV_FACE_SIZE);
-        let plan = environment_upload_plan(ENV_FACE_SIZE).ok_or_else(|| {
-            VulkanError::Allocation("environment upload dimensions overflow".into())
-        })?;
-        let expected_bytes = usize::try_from(plan.total_bytes).map_err(|_| {
-            VulkanError::Allocation(
-                "environment upload size is not representable by the host".into(),
-            )
-        })?;
-        if pixels.len() != expected_bytes {
-            return Err(VulkanError::Allocation(format!(
-                "environment pixel data contains {} bytes, expected {expected_bytes}",
-                pixels.len()
-            )));
-        }
+        let pixels = &payload.pixels;
+        let total_bytes = u64::try_from(pixels.len())
+            .map_err(|_| VulkanError::Allocation("environment payload is too large".into()))?;
 
         // ---- Staging buffer (CpuToGpu, TRANSFER_SRC) ----
         let buf_info = vk::BufferCreateInfo::default()
-            .size(plan.total_bytes)
+            .size(total_bytes)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `d` is a valid AshDevice; `buf_info` describes a valid
@@ -513,7 +638,7 @@ impl VulkanDevice {
                 pixels.len()
             )));
         }
-        slice[..pixels.len()].copy_from_slice(&pixels);
+        slice[..pixels.len()].copy_from_slice(pixels.as_slice());
 
         // ---- Temporary command pool + buffer for transfer ----
         let cp_info = vk::CommandPoolCreateInfo::default()
@@ -549,7 +674,7 @@ impl VulkanDevice {
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: payload.mip_count,
                 base_array_layer: 0,
                 layer_count: ENV_FACE_COUNT,
             })
@@ -572,22 +697,24 @@ impl VulkanDevice {
         }
 
         // Copy staging buffer → cubemap, one region per face layer
-        let buffer_copy_regions: Vec<vk::BufferImageCopy> = (0..ENV_FACE_COUNT)
-            .map(|layer| {
+        let buffer_copy_regions: Vec<vk::BufferImageCopy> = payload
+            .regions
+            .iter()
+            .map(|region| {
                 vk::BufferImageCopy::default()
-                    .buffer_offset(plan.face_offsets[layer as usize])
+                    .buffer_offset(region.offset)
                     .buffer_row_length(0)
                     .buffer_image_height(0)
                     .image_subresource(vk::ImageSubresourceLayers {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: layer,
+                        mip_level: region.mip_level,
+                        base_array_layer: region.face,
                         layer_count: 1,
                     })
                     .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
                     .image_extent(vk::Extent3D {
-                        width: ENV_FACE_SIZE,
-                        height: ENV_FACE_SIZE,
+                        width: region.face_size,
+                        height: region.face_size,
                         depth: 1,
                     })
             })
@@ -610,7 +737,7 @@ impl VulkanDevice {
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: payload.mip_count,
                 base_array_layer: 0,
                 layer_count: ENV_FACE_COUNT,
             })
@@ -823,6 +950,39 @@ mod tests {
         assert!(
             sky[2] > ground[2],
             "sky should contain more blue than ground"
+        );
+    }
+
+    #[test]
+    fn hdr_environment_payload_keeps_mip_major_cube_face_offsets() {
+        let mip0_face = vec![0_u8; 4 * 4 * 8];
+        let mip1_face = vec![1_u8; 2 * 2 * 8];
+        let upload = EnvironmentMapUpload {
+            environment_id: engine_renderer::AssetId::new("environment.hdr"),
+            format: EnvironmentMapFormat::Rgba16Float,
+            mip_levels: vec![
+                engine_renderer::EnvironmentCubeMip {
+                    face_size: 4,
+                    faces: vec![mip0_face.clone(); 6],
+                },
+                engine_renderer::EnvironmentCubeMip {
+                    face_size: 2,
+                    faces: vec![mip1_face.clone(); 6],
+                },
+            ],
+            content_hash: [0; 32],
+        };
+
+        let payload = EnvironmentPayload::from_upload(&upload).unwrap();
+
+        assert_eq!(payload.format, vk::Format::R16G16B16A16_SFLOAT);
+        assert_eq!(payload.mip_count, 2);
+        assert_eq!(payload.regions.len(), 12);
+        assert_eq!(payload.regions[6].mip_level, 1);
+        assert_eq!(payload.regions[6].offset, (mip0_face.len() * 6) as u64);
+        assert_eq!(
+            payload.pixels.len(),
+            mip0_face.len() * 6 + mip1_face.len() * 6
         );
     }
 }

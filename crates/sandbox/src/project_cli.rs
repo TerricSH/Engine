@@ -555,19 +555,20 @@ fn parse_import_asset_type(value: &str) -> Result<AssetType, String> {
         "mesh" => Ok(AssetType::Mesh),
         "texture" => Ok(AssetType::Texture),
         "material" => Ok(AssetType::Material),
+        "environment" | "environment-map" | "hdri" => Ok(AssetType::EnvironmentMap),
         "audio" => Ok(AssetType::Audio),
         "animation" => Ok(AssetType::Animation),
         "skeleton" => Ok(AssetType::Skeleton),
         "navmesh" | "nav" => Ok(AssetType::NavMesh),
         "prefab" => Ok(AssetType::Prefab),
         _ => Err(format!(
-            "unsupported import type '{value}'; expected mesh, texture, material, audio, animation, skeleton, navmesh, or prefab"
+            "unsupported import type '{value}'; expected mesh, texture, material, environment, audio, animation, skeleton, navmesh, or prefab"
         )),
     }
 }
 
 fn import_usage() -> String {
-    "usage: sandbox project import <project> <source-file> --id <asset-id> [--type mesh|texture|material|audio|animation|skeleton|navmesh|prefab] [--folder <path-below-assets/source>]".into()
+    "usage: sandbox project import <project> <source-file> --id <asset-id> [--type mesh|texture|material|environment|audio|animation|skeleton|navmesh|prefab] [--folder <path-below-assets/source>]".into()
 }
 
 fn parse_single_project_path(command: &str, args: &[String]) -> Result<PathBuf, String> {
@@ -2113,6 +2114,8 @@ fn validate_project_asset_type(
         | AssetType::Shader
         | AssetType::Scene
         | AssetType::Material
+        | AssetType::EnvironmentMap
+        | AssetType::MorphTargetSet
         | AssetType::Logic => Ok(()),
         _ => {
             let type_id = registered_asset_type_id(asset_type).ok_or_else(|| {
@@ -2287,11 +2290,21 @@ fn import_project_asset(request: &ProjectImportRequest) -> Result<(), String> {
                 cook_rules.gltf_primitive_index = Some(primitive_index as u32);
             }
             prepared_assets.push(SourceAssetEntry {
-                id: AssetId::new(id),
+                id: AssetId::new(&id),
                 asset_type: AssetType::Mesh,
                 source_path: manifest_source_path(&relative_source),
-                cook_rules,
+                cook_rules: cook_rules.clone(),
             });
+            if !scene.primitives[primitive_index].morph_targets.is_empty() {
+                let morph_id = format!("{id}.morphs");
+                validate_import_asset_id(&morph_id)?;
+                prepared_assets.push(SourceAssetEntry {
+                    id: AssetId::new(morph_id),
+                    asset_type: AssetType::MorphTargetSet,
+                    source_path: manifest_source_path(&relative_source),
+                    cook_rules,
+                });
+            }
         }
 
         let imported_skins = engine_animation::import_gltf_animation_assets(&scene)?;
@@ -2790,6 +2803,8 @@ fn resolve_import_asset_type(
         Some(AssetType::Material)
     } else if matches!(extension.as_str(), "gltf" | "glb") {
         Some(AssetType::Mesh)
+    } else if matches!(extension.as_str(), "hdr" | "exr") {
+        Some(AssetType::EnvironmentMap)
     } else if is_supported_texture_extension(&extension) {
         Some(AssetType::Texture)
     } else if matches!(extension.as_str(), "wav" | "mp3" | "ogg" | "flac") {
@@ -2814,6 +2829,7 @@ fn resolve_import_asset_type(
         AssetType::Mesh => matches!(extension.as_str(), "gltf" | "glb"),
         AssetType::Texture => is_supported_texture_extension(&extension),
         AssetType::Material => extension == "json",
+        AssetType::EnvironmentMap => matches!(extension.as_str(), "hdr" | "exr"),
         AssetType::Audio => matches!(extension.as_str(), "wav" | "mp3" | "ogg" | "flac"),
         AssetType::Animation => extension == "anim",
         AssetType::Skeleton => extension == "skel",
@@ -2868,6 +2884,7 @@ fn import_asset_type_label(asset_type: &AssetType) -> &'static str {
         AssetType::Mesh => "mesh",
         AssetType::Texture => "texture",
         AssetType::Material => "material",
+        AssetType::EnvironmentMap => "environment",
         AssetType::Audio => "audio",
         AssetType::Animation => "animation",
         AssetType::Skeleton => "skeleton",

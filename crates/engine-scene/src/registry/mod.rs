@@ -88,6 +88,8 @@ mod tests {
         assert!(reg.is_registered("engine.camera"));
         assert!(reg.is_registered("engine.light"));
         assert!(reg.is_registered("engine.interactable"));
+        assert!(reg.is_registered("engine.lod_group"));
+        assert!(reg.is_registered("engine.hlod_cluster"));
         assert!(reg.is_registered("engine.bounds"));
         assert!(reg.is_registered("engine.prefab_instance_ref"));
 
@@ -102,6 +104,8 @@ mod tests {
                 "engine.camera",
                 "engine.light",
                 "engine.interactable",
+                "engine.lod_group",
+                "engine.hlod_cluster",
                 "engine.bounds",
                 "engine.prefab_instance_ref",
             ]
@@ -114,13 +118,15 @@ mod tests {
         reg.register_core();
 
         let storages = reg.create_storages();
-        assert_eq!(storages.len(), 8);
+        assert_eq!(storages.len(), 10);
         assert!(storages.contains_key("engine.name"));
         assert!(storages.contains_key("engine.transform"));
         assert!(storages.contains_key("engine.renderable"));
         assert!(storages.contains_key("engine.camera"));
         assert!(storages.contains_key("engine.light"));
         assert!(storages.contains_key("engine.interactable"));
+        assert!(storages.contains_key("engine.lod_group"));
+        assert!(storages.contains_key("engine.hlod_cluster"));
         assert!(storages.contains_key("engine.bounds"));
         assert!(storages.contains_key("engine.prefab_instance_ref"));
 

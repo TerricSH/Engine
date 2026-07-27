@@ -533,6 +533,8 @@ fn skeleton_component_roundtrip() {
     let sc = SkeletonComponent {
         skeleton_asset: Some("human.skel".into()),
         bind_shape: [1.0, 2.0, 3.0],
+        morph_target_set: Some("human.morphs".into()),
+        morph_weights: vec![0.5],
     };
     let bytes = bincode::serialize(&sc).unwrap();
     let restored: SkeletonComponent = bincode::deserialize(&bytes).unwrap();
@@ -694,6 +696,8 @@ fn skinned_extract_producer_push_and_drain() {
         bounds_max: [1.0, 1.0, 1.0],
         render_layer: "default".into(),
         cast_shadows: true,
+        morph_target_set: None,
+        morph_weights: Vec::new(),
     });
 
     assert_eq!(producer.pending_count(), 1);
@@ -716,6 +720,8 @@ fn skinned_extract_producer_produce_injects_into_input() {
         bounds_max: [1.0, 1.0, 1.0],
         render_layer: "default".into(),
         cast_shadows: true,
+        morph_target_set: Some("face.morphs".into()),
+        morph_weights: vec![0.25, 0.75],
     });
 
     let mut input = engine_renderer::RenderFrameInput::empty(42);
@@ -740,6 +746,8 @@ fn skinned_extract_replaces_the_matching_static_drawable() {
         bounds_max: [1.0; 3],
         render_layer: "default".into(),
         cast_shadows: true,
+        morph_target_set: None,
+        morph_weights: Vec::new(),
     });
 
     let drawable = |entity: &str| engine_renderer::RenderableItem {
@@ -838,6 +846,8 @@ fn measure_far_origin_skinned(distance: f32, camera_relative: bool) -> (f64, f64
             SkeletonComponent {
                 skeleton_asset: Some("skel-far".into()),
                 bind_shape: [0.5, 0.5, 0.5],
+                morph_target_set: None,
+                morph_weights: Vec::new(),
             },
         );
 
@@ -973,6 +983,8 @@ fn bridge_skinned_items_shifts_world_transform_when_camera_relative_enabled() {
             SkeletonComponent {
                 skeleton_asset: Some("skel-shift".into()),
                 bind_shape: [0.5, 0.5, 0.5],
+                morph_target_set: None,
+                morph_weights: Vec::new(),
             },
         );
 
@@ -1077,6 +1089,8 @@ fn register_animation_extensions_registers_components() {
         bounds_max: [0.5; 3],
         render_layer: "default".into(),
         cast_shadows: true,
+        morph_target_set: None,
+        morph_weights: Vec::new(),
     });
     let mut frame = engine_renderer::RenderFrameInput::empty(1);
     render_ext_reg.produce_all(&mut frame, 1);

@@ -89,6 +89,43 @@ fn script_api_contract_crate_remains_data_only() {
 }
 
 #[test]
+fn engine_core_composition_root_stays_bounded_and_uses_leaf_features() {
+    let root = workspace_root();
+    let source_root = root.join("crates/engine-core/src");
+    let facade = source_root.join("lib.rs");
+    let facade_size = fs::metadata(&facade)
+        .expect("engine-core facade metadata")
+        .len();
+    assert!(
+        facade_size <= 160 * 1024,
+        "engine-core/src/lib.rs grew to {facade_size} bytes; move domain behavior behind runtime/ \
+         or script_commands/ instead of expanding the composition root"
+    );
+    for required_boundary in ["runtime/rendering.rs", "script_commands/mod.rs"] {
+        assert!(
+            source_root.join(required_boundary).is_file(),
+            "engine-core boundary module is missing: {required_boundary}"
+        );
+    }
+
+    let mut sources = Vec::new();
+    visit_rust_sources(&source_root, &mut sources);
+    for source in sources {
+        let text = fs::read_to_string(&source)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", source.display()));
+        for compatibility_alias in ["runtime-subsystems", "gameplay", "terrain"] {
+            let forbidden = format!("feature = \"{compatibility_alias}\"");
+            assert!(
+                !text.contains(&forbidden),
+                "{} gates implementation with compatibility feature '{compatibility_alias}'; \
+                 use the owning leaf feature instead",
+                source.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn removed_custom_editor_ui_cannot_reenter_production_sources() {
     let root = workspace_root();
     for retired in [

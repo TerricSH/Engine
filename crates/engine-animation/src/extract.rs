@@ -42,6 +42,8 @@ pub struct PendingSkinnedItem {
     pub render_layer: String,
     /// Whether the item casts shadows.
     pub cast_shadows: bool,
+    pub morph_target_set: Option<String>,
+    pub morph_weights: Vec<f32>,
 }
 
 /// Render extension producer that injects skinned items into the frame input
@@ -120,6 +122,8 @@ impl RenderExtensionProducer for SkinnedExtractProducer {
                 skeleton: engine_serialize::AssetId::new(&item.skeleton),
                 bone_palette: item.bone_palette.into_iter().map(mat4x4_to_flat).collect(),
                 bone_palette_layout: BonePaletteLayout::Full4x4 { count: bone_count },
+                morph_target_set: item.morph_target_set.map(engine_serialize::AssetId::new),
+                morph_weights: item.morph_weights,
                 world_transform: mat4x4_to_flat(item.world_transform),
                 bounds: AxisAlignedBox {
                     min: item.bounds_min,
@@ -269,6 +273,13 @@ pub fn bridge_skinned_items(
             bounds_max,
             render_layer: renderable.render_layer.clone(),
             cast_shadows: renderable.cast_shadows,
+            morph_target_set: skeleton_component
+                .as_ref()
+                .and_then(|component| component.morph_target_set.clone()),
+            morph_weights: skeleton_component
+                .as_ref()
+                .map(|component| component.morph_weights.clone())
+                .unwrap_or_default(),
         });
     }
 }

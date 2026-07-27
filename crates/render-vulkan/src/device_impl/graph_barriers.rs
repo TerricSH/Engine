@@ -110,6 +110,20 @@ impl VulkanDevice {
                 vk::ImageAspectFlags::COLOR,
                 1,
             ),
+            "oit_accumulation" => (
+                self.oit_accum_image.ok_or_else(|| {
+                    "OIT accumulation graph resource is not initialized".to_owned()
+                })?,
+                vk::ImageAspectFlags::COLOR,
+                1,
+            ),
+            "oit_optical_depth" => (
+                self.oit_optical_depth_image.ok_or_else(|| {
+                    "OIT optical-depth graph resource is not initialized".to_owned()
+                })?,
+                vk::ImageAspectFlags::COLOR,
+                1,
+            ),
             "depth_stencil" => (
                 self.depth_image
                     .ok_or_else(|| "depth graph resource is not initialized".to_owned())?,

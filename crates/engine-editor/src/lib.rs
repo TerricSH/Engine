@@ -91,6 +91,8 @@ pub mod gizmo;
 #[cfg(feature = "tooling-editor")]
 pub mod gizmo_overlay;
 #[cfg(feature = "tooling-editor")]
+pub mod hlod_baker;
+#[cfg(feature = "tooling-editor")]
 pub mod io;
 #[cfg(feature = "tooling-editor")]
 pub mod material_editor;
@@ -112,6 +114,8 @@ pub use commands::{
 };
 #[cfg(feature = "tooling-editor")]
 pub use diagnostics::{DiagnosticEntry, DiagnosticsPanel};
+#[cfg(feature = "tooling-editor")]
+pub use hlod_baker::{bake_scene_hlod_assets, HlodAuthoringError, HlodAuthoringReport};
 #[cfg(feature = "tooling-editor")]
 pub use io::{default_scene_path, load_scene, save_scene};
 #[cfg(feature = "tooling-editor")]

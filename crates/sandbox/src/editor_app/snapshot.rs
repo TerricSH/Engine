@@ -1172,9 +1172,12 @@ fn asset_kind_name(kind: AssetKind) -> &'static str {
     match kind {
         AssetKind::Scene => "scene",
         AssetKind::Prefab => "prefab",
-        AssetKind::Mesh | AssetKind::Skeleton | AssetKind::Animation => "model",
+        AssetKind::Mesh
+        | AssetKind::Skeleton
+        | AssetKind::Animation
+        | AssetKind::MorphTargetSet => "model",
         AssetKind::Material => "material",
-        AssetKind::Texture => "texture",
+        AssetKind::Texture | AssetKind::EnvironmentMap => "texture",
         AssetKind::Audio => "audio",
         AssetKind::Script => "script",
         AssetKind::Shader | AssetKind::Pipeline => "shader",
@@ -1324,9 +1327,13 @@ mod tests {
             AssetKind::NavMesh,
             AssetKind::Logic,
             AssetKind::Prefab,
+            AssetKind::EnvironmentMap,
+            AssetKind::MorphTargetSet,
             AssetKind::Unknown,
         ];
         assert!(kinds.iter().all(|kind| !asset_kind_name(*kind).is_empty()));
+        assert_eq!(asset_kind_name(AssetKind::EnvironmentMap), "texture");
+        assert_eq!(asset_kind_name(AssetKind::MorphTargetSet), "model");
     }
 
     #[test]

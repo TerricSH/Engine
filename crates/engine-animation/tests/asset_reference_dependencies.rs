@@ -47,6 +47,8 @@ fn empty_animation_asset_references_remain_omitted() {
         SkeletonComponent {
             skeleton_asset: None,
             bind_shape: [0.5; 3],
+            morph_target_set: None,
+            morph_weights: Vec::new(),
         },
     );
 

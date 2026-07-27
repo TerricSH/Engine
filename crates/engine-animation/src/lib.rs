@@ -107,7 +107,7 @@ pub fn register_animation_extensions(
             type_id: AnimationPlayer::TYPE_ID,
             display_name: "Animation Player",
             schema_version: (0, 1, 0),
-            has_editor: false,
+            has_editor: true,
             script_access: engine_scene::ScriptAccess::None,
         },
         storage_factory: anim_player_storage,

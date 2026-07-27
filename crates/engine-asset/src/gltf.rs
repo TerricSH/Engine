@@ -3,8 +3,9 @@
 //! The importer preserves document indices, expands every mesh primitive into
 //! an explicit [`GltfPrimitive`], resolves the selected scene's complete world
 //! transforms, and preserves `JOINTS_0` / `WEIGHTS_0` data for skinned meshes.
-//! Triangle lists are the only supported topology and morph targets remain an
-//! explicit unsupported feature.
+//! Triangle lists are the only supported topology. Position and normal morph
+//! deltas are preserved per primitive for the renderer's bounded target-set
+//! path.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,6 +16,8 @@ use glam::{Mat4, Vec2, Vec3};
 use thiserror::Error;
 
 use crate::mesh::MeshData;
+
+const MAX_GLTF_MORPH_TARGETS: usize = 8;
 
 /// PBR material properties extracted from a glTF material.
 #[derive(Clone, Debug)]
@@ -86,6 +89,14 @@ pub struct GltfPrimitive {
     pub topology: gltf::mesh::Mode,
     pub source_mesh_index: usize,
     pub source_primitive_index: usize,
+    pub morph_targets: Vec<GltfMorphTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GltfMorphTarget {
+    pub name: String,
+    pub position_deltas: Vec<Vec3>,
+    pub normal_deltas: Vec<Vec3>,
 }
 
 /// A node belonging to the selected glTF scene.
@@ -100,6 +111,8 @@ pub struct GltfNode {
     pub primitive_indices: Vec<usize>,
     /// Original glTF skin index for a skinned mesh node.
     pub skin_index: Option<usize>,
+    /// Node weights override mesh defaults according to glTF 2.0.
+    pub morph_weights: Vec<f32>,
     /// Child indices into the owning scene's `nodes` vector.
     pub children: Vec<usize>,
 }
@@ -216,11 +229,22 @@ pub enum GltfImportError {
     },
 
     #[error(
-        "glTF mesh {mesh_index} primitive {primitive_index} uses morph targets, which are unsupported by the importer"
+        "glTF mesh {mesh_index} primitive {primitive_index} has {target_count} morph targets; at most 8 are supported"
     )]
-    UnsupportedMorphTargets {
+    TooManyMorphTargets {
         mesh_index: usize,
         primitive_index: usize,
+        target_count: usize,
+    },
+
+    #[error(
+        "glTF mesh {mesh_index} primitive {primitive_index} morph target {target_index} has an attribute count that does not match {vertex_count} vertices"
+    )]
+    MorphTargetCountMismatch {
+        mesh_index: usize,
+        primitive_index: usize,
+        target_index: usize,
+        vertex_count: usize,
     },
 
     #[error(
@@ -380,13 +404,6 @@ pub fn load_gltf_scene(path: &Path) -> Result<GltfScene, GltfImportError> {
                     topology: primitive.mode(),
                 });
             }
-            if primitive.morph_targets().next().is_some() {
-                return Err(GltfImportError::UnsupportedMorphTargets {
-                    mesh_index: source_mesh_index,
-                    primitive_index: source_primitive_index,
-                });
-            }
-
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
             let positions: Vec<Vec3> = reader
                 .read_positions()
@@ -415,6 +432,12 @@ pub fn load_gltf_scene(path: &Path) -> Result<GltfScene, GltfImportError> {
                 .read_normals()
                 .map(|values| values.map(Vec3::from_array).collect())
                 .unwrap_or_else(|| generate_vertex_normals(&positions, &indices));
+            let morph_targets = read_morph_targets(
+                &reader,
+                positions.len(),
+                source_mesh_index,
+                source_primitive_index,
+            )?;
             let (joints, weights) = read_skin_attributes(
                 &reader,
                 positions.len(),
@@ -440,6 +463,7 @@ pub fn load_gltf_scene(path: &Path) -> Result<GltfScene, GltfImportError> {
                 topology: gltf::mesh::Mode::Triangles,
                 source_mesh_index,
                 source_primitive_index,
+                morph_targets,
             });
             mesh_to_primitives[source_mesh_index].push(primitive_index);
         }
@@ -1081,6 +1105,57 @@ fn normalize_animation_quaternion(value: [f32; 4]) -> [f32; 4] {
     }
 }
 
+fn read_morph_targets<'a, 's, F>(
+    reader: &gltf::mesh::Reader<'a, 's, F>,
+    vertex_count: usize,
+    mesh_index: usize,
+    primitive_index: usize,
+) -> Result<Vec<GltfMorphTarget>, GltfImportError>
+where
+    F: Clone + Fn(gltf::Buffer<'a>) -> Option<&'s [u8]>,
+{
+    let target_count = reader.clone().read_morph_targets().len();
+    if target_count > MAX_GLTF_MORPH_TARGETS {
+        return Err(GltfImportError::TooManyMorphTargets {
+            mesh_index,
+            primitive_index,
+            target_count,
+        });
+    }
+    reader
+        .clone()
+        .read_morph_targets()
+        .enumerate()
+        .map(|(target_index, (positions, normals, _tangents))| {
+            let position_deltas = positions
+                .map(|values| values.map(Vec3::from_array).collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![Vec3::ZERO; vertex_count]);
+            let normal_deltas = normals
+                .map(|values| values.map(Vec3::from_array).collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![Vec3::ZERO; vertex_count]);
+            if position_deltas.len() != vertex_count
+                || normal_deltas.len() != vertex_count
+                || position_deltas
+                    .iter()
+                    .chain(&normal_deltas)
+                    .any(|delta| !delta.is_finite())
+            {
+                return Err(GltfImportError::MorphTargetCountMismatch {
+                    mesh_index,
+                    primitive_index,
+                    target_index,
+                    vertex_count,
+                });
+            }
+            Ok(GltfMorphTarget {
+                name: format!("target-{target_index}"),
+                position_deltas,
+                normal_deltas,
+            })
+        })
+        .collect()
+}
+
 fn read_skin_attributes<'a, 's, F>(
     reader: &gltf::mesh::Reader<'a, 's, F>,
     position_count: usize,
@@ -1240,6 +1315,11 @@ fn flatten_node(
         .and_then(|mesh| mesh_to_primitives.get(mesh.index()))
         .cloned()
         .unwrap_or_default();
+    let morph_weights = node
+        .weights()
+        .or_else(|| node.mesh().and_then(|mesh| mesh.weights()))
+        .map(<[f32]>::to_vec)
+        .unwrap_or_default();
     let node_index = nodes.len();
 
     nodes.push(GltfNode {
@@ -1248,6 +1328,7 @@ fn flatten_node(
         transform,
         primitive_indices,
         skin_index: node.skin().map(|skin| skin.index()),
+        morph_weights,
         children: Vec::new(),
     });
     if is_root {
@@ -1825,6 +1906,63 @@ mod tests {
                 topology: gltf::mesh::Mode::Lines,
             }
         ));
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn position_morph_targets_are_imported_and_cooked() {
+        let dir = temp_dir("morph-target");
+        let gltf_path = dir.join("morph.gltf");
+        let buffer_path = dir.join("morph.bin");
+        let positions = [[0.0_f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let deltas = [[0.0_f32, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.3]];
+        let mut bytes = Vec::new();
+        for value in positions.into_iter().chain(deltas) {
+            for component in value {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        fs::write(&buffer_path, bytes).expect("write morph buffer");
+        fs::write(
+            &gltf_path,
+            r#"{
+  "asset": {"version": "2.0"},
+  "buffers": [{"uri": "morph.bin", "byteLength": 72}],
+  "bufferViews": [
+    {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+    {"buffer": 0, "byteOffset": 36, "byteLength": 36}
+  ],
+  "accessors": [
+    {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+     "min": [0, 0, 0], "max": [1, 1, 0]},
+    {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3"}
+  ],
+  "meshes": [{"weights": [0.4], "primitives": [{
+    "attributes": {"POSITION": 0},
+    "targets": [{"POSITION": 1}]
+  }]}],
+  "nodes": [{"mesh": 0}],
+  "scenes": [{"nodes": [0]}],
+  "scene": 0
+}"#,
+        )
+        .expect("write morph glTF");
+
+        let scene = load_gltf_scene(&gltf_path).expect("morph glTF should load");
+        assert_eq!(scene.primitives[0].morph_targets.len(), 1);
+        assert_eq!(
+            scene.primitives[0].morph_targets[0].position_deltas[1],
+            Vec3::new(0.0, 0.2, 0.0)
+        );
+        assert_eq!(scene.nodes[0].morph_weights, vec![0.4]);
+
+        let output = dir.join("morph.cooked");
+        crate::cook::cook_morph_target_set(&gltf_path, &output, None)
+            .expect("cook morph target set");
+        let artifact = crate::cook::read_cooked_artifact(&output).unwrap();
+        let cooked = crate::cook::decode_cooked_morph_target_set(&artifact).unwrap();
+        assert_eq!(cooked.vertex_count, 3);
+        assert_eq!(cooked.targets.len(), 1);
         fs::remove_dir_all(dir).expect("remove test directory");
     }
 }

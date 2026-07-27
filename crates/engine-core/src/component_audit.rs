@@ -72,6 +72,22 @@ const AUDIT_ANNOTATIONS: &[(&str, AuditAnnotation)] = &[
         },
     ),
     (
+        "engine.lod_group",
+        AuditAnnotation {
+            reconciler: "per frame (render extraction selects assets by base-camera distance)",
+            caveat: "write takes effect live",
+            decision: "ReadWrite — authored LOD/HLOD policy is validated and re-extracted next frame",
+        },
+    ),
+    (
+        "engine.hlod_cluster",
+        AuditAnnotation {
+            reconciler: "per frame (render extraction switches source/proxy cluster roles)",
+            caveat: "write takes effect live and can replace a complete source cluster",
+            decision: "ReadWrite — cluster membership and proxy thresholds are validated and re-extracted next frame",
+        },
+    ),
+    (
         "engine.interactable",
         AuditAnnotation {
             reconciler: "per physics query (interaction metadata extraction)",

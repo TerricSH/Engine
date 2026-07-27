@@ -1,4 +1,6 @@
-use engine_renderer::{PassGraphConfig, ToneMapping};
+use engine_renderer::{
+    PassGraphConfig, PostProcessSettings, ReflectionProbe, ToneMapping, TransparencyMode,
+};
 use engine_serialize::{
     AssetId, ComponentTypeId, Diagnostic, DiagnosticSeverity, EngineVersion, PersistentId,
     SchemaVersion, Value,
@@ -52,7 +54,17 @@ pub struct SceneSettings {
     pub gravity: Option<[f32; 3]>,
     pub ambient: [f32; 4],
     pub environment_map: Option<AssetId>,
+    #[serde(default = "default_environment_intensity")]
+    pub environment_intensity: f32,
+    #[serde(default)]
+    pub environment_rotation_radians: f32,
+    #[serde(default)]
+    pub reflection_probes: Vec<ReflectionProbe>,
+    #[serde(default)]
+    pub post_process: PostProcessSettings,
     pub tone_mapping: ToneMapping,
+    #[serde(default)]
+    pub transparency_mode: TransparencyMode,
     pub pass_graph_config: PassGraphConfig,
     /// Opt-in camera-relative rendering (ENG-01): renderer extraction emits
     /// the base view matrix with its translation removed and shifts every
@@ -99,6 +111,10 @@ fn default_origin_shift_threshold() -> f32 {
     DEFAULT_ORIGIN_SHIFT_THRESHOLD
 }
 
+fn default_environment_intensity() -> f32 {
+    1.0
+}
+
 impl Default for OriginShiftSettings {
     fn default() -> Self {
         Self {
@@ -118,7 +134,12 @@ impl Default for SceneSettings {
             gravity: Some([0.0, -9.81, 0.0]),
             ambient: [0.03, 0.03, 0.03, 1.0],
             environment_map: None,
+            environment_intensity: 1.0,
+            environment_rotation_radians: 0.0,
+            reflection_probes: Vec::new(),
+            post_process: PostProcessSettings::default(),
             tone_mapping: ToneMapping::Aces,
+            transparency_mode: TransparencyMode::default(),
             pass_graph_config: PassGraphConfig::default(),
             camera_relative_rendering: false,
             origin_shift: OriginShiftSettings::default(),
@@ -326,6 +347,15 @@ impl Scene {
                 }
             }
         }
+        if let Some(environment_map) = &self.scene_settings.environment_map {
+            deps.insert(environment_map.clone());
+        }
+        deps.extend(
+            self.scene_settings
+                .reflection_probes
+                .iter()
+                .map(|probe| probe.environment_map.clone()),
+        );
 
         deps.into_iter().collect()
     }

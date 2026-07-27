@@ -2,8 +2,10 @@
 // Engine-owned tactical-game toolkit. Game-specific rules should compose these
 // services through their strategy interfaces instead of modifying this file.
 // </auto-generated>
+#nullable enable
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Engine.Gameplay;
 
 namespace Engine.Tactics;
 
@@ -835,25 +837,10 @@ public sealed class DefaultHitChancePolicy : IHitChancePolicy
     }
 }
 
-public sealed class DeterministicRandom
+// Compatibility wrapper retained for projects compiled against Script API 0.10.
+public sealed class DeterministicRandom : Engine.Gameplay.DeterministicRandom
 {
-    public ulong State { get; private set; }
-
-    public DeterministicRandom(ulong seed) => State = seed;
-
-    public ulong NextUInt64()
-    {
-        unchecked
-        {
-            State += 0x9e3779b97f4a7c15UL;
-            var value = State;
-            value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9UL;
-            value = (value ^ (value >> 27)) * 0x94d049bb133111ebUL;
-            return value ^ (value >> 31);
-        }
-    }
-
-    public int RollBasisPoints() => (int)(NextUInt64() % 10_000);
+    public DeterministicRandom(ulong seed) : base(seed) { }
 }
 
 public sealed class CombatResolver
