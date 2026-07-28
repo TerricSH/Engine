@@ -10,7 +10,7 @@
 
 1. `EngineRuntime::render_frame_with_ui()` 从 ECS `World` 提取当前帧。
 2. `extract_renderer_input_from_world()` 解析层级变换、相机和灯光，选择 `LodGroup` 资源，并完成视锥裁剪及绘制项排序。
-3. 数据被汇总为 `RenderFrameInput`，随后注入渲染扩展和 UI；`sync_render_assets()` 只能通过 `Renderer::upload_*()` 校验资源，再委托 `SceneRenderer::upload_*()` 创建和缓存 Vulkan 资源。
+3. 数据被汇总为 `RenderFrameInput`，随后注入渲染扩展和 UI；`sync_render_assets()` 以 `AssetRegistry` 为唯一所有权来源，通过 `Renderer::upload_*()` 创建或更新资源，并在已同步的 typed entry 被注销或改型时通过同一同步阶段移除后端资源。Mesh、Texture、Material、Environment Map 和 Morph Target Set 的生产者都不直接维护 GPU 删除队列。
 4. 帧绘制走另一条同样经过渲染前端的路径：`Renderer::draw_scene()` 校验输入、构建 Render Graph，并通过唯一的 `compile()` 完成拓扑排序、无用 Pass 剔除和 Barrier 推导。
 5. Vulkan `SceneRenderer` 构建 clustered-light 列表，合并可实例化的静态/粒子批次，并按编译顺序执行可选的 CSM 阴影、HDR PBR Forward+、环境 IBL、后处理/Tone Map 和 UI Overlay。
 6. `end_frame()` 结束命令缓冲区，随后执行 `queue_submit()` 与 `queue_present()`。

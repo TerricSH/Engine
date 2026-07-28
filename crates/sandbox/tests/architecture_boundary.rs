@@ -233,6 +233,7 @@ fn retired_render_and_asset_compatibility_paths_cannot_reenter() {
         "load_mesh_from_gltf",
         "load_meshes_from_gltf",
         "cook_orchestrate_unchecked",
+        "pub fn cook_orchestrate(",
         "run_engine_character_demo",
         "engine-character-demo",
         "mesh_upload_from_data",
@@ -404,6 +405,49 @@ fn render_graph_has_one_canonical_compiler() {
         source.matches("pub fn compile(&self)").count(),
         1,
         "RenderGraph must expose exactly one compiler"
+    );
+}
+
+#[test]
+fn registry_sync_is_the_only_engine_core_backend_resource_owner() {
+    let root = workspace_root();
+    let runtime_root = fs::read_to_string(root.join("crates/engine-core/src/lib.rs"))
+        .expect("engine runtime root");
+    let rendering = fs::read_to_string(root.join("crates/engine-core/src/runtime/rendering.rs"))
+        .expect("engine runtime rendering facade");
+    assert!(rendering.contains("fn remove_unregistered_render_assets"));
+    assert_eq!(
+        rendering.matches("self.renderer.remove_resource(").count(),
+        1,
+        "EngineRuntime must reconcile every backend removal in the canonical registry sync"
+    );
+
+    let runtime_mesh = fs::read_to_string(root.join("crates/engine-core/src/runtime_mesh.rs"))
+        .expect("runtime mesh source");
+    let production = runtime_mesh
+        .split("#[cfg(test)]")
+        .next()
+        .expect("runtime mesh production source");
+    for retired in ["pending_gpu_removals", "self.renderer", "ResourceRemoval"] {
+        assert!(
+            !production.contains(retired),
+            "runtime meshes must use AssetRegistry synchronization, not '{retired}'"
+        );
+    }
+    for retired in [
+        "upload_temporary_preview_texture",
+        "remove_temporary_preview_texture",
+        "temporary_preview_texture_ids",
+    ] {
+        assert!(
+            !rendering.contains(retired),
+            "temporary preview resources must not expose the retired backend-style API '{retired}'"
+        );
+    }
+    assert!(
+        runtime_root.contains("temporary_preview_textures")
+            && rendering.contains("Arc::ptr_eq(&owned.shared(), &current.shared())"),
+        "temporary preview ownership must follow the exact registry allocation, not only AssetId"
     );
 }
 

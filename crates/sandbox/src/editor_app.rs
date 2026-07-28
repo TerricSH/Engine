@@ -4553,7 +4553,8 @@ mod tests {
         assert!(params.contains_key("performance"));
         assert!(params.contains_key("animation"));
         assert!(params.contains_key("build"));
-        assert_eq!(params.len(), 3);
+        assert!(params.contains_key("terrain"));
+        assert_eq!(params.len(), 4);
         assert!(!params.contains_key("hierarchy"));
         assert!(!params.contains_key("projectName"));
     }

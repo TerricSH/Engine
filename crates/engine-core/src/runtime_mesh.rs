@@ -33,14 +33,13 @@
 //! # GPU frame safety
 //!
 //! [`EngineRuntime::destroy_runtime_mesh`] removes the typed registry entry
-//! immediately (so the next frame can no longer reference it) but defers the
-//! backend resource destruction to the start of the next rendered frame — a
-//! frames-in-flight boundary. The Vulkan backend's `remove_resource` then
-//! performs its own `wait_idle` before freeing buffers, so a mesh referenced
-//! by an in-flight frame is never freed mid-frame. Re-creating a mesh under
-//! the same name before the drain cancels the pending removal: the next
-//! upload for that ID replaces the old GPU buffers through the backend's
-//! existing (wait-idle-guarded) replacement path.
+//! immediately (so the next frame can no longer reference it). The canonical
+//! render-asset synchronizer notices the missing typed entry at the next frame
+//! boundary and removes the backend object. The Vulkan backend then performs
+//! its own `wait_idle` before freeing buffers, so a mesh referenced by an
+//! in-flight frame is never freed mid-frame. Re-creating a mesh under the same
+//! name before synchronization leaves one live registry entry, so the next
+//! upload replaces the old GPU buffers without a conflicting removal.
 //!
 //! # Updates
 //!
@@ -60,8 +59,7 @@ use std::fmt;
 
 use engine_asset::mesh::{mesh_data_to_upload_bytes, MeshData};
 use engine_renderer::{
-    AssetId, AxisAlignedBox, IndexFormat, MeshUpload, MeshVertexFormat, Pbr32Vertex, ResourceKind,
-    ResourceRemoval,
+    AssetId, AxisAlignedBox, IndexFormat, MeshUpload, MeshVertexFormat, Pbr32Vertex,
 };
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
 use glam::{Vec2, Vec3};
@@ -306,9 +304,6 @@ pub struct RuntimeMeshMemory {
     pub vertex_bytes: u64,
     /// Total packed index payload bytes.
     pub index_bytes: u64,
-    /// Mesh IDs whose backend destruction is deferred to the next frame
-    /// boundary (see the module-level GPU frame-safety note).
-    pub pending_gpu_removals: usize,
 }
 
 impl RuntimeMeshMemory {
@@ -335,7 +330,7 @@ struct RuntimeMeshSlot {
     entry: Option<RuntimeMeshEntry>,
 }
 
-/// Handle table tracking live runtime meshes and deferred GPU removals.
+/// Handle table tracking live runtime meshes.
 ///
 /// Registry bookkeeping stays in the shared [`AssetRegistry`]; this table
 /// only owns handle validation, name → slot lookup, and per-mesh stats.
@@ -344,7 +339,6 @@ pub(crate) struct RuntimeMeshTable {
     slots: Vec<RuntimeMeshSlot>,
     free: Vec<u32>,
     by_name: BTreeMap<String, u32>,
-    pending_gpu_removals: Vec<AssetId>,
 }
 
 impl RuntimeMeshTable {
@@ -404,10 +398,7 @@ impl RuntimeMeshTable {
     }
 
     fn memory(&self) -> RuntimeMeshMemory {
-        let mut memory = RuntimeMeshMemory {
-            pending_gpu_removals: self.pending_gpu_removals.len(),
-            ..RuntimeMeshMemory::default()
-        };
+        let mut memory = RuntimeMeshMemory::default();
         for entry in self.slots.iter().filter_map(|slot| slot.entry.as_ref()) {
             memory.mesh_count += 1;
             memory.vertex_count += u64::from(entry.vertex_count);
@@ -452,13 +443,6 @@ impl EngineRuntime {
             )));
         }
         let upload = mesh.to_upload(asset_id.clone())?;
-
-        // A pending removal for this ID (destroy → re-create between frames)
-        // is cancelled: the next upload replaces the old GPU buffers through
-        // the backend's wait-idle-guarded replacement path.
-        self.runtime_mesh_table
-            .pending_gpu_removals
-            .retain(|pending| pending != &asset_id);
 
         let entry = RuntimeMeshEntry {
             asset_id,
@@ -569,8 +553,9 @@ impl EngineRuntime {
     /// The typed registry entry is removed immediately, so subsequent frames
     /// can no longer resolve the ID (a renderable still referencing it
     /// surfaces the usual missing-asset diagnostic). The backend GPU resource
-    /// destruction is deferred to the next rendered frame boundary; see the
-    /// module-level GPU frame-safety note.
+    /// destruction is reconciled by the canonical render-asset sync at the
+    /// next rendered frame boundary; see the module-level GPU frame-safety
+    /// note.
     pub fn destroy_runtime_mesh(
         &mut self,
         handle: RuntimeMeshHandle,
@@ -588,9 +573,6 @@ impl EngineRuntime {
             .to_string();
         self.runtime_mesh_table.by_name.remove(&name);
         self.asset_registry.unload(&entry.asset_id);
-        self.runtime_mesh_table
-            .pending_gpu_removals
-            .push(entry.asset_id);
         Ok(())
     }
 
@@ -614,27 +596,6 @@ impl EngineRuntime {
     /// must not overwrite. Used by cooked-batch validation.
     pub(crate) fn is_runtime_mesh_asset_id(&self, id: &AssetId) -> bool {
         self.runtime_mesh_table.contains_asset_id(id)
-    }
-
-    /// Issue deferred backend destruction for meshes destroyed since the
-    /// previous frame. Runs at the top of every rendered frame — the
-    /// frames-in-flight boundary. Backend failures are reported as asset
-    /// diagnostics instead of failing the frame: a leaked GPU buffer must not
-    /// take down rendering.
-    pub(crate) fn drain_deferred_runtime_mesh_removals(&mut self) {
-        if self.runtime_mesh_table.pending_gpu_removals.is_empty() {
-            return;
-        }
-        let pending = std::mem::take(&mut self.runtime_mesh_table.pending_gpu_removals);
-        for resource_id in pending {
-            let removal = ResourceRemoval {
-                kind: ResourceKind::Mesh,
-                resource_id,
-            };
-            if let Err(diagnostics) = self.renderer.remove_resource(removal) {
-                self.collector.push_asset_diags(diagnostics);
-            }
-        }
     }
 }
 
@@ -690,7 +651,7 @@ pub(crate) fn runtime_mesh_conflict_diagnostic(id: &AssetId, kind: &str) -> Diag
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_renderer::{BackendRenderer, FrameStats};
+    use engine_renderer::{BackendRenderer, FrameStats, ResourceRemoval};
     use std::sync::{Arc, Mutex};
 
     fn triangle() -> RuntimeMeshDescriptor {
@@ -770,7 +731,6 @@ mod tests {
         assert_eq!(memory.vertex_bytes, 3 * 32);
         assert_eq!(memory.index_bytes, 3 * 4);
         assert_eq!(memory.total_bytes(), 3 * 32 + 3 * 4);
-        assert_eq!(memory.pending_gpu_removals, 0);
     }
 
     #[test]
@@ -1011,7 +971,6 @@ mod tests {
         let memory = runtime.runtime_mesh_memory();
         assert_eq!(memory.mesh_count, 0);
         assert_eq!(memory.total_bytes(), 0);
-        assert_eq!(memory.pending_gpu_removals, 1);
     }
 
     #[test]
@@ -1070,9 +1029,8 @@ mod tests {
             Err(RuntimeMeshError::StaleHandle { slot: old.slot() })
         );
         assert_eq!(registered_upload(&runtime, new).vertex_count, 4);
-        // The queued GPU removal for the old incarnation was cancelled: the
-        // next upload replaces the buffers through the guarded path.
-        assert_eq!(runtime.runtime_mesh_memory().pending_gpu_removals, 0);
+        // Registry reconciliation sees one live entry, so the next upload
+        // replaces the buffers without issuing a stale removal first.
     }
 
     #[test]
@@ -1093,7 +1051,6 @@ mod tests {
         let memory = runtime.runtime_mesh_memory();
         assert_eq!(memory.mesh_count, 1);
         assert_eq!(memory.vertex_count, 4);
-        assert_eq!(memory.pending_gpu_removals, 1);
     }
 
     // ── Cooked-batch interaction ────────────────────────────────────────
@@ -1217,6 +1174,7 @@ mod tests {
     struct MeshTrace {
         uploads: Vec<(String, [u8; 32])>,
         removals: Vec<String>,
+        removal_failures_remaining: usize,
     }
 
     /// Headless backend that records mesh uploads/removals and reports one
@@ -1291,11 +1249,17 @@ mod tests {
         }
 
         fn remove_resource(&mut self, removal: ResourceRemoval) -> Result<(), Vec<Diagnostic>> {
-            self.trace
-                .lock()
-                .unwrap()
-                .removals
-                .push(removal.resource_id.id.clone());
+            let mut trace = self.trace.lock().unwrap();
+            if trace.removal_failures_remaining > 0 {
+                trace.removal_failures_remaining -= 1;
+                return Err(vec![Diagnostic::new(
+                    "TEST_RESOURCE_REMOVAL_FAILED",
+                    DiagnosticSeverity::Error,
+                    "runtime-mesh-test",
+                    "injected backend removal failure",
+                )]);
+            }
+            trace.removals.push(removal.resource_id.id.clone());
             Ok(())
         }
     }
@@ -1404,22 +1368,19 @@ mod tests {
             trace.lock().unwrap().removals.is_empty(),
             "GPU destruction must not happen mid-frame"
         );
-        assert_eq!(runtime.runtime_mesh_memory().pending_gpu_removals, 1);
 
         // The renderable still references the destroyed mesh; extraction no
-        // longer resolves it, so the frame fails asset sync — but the
-        // deferred removal is drained first, at the frame boundary.
+        // longer resolves it, so the frame fails asset sync — but registry
+        // reconciliation removes the stale backend resource first.
         let _ = runtime.render_frame(1);
         {
             let trace = trace.lock().unwrap();
             assert_eq!(
                 trace.removals,
                 vec!["runtime-mesh-temp".to_string()],
-                "deferred removal issued exactly once at the next frame boundary"
+                "registry reconciliation removes the resource exactly once"
             );
         }
-        assert_eq!(runtime.runtime_mesh_memory().pending_gpu_removals, 0);
-
         // Once the renderable points at the built-in cube again, rendering
         // recovers; no further removals are queued.
         runtime
@@ -1427,6 +1388,42 @@ mod tests {
             .expect("scene reloads");
         runtime.render_frame(2).expect("frame renders");
         assert_eq!(trace.lock().unwrap().removals.len(), 1);
+    }
+
+    #[test]
+    fn failed_registry_removal_is_reported_and_retried() {
+        let _guard = crate::tests::serial_ffi_world_test();
+        let trace = Arc::new(Mutex::new(MeshTrace::default()));
+        let mut runtime = runtime();
+        runtime.set_renderer_backend(Box::new(TraceBackend {
+            trace: Arc::clone(&trace),
+        }));
+        let handle = runtime
+            .create_runtime_mesh("retry", triangle())
+            .expect("create");
+        let id = runtime.runtime_mesh_asset_id(handle).unwrap();
+        runtime
+            .load_scene(sample_scene_with_mesh(&id.id))
+            .expect("scene loads");
+        runtime.render_frame(0).expect("frame renders");
+
+        runtime.destroy_runtime_mesh(handle).expect("destroy");
+        runtime
+            .load_scene(sample_scene_with_mesh("mesh-cube"))
+            .expect("scene reloads");
+        trace.lock().unwrap().removal_failures_remaining = 1;
+
+        let diagnostics = runtime.render_frame(1).expect_err("failure is reported");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "TEST_RESOURCE_REMOVAL_FAILED"));
+        assert!(trace.lock().unwrap().removals.is_empty());
+
+        runtime.render_frame(2).expect("next frame retries removal");
+        assert_eq!(
+            trace.lock().unwrap().removals,
+            vec!["runtime-mesh-retry".to_string()]
+        );
     }
 
     #[test]

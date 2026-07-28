@@ -107,6 +107,117 @@ pub(crate) fn serial_ffi_world_test() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn one_pixel_texture(id: &str, hash: u8) -> TextureUpload {
+    TextureUpload {
+        texture_id: AssetId::new(id),
+        width: 1,
+        height: 1,
+        format: engine_renderer::TextureUploadFormat::Rgba8,
+        color_space: engine_renderer::ColorSpace::Srgb,
+        mip_levels: vec![engine_renderer::TextureMipLevel {
+            width: 1,
+            height: 1,
+            bytes: vec![255, 255, 255, 255],
+        }],
+        sampler: engine_renderer::SamplerDescriptor::default(),
+        content_hash: [hash; 32],
+    }
+}
+
+#[test]
+fn temporary_preview_texture_cannot_clobber_persistent_assets() {
+    let mut runtime = EngineRuntime::new(EngineConfig::default());
+    let preview_id = AssetId::new("editor-preview-thumbnail");
+
+    runtime
+        .register_temporary_preview_texture(one_pixel_texture(&preview_id.id, 1))
+        .expect("new temporary preview registers");
+    runtime
+        .register_temporary_preview_texture(one_pixel_texture(&preview_id.id, 2))
+        .expect("the owning preview entry may be refreshed");
+    assert_eq!(
+        runtime
+            .asset_registry()
+            .get::<TextureUpload>(&preview_id)
+            .expect("preview texture")
+            .get()
+            .content_hash,
+        [2; 32]
+    );
+    assert!(runtime.unregister_temporary_preview_texture(preview_id.clone()));
+    assert!(!runtime.unregister_temporary_preview_texture(preview_id));
+
+    let persistent_mesh = AssetId::new("mesh-cube");
+    let diagnostics = match runtime
+        .register_temporary_preview_texture(one_pixel_texture(&persistent_mesh.id, 3))
+    {
+        Ok(_) => panic!("temporary preview must not replace a persistent asset"),
+        Err(diagnostics) => diagnostics,
+    };
+    assert_eq!(diagnostics[0].code, "AS0003");
+    assert!(runtime
+        .asset_registry()
+        .get::<MeshUpload>(&persistent_mesh)
+        .is_some());
+}
+
+#[test]
+fn persistent_replacement_revokes_temporary_preview_ownership() {
+    let mut runtime = EngineRuntime::new(EngineConfig::default());
+    let id = AssetId::new("editor-preview-replaced");
+    runtime
+        .register_temporary_preview_texture(one_pixel_texture(&id.id, 1))
+        .expect("preview registers");
+
+    runtime.register_texture_asset(one_pixel_texture(&id.id, 2));
+
+    assert!(
+        !runtime.unregister_temporary_preview_texture(id.clone()),
+        "a stale preview owner must not unregister the persistent replacement"
+    );
+    assert_eq!(
+        runtime
+            .asset_registry()
+            .get::<TextureUpload>(&id)
+            .expect("persistent texture remains registered")
+            .get()
+            .content_hash,
+        [2; 32]
+    );
+}
+
+#[test]
+fn direct_registry_replacement_cannot_be_clobbered_by_stale_preview_owner() {
+    let mut runtime = EngineRuntime::new(EngineConfig::default());
+    let id = AssetId::new("editor-preview-directly-replaced");
+    runtime
+        .register_temporary_preview_texture(one_pixel_texture(&id.id, 1))
+        .expect("preview registers");
+    runtime
+        .asset_registry_mut()
+        .insert_typed(id.clone(), one_pixel_texture(&id.id, 2));
+
+    let diagnostics = match runtime.register_temporary_preview_texture(one_pixel_texture(&id.id, 3))
+    {
+        Ok(_) => panic!("stale preview owner must not replace the current registry entry"),
+        Err(diagnostics) => diagnostics,
+    };
+    assert_eq!(diagnostics[0].code, "AS0003");
+    assert!(
+        !runtime.unregister_temporary_preview_texture(id.clone()),
+        "stale preview owner must not unregister a direct replacement"
+    );
+    assert_eq!(
+        runtime
+            .asset_registry()
+            .get::<TextureUpload>(&id)
+            .expect("replacement remains registered")
+            .get()
+            .content_hash,
+        [2; 32]
+    );
+}
+
 fn insert_empty_component(scene: &mut Scene, type_id: &str) -> String {
     let entity = scene.entities.first_mut().expect("sample scene entity");
     entity.components.insert(

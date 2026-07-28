@@ -340,31 +340,6 @@ pub fn write_cooked_artifact(
     })
 }
 
-pub fn cook_orchestrate(
-    source_dir: &Path,
-    cooked_dir: &Path,
-    graph: &mut DependencyGraph,
-) -> Vec<CookResult> {
-    let report = cook_orchestrate_checked(source_dir, cooked_dir, graph);
-    for diagnostic in &report.diagnostics {
-        if matches!(
-            diagnostic.severity,
-            DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
-        ) {
-            tracing::error!(
-                code = diagnostic.code,
-                message = diagnostic.message,
-                "asset cook diagnostic"
-            );
-        }
-    }
-    report
-        .results
-        .into_iter()
-        .filter(|result| result.success)
-        .collect()
-}
-
 /// Cook all manifests and retain every success and failure in a deterministic report.
 ///
 /// This entry point never hides partial failures and is therefore the required API

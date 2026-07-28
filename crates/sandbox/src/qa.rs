@@ -27,24 +27,27 @@ impl BackendRenderer for QaBackend {
     fn apply_pass_barriers(
         &mut self,
         _input: &RenderFrameInput,
-        _pass: &engine_renderer::render_graph2::PassNode,
+        pass: &engine_renderer::render_graph2::PassNode,
         barriers: &[engine_renderer::render_graph2::CompiledBarrier],
     ) -> Result<(), Vec<Diagnostic>> {
         if let Some(unsupported) = barriers.iter().find(|barrier| {
-            !matches!(
-                barrier.resource_name.as_str(),
-                "shadow_map"
-                    | "shadow_depth"
-                    | "depth"
-                    | "depth_stencil"
-                    | "hdr_color"
-                    | "ldr_color"
-                    | "swapchain"
-            )
+            let declared_as_attachment = pass
+                .inputs
+                .iter()
+                .chain(&pass.outputs)
+                .any(|attachment| attachment.name == barrier.resource_name);
+            let declared_as_depth = pass
+                .depth_stencil
+                .as_ref()
+                .is_some_and(|attachment| attachment.name == barrier.resource_name);
+            !declared_as_attachment && !declared_as_depth
         }) {
             return Err(vec![qa_error(
                 "QA0005",
-                format!("unknown graph resource '{}'", unsupported.resource_name),
+                format!(
+                    "pass '{}' received a barrier for undeclared graph resource '{}'",
+                    pass.name, unsupported.resource_name
+                ),
             )]);
         }
         // Headless QA validates graph transitions but owns no GPU resources.

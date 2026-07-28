@@ -22,7 +22,7 @@ pub use terrain::{TerrainBindingStats, TerrainSystem};
 use engine_asset::{AssetHandle, AssetRegistry};
 use engine_renderer::{
     AssetId, DebugDrawRegistry, MaterialUpload, MeshUpload, MeshVertexFormat,
-    RenderExtensionRegistry, Renderer,
+    RenderExtensionRegistry, Renderer, TextureUpload,
 };
 use engine_scene::{
     validate_scene, AssetTypeRegistry, ComponentRegistry, Scene, SceneLoadDiagnostic, World,
@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[cfg(test)]
-use engine_renderer::{FrameStats, TextureUpload};
+use engine_renderer::FrameStats;
 
 pub mod ffi_init;
 pub mod game_loop;
@@ -240,6 +240,19 @@ impl Default for EngineRuntimeBuilder {
 
 // ── Engine runtime ────────────────────────────────────────────────────────
 
+/// Registry-backed GPU resources known to have reached the active backend.
+///
+/// This is reconciliation state, not a second owner: the typed
+/// [`AssetRegistry`] entry remains authoritative for both upload and removal.
+#[derive(Default)]
+struct SyncedRenderResources {
+    meshes: BTreeSet<AssetId>,
+    textures: BTreeSet<AssetId>,
+    materials: BTreeSet<AssetId>,
+    environment_maps: BTreeSet<AssetId>,
+    morph_target_sets: BTreeSet<AssetId>,
+}
+
 pub struct EngineRuntime {
     config: EngineConfig,
     renderer: Renderer,
@@ -250,8 +263,15 @@ pub struct EngineRuntime {
     /// Handle table for runtime-registered dynamic meshes (ENG-20). The
     /// meshes themselves live as typed `MeshUpload` assets in
     /// `asset_registry`; the table owns handle generations, name lookup,
-    /// memory accounting, and deferred GPU removals.
+    /// and memory accounting.
     runtime_mesh_table: runtime_mesh::RuntimeMeshTable,
+    /// Resources created from the registry and awaiting lifetime
+    /// reconciliation by the canonical render sync.
+    synced_render_resources: SyncedRenderResources,
+    /// Exact registry allocations owned by the tooling-preview entry point.
+    /// Allocation identity prevents a stale preview owner from unloading a
+    /// persistent replacement that reused the same [`AssetId`].
+    temporary_preview_textures: BTreeMap<AssetId, AssetHandle<TextureUpload>>,
     /// Lazily created background cooked-asset decoder; see
     /// [`EngineRuntime::enqueue_cooked_asset_stream`]. `None` until the first
     /// streamed enqueue so runtimes that never stream never spawn a thread.
@@ -372,6 +392,8 @@ impl EngineRuntime {
             loaded_cooked_asset_ids: BTreeSet::new(),
             loaded_extension_asset_ids: BTreeMap::new(),
             runtime_mesh_table: runtime_mesh::RuntimeMeshTable::default(),
+            synced_render_resources: SyncedRenderResources::default(),
+            temporary_preview_textures: BTreeMap::new(),
             stream_loader: None,
             stream_budget: asset_stream::DEFAULT_STREAM_COMMIT_BUDGET,
             scene: None,

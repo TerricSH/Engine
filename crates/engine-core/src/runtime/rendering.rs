@@ -6,13 +6,15 @@
 use engine_asset::{AssetHandle, AssetRegistry};
 use engine_renderer::{
     BackendRenderer, EnvironmentMapUpload, EnvironmentSettings, FrameStats, MaterialUpload,
-    MeshUpload, MorphTargetSetUpload, RenderFrameInput, TextureUpload,
+    MeshUpload, MorphTargetSetUpload, RenderFrameInput, ResourceKind, ResourceRemoval,
+    TextureUpload,
 };
 use engine_scene::{
     extract_renderer_input_from_world, extract_renderer_input_from_world_with_viewport,
     RenderViewportContext,
 };
 use engine_serialize::{Diagnostic, DiagnosticSeverity};
+use std::sync::Arc;
 
 use crate::{
     missing_registered_render_asset, validate_registered_asset_id, DiagnosticsCollector,
@@ -24,6 +26,7 @@ impl EngineRuntime {
     pub fn set_renderer_backend(&mut self, mut backend: Box<dyn BackendRenderer>) {
         backend.set_gpu_timing_enabled(self.config.gpu_timestamps);
         self.renderer.set_backend(backend);
+        self.synced_render_resources = crate::SyncedRenderResources::default();
     }
 
     /// Resize the active backend without exposing unrestricted renderer access.
@@ -31,30 +34,54 @@ impl EngineRuntime {
         self.renderer.resize(width, height)
     }
 
-    /// Upload an editor-owned, short-lived preview texture.
-    pub fn upload_temporary_preview_texture(
+    /// Register an editor-owned, short-lived preview texture.
+    ///
+    /// Persistent resources use the typed registry entry points below. The
+    /// exact handle retained here prevents an old preview owner from
+    /// unregistering a persistent replacement that reused the same ID.
+    pub fn register_temporary_preview_texture(
         &mut self,
         upload: TextureUpload,
-    ) -> Result<engine_renderer::UploadReceipt, Vec<Diagnostic>> {
+    ) -> Result<AssetHandle<TextureUpload>, Vec<Diagnostic>> {
         let id = upload.texture_id.clone();
-        self.asset_registry.insert_typed(id, upload);
-        Ok(engine_renderer::UploadReceipt {
-            revision: 1,
-            warnings: Vec::new(),
-        })
+        let owns_current_entry = self
+            .temporary_preview_textures
+            .get(&id)
+            .zip(self.asset_registry.get::<TextureUpload>(&id))
+            .is_some_and(|(owned, current)| Arc::ptr_eq(&owned.shared(), &current.shared()));
+        if self.asset_registry.contains(&id) && !owns_current_entry {
+            let mut diagnostic = Diagnostic::new(
+                "AS0003",
+                DiagnosticSeverity::Error,
+                "engine-core.render-assets",
+                format!(
+                    "temporary preview texture '{}' conflicts with a persistent registered asset",
+                    id.id
+                ),
+            );
+            diagnostic.asset = Some(id);
+            return Err(vec![diagnostic]);
+        }
+        let handle = self.asset_registry.insert_typed(id.clone(), upload);
+        self.temporary_preview_textures.insert(id, handle.clone());
+        Ok(handle)
     }
 
-    /// Release a temporary preview texture.
-    pub fn remove_temporary_preview_texture(
+    /// Unregister a texture owned by the tooling-preview entry point.
+    ///
+    /// Backend removal is deferred to the next canonical registry sync.
+    pub fn unregister_temporary_preview_texture(
         &mut self,
         texture_id: engine_renderer::AssetId,
-    ) -> Result<(), Vec<Diagnostic>> {
-        self.asset_registry.unload(&texture_id);
-        self.renderer
-            .remove_resource(engine_renderer::ResourceRemoval {
-                kind: engine_renderer::ResourceKind::Texture,
-                resource_id: texture_id,
-            })
+    ) -> bool {
+        let Some(owned) = self.temporary_preview_textures.remove(&texture_id) else {
+            return false;
+        };
+        let still_owns_entry = self
+            .asset_registry
+            .get::<TextureUpload>(&texture_id)
+            .is_some_and(|current| Arc::ptr_eq(&owned.shared(), &current.shared()));
+        still_owns_entry && self.asset_registry.unload(&texture_id)
     }
 
     /// Runtime asset cache used by renderer-resource synchronization.
@@ -68,11 +95,13 @@ impl EngineRuntime {
 
     pub fn register_mesh_asset(&mut self, upload: MeshUpload) -> AssetHandle<MeshUpload> {
         let id = upload.mesh_id.clone();
+        self.temporary_preview_textures.remove(&id);
         self.asset_registry.insert_typed(id, upload)
     }
 
     pub fn register_texture_asset(&mut self, upload: TextureUpload) -> AssetHandle<TextureUpload> {
         let id = upload.texture_id.clone();
+        self.temporary_preview_textures.remove(&id);
         self.asset_registry.insert_typed(id, upload)
     }
 
@@ -81,6 +110,7 @@ impl EngineRuntime {
         upload: EnvironmentMapUpload,
     ) -> AssetHandle<EnvironmentMapUpload> {
         let id = upload.environment_id.clone();
+        self.temporary_preview_textures.remove(&id);
         self.asset_registry.insert_typed(id, upload)
     }
 
@@ -89,6 +119,7 @@ impl EngineRuntime {
         upload: MorphTargetSetUpload,
     ) -> AssetHandle<MorphTargetSetUpload> {
         let id = upload.target_set_id.clone();
+        self.temporary_preview_textures.remove(&id);
         self.asset_registry.insert_typed(id, upload)
     }
 
@@ -105,6 +136,7 @@ impl EngineRuntime {
         upload: MaterialUpload,
     ) -> AssetHandle<MaterialUpload> {
         let id = upload.material_id.clone();
+        self.temporary_preview_textures.remove(&id);
         self.asset_registry.insert_typed(id, upload)
     }
 
@@ -163,7 +195,6 @@ impl EngineRuntime {
         ui_batches: Vec<engine_renderer::UiBatch>,
         viewport: Option<RenderViewportContext>,
     ) -> Result<FrameStats, Vec<Diagnostic>> {
-        self.drain_deferred_runtime_mesh_removals();
         self.frame_timing.begin_stage("extraction");
         let extraction = self.world_slot.with_world(|world| {
             let mut result = match viewport {
@@ -261,6 +292,8 @@ impl EngineRuntime {
     }
 
     fn sync_render_assets(&mut self, input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
+        self.remove_unregistered_render_assets()?;
+
         let mut material_ids = std::collections::BTreeMap::new();
         let mut mesh_ids = std::collections::BTreeMap::new();
         for drawable in &input.drawables {
@@ -353,26 +386,138 @@ impl EngineRuntime {
         }
 
         for upload in textures {
+            let id = upload.texture_id.clone();
             let receipt = self.renderer.upload_texture(upload)?;
+            self.synced_render_resources.textures.insert(id);
             self.collector.push_asset_diags(receipt.warnings);
         }
         for upload in materials {
+            let id = upload.material_id.clone();
             let receipt = self.renderer.upload_material(upload)?;
+            self.synced_render_resources.materials.insert(id);
             self.collector.push_asset_diags(receipt.warnings);
         }
         for upload in meshes {
+            let id = upload.mesh_id.clone();
             let receipt = self.renderer.upload_mesh(upload)?;
+            self.synced_render_resources.meshes.insert(id);
             self.collector.push_asset_diags(receipt.warnings);
         }
         for upload in morph_target_sets {
+            let id = upload.target_set_id.clone();
             let receipt = self.renderer.upload_morph_target_set(upload)?;
+            self.synced_render_resources.morph_target_sets.insert(id);
             self.collector.push_asset_diags(receipt.warnings);
         }
         for upload in environment_maps {
+            let id = upload.environment_id.clone();
             let receipt = self.renderer.upload_environment_map(upload)?;
+            self.synced_render_resources.environment_maps.insert(id);
             self.collector.push_asset_diags(receipt.warnings);
         }
         Ok(())
+    }
+
+    /// Reconcile backend lifetime with the authoritative typed registry.
+    ///
+    /// Failed removals stay in the synchronized sets and are retried on a
+    /// later frame instead of being silently skipped.
+    fn remove_unregistered_render_assets(&mut self) -> Result<(), Vec<Diagnostic>> {
+        let mut removals = Vec::new();
+        removals.extend(
+            self.synced_render_resources
+                .materials
+                .iter()
+                .filter(|id| self.asset_registry.get::<MaterialUpload>(id).is_none())
+                .cloned()
+                .map(|resource_id| ResourceRemoval {
+                    kind: ResourceKind::Material,
+                    resource_id,
+                }),
+        );
+        removals.extend(
+            self.synced_render_resources
+                .meshes
+                .iter()
+                .filter(|id| self.asset_registry.get::<MeshUpload>(id).is_none())
+                .cloned()
+                .map(|resource_id| ResourceRemoval {
+                    kind: ResourceKind::Mesh,
+                    resource_id,
+                }),
+        );
+        removals.extend(
+            self.synced_render_resources
+                .morph_target_sets
+                .iter()
+                .filter(|id| {
+                    self.asset_registry
+                        .get::<MorphTargetSetUpload>(id)
+                        .is_none()
+                })
+                .cloned()
+                .map(|resource_id| ResourceRemoval {
+                    kind: ResourceKind::MorphTargetSet,
+                    resource_id,
+                }),
+        );
+        removals.extend(
+            self.synced_render_resources
+                .environment_maps
+                .iter()
+                .filter(|id| {
+                    self.asset_registry
+                        .get::<EnvironmentMapUpload>(id)
+                        .is_none()
+                })
+                .cloned()
+                .map(|resource_id| ResourceRemoval {
+                    kind: ResourceKind::EnvironmentMap,
+                    resource_id,
+                }),
+        );
+        removals.extend(
+            self.synced_render_resources
+                .textures
+                .iter()
+                .filter(|id| self.asset_registry.get::<TextureUpload>(id).is_none())
+                .cloned()
+                .map(|resource_id| ResourceRemoval {
+                    kind: ResourceKind::Texture,
+                    resource_id,
+                }),
+        );
+
+        let mut diagnostics = Vec::new();
+        for removal in removals {
+            let kind = removal.kind;
+            let id = removal.resource_id.clone();
+            match self.renderer.remove_resource(removal) {
+                Ok(()) => match kind {
+                    ResourceKind::Mesh => {
+                        self.synced_render_resources.meshes.remove(&id);
+                    }
+                    ResourceKind::Texture => {
+                        self.synced_render_resources.textures.remove(&id);
+                    }
+                    ResourceKind::Material => {
+                        self.synced_render_resources.materials.remove(&id);
+                    }
+                    ResourceKind::EnvironmentMap => {
+                        self.synced_render_resources.environment_maps.remove(&id);
+                    }
+                    ResourceKind::MorphTargetSet => {
+                        self.synced_render_resources.morph_target_sets.remove(&id);
+                    }
+                },
+                Err(errors) => diagnostics.extend(errors),
+            }
+        }
+        if diagnostics.is_empty() {
+            Ok(())
+        } else {
+            Err(diagnostics)
+        }
     }
 
     fn refresh_generated_ui_assets(&mut self) {
