@@ -5,9 +5,45 @@ Architecture boundaries and feature-gating rules are documented in
 The JRPG rendering baseline and backend parity limits are documented in
 [`docs/RENDERING_ARCHITECTURE.md`](docs/RENDERING_ARCHITECTURE.md).
 
-This repository contains a Rust game engine, project player, editor, asset cooker, and Windows release pipeline. The supported workflow starts from a `game.project.json` and uses the `project`, `game`, or `editor` command families.
+This repository contains a Rust game engine, project player, editor, asset
+cooker, and Windows release pipeline. The product boundary is an installed
+engine application plus an external game-project workspace: the engine
+installation is treated as read-only, while project source, generated outputs,
+and packages stay under the directory that contains `game.project.json`.
 
-## Create and run a game
+## Installed editor workflow
+
+An assembled Windows installation contains `bin/EngineEditor.exe`, a
+precompiled game runtime and asset cooker, the managed gameplay SDK and script
+host, and `engine.installation.json`. Open a project outside that installation
+by passing either its directory or manifest:
+
+```powershell
+$engine = "C:\Engine\v0.1.0\windows-x86_64"
+$project = "D:\Games\MyGame"
+
+& "$engine\bin\EngineEditor.exe" project new $project --name MyGame --with-csharp
+& "$engine\bin\EngineEditor.exe" project editor $project
+```
+
+For a scripted project, opening it validates the installation and project
+contract, then deploys the prebuilt SDK and host to
+`build/script-sdk/EngineGameplay.dll` and `build/script-host/`. It does not
+build game-authored C# merely because the project was opened; Rebuild, Play,
+Build, or `project build-scripts` performs that work. Project content and
+generated game outputs remain in `$project`; Windows packages default to
+`$project\Dist`.
+
+Installed authoring and packaging do not require the engine source tree, Cargo,
+Rust, or Git. C# projects do require a .NET 8 SDK to compile game scripts, and
+their framework-dependent script host requires a .NET 8 runtime. See
+[`docs/ENGINE_INSTALLATION.md`](docs/ENGINE_INSTALLATION.md) for the installed
+layout and trust boundary.
+
+## Source-tree development
+
+The following commands are for engine maintainers working from this checkout.
+They compile the engine with Cargo; they are not the installed-user workflow.
 
 ```powershell
 cargo run -p sandbox -- project new .\MyGame --name MyGame
@@ -38,8 +74,9 @@ cargo run -p sandbox --features backend-vulkan,target-desktop -- game .\MyGame
 cargo run -p sandbox --features backend-vulkan,tooling-editor,target-desktop -- editor .\MyGame
 ```
 
-For a managed project, add `subsystem-scripting-csharp` to the editor feature
-list. The editor rebuilds C# scripts before every Play session, supports the
+For a managed source-development project, add `subsystem-scripting-csharp` to
+the editor feature list. The editor rebuilds C# scripts before every Play
+session, supports the
 project scene catalog, protects dirty documents during scene switches and
 window close, and can recook project assets from the Asset Browser. Generated
 C# scripts can query persistent scene entities, create Transform-bearing
@@ -89,14 +126,25 @@ documented in [`docs/INTERACTION.md`](docs/INTERACTION.md).
 
 The ready-to-run sample is at [`examples/minimal-game`](examples/minimal-game). It uses cooked mesh, texture, and material data in its startup scene.
 
-## Package a project
+## Package a project from an installation
 
 ```powershell
-.\.github\scripts\package-windows.ps1 `
-  -ProjectPath .\examples\minimal-game\game.project.json
+$engine = "C:\Engine\v0.1.0\windows-x86_64"
+& "$engine\tools\package-windows.ps1" `
+  -EngineInstallRoot $engine `
+  -ProjectPath "D:\Games\MyGame\game.project.json"
 ```
 
-The package contains the project manifest, every cataloged scene, cooked assets, runtime executable, reports, checksums, and symbols. Scene paths and hashes are recorded in release metadata. Its smoke test launches the packaged project for three headless frames and requires visible indexed geometry.
+The default output is
+`D:\Games\MyGame\Dist\<version>\`. The package contains the project manifest,
+every cataloged scene, cooked assets, runtime executable, reports, checksums,
+and symbols. Scene paths and hashes are recorded in release metadata. Its smoke
+test launches the packaged project for three headless frames and requires
+visible indexed geometry. Existing version directories are not overwritten.
+
+Maintainers can assemble the installation itself, and can still run the
+source-tree release path, as documented in
+[`docs/RELEASE_PACKAGING.md`](docs/RELEASE_PACKAGING.md).
 
 See [`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md),
 [`docs/GAME_ENGINE_BOUNDARY.md`](docs/GAME_ENGINE_BOUNDARY.md),
@@ -110,5 +158,6 @@ See [`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md),
 [`docs/JRPG_GAME_PLATFORM.md`](docs/JRPG_GAME_PLATFORM.md),
 [`docs/RENDERING_ARCHITECTURE.md`](docs/RENDERING_ARCHITECTURE.md),
 [`docs/HL2_READINESS.md`](docs/HL2_READINESS.md),
-[`docs/CI_RELEASE_GATES.md`](docs/CI_RELEASE_GATES.md), and
+[`docs/CI_RELEASE_GATES.md`](docs/CI_RELEASE_GATES.md),
+[`docs/ENGINE_INSTALLATION.md`](docs/ENGINE_INSTALLATION.md), and
 [`docs/RELEASE_PACKAGING.md`](docs/RELEASE_PACKAGING.md) for details.

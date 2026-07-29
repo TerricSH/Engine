@@ -8,6 +8,7 @@ mod diagnostics;
 mod editor_asset_ops;
 #[cfg(any(all(feature = "tooling-editor", feature = "backend-vulkan"), test))]
 mod editor_build_ops;
+mod engine_installation;
 mod project_app;
 mod project_cli;
 mod project_input;

@@ -4821,7 +4821,8 @@ pub(crate) struct ScriptApiSyncReport {
     pub project: String,
     pub script_api: &'static str,
     pub version: &'static str,
-    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub contract: String,
     pub msbuild_targets: String,
     pub sdk_assembly: String,
@@ -4955,12 +4956,14 @@ fn ensure_script_sdk_import(script_project: &Path) -> Result<(), String> {
 /// Write the engine-owned Script SDK integration and deterministic manifest.
 ///
 /// Game projects own their explicitly created gameplay sources. The managed
-/// API implementation is materialized under `build/`, compiled into a separate
-/// `EngineGameplay.dll`, and referenced through an engine-owned MSBuild target.
+/// API implementation stays outside the game source directory and is
+/// referenced through an engine-owned MSBuild target. Installed engines deploy
+/// a prebuilt `EngineGameplay.dll`; source-tree development materializes the
+/// SDK source only when it is explicitly built.
 pub(crate) fn write_generated_script_api(
     project_root: &Path,
     script_project: &Path,
-) -> Result<(PathBuf, PathBuf), String> {
+) -> Result<PathBuf, String> {
     let source_dir = script_project.parent().ok_or_else(|| {
         format!(
             "script_project has no source directory: {}",
@@ -4997,8 +5000,7 @@ pub(crate) fn write_generated_script_api(
     }
     write_file(&msbuild_targets, SCRIPT_SDK_TARGETS)?;
     write_file(&contract, &generated_script_api_manifest_json()?)?;
-    let (source, _) = materialize_script_sdk_source(project_root)?;
-    Ok((source, contract))
+    Ok(contract)
 }
 
 pub(crate) fn sync_project_script_api(
@@ -5013,16 +5015,32 @@ pub(crate) fn sync_project_script_api(
                 .into(),
         );
     }
-    let (source, contract) = write_generated_script_api(&project.root, script_project)?;
+    let contract = write_generated_script_api(&project.root, script_project)?;
+    let script_api_hash = validate_generated_script_api(&project.root, script_project)?;
+    let installation =
+        crate::engine_installation::EngineInstallation::discover_from_current_executable()?;
+    let source = if let Some(installation) = installation.as_ref() {
+        installation.validate_managed_sdk_contract(
+            engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA,
+            engine_script_api::GAMEPLAY_SCRIPT_API_VERSION,
+            &script_api_hash,
+        )?;
+        deploy_installed_managed_tools(project, installation)?;
+        None
+    } else {
+        crate::engine_installation::development_source_root()?;
+        let (source, _) = materialize_script_sdk_source(&project.root)?;
+        Some(report_path(&source))
+    };
     let source_dir = script_project
         .parent()
         .ok_or_else(|| "script_project has no source directory".to_string())?;
     Ok(ScriptApiSyncReport {
-        schema: "ProjectScriptApiSyncReport-v0",
+        schema: "ProjectScriptApiSyncReport-v1",
         project: project.manifest.name.clone(),
         script_api: engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA,
         version: engine_script_api::GAMEPLAY_SCRIPT_API_VERSION,
-        source: report_path(&source),
+        source,
         contract: report_path(&contract),
         msbuild_targets: report_path(
             &source_dir.join(engine_script_api::GENERATED_MSBUILD_TARGETS_FILE),
@@ -5072,6 +5090,98 @@ fn validate_generated_script_api(
         ));
     }
     Ok(script_api_sha256())
+}
+
+/// Deploy the immutable managed SDK and process host carried by an installed
+/// editor. This operation never evaluates project code and is therefore safe
+/// to run while opening a workspace.
+///
+/// Source-tree development returns `Ok(false)` and keeps its explicit
+/// build-from-source path. An invalid explicit installation fails closed.
+pub(crate) fn deploy_installed_project_script_runtime(
+    project: &GameProject,
+) -> Result<bool, String> {
+    if project.script_project.is_none() && project.script_assembly.is_none() {
+        return Ok(false);
+    }
+    let Some(installation) =
+        crate::engine_installation::EngineInstallation::discover_from_current_executable()?
+    else {
+        return Ok(false);
+    };
+    let script_project = project
+        .script_project
+        .as_deref()
+        .ok_or_else(|| "installed script runtime deployment requires script_project".to_string())?;
+    let script_api_hash = validate_generated_script_api(&project.root, script_project)?;
+    installation.validate_managed_sdk_contract(
+        engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA,
+        engine_script_api::GAMEPLAY_SCRIPT_API_VERSION,
+        &script_api_hash,
+    )?;
+    deploy_installed_managed_tools(project, &installation)?;
+    Ok(true)
+}
+
+fn deploy_installed_managed_tools(
+    project: &GameProject,
+    installation: &crate::engine_installation::EngineInstallation,
+) -> Result<(), String> {
+    deploy_installed_managed_tools_from(
+        project,
+        &installation.managed_sdk,
+        &installation.script_host,
+        self_test_script_host,
+    )
+}
+
+fn deploy_installed_managed_tools_from<F>(
+    project: &GameProject,
+    installed_sdk: &Path,
+    installed_host: &Path,
+    validate_host: F,
+) -> Result<(), String>
+where
+    F: Fn(&Path, &Path) -> Result<(), String>,
+{
+    let sdk_output_dir = project.root.join("build/script-sdk");
+    ensure_inside_project(&project.root, &sdk_output_dir, "script SDK output")?;
+    let sdk_output_next = sibling_with_suffix(&sdk_output_dir, ".next")?;
+    let installed_sdk_name = format!("{}.dll", engine_script_api::MANAGED_SDK_ASSEMBLY_NAME);
+    if !directory_contains_only_regular_file_equal(
+        &sdk_output_dir,
+        &installed_sdk_name,
+        installed_sdk,
+    )? {
+        reset_owned_directory(&project.root, &sdk_output_next)?;
+        copy_installed_file(
+            installed_sdk,
+            &sdk_output_next.join(&installed_sdk_name),
+            "managed gameplay SDK",
+        )?;
+        replace_owned_directory(&project.root, &sdk_output_next, &sdk_output_dir)?;
+    }
+
+    let host_dir = project.root.join("build/script-host");
+    let host_executable = host_dir.join(host_executable_name());
+    if directory_files_equal(installed_host, &host_dir)? {
+        validate_host(&host_executable, &host_dir)?;
+        return Ok(());
+    }
+
+    let host_next = project.root.join("build/script-host.next");
+    reset_owned_directory(&project.root, &host_next)?;
+    copy_installed_directory_files(installed_host, &host_next, "managed script host")?;
+    let next_host_executable = host_next.join(host_executable_name());
+    if !next_host_executable.is_file() {
+        return Err(format!(
+            "installed managed script host does not contain {}: {}",
+            host_executable_name(),
+            installed_host.display()
+        ));
+    }
+    validate_host(&next_host_executable, &host_next)?;
+    replace_owned_directory(&project.root, &host_next, &host_dir)
 }
 
 /// Validate the source/runtime script pairing and every scene attachment.
@@ -5212,32 +5322,49 @@ pub(crate) fn build_project_scripts(
         ));
     }
     let script_api_hash = validate_generated_script_api(&project.root, script_project)?;
-    let (_, sdk_project) = materialize_script_sdk_source(&project.root)?;
+    let installation =
+        crate::engine_installation::EngineInstallation::discover_from_current_executable()?;
+    if let Some(installation) = installation.as_ref() {
+        installation.validate_managed_sdk_contract(
+            engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA,
+            engine_script_api::GAMEPLAY_SCRIPT_API_VERSION,
+            &script_api_hash,
+        )?;
+        deploy_installed_managed_tools(project, installation)?;
+    } else {
+        crate::engine_installation::development_source_root()?;
+    }
+    let dotnet = resolve_dotnet_executable()?;
 
     let sdk_output_dir = project.root.join("build/script-sdk");
     ensure_inside_project(&project.root, &sdk_output_dir, "script SDK output")?;
     let sdk_output_next = sibling_with_suffix(&sdk_output_dir, ".next")?;
-    reset_owned_directory(&project.root, &sdk_output_next)?;
-    let sdk_output = Command::new("dotnet")
-        .arg("build")
-        .arg(&sdk_project)
-        .arg("--configuration")
-        .arg("Release")
-        .arg("--nologo")
-        .arg("--output")
-        .arg(&sdk_output_next)
-        .current_dir(sdk_project.parent().unwrap_or(&project.root))
-        .output()
-        .map_err(|error| format!("could not launch Engine Gameplay SDK build: {error}"))?;
-    ensure_command_success("Engine Gameplay SDK build", sdk_output)?;
-    let next_sdk_assembly = sdk_output_next.join(format!(
-        "{}.dll",
-        engine_script_api::MANAGED_SDK_ASSEMBLY_NAME
-    ));
-    if !next_sdk_assembly.is_file() {
+    let sdk_assembly_name = format!("{}.dll", engine_script_api::MANAGED_SDK_ASSEMBLY_NAME);
+    let sdk_assembly = if installation.is_some() {
+        sdk_output_dir.join(&sdk_assembly_name)
+    } else {
+        // Source-tree development keeps a deterministic fallback so engine API
+        // work can be tested before an installed distribution is assembled.
+        reset_owned_directory(&project.root, &sdk_output_next)?;
+        let (_, sdk_project) = materialize_script_sdk_source(&project.root)?;
+        let sdk_output = Command::new(&dotnet)
+            .arg("build")
+            .arg(&sdk_project)
+            .arg("--configuration")
+            .arg("Release")
+            .arg("--nologo")
+            .arg("--output")
+            .arg(&sdk_output_next)
+            .current_dir(sdk_project.parent().unwrap_or(&project.root))
+            .output()
+            .map_err(|error| format!("could not launch Engine Gameplay SDK build: {error}"))?;
+        ensure_command_success("Engine Gameplay SDK build", sdk_output)?;
+        sdk_output_next.join(&sdk_assembly_name)
+    };
+    if !sdk_assembly.is_file() {
         return Err(format!(
-            "dotnet build succeeded but did not produce the Engine Gameplay SDK {}",
-            next_sdk_assembly.display()
+            "managed gameplay SDK was not deployed to {}",
+            sdk_assembly.display()
         ));
     }
 
@@ -5252,7 +5379,7 @@ pub(crate) fn build_project_scripts(
     let output_next = sibling_with_suffix(output_dir, ".next")?;
     reset_owned_directory(&project.root, &output_next)?;
 
-    let game_output = Command::new("dotnet")
+    let game_output = Command::new(&dotnet)
         .arg("build")
         .arg(script_project)
         .arg("--configuration")
@@ -5262,7 +5389,7 @@ pub(crate) fn build_project_scripts(
         .arg(&output_next)
         .arg(format!(
             "-p:EngineGameplaySdkPath={}",
-            next_sdk_assembly.display()
+            sdk_assembly.display()
         ))
         .current_dir(script_project.parent().unwrap_or(&project.root))
         .output()
@@ -5293,65 +5420,73 @@ pub(crate) fn build_project_scripts(
         ));
     }
 
-    // The process host is engine-owned and only changes when the embedded
-    // source changes. Reusing a current host is important on Windows: the
-    // previous Play session may still have its executable open while a new
-    // game assembly is being prepared transactionally.
-    let host_source_dir = project.root.join("build/script-host-source");
-    ensure_inside_project(&project.root, &host_source_dir, "script host source")?;
     let host_dir = project.root.join("build/script-host");
     let host_executable = host_dir.join(host_executable_name());
-    let host_is_current = host_executable.is_file()
-        && file_contents_equal(
-            &host_source_dir.join("EngineScriptHost.csproj"),
-            SCRIPT_HOST_PROJECT,
-        )
-        && file_contents_equal(&host_source_dir.join("Program.cs"), SCRIPT_HOST_SOURCE);
-
-    if host_is_current {
-        self_test_script_host(&host_executable, &host_dir)?;
-    } else {
-        std::fs::create_dir_all(&host_source_dir).map_err(|error| {
-            format!(
-                "could not create script host source directory {}: {error}",
-                host_source_dir.display()
+    if installation.is_none() {
+        let host_source_dir = project.root.join("build/script-host-source");
+        ensure_inside_project(&project.root, &host_source_dir, "script host source")?;
+        // Reusing a current host matters on Windows: an earlier Play session
+        // may still have its executable open while the next game assembly is
+        // prepared transactionally.
+        let host_is_current = host_executable.is_file()
+            && file_contents_equal(
+                &host_source_dir.join("EngineScriptHost.csproj"),
+                SCRIPT_HOST_PROJECT,
             )
-        })?;
-        write_file(
-            &host_source_dir.join("EngineScriptHost.csproj"),
-            SCRIPT_HOST_PROJECT,
-        )?;
-        write_file(&host_source_dir.join("Program.cs"), SCRIPT_HOST_SOURCE)?;
+            && file_contents_equal(&host_source_dir.join("Program.cs"), SCRIPT_HOST_SOURCE);
 
-        let host_next = project.root.join("build/script-host.next");
-        reset_owned_directory(&project.root, &host_next)?;
-        let host_output = Command::new("dotnet")
-            .arg("publish")
-            .arg(host_source_dir.join("EngineScriptHost.csproj"))
-            .arg("--configuration")
-            .arg("Release")
-            .arg("--nologo")
-            .arg("--self-contained")
-            .arg("false")
-            .arg("--output")
-            .arg(&host_next)
-            .current_dir(&host_source_dir)
-            .output()
-            .map_err(|error| format!("could not launch dotnet publish: {error}"))?;
-        ensure_command_success("C# script host publish", host_output)?;
+        if host_is_current {
+            self_test_script_host(&host_executable, &host_dir)?;
+        } else {
+            std::fs::create_dir_all(&host_source_dir).map_err(|error| {
+                format!(
+                    "could not create script host source directory {}: {error}",
+                    host_source_dir.display()
+                )
+            })?;
+            write_file(
+                &host_source_dir.join("EngineScriptHost.csproj"),
+                SCRIPT_HOST_PROJECT,
+            )?;
+            write_file(&host_source_dir.join("Program.cs"), SCRIPT_HOST_SOURCE)?;
 
-        let next_host_executable = host_next.join(host_executable_name());
-        if !next_host_executable.is_file() {
-            return Err(format!(
-                "dotnet publish succeeded but did not produce the script host {}",
-                next_host_executable.display()
-            ));
+            let host_next = project.root.join("build/script-host.next");
+            reset_owned_directory(&project.root, &host_next)?;
+            let host_output = Command::new(&dotnet)
+                .arg("publish")
+                .arg(host_source_dir.join("EngineScriptHost.csproj"))
+                .arg("--configuration")
+                .arg("Release")
+                .arg("--nologo")
+                .arg("--self-contained")
+                .arg("false")
+                .arg("--output")
+                .arg(&host_next)
+                .current_dir(&host_source_dir)
+                .output()
+                .map_err(|error| format!("could not launch dotnet publish: {error}"))?;
+            ensure_command_success("C# script host publish", host_output)?;
+
+            let next_host_executable = host_next.join(host_executable_name());
+            if !next_host_executable.is_file() {
+                return Err(format!(
+                    "dotnet publish succeeded but did not produce the script host {}",
+                    next_host_executable.display()
+                ));
+            }
+            self_test_script_host(&next_host_executable, &host_next)?;
+            replace_owned_directory(&project.root, &host_next, &host_dir)?;
         }
-        self_test_script_host(&next_host_executable, &host_next)?;
-        replace_owned_directory(&project.root, &host_next, &host_dir)?;
+    } else if !host_executable.is_file() {
+        return Err(format!(
+            "installed managed script host was not deployed to {}",
+            host_executable.display()
+        ));
     }
 
-    replace_owned_directory(&project.root, &sdk_output_next, &sdk_output_dir)?;
+    if installation.is_none() {
+        replace_owned_directory(&project.root, &sdk_output_next, &sdk_output_dir)?;
+    }
     replace_owned_directory(&project.root, &output_next, output_dir)?;
 
     let dependency_assemblies = managed_dependencies(output_dir, script_assembly)?.len();
@@ -5732,6 +5867,207 @@ fn file_contents_equal(path: &Path, expected: &str) -> bool {
     std::fs::read_to_string(path).is_ok_and(|contents| contents == expected)
 }
 
+fn copy_installed_file(source: &Path, destination: &Path, label: &str) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| {
+        format!(
+            "could not inspect installed {label} {}: {error}",
+            source.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "installed {label} is not a regular file: {}",
+            source.display()
+        ));
+    }
+    std::fs::copy(source, destination).map_err(|error| {
+        format!(
+            "could not copy installed {label} from {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_installed_directory_files(
+    source: &Path,
+    destination: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(source)
+        .map_err(|error| {
+            format!(
+                "could not enumerate installed {label} {}: {error}",
+                source.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "could not inspect installed {label} {}: {error}",
+                source.display()
+            )
+        })?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    if entries.is_empty() {
+        return Err(format!(
+            "installed {label} directory is empty: {}",
+            source.display()
+        ));
+    }
+    for entry in entries {
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+            format!(
+                "could not inspect installed {label} entry {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "installed {label} contains a non-file entry: {}",
+                entry.path().display()
+            ));
+        }
+        copy_installed_file(&entry.path(), &destination.join(entry.file_name()), label)?;
+    }
+    Ok(())
+}
+
+fn regular_files_equal(expected: &Path, actual: &Path) -> Result<bool, String> {
+    if !actual.is_file() {
+        return Ok(false);
+    }
+    let expected_metadata = std::fs::symlink_metadata(expected).map_err(|error| {
+        format!(
+            "could not inspect managed tool file {}: {error}",
+            expected.display()
+        )
+    })?;
+    let actual_metadata = std::fs::symlink_metadata(actual).map_err(|error| {
+        format!(
+            "could not inspect project managed tool file {}: {error}",
+            actual.display()
+        )
+    })?;
+    if expected_metadata.file_type().is_symlink()
+        || actual_metadata.file_type().is_symlink()
+        || !expected_metadata.is_file()
+        || !actual_metadata.is_file()
+        || expected_metadata.len() != actual_metadata.len()
+    {
+        return Ok(false);
+    }
+    let expected_bytes = std::fs::read(expected).map_err(|error| {
+        format!(
+            "could not compare managed tool file {}: {error}",
+            expected.display()
+        )
+    })?;
+    let actual_bytes = std::fs::read(actual).map_err(|error| {
+        format!(
+            "could not compare managed tool file {}: {error}",
+            actual.display()
+        )
+    })?;
+    Ok(expected_bytes == actual_bytes)
+}
+
+fn directory_contains_only_regular_file_equal(
+    directory: &Path,
+    expected_name: &str,
+    expected_file: &Path,
+) -> Result<bool, String> {
+    if !directory.is_dir() {
+        return Ok(false);
+    }
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|error| {
+            format!(
+                "could not enumerate managed tool directory {}: {error}",
+                directory.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "could not inspect managed tool directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    if entries.len() != 1 {
+        return Ok(false);
+    }
+    let entry = entries.pop().expect("one directory entry");
+    if entry.file_name() != OsString::from(expected_name) {
+        return Ok(false);
+    }
+    regular_files_equal(expected_file, &entry.path())
+}
+
+fn directory_files_equal(expected: &Path, actual: &Path) -> Result<bool, String> {
+    if !actual.is_dir() {
+        return Ok(false);
+    }
+    let list_files = |directory: &Path| -> Result<Vec<(OsString, PathBuf)>, String> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(directory).map_err(|error| {
+            format!(
+                "could not enumerate managed tool directory {}: {error}",
+                directory.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "could not enumerate managed tool directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+                format!(
+                    "could not inspect managed tool entry {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Ok(Vec::new());
+            }
+            files.push((entry.file_name(), entry.path()));
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(files)
+    };
+    let expected_files = list_files(expected)?;
+    let actual_files = list_files(actual)?;
+    if expected_files.is_empty()
+        || expected_files.len() != actual_files.len()
+        || expected_files
+            .iter()
+            .zip(&actual_files)
+            .any(|(left, right)| left.0 != right.0)
+    {
+        return Ok(false);
+    }
+    for ((_, expected_path), (_, actual_path)) in expected_files.iter().zip(&actual_files) {
+        let expected_bytes = std::fs::read(expected_path).map_err(|error| {
+            format!(
+                "could not compare managed tool file {}: {error}",
+                expected_path.display()
+            )
+        })?;
+        let actual_bytes = std::fs::read(actual_path).map_err(|error| {
+            format!(
+                "could not compare managed tool file {}: {error}",
+                actual_path.display()
+            )
+        })?;
+        if expected_bytes != actual_bytes {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn self_test_script_host(executable: &Path, working_directory: &Path) -> Result<(), String> {
     let output = Command::new(executable)
         .arg("--self-test")
@@ -5739,6 +6075,46 @@ fn self_test_script_host(executable: &Path, working_directory: &Path) -> Result<
         .output()
         .map_err(|error| format!("could not launch C# script host self-test: {error}"))?;
     ensure_command_success("C# script host gameplay bridge self-test", output)
+}
+
+fn resolve_dotnet_executable() -> Result<PathBuf, String> {
+    let executable_name = if cfg!(windows) {
+        "dotnet.exe"
+    } else {
+        "dotnet"
+    };
+    let mut candidates = Vec::new();
+    if let Some(host) = std::env::var_os("DOTNET_HOST_PATH").filter(|value| !value.is_empty()) {
+        candidates.push(PathBuf::from(host));
+    }
+    if let Some(root) = std::env::var_os("DOTNET_ROOT").filter(|value| !value.is_empty()) {
+        candidates.push(PathBuf::from(root).join(executable_name));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(
+            std::env::split_paths(&path)
+                .filter(|directory| directory.is_absolute())
+                .map(|directory| directory.join(executable_name)),
+        );
+    }
+    for candidate in candidates {
+        if !candidate.is_absolute() || !candidate.is_file() {
+            continue;
+        }
+        let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+            format!(
+                "could not resolve .NET host {}: {error}",
+                candidate.display()
+            )
+        })?;
+        if resolved.is_file() {
+            return Ok(resolved);
+        }
+    }
+    Err(
+        "could not locate an absolute dotnet executable via DOTNET_HOST_PATH, DOTNET_ROOT, or PATH"
+            .into(),
+    )
 }
 
 fn ensure_command_success(label: &str, output: std::process::Output) -> Result<(), String> {
@@ -5787,6 +6163,7 @@ fn replace_owned_directory(
     ensure_inside_project(project_root, next, "generated next directory")?;
     ensure_inside_project(project_root, final_path, "generated output directory")?;
     let backup = sibling_with_suffix(final_path, ".previous")?;
+    ensure_inside_project(project_root, &backup, "generated backup directory")?;
     if backup.exists() {
         std::fs::remove_dir_all(&backup)
             .map_err(|error| format!("could not clear {}: {error}", backup.display()))?;
@@ -5833,13 +6210,69 @@ fn ensure_inside_project(root: &Path, path: &Path, field: &str) -> Result<(), St
     } else {
         root.join(path)
     };
-    if !absolute.starts_with(root) || absolute == root {
+    if absolute
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!(
+            "{field} contains unsafe path traversal: {}",
+            path.display()
+        ));
+    }
+    let resolved_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("could not resolve project root {}: {error}", root.display()))?;
+    let resolved = resolve_through_existing_ancestor(&absolute, field)?;
+    if !resolved.starts_with(&resolved_root) || resolved == resolved_root {
         return Err(format!(
             "{field} must remain inside the project root: {}",
             path.display()
         ));
     }
     Ok(())
+}
+
+fn resolve_through_existing_ancestor(path: &Path, field: &str) -> Result<PathBuf, String> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    format!(
+                        "{field} has no existing filesystem ancestor: {}",
+                        path.display()
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| {
+                        format!(
+                            "{field} has no existing filesystem ancestor: {}",
+                            path.display()
+                        )
+                    })?
+                    .to_path_buf();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect {field} ancestor {}: {error}",
+                    existing.display()
+                ))
+            }
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&existing).map_err(|error| {
+        format!(
+            "could not resolve {field} ancestor {}: {error}",
+            existing.display()
+        )
+    })?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 fn write_file(path: &Path, content: &str) -> Result<(), String> {
@@ -6127,8 +6560,14 @@ mod tests {
         )
         .unwrap();
 
-        let (source, contract) = write_generated_script_api(root, &script_project)
+        let contract = write_generated_script_api(root, &script_project)
             .expect("write generated Script API contract");
+        assert!(
+            !root.join("build/script-sdk-source").exists(),
+            "writing the project integration must not materialize the engine SDK source"
+        );
+        let (source, _) =
+            materialize_script_sdk_source(root).expect("materialize development SDK source");
         assert_eq!(
             std::fs::read_to_string(&source).unwrap(),
             STARTER_SCRIPT_API_SOURCE
@@ -6217,6 +6656,102 @@ mod tests {
         let error = validate_generated_script_api(root, &script_project)
             .expect_err("generated contract drift must stop the script build");
         assert!(error.contains("sync-script-api"));
+    }
+
+    #[test]
+    fn installed_deployment_exactly_mirrors_sdk_and_host_without_sources() {
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let root = temporary.path().join("game");
+        crate::project_cli::create_project(&root, Some("Installed Tools"), true)
+            .expect("scripted project");
+        let project = GameProject::load(&root).expect("load scripted project");
+
+        let installed_sdk = temporary.path().join("install/sdk/EngineGameplay.dll");
+        let installed_host = temporary.path().join("install/sdk/script-host");
+        std::fs::create_dir_all(installed_sdk.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&installed_host).unwrap();
+        let installed_sdk_bytes = [0x00, 0xff, 0x45, 0x53, 0x44, 0x4b];
+        std::fs::write(&installed_sdk, installed_sdk_bytes).unwrap();
+        for (name, bytes) in [
+            (
+                host_executable_name(),
+                b"verified host executable".as_slice(),
+            ),
+            ("EngineScriptHost.dll", b"verified host assembly".as_slice()),
+            (
+                "EngineScriptHost.runtimeconfig.json",
+                b"{\"runtimeOptions\":{}}".as_slice(),
+            ),
+        ] {
+            std::fs::write(installed_host.join(name), bytes).unwrap();
+        }
+
+        let project_sdk = root.join("build/script-sdk");
+        let project_host = root.join("build/script-host");
+        std::fs::create_dir_all(&project_sdk).unwrap();
+        std::fs::create_dir_all(&project_host).unwrap();
+        std::fs::write(project_sdk.join("EngineGameplay.dll"), b"wrong SDK").unwrap();
+        std::fs::write(project_sdk.join("stale.dll"), b"stale SDK file").unwrap();
+        std::fs::write(
+            project_host.join(host_executable_name()),
+            b"wrong host executable",
+        )
+        .unwrap();
+        std::fs::write(project_host.join("stale.dll"), b"stale host file").unwrap();
+
+        let validations = std::cell::Cell::new(0usize);
+        let validate_host = |executable: &Path, directory: &Path| {
+            assert_eq!(executable, directory.join(host_executable_name()));
+            assert!(executable.is_file());
+            validations.set(validations.get() + 1);
+            Ok(())
+        };
+        deploy_installed_managed_tools_from(
+            &project,
+            &installed_sdk,
+            &installed_host,
+            &validate_host,
+        )
+        .expect("deploy installed managed tools");
+
+        assert!(directory_contains_only_regular_file_equal(
+            &project_sdk,
+            "EngineGameplay.dll",
+            &installed_sdk
+        )
+        .unwrap());
+        assert!(directory_files_equal(&installed_host, &project_host).unwrap());
+        assert_eq!(
+            std::fs::read(project_sdk.join("EngineGameplay.dll")).unwrap(),
+            installed_sdk_bytes
+        );
+        for entry in std::fs::read_dir(&installed_host).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(
+                std::fs::read(project_host.join(entry.file_name())).unwrap(),
+                std::fs::read(entry.path()).unwrap()
+            );
+        }
+        assert_eq!(std::fs::read_dir(&project_sdk).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(&project_host).unwrap().count(),
+            std::fs::read_dir(&installed_host).unwrap().count()
+        );
+        assert!(!root.join("build/script-sdk.next").exists());
+        assert!(!root.join("build/script-sdk.previous").exists());
+        assert!(!root.join("build/script-host.next").exists());
+        assert!(!root.join("build/script-host.previous").exists());
+        assert!(!root.join("build/script-sdk-source").exists());
+        assert!(!root.join("build/script-host-source").exists());
+
+        deploy_installed_managed_tools_from(
+            &project,
+            &installed_sdk,
+            &installed_host,
+            &validate_host,
+        )
+        .expect("reuse identical installed managed tools");
+        assert_eq!(validations.get(), 2);
     }
 
     #[test]

@@ -4,6 +4,9 @@ param(
     [string]$OutputRoot = "",
     [string]$CargoTargetDir = "",
     [string]$ProjectPath = "",
+    # Installed editors pass their immutable distribution root. In this mode
+    # packaging consumes prebuilt tools and never invokes Cargo or Git.
+    [string]$EngineInstallRoot = "",
     # The project player currently has a real windowed implementation only for
     # Vulkan. Keep the release surface honest until DX12 has one too.
     [ValidateSet("vulkan")]
@@ -20,18 +23,23 @@ if (Test-Path Variable:\PSNativeCommandUseErrorActionPreference) {
 }
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
-if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
-    $OutputRoot = Join-Path $repoRoot "artifacts\release"
+$installedMode = -not [string]::IsNullOrWhiteSpace($EngineInstallRoot)
+$cargoTargetWasRequested = -not [string]::IsNullOrWhiteSpace($CargoTargetDir)
+if ($installedMode -and $cargoTargetWasRequested) {
+    throw "Installed-engine packaging uses prebuilt tools and does not accept -CargoTargetDir"
 }
-$OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
-if ([string]::IsNullOrWhiteSpace($CargoTargetDir)) {
-    $CargoTargetDir = Join-Path $repoRoot "target"
+if ($installedMode -and $SkipBuild) {
+    throw "Installed-engine packaging is already prebuilt and does not accept -SkipBuild"
 }
-$CargoTargetDir = [System.IO.Path]::GetFullPath($CargoTargetDir)
-$cargoReleaseDir = Join-Path $CargoTargetDir "release"
+if ($installedMode -and $AllowDirty) {
+    throw "Installed-engine packaging has immutable verified tools and does not accept -AllowDirty"
+}
 $platform = "windows-x86_64"
 
 if ([string]::IsNullOrWhiteSpace($ProjectPath)) {
+    if ($installedMode) {
+        throw "Installed-engine packaging requires -ProjectPath"
+    }
     $ProjectPath = Join-Path $repoRoot "examples\minimal-game\game.project.json"
 }
 $ProjectPath = [System.IO.Path]::GetFullPath($ProjectPath)
@@ -42,40 +50,152 @@ if (-not (Test-Path -LiteralPath $ProjectPath -PathType Leaf)) {
     throw "Game project manifest was not found: $ProjectPath"
 }
 $projectRoot = [System.IO.Path]::GetDirectoryName($ProjectPath)
-$projectManifestJson = Get-Content -LiteralPath $ProjectPath -Raw
-# Windows PowerShell already rejects duplicate JSON object keys. PowerShell 7
-# may run on a newer JSON implementation, so inspect the raw scenes object when
-# System.Text.Json is available and enforce portable uniqueness explicitly.
-$jsonDocumentType = [Type]::GetType("System.Text.Json.JsonDocument, System.Text.Json", $false)
-if ($null -ne $jsonDocumentType) {
-    $jsonDocument = $jsonDocumentType::Parse($projectManifestJson)
-    try {
-        $sceneObjectCount = 0
-        $rawSceneIds = [System.Collections.Generic.HashSet[string]]::new(
-            [StringComparer]::OrdinalIgnoreCase
-        )
-        foreach ($rootProperty in $jsonDocument.RootElement.EnumerateObject()) {
-            if ($rootProperty.Name -cne "scenes") {
-                continue
+if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
+    $OutputRoot = if ($installedMode) {
+        Join-Path $projectRoot "Dist"
+    }
+    else {
+        Join-Path $repoRoot "artifacts\release"
+    }
+}
+$OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
+if ($installedMode) {
+    $projectPrefix = $projectRoot.TrimEnd('\') + '\'
+    if ($OutputRoot -eq $projectRoot -or
+        -not $OutputRoot.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Installed-engine package output must be a dedicated directory inside the project workspace"
+    }
+    $ancestor = $OutputRoot
+    while ($ancestor.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-Path -LiteralPath $ancestor) {
+            $ancestorItem = Get-Item -LiteralPath $ancestor -Force
+            if (($ancestorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Installed-engine package output may not traverse a reparse point: $ancestor"
             }
-            $sceneObjectCount += 1
-            if ($sceneObjectCount -gt 1) {
-                throw "Game project manifest contains a duplicate 'scenes' field"
-            }
-            if ($rootProperty.Value.ValueKind.ToString() -ne "Object") {
-                continue
-            }
-            foreach ($sceneProperty in $rootProperty.Value.EnumerateObject()) {
-                if (-not $rawSceneIds.Add($sceneProperty.Name)) {
-                    throw "Project scene ID '$($sceneProperty.Name)' is duplicated or differs from another ID only by letter case"
+        }
+        $ancestor = Split-Path -Parent $ancestor
+    }
+}
+if ([string]::IsNullOrWhiteSpace($CargoTargetDir)) {
+    $CargoTargetDir = Join-Path $repoRoot "target"
+}
+$CargoTargetDir = [System.IO.Path]::GetFullPath($CargoTargetDir)
+$cargoReleaseDir = Join-Path $CargoTargetDir "release"
+
+function ConvertFrom-JsonStringToken {
+    param(
+        [Parameter(Mandatory)][string]$Token
+    )
+    $builder = [System.Text.StringBuilder]::new()
+    for ($index = 1; $index -lt $Token.Length - 1; $index += 1) {
+        $character = $Token[$index]
+        if ($character -ne '\') {
+            [void]$builder.Append($character)
+            continue
+        }
+        $index += 1
+        if ($index -ge $Token.Length - 1) {
+            throw "JSON string ends with an incomplete escape"
+        }
+        $escaped = $Token[$index]
+        switch ($escaped) {
+            '"' { [void]$builder.Append('"') }
+            '\' { [void]$builder.Append('\') }
+            '/' { [void]$builder.Append('/') }
+            'b' { [void]$builder.Append([char]0x08) }
+            'f' { [void]$builder.Append([char]0x0c) }
+            'n' { [void]$builder.Append([char]0x0a) }
+            'r' { [void]$builder.Append([char]0x0d) }
+            't' { [void]$builder.Append([char]0x09) }
+            'u' {
+                if ($index + 4 -ge $Token.Length) {
+                    throw "JSON string contains an incomplete Unicode escape"
                 }
+                $hex = $Token.Substring($index + 1, 4)
+                if ($hex -notmatch '^[0-9A-Fa-f]{4}$') {
+                    throw "JSON string contains an invalid Unicode escape '\u$hex'"
+                }
+                [void]$builder.Append([char][Convert]::ToInt32($hex, 16))
+                $index += 4
+            }
+            default {
+                throw "JSON string contains an invalid escape '\$escaped'"
             }
         }
     }
-    finally {
-        $jsonDocument.Dispose()
+    return $builder.ToString()
+}
+
+function Assert-NoDuplicateJsonObjectKeys {
+    param(
+        [Parameter(Mandatory)][string]$Json,
+        [Parameter(Mandatory)][string]$Label
+    )
+    $contexts = [System.Collections.Generic.Stack[object]]::new()
+    for ($index = 0; $index -lt $Json.Length; $index += 1) {
+        $character = $Json[$index]
+        if ($character -eq '{') {
+            $contexts.Push([PSCustomObject]@{
+                kind = "object"
+                keys = [System.Collections.Generic.HashSet[string]]::new(
+                    [StringComparer]::OrdinalIgnoreCase
+                )
+            })
+            continue
+        }
+        if ($character -eq '[') {
+            $contexts.Push([PSCustomObject]@{ kind = "array"; keys = $null })
+            continue
+        }
+        if ($character -eq '}' -or $character -eq ']') {
+            if ($contexts.Count -gt 0) {
+                [void]$contexts.Pop()
+            }
+            continue
+        }
+        if ($character -ne '"') {
+            continue
+        }
+
+        $tokenStart = $index
+        $escaped = $false
+        for ($index += 1; $index -lt $Json.Length; $index += 1) {
+            $character = $Json[$index]
+            if ($escaped) {
+                $escaped = $false
+                continue
+            }
+            if ($character -eq '\') {
+                $escaped = $true
+                continue
+            }
+            if ($character -eq '"') {
+                break
+            }
+        }
+        if ($index -ge $Json.Length) {
+            throw "$Label contains an unterminated JSON string"
+        }
+        $lookahead = $index + 1
+        while ($lookahead -lt $Json.Length -and [char]::IsWhiteSpace($Json[$lookahead])) {
+            $lookahead += 1
+        }
+        if ($lookahead -ge $Json.Length -or $Json[$lookahead] -ne ':') {
+            continue
+        }
+        if ($contexts.Count -eq 0 -or $contexts.Peek().kind -ne "object") {
+            continue
+        }
+        $token = $Json.Substring($tokenStart, $index - $tokenStart + 1)
+        $key = ConvertFrom-JsonStringToken -Token $token
+        if (-not $contexts.Peek().keys.Add($key)) {
+            throw "$Label contains a duplicate or case-conflicting object key '$key'"
+        }
     }
 }
+
+$projectManifestJson = Get-Content -LiteralPath $ProjectPath -Raw
+Assert-NoDuplicateJsonObjectKeys -Json $projectManifestJson -Label "Game project manifest"
 try {
     $projectManifest = $projectManifestJson | ConvertFrom-Json
 }
@@ -95,6 +215,30 @@ if ($hasScriptProject -ne $hasScriptAssembly) {
     throw "Scripted projects must configure both script_project and script_assembly"
 }
 $hasScripts = $hasScriptProject -and $hasScriptAssembly
+$assetSourceProperty = $projectManifest.PSObject.Properties["asset_source"]
+$assetSourceRelative = if ($null -eq $assetSourceProperty -or
+    [string]::IsNullOrWhiteSpace([string]$assetSourceProperty.Value)) {
+    "assets/source"
+}
+else {
+    [string]$assetSourceProperty.Value
+}
+$cookedAssetsProperty = $projectManifest.PSObject.Properties["cooked_assets"]
+$cookedAssetsRelative = if ($null -eq $cookedAssetsProperty -or
+    [string]::IsNullOrWhiteSpace([string]$cookedAssetsProperty.Value)) {
+    "build/cooked"
+}
+else {
+    [string]$cookedAssetsProperty.Value
+}
+$inputActionsProperty = $projectManifest.PSObject.Properties["input_actions"]
+$inputActionsRelative = if ($null -eq $inputActionsProperty -or
+    [string]::IsNullOrWhiteSpace([string]$inputActionsProperty.Value)) {
+    $null
+}
+else {
+    [string]$inputActionsProperty.Value
+}
 
 function Invoke-Native {
     param(
@@ -179,6 +323,58 @@ function Resolve-ProjectRelativePath {
         throw "Project field '$Field' resolves outside the project root"
     }
     return $resolved
+}
+
+function Test-PathTreesOverlap {
+    param(
+        [Parameter(Mandatory)][string]$Left,
+        [Parameter(Mandatory)][string]$Right
+    )
+    $leftPath = [System.IO.Path]::GetFullPath($Left).TrimEnd('\')
+    $rightPath = [System.IO.Path]::GetFullPath($Right).TrimEnd('\')
+    if ([string]::Equals($leftPath, $rightPath, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $leftPrefix = $leftPath + '\'
+    $rightPrefix = $rightPath + '\'
+    return $leftPath.StartsWith($rightPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $rightPath.StartsWith($leftPrefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-PackagePathDisjointFromProjectBuild {
+    param(
+        [Parameter(Mandatory)][string]$Candidate,
+        [Parameter(Mandatory)][string]$CandidateLabel,
+        [Parameter(Mandatory)][object[]]$ProtectedDirectories
+    )
+    foreach ($protected in $ProtectedDirectories) {
+        if (Test-PathTreesOverlap -Left $Candidate -Right ([string]$protected.path)) {
+            throw "$CandidateLabel '$Candidate' overlaps the project-owned $($protected.label) directory '$($protected.path)'; choose a dedicated package output directory"
+        }
+    }
+}
+
+function Assert-NoReparsePointBelowRoot {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Field
+    )
+    $rootPath = [System.IO.Path]::GetFullPath($Root)
+    $rootPrefix = $rootPath.TrimEnd('\') + '\'
+    $cursor = [System.IO.Path]::GetFullPath($Path)
+    if (-not $cursor.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Project field '$Field' resolves outside the project root"
+    }
+    while ($cursor.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-Path -LiteralPath $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Project field '$Field' may not traverse a reparse point: $cursor"
+            }
+        }
+        $cursor = Split-Path -Parent $cursor
+    }
 }
 
 function Get-ProjectSceneCatalog {
@@ -315,22 +511,177 @@ function New-DeterministicZip {
     }
 }
 
-$projectScenes = Get-ProjectSceneCatalog -Root $projectRoot -Manifest $projectManifest
+function Get-InstalledFile {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][object]$Manifest,
+        [Parameter(Mandatory)][string]$Field
+    )
+    $property = $Manifest.PSObject.Properties[$Field]
+    if ($null -eq $property -or $property.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+        throw "Engine installation field '$Field' must be a non-empty relative path"
+    }
+    $relative = ([string]$property.Value).Replace('\', '/')
+    $resolved = Resolve-ProjectRelativePath -Root $Root -RelativePath $relative -Field $Field
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Engine installation file '$Field' was not found: $resolved"
+    }
+    $hashProperty = $Manifest.files.PSObject.Properties |
+        Where-Object { [string]::Equals($_.Name, $relative, [StringComparison]::Ordinal) } |
+        Select-Object -First 1
+    if ($null -eq $hashProperty -or [string]$hashProperty.Value -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "Engine installation file '$Field' is not covered by a valid files SHA-256: $relative"
+    }
+    $actual = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToLowerInvariant()
+    $expected = ([string]$hashProperty.Value).ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw "Engine installation file '$Field' failed SHA-256 verification: $relative"
+    }
+    return $resolved
+}
 
-Push-Location $repoRoot
-try {
-    $commit = Get-NativeOutput "git" @("rev-parse", "--verify", "HEAD")
-    $dirty = -not [string]::IsNullOrWhiteSpace((Get-NativeOutput "git" @("status", "--porcelain")))
-    if ($dirty -and -not $AllowDirty) {
-        throw "Release packaging requires a clean worktree. Use -AllowDirty only for a local dry run."
+$protectedProjectBuildDirectories = @(
+    [PSCustomObject]@{
+        label = "cooked_assets"
+        path = Resolve-ProjectRelativePath `
+            -Root $projectRoot `
+            -RelativePath $cookedAssetsRelative `
+            -Field "cooked_assets"
+    },
+    [PSCustomObject]@{
+        label = "managed script SDK"
+        path = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "build\script-sdk"))
+    },
+    [PSCustomObject]@{
+        label = "managed script host"
+        path = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "build\script-host"))
+    }
+)
+if ($hasScripts) {
+    $scriptAssemblyPathForOutputValidation = Resolve-ProjectRelativePath `
+        -Root $projectRoot `
+        -RelativePath ([string]$scriptAssemblyProperty.Value) `
+        -Field "script_assembly"
+    $protectedProjectBuildDirectories += [PSCustomObject]@{
+        label = "script_assembly output"
+        path = [System.IO.Path]::GetDirectoryName($scriptAssemblyPathForOutputValidation)
+    }
+}
+if ($installedMode) {
+    Assert-PackagePathDisjointFromProjectBuild `
+        -Candidate $OutputRoot `
+        -CandidateLabel "Installed-engine package output root" `
+        -ProtectedDirectories $protectedProjectBuildDirectories
+}
+
+$engineInstallation = $null
+$projectToolExe = $null
+$sandboxExe = $null
+$sandboxPdb = $null
+$assetCookExe = $null
+$installationNotices = $null
+if ($installedMode) {
+    $EngineInstallRoot = [System.IO.Path]::GetFullPath($EngineInstallRoot)
+    $installationManifestPath = Join-Path $EngineInstallRoot "engine.installation.json"
+    if (-not (Test-Path -LiteralPath $installationManifestPath -PathType Leaf)) {
+        throw "Engine installation manifest was not found: $installationManifestPath"
+    }
+    $engineInstallationJson = Get-Content -LiteralPath $installationManifestPath -Raw
+    Assert-NoDuplicateJsonObjectKeys `
+        -Json $engineInstallationJson `
+        -Label "Engine installation manifest"
+    $engineInstallation = $engineInstallationJson | ConvertFrom-Json
+    if ($engineInstallation.schema -ne "EngineInstallation-v0") {
+        throw "Unsupported engine installation schema '$($engineInstallation.schema)'"
+    }
+    if ($null -eq $engineInstallation.files -or
+        @($engineInstallation.files.PSObject.Properties).Count -eq 0) {
+        throw "Engine installation manifest contains no file hashes"
+    }
+    foreach ($fileHash in $engineInstallation.files.PSObject.Properties) {
+        $relative = ([string]$fileHash.Name).Replace('\', '/')
+        if ([string]$fileHash.Value -notmatch '^[0-9A-Fa-f]{64}$') {
+            throw "Engine installation contains an invalid SHA-256 for '$relative'"
+        }
+        $file = Resolve-ProjectRelativePath -Root $EngineInstallRoot -RelativePath $relative -Field "files.$relative"
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            throw "Engine installation file listed in the manifest is missing: $file"
+        }
+        $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne ([string]$fileHash.Value).ToLowerInvariant()) {
+            throw "Engine installation file failed SHA-256 verification: $relative"
+        }
     }
 
-    if ([string]::IsNullOrWhiteSpace($Version)) {
-        if (-not [string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
-            $Version = $env:RELEASE_VERSION
+    $projectToolExe = Get-InstalledFile -Root $EngineInstallRoot -Manifest $engineInstallation -Field "editor"
+    $sandboxExe = Get-InstalledFile -Root $EngineInstallRoot -Manifest $engineInstallation -Field "windows_runtime"
+    $sandboxPdb = Get-InstalledFile -Root $EngineInstallRoot -Manifest $engineInstallation -Field "windows_symbols"
+    $assetCookExe = Get-InstalledFile -Root $EngineInstallRoot -Manifest $engineInstallation -Field "asset_cooker"
+    $installationNotices = Get-InstalledFile -Root $EngineInstallRoot -Manifest $engineInstallation -Field "notices"
+
+    $scriptHostRelative = [string]$engineInstallation.script_host
+    $scriptHostRoot = Resolve-ProjectRelativePath -Root $EngineInstallRoot -RelativePath $scriptHostRelative -Field "script_host"
+    if (-not (Test-Path -LiteralPath $scriptHostRoot -PathType Container)) {
+        throw "Engine installation script host directory was not found: $scriptHostRoot"
+    }
+    $scriptHostFiles = @(Get-ChildItem -LiteralPath $scriptHostRoot -Force)
+    if ($scriptHostFiles.Count -eq 0 -or @($scriptHostFiles | Where-Object { -not $_.PSIsContainer }).Count -eq 0) {
+        throw "Engine installation script host directory contains no files: $scriptHostRoot"
+    }
+    if (@($scriptHostFiles | Where-Object { $_.PSIsContainer -or $_.LinkType }).Count -ne 0) {
+        throw "Engine installation script host must contain regular top-level files only: $scriptHostRoot"
+    }
+    foreach ($hostFile in $scriptHostFiles) {
+        $relative = (Get-RelativeReleasePath -Base $EngineInstallRoot -Path $hostFile.FullName).Replace('\', '/')
+        $hashProperty = $engineInstallation.files.PSObject.Properties |
+            Where-Object { [string]::Equals($_.Name, $relative, [StringComparison]::Ordinal) } |
+            Select-Object -First 1
+        if ($null -eq $hashProperty) {
+            throw "Engine installation script host contains an unlisted file: $relative"
         }
-        else {
-            $Version = Get-NativeOutput "git" @("describe", "--tags", "--always")
+    }
+}
+
+$projectScenes = Get-ProjectSceneCatalog -Root $projectRoot -Manifest $projectManifest
+
+$operationRoot = if ($installedMode) { $projectRoot } else { $repoRoot }
+$packageStagingRoot = $null
+Push-Location $operationRoot
+try {
+    if ($installedMode) {
+        $commit = [string]$engineInstallation.source_commit
+        $dirty = $false
+        $commitEpoch = [long]$engineInstallation.source_date_epoch
+        $rustcVersion = [string]$engineInstallation.rustc
+        if ([string]::IsNullOrWhiteSpace($commit) -or
+            $commitEpoch -lt 315532800 -or
+            $commitEpoch -gt 4354819199 -or
+            [string]::IsNullOrWhiteSpace($rustcVersion)) {
+            throw "Engine installation provenance metadata is incomplete"
+        }
+        if ([string]::IsNullOrWhiteSpace($Version)) {
+            if (-not [string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
+                $Version = $env:RELEASE_VERSION
+            }
+            else {
+                $Version = [string]$engineInstallation.engine_version
+            }
+        }
+    }
+    else {
+        $commit = Get-NativeOutput "git" @("rev-parse", "--verify", "HEAD")
+        $dirty = -not [string]::IsNullOrWhiteSpace((Get-NativeOutput "git" @("status", "--porcelain")))
+        if ($dirty -and -not $AllowDirty) {
+            throw "Release packaging requires a clean worktree. Use -AllowDirty only for a local dry run."
+        }
+        if ([string]::IsNullOrWhiteSpace($Version)) {
+            if (-not [string]::IsNullOrWhiteSpace($env:RELEASE_VERSION)) {
+                $Version = $env:RELEASE_VERSION
+            }
+            else {
+                $Version = Get-NativeOutput "git" @("describe", "--tags", "--always")
+            }
         }
     }
     if ($Version -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$') {
@@ -338,15 +689,24 @@ try {
     }
 
     $releaseRoot = [System.IO.Path]::GetFullPath((Join-Path $OutputRoot $Version))
-    $stageRoot = [System.IO.Path]::GetFullPath((Join-Path $releaseRoot $platform))
+    if ($installedMode) {
+        Assert-PackagePathDisjointFromProjectBuild `
+            -Candidate $releaseRoot `
+            -CandidateLabel "Installed-engine package release directory" `
+            -ProtectedDirectories $protectedProjectBuildDirectories
+    }
+    if (Test-Path -LiteralPath $releaseRoot) {
+        throw "Release version already exists and will not be overwritten: $releaseRoot"
+    }
+    New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+    $packageStagingRoot = Join-Path $OutputRoot (".engine-package-{0}-{1}" -f $PID, [Guid]::NewGuid().ToString("N"))
+    $workingReleaseRoot = Join-Path $packageStagingRoot $Version
+    $stageRoot = [System.IO.Path]::GetFullPath((Join-Path $workingReleaseRoot $platform))
     $symbolStageName = "$platform-symbols"
-    $symbolStageRoot = [System.IO.Path]::GetFullPath((Join-Path $releaseRoot $symbolStageName))
+    $symbolStageRoot = [System.IO.Path]::GetFullPath((Join-Path $workingReleaseRoot $symbolStageName))
     foreach ($ownedPath in @($stageRoot, $symbolStageRoot)) {
-        if (-not $ownedPath.StartsWith(($OutputRoot.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $ownedPath.StartsWith(($packageStagingRoot.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) {
             throw "Refusing to stage outside output root: $ownedPath"
-        }
-        if (Test-Path -LiteralPath $ownedPath) {
-            Remove-Item -LiteralPath $ownedPath -Recurse -Force
         }
     }
 
@@ -359,11 +719,16 @@ try {
     $configDir = New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "config")
 
     $featureList = @("backend-$Backend", "target-desktop")
-    if ($hasScripts) {
+    if ($installedMode) {
+        # The distributed player is one stable superset build so every project
+        # uses the exact runtime covered by the installation manifest.
+        $featureList += @("terrain", "subsystem-scripting-csharp")
+    }
+    elseif ($hasScripts) {
         $featureList += "subsystem-scripting-csharp"
     }
     $features = $featureList -join ','
-    if (-not $SkipBuild) {
+    if (-not $installedMode -and -not $SkipBuild) {
         $workspaceFeatureList = @("sandbox/backend-$Backend", "sandbox/target-desktop")
         if ($hasScripts) {
             $workspaceFeatureList += "sandbox/subsystem-scripting-csharp"
@@ -375,27 +740,36 @@ try {
         )
     }
 
-    $sandboxExe = Join-Path $cargoReleaseDir "sandbox.exe"
+    if (-not $installedMode) {
+        $sandboxExe = Join-Path $cargoReleaseDir "sandbox.exe"
+        $projectToolExe = $sandboxExe
+        $sandboxPdb = Join-Path $cargoReleaseDir "sandbox.pdb"
+        $assetCookExe = Join-Path $cargoReleaseDir "asset-cook.exe"
+    }
     if (-not (Test-Path -LiteralPath $sandboxExe -PathType Leaf)) {
         throw "Release executable was not produced: $sandboxExe"
     }
     Copy-Item -LiteralPath $sandboxExe -Destination (Join-Path $binaryDir "sandbox.exe")
-    $sandboxPdb = Join-Path $cargoReleaseDir "sandbox.pdb"
     if (-not (Test-Path -LiteralPath $sandboxPdb -PathType Leaf)) {
         throw "Release symbols were not produced: $sandboxPdb"
     }
     $stagedPdb = Join-Path $symbolDir "sandbox.pdb"
     Copy-Item -LiteralPath $sandboxPdb -Destination $stagedPdb
 
-    $assetCookExe = Join-Path $cargoReleaseDir "asset-cook.exe"
-    if (-not (Test-Path -LiteralPath $assetCookExe -PathType Leaf)) {
+    if (-not $installedMode -and -not (Test-Path -LiteralPath $assetCookExe -PathType Leaf)) {
         throw "Release asset cooker was not produced: $assetCookExe"
     }
-    $sourceAssetRoot = Resolve-ProjectRelativePath -Root $projectRoot -RelativePath ([string]$projectManifest.asset_source) -Field "asset_source"
+    $sourceAssetRoot = Resolve-ProjectRelativePath `
+        -Root $projectRoot `
+        -RelativePath $assetSourceRelative `
+        -Field "asset_source"
     $startupScenePath = $projectScenes.startup.source_path
     $inputActionsPath = $null
-    if ($null -ne $projectManifest.input_actions -and -not [string]::IsNullOrWhiteSpace([string]$projectManifest.input_actions)) {
-        $inputActionsPath = Resolve-ProjectRelativePath -Root $projectRoot -RelativePath ([string]$projectManifest.input_actions) -Field "input_actions"
+    if ($null -ne $inputActionsRelative) {
+        $inputActionsPath = Resolve-ProjectRelativePath `
+            -Root $projectRoot `
+            -RelativePath $inputActionsRelative `
+            -Field "input_actions"
     }
     $scriptProjectPath = $null
     $scriptAssemblyPath = $null
@@ -414,7 +788,7 @@ try {
     }
 
     if ($hasScripts) {
-        Invoke-Native "build game scripts and publish script host" $sandboxExe @(
+        Invoke-Native "build game scripts and deploy script host" $projectToolExe @(
             "project", "build-scripts", $ProjectPath
         )
         if (-not (Test-Path -LiteralPath $scriptAssemblyPath -PathType Leaf)) {
@@ -422,8 +796,33 @@ try {
         }
     }
 
+    $projectCookedAssets = $null
+    if ($installedMode) {
+        $projectCookedAssets = Resolve-ProjectRelativePath `
+            -Root $projectRoot `
+            -RelativePath $cookedAssetsRelative `
+            -Field "cooked_assets"
+        Assert-NoReparsePointBelowRoot `
+            -Root $projectRoot `
+            -Path $projectCookedAssets `
+            -Field "cooked_assets"
+        $outputPrefix = $OutputRoot.TrimEnd('\') + '\'
+        $cookedPrefix = $projectCookedAssets.TrimEnd('\') + '\'
+        if ($projectCookedAssets -eq $OutputRoot -or
+            $projectCookedAssets.StartsWith($outputPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            $OutputRoot.StartsWith($cookedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Project cooked_assets and installed package output must be disjoint directories"
+        }
+        Invoke-Native "cook project assets with the installed engine registry" $projectToolExe @(
+            "project", "cook", $ProjectPath
+        )
+        if (-not (Test-Path -LiteralPath $projectCookedAssets -PathType Container)) {
+            throw "Installed project cook did not produce the configured cooked directory: $projectCookedAssets"
+        }
+    }
+
     $projectCheckReport = Join-Path $manifestDir "project-check.json"
-    Invoke-Native "validate game project" $sandboxExe @(
+    Invoke-Native "validate game project" $projectToolExe @(
         "project", "check", $ProjectPath, "--report", $projectCheckReport
     )
     $checkReport = Get-Content -LiteralPath $projectCheckReport -Raw | ConvertFrom-Json
@@ -432,7 +831,10 @@ try {
     }
 
     $stagedProjectPath = Join-Path $stageRoot "game.project.json"
-    $projectManifest.cooked_assets = "assets/cooked"
+    $projectManifest | Add-Member `
+        -NotePropertyName "cooked_assets" `
+        -NotePropertyValue "assets/cooked" `
+        -Force
     if ($hasScripts) {
         $scriptStageDir = New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "scripts")
         $scriptOutputDir = Split-Path -Parent $scriptAssemblyPath
@@ -467,23 +869,56 @@ try {
     }
     $stagedScenePath = [string]$stagedScenePaths[$projectScenes.startup.id]
     if ($null -ne $inputActionsPath) {
-        $stagedInputActionsPath = Join-Path $stageRoot ([string]$projectManifest.input_actions)
+        $stagedInputActionsPath = Join-Path $stageRoot $inputActionsRelative
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stagedInputActionsPath) | Out-Null
         Copy-Item -LiteralPath $inputActionsPath -Destination $stagedInputActionsPath
     }
 
     $assetCookReport = Join-Path $manifestDir "asset-cook.json"
-    Invoke-Native "strict deterministic asset cook" $assetCookExe @(
-        "--source", $sourceAssetRoot,
-        "--output", $assetDir.FullName,
-        "--report", $assetCookReport
-    )
-    $cookReport = Get-Content -LiteralPath $assetCookReport -Raw | ConvertFrom-Json
-    if ($cookReport.schema -ne "AssetCookReport-v0") {
-        throw "Asset cooker emitted an unexpected report schema: $($cookReport.schema)"
+    if ($installedMode) {
+        $cookedEntries = @(Get-ChildItem -LiteralPath $projectCookedAssets -Force)
+        $reparseEntries = @(
+            Get-ChildItem -LiteralPath $projectCookedAssets -Recurse -Force |
+                Where-Object {
+                    ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+                }
+        )
+        if ($reparseEntries.Count -ne 0) {
+            throw "Configured cooked assets contain a reparse point: $($reparseEntries[0].FullName)"
+        }
+        foreach ($entry in $cookedEntries) {
+            Copy-Item `
+                -LiteralPath $entry.FullName `
+                -Destination (Join-Path $assetDir.FullName $entry.Name) `
+                -Recurse
+        }
+        if ([long]$checkReport.cooked_assets -ne [long]$checkReport.declared_assets) {
+            throw "Installed project cook produced $($checkReport.cooked_assets) cooked artifacts for $($checkReport.declared_assets) declared assets"
+        }
+        $cookReport = [ordered]@{
+            schema = "AssetCookReport-v0"
+            source = "installed-project-cook"
+            declared_asset_count = [long]$checkReport.declared_assets
+            succeeded_asset_count = [long]$checkReport.cooked_assets
+            failed_asset_count = 0
+            failed_manifest_count = 0
+            diagnostics = @()
+        }
+        Write-Utf8NoBom $assetCookReport (($cookReport | ConvertTo-Json -Depth 5) + "`n")
     }
-    if ($cookReport.succeeded_asset_count -ne $cookReport.declared_asset_count) {
-        throw "Asset cook did not produce every declared asset"
+    else {
+        Invoke-Native "strict deterministic asset cook" $assetCookExe @(
+            "--source", $sourceAssetRoot,
+            "--output", $assetDir.FullName,
+            "--report", $assetCookReport
+        )
+        $cookReport = Get-Content -LiteralPath $assetCookReport -Raw | ConvertFrom-Json
+        if ($cookReport.schema -ne "AssetCookReport-v0") {
+            throw "Asset cooker emitted an unexpected report schema: $($cookReport.schema)"
+        }
+        if ($cookReport.succeeded_asset_count -ne $cookReport.declared_asset_count) {
+            throw "Asset cook did not produce every declared asset"
+        }
     }
 
     $assetEntries = @(
@@ -505,26 +940,30 @@ try {
     }
     Write-Utf8NoBom (Join-Path $manifestDir "assets.json") ($assetManifestJson + "`n")
 
-    $metadata = (Get-NativeOutput "cargo" @("metadata", "--locked", "--format-version", "1")) | ConvertFrom-Json
-    $notices = @(
-        $metadata.packages |
-            Where-Object { $null -ne $_.source } |
-            Sort-Object name, version |
-            ForEach-Object {
-                $license = if ([string]::IsNullOrWhiteSpace($_.license)) { "UNKNOWN" } else { $_.license }
-                $repository = if ([string]::IsNullOrWhiteSpace($_.repository)) { "" } else { " $($_.repository)" }
-                "$($_.name) $($_.version) | $license$repository"
-            }
-    )
-    $noticeHeader = @(
-        "Third-party dependency notices",
-        "Generated from Cargo.lock/Cargo metadata for release $Version.",
-        ""
-    )
-    Write-Utf8NoBom (Join-Path $manifestDir "NOTICES.txt") ((($noticeHeader + $notices) -join "`n") + "`n")
-
-    $commitEpoch = [long](Get-NativeOutput "git" @("show", "-s", "--format=%ct", $commit))
-    $rustcVersion = Get-NativeOutput "rustc" @("--version")
+    if ($installedMode) {
+        Copy-Item -LiteralPath $installationNotices -Destination (Join-Path $manifestDir "NOTICES.txt")
+    }
+    else {
+        $metadata = (Get-NativeOutput "cargo" @("metadata", "--locked", "--format-version", "1")) | ConvertFrom-Json
+        $notices = @(
+            $metadata.packages |
+                Where-Object { $null -ne $_.source } |
+                Sort-Object name, version |
+                ForEach-Object {
+                    $license = if ([string]::IsNullOrWhiteSpace($_.license)) { "UNKNOWN" } else { $_.license }
+                    $repository = if ([string]::IsNullOrWhiteSpace($_.repository)) { "" } else { " $($_.repository)" }
+                    "$($_.name) $($_.version) | $license$repository"
+                }
+        )
+        $noticeHeader = @(
+            "Third-party dependency notices",
+            "Generated from Cargo.lock/Cargo metadata for release $Version.",
+            ""
+        )
+        Write-Utf8NoBom (Join-Path $manifestDir "NOTICES.txt") ((($noticeHeader + $notices) -join "`n") + "`n")
+        $commitEpoch = [long](Get-NativeOutput "git" @("show", "-s", "--format=%ct", $commit))
+        $rustcVersion = Get-NativeOutput "rustc" @("--version")
+    }
     $sceneReleaseEntries = @(
         foreach ($scene in $projectScenes.entries) {
             $sceneStagePath = [string]$stagedScenePaths[$scene.id]
@@ -562,6 +1001,13 @@ try {
         }
         launch = "binaries/sandbox.exe game game.project.json"
         symbol_bundle = "$symbolStageName.zip"
+    }
+    if ($installedMode) {
+        $releaseMetadata.engine_installation = [ordered]@{
+            schema = [string]$engineInstallation.schema
+            engine_version = [string]$engineInstallation.engine_version
+            manifest_sha256 = (Get-FileHash -LiteralPath $installationManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
     }
     Write-Utf8NoBom (Join-Path $manifestDir "release.json") (($releaseMetadata | ConvertTo-Json -Depth 8) + "`n")
     Write-Utf8NoBom (Join-Path $configDir "runtime.json") (([ordered]@{
@@ -644,15 +1090,21 @@ try {
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $timestamp = [DateTimeOffset]::FromUnixTimeSeconds($commitEpoch)
-    $archivePath = Join-Path $releaseRoot "$platform.zip"
+    $archivePath = Join-Path $workingReleaseRoot "$platform.zip"
     New-DeterministicZip $stageRoot $platform $archivePath $timestamp
-    $symbolArchivePath = Join-Path $releaseRoot "$symbolStageName.zip"
+    $symbolArchivePath = Join-Path $workingReleaseRoot "$symbolStageName.zip"
     New-DeterministicZip $symbolDir $symbolStageName $symbolArchivePath $timestamp
 
     $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Utf8NoBom "$archivePath.sha256" "$archiveHash  $([System.IO.Path]::GetFileName($archivePath))`n"
     $symbolArchiveHash = (Get-FileHash -LiteralPath $symbolArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Utf8NoBom "$symbolArchivePath.sha256" "$symbolArchiveHash  $([System.IO.Path]::GetFileName($symbolArchivePath))`n"
+    if (Test-Path -LiteralPath $releaseRoot) {
+        throw "Release version appeared while packaging and will not be overwritten: $releaseRoot"
+    }
+    Move-Item -LiteralPath $workingReleaseRoot -Destination $releaseRoot
+    $archivePath = Join-Path $releaseRoot "$platform.zip"
+    $symbolArchivePath = Join-Path $releaseRoot "$symbolStageName.zip"
     Write-Host "`nRelease package: $archivePath"
     Write-Host "SHA-256: $archiveHash"
     Write-Host "Symbol package: $symbolArchivePath"
@@ -660,4 +1112,9 @@ try {
 }
 finally {
     Pop-Location
+    if ($null -ne $packageStagingRoot -and
+        (Test-Path -LiteralPath $packageStagingRoot) -and
+        $packageStagingRoot.StartsWith(($OutputRoot.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $packageStagingRoot -Recurse -Force
+    }
 }

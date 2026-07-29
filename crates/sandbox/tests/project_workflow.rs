@@ -594,7 +594,10 @@ fn csharp_script_api_sync_restores_engine_owned_contract() {
     let source = root.join("build/script-sdk-source/EngineGameplay.cs");
     let contract = root.join("scripts/GameScripts/EngineGameplay.contract.json");
     let targets = root.join("scripts/GameScripts/EngineGameplay.targets");
-    assert!(source.is_file());
+    assert!(
+        !source.exists(),
+        "project creation must not materialize the development SDK source"
+    );
     assert!(contract.is_file());
     assert!(targets.is_file());
     assert!(!legacy_source.exists());
@@ -608,7 +611,7 @@ fn csharp_script_api_sync_restores_engine_owned_contract() {
     let output = run(&["project", "sync-script-api", path_text(&root)]);
     assert_success(&output, "managed contract sync");
     let report = stdout_json(&output);
-    assert_eq!(report["schema"], "ProjectScriptApiSyncReport-v0");
+    assert_eq!(report["schema"], "ProjectScriptApiSyncReport-v1");
     assert_eq!(
         report["script_api"],
         engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA
@@ -618,6 +621,10 @@ fn csharp_script_api_sync_restores_engine_owned_contract() {
         engine_script_api::GAMEPLAY_SCRIPT_API_VERSION
     );
     assert_eq!(report["passed"], true);
+    assert_eq!(
+        report["source"],
+        source.to_string_lossy().replace('\\', "/")
+    );
     assert!(!legacy_source.exists());
 
     let manifest: serde_json::Value = serde_json::from_slice(

@@ -1,9 +1,9 @@
 //! Headless build operations used by the editor.
 //!
 //! This module deliberately delegates authoring builds to the public sandbox
-//! project CLI and Windows releases to `.github/scripts/package-windows.ps1`.
-//! Keeping those entry points authoritative prevents the editor from growing a
-//! second, subtly different cook or packaging pipeline.
+//! project CLI and Windows releases to the engine distribution's packaging
+//! tool. Source-tree development uses the same script from `.github/scripts`;
+//! an installed editor resolves every tool from `engine.installation.json`.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -240,26 +240,24 @@ pub(crate) enum EditorBuildResult {
 /// Configures and launches the engine's authoritative build entry points.
 #[derive(Clone, Debug)]
 pub(crate) struct EditorBuildService {
-    repository_root: PathBuf,
+    toolchain: EditorBuildToolchain,
     sandbox_executable: PathBuf,
     powershell_executable: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+enum EditorBuildToolchain {
+    Installed(crate::engine_installation::EngineInstallation),
+    Development { repository_root: PathBuf },
+}
+
 impl EditorBuildService {
-    /// Build a service for a running sandbox editor.
+    /// Build a service for a running editor.
+    ///
+    /// Installed distributions are resolved first. Only a process without an
+    /// installation manifest may use the compile-time repository fallback.
     pub(crate) fn for_current_editor() -> Result<Self, EditorBuildError> {
         let operation = EditorBuildOperationKind::Validate;
-        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| {
-                EditorBuildError::request(
-                    operation,
-                    EditorBuildFailureKind::InvalidRequest,
-                    "sandbox crate is not inside a workspace root",
-                )
-            })?
-            .to_path_buf();
         let sandbox_executable = std::env::current_exe().map_err(|error| {
             EditorBuildError::request(
                 operation,
@@ -267,17 +265,46 @@ impl EditorBuildService {
                 format!("could not locate the running sandbox executable: {error}"),
             )
         })?;
-        Self::new(repository_root, sandbox_executable)
-    }
+        let installation =
+            crate::engine_installation::EngineInstallation::discover_from_current_executable()
+                .map_err(|message| {
+                    EditorBuildError::request(
+                        operation,
+                        EditorBuildFailureKind::InvalidRequest,
+                        message,
+                    )
+                })?;
+        if let Some(installation) = installation {
+            return Self::with_installed_powershell(
+                installation,
+                system_powershell_executable().map_err(|message| {
+                    EditorBuildError::request(
+                        operation,
+                        EditorBuildFailureKind::InvalidRequest,
+                        message,
+                    )
+                })?,
+            );
+        }
 
-    pub(crate) fn new(
-        repository_root: impl Into<PathBuf>,
-        sandbox_executable: impl Into<PathBuf>,
-    ) -> Result<Self, EditorBuildError> {
+        let repository_root =
+            crate::engine_installation::development_source_root().map_err(|message| {
+                EditorBuildError::request(
+                    operation,
+                    EditorBuildFailureKind::InvalidRequest,
+                    message,
+                )
+            })?;
         Self::with_powershell(
             repository_root,
             sandbox_executable,
-            PathBuf::from("powershell.exe"),
+            system_powershell_executable().map_err(|message| {
+                EditorBuildError::request(
+                    operation,
+                    EditorBuildFailureKind::InvalidRequest,
+                    message,
+                )
+            })?,
         )
     }
 
@@ -312,7 +339,28 @@ impl EditorBuildService {
             ));
         }
         Ok(Self {
-            repository_root,
+            toolchain: EditorBuildToolchain::Development { repository_root },
+            sandbox_executable,
+            powershell_executable,
+        })
+    }
+
+    fn with_installed_powershell(
+        installation: crate::engine_installation::EngineInstallation,
+        powershell_executable: impl Into<PathBuf>,
+    ) -> Result<Self, EditorBuildError> {
+        let operation = EditorBuildOperationKind::Validate;
+        let powershell_executable = powershell_executable.into();
+        if powershell_executable.as_os_str().is_empty() {
+            return Err(EditorBuildError::request(
+                operation,
+                EditorBuildFailureKind::InvalidRequest,
+                "PowerShell executable must not be empty",
+            ));
+        }
+        let sandbox_executable = installation.editor.clone();
+        Ok(Self {
+            toolchain: EditorBuildToolchain::Installed(installation),
             sandbox_executable,
             powershell_executable,
         })
@@ -380,7 +428,7 @@ impl EditorBuildService {
                         OsString::from("--report"),
                         report_path.clone().into_os_string(),
                     ],
-                    working_directory: self.repository_root.clone(),
+                    working_directory: project.root.clone(),
                     completion: CompletionPlan::Validate {
                         report_path,
                         _report_directory: report_directory,
@@ -395,7 +443,7 @@ impl EditorBuildService {
                     OsString::from("build"),
                     manifest_path.clone().into_os_string(),
                 ],
-                working_directory: self.repository_root.clone(),
+                working_directory: project.root.clone(),
                 completion: CompletionPlan::CookAndCompile { manifest_path },
             }),
             EditorBuildOperation::PackageWindows(options) => {
@@ -415,46 +463,64 @@ impl EditorBuildService {
             EditorBuildError::request(kind, EditorBuildFailureKind::InvalidRequest, message)
         })?;
 
-        let script = canonical_file(
-            self.repository_root
-                .join(".github/scripts/package-windows.ps1"),
-            "official Windows package script",
-        )
-        .map_err(|message| {
-            EditorBuildError::request(kind, EditorBuildFailureKind::InvalidRequest, message)
-        })?;
-        if !script.starts_with(&self.repository_root) {
-            return Err(EditorBuildError::request(
-                kind,
-                EditorBuildFailureKind::InvalidRequest,
-                "official Windows package script resolves outside the repository",
-            ));
-        }
+        let (script, installation_root) = match &self.toolchain {
+            EditorBuildToolchain::Installed(installation) => (
+                installation.package_script.clone(),
+                Some(installation.root.clone()),
+            ),
+            EditorBuildToolchain::Development { repository_root } => {
+                let script = canonical_file(
+                    repository_root.join(".github/scripts/package-windows.ps1"),
+                    "development Windows package script",
+                )
+                .map_err(|message| {
+                    EditorBuildError::request(kind, EditorBuildFailureKind::InvalidRequest, message)
+                })?;
+                if !script.starts_with(repository_root) {
+                    return Err(EditorBuildError::request(
+                        kind,
+                        EditorBuildFailureKind::InvalidRequest,
+                        "development Windows package script resolves outside the repository",
+                    ));
+                }
+                (script, None)
+            }
+        };
 
+        let installed = matches!(&self.toolchain, EditorBuildToolchain::Installed(_));
         let output_root = resolve_output_directory(
-            &self.repository_root,
             &project.root,
             &options.output_root,
             "package output root",
+            installed,
         )
         .map_err(|message| {
             EditorBuildError::request(kind, EditorBuildFailureKind::InvalidRequest, message)
         })?;
+        if installed {
+            validate_installed_package_output(project, &output_root, &options.version).map_err(
+                |message| {
+                    EditorBuildError::request(kind, EditorBuildFailureKind::InvalidRequest, message)
+                },
+            )?;
+        }
         let cargo_target_dir = options
             .cargo_target_dir
             .as_deref()
             .map(|path| {
-                resolve_output_directory(
-                    &self.repository_root,
-                    &project.root,
-                    path,
-                    "Cargo target directory",
-                )
+                resolve_output_directory(&project.root, path, "Cargo target directory", false)
             })
             .transpose()
             .map_err(|message| {
                 EditorBuildError::request(kind, EditorBuildFailureKind::InvalidRequest, message)
             })?;
+        if installation_root.is_some() && cargo_target_dir.is_some() {
+            return Err(EditorBuildError::request(
+                kind,
+                EditorBuildFailureKind::InvalidRequest,
+                "an installed engine uses prebuilt tools and does not accept a Cargo target directory",
+            ));
+        }
 
         let mut arguments = vec![
             OsString::from("-NoLogo"),
@@ -473,6 +539,10 @@ impl EditorBuildService {
             OsString::from("-Backend"),
             OsString::from("vulkan"),
         ];
+        if let Some(root) = installation_root.as_ref() {
+            arguments.push(OsString::from("-EngineInstallRoot"));
+            arguments.push(root.clone().into_os_string());
+        }
         if let Some(target_dir) = cargo_target_dir {
             arguments.push(OsString::from("-CargoTargetDir"));
             arguments.push(target_dir.into_os_string());
@@ -492,7 +562,7 @@ impl EditorBuildService {
             kind,
             executable: self.powershell_executable.clone(),
             arguments,
-            working_directory: self.repository_root.clone(),
+            working_directory: project.root.clone(),
             completion: CompletionPlan::PackageWindows {
                 version: options.version,
                 allow_dirty: options.allow_dirty,
@@ -885,10 +955,10 @@ fn validate_release_version(version: &str) -> Result<(), String> {
 }
 
 fn resolve_output_directory(
-    repository_root: &Path,
     project_root: &Path,
     requested: &Path,
     label: &str,
+    require_project_local: bool,
 ) -> Result<PathBuf, String> {
     if requested.as_os_str().is_empty() {
         return Err(format!("{label} must not be empty"));
@@ -899,31 +969,153 @@ fn resolve_output_directory(
     {
         return Err(format!("{label} must not contain '..' traversal"));
     }
-    let resolved = if requested.is_absolute() {
+    let requested_path = if requested.is_absolute() {
         requested.to_path_buf()
     } else {
-        repository_root.join(requested)
+        project_root.join(requested)
     };
-    let comparable = if resolved.exists() {
-        portable_windows_path(std::fs::canonicalize(&resolved).map_err(|error| {
-            format!("could not resolve {label} {}: {error}", resolved.display())
-        })?)
-    } else {
-        resolved.clone()
-    };
-    if comparable.parent().is_none() || comparable == repository_root || comparable == project_root
-    {
+    let comparable =
+        portable_windows_path(resolve_through_existing_ancestor(&requested_path, label)?);
+    let project_root =
+        portable_windows_path(std::fs::canonicalize(project_root).map_err(|error| {
+            format!(
+                "could not resolve project root {}: {error}",
+                project_root.display()
+            )
+        })?);
+    if comparable.parent().is_none() || comparable == project_root {
         return Err(format!(
-            "{label} must be a dedicated directory, not a filesystem, repository, or project root"
+            "{label} must be a dedicated directory, not a filesystem or project root"
         ));
     }
-    if resolved.is_file() {
+    if require_project_local && !comparable.starts_with(&project_root) {
+        return Err(format!(
+            "{label} must remain inside the project workspace for an installed engine: {}",
+            requested.display()
+        ));
+    }
+    if requested_path.is_file() {
         return Err(format!(
             "{label} points to a regular file: {}",
-            resolved.display()
+            requested_path.display()
         ));
     }
+    Ok(comparable)
+}
+
+fn validate_installed_package_output(
+    project: &GameProject,
+    output_root: &Path,
+    version: &str,
+) -> Result<(), String> {
+    let output_root = portable_windows_path(resolve_through_existing_ancestor(
+        output_root,
+        "package output root",
+    )?);
+    let release_root = portable_windows_path(resolve_through_existing_ancestor(
+        &output_root.join(version),
+        "package release directory",
+    )?);
+    let mut protected_directories = vec![
+        ("cooked_assets", project.cooked_assets.clone()),
+        ("managed script SDK", project.root.join("build/script-sdk")),
+        (
+            "managed script host",
+            project.root.join("build/script-host"),
+        ),
+    ];
+    if let Some(script_output) = project.script_assembly.as_deref().and_then(Path::parent) {
+        protected_directories.push(("script_assembly output", script_output.to_path_buf()));
+    }
+
+    for (protected_label, protected_path) in protected_directories {
+        let protected_path = portable_windows_path(resolve_through_existing_ancestor(
+            &protected_path,
+            protected_label,
+        )?);
+        for (candidate_label, candidate) in [
+            ("package output root", output_root.as_path()),
+            ("package release directory", release_root.as_path()),
+        ] {
+            if paths_overlap(candidate, &protected_path) {
+                return Err(format!(
+                    "{candidate_label} {} overlaps the project-owned {protected_label} directory {}; choose a dedicated package output directory",
+                    candidate.display(),
+                    protected_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn resolve_through_existing_ancestor(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match std::fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    format!(
+                        "{label} has no existing filesystem ancestor: {}",
+                        path.display()
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| {
+                        format!(
+                            "{label} has no existing filesystem ancestor: {}",
+                            path.display()
+                        )
+                    })?
+                    .to_path_buf();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect {label} ancestor {}: {error}",
+                    existing.display()
+                ))
+            }
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&existing).map_err(|error| {
+        format!(
+            "could not resolve {label} ancestor {}: {error}",
+            existing.display()
+        )
+    })?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
     Ok(resolved)
+}
+
+#[cfg(windows)]
+fn system_windows_executable(relative: &str) -> Result<PathBuf, String> {
+    let system_root = std::env::var_os("SystemRoot")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "SystemRoot is not configured".to_string())?;
+    canonical_file(
+        PathBuf::from(system_root).join("System32").join(relative),
+        relative,
+    )
+}
+
+#[cfg(windows)]
+fn system_powershell_executable() -> Result<PathBuf, String> {
+    system_windows_executable(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
+#[cfg(not(windows))]
+fn system_powershell_executable() -> Result<PathBuf, String> {
+    Ok(PathBuf::from("powershell.exe"))
 }
 
 fn canonical_directory(path: PathBuf, label: &str) -> Result<PathBuf, String> {
@@ -1170,7 +1362,8 @@ fn hide_child_window(_command: &mut Command) {}
 
 #[cfg(windows)]
 fn terminate_child_tree(child: &mut Child) -> Result<(), String> {
-    let mut command = Command::new("taskkill.exe");
+    let taskkill = system_windows_executable("taskkill.exe")?;
+    let mut command = Command::new(taskkill);
     command
         .args(["/PID", &child.id().to_string(), "/T", "/F"])
         .stdin(Stdio::null())
@@ -1248,6 +1441,19 @@ mod tests {
         (directory, manifest_path)
     }
 
+    fn scripted_project_fixture() -> (tempfile::TempDir, PathBuf) {
+        let (directory, manifest_path) = project_fixture();
+        let root = manifest_path.parent().unwrap();
+        let script_project = root.join("scripts/GameScripts/GameScripts.csproj");
+        std::fs::create_dir_all(script_project.parent().unwrap()).unwrap();
+        std::fs::write(&script_project, "<Project />\n").unwrap();
+        let mut manifest = ProjectManifest::new("Scripted Build Service Test");
+        manifest.script_project = Some(PathBuf::from("scripts/GameScripts/GameScripts.csproj"));
+        manifest.script_assembly = Some(PathBuf::from("build/scripts/GameScripts.dll"));
+        let manifest_path = manifest.write_to_root(root).unwrap();
+        (directory, manifest_path)
+    }
+
     fn service() -> EditorBuildService {
         EditorBuildService::with_powershell(
             workspace_root(),
@@ -1255,6 +1461,79 @@ mod tests {
             PathBuf::from("powershell.exe"),
         )
         .unwrap()
+    }
+
+    fn installed_service() -> (tempfile::TempDir, EditorBuildService) {
+        use crate::engine_installation::{
+            EngineInstallation, EngineInstallationManifest, ENGINE_INSTALLATION_FILE_NAME,
+            ENGINE_INSTALLATION_SCHEMA,
+        };
+        use std::collections::BTreeMap;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("installed-engine");
+        for folder in [
+            "bin",
+            "runtime/windows-x86_64",
+            "tools",
+            "sdk",
+            "sdk/script-host",
+        ] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let files = [
+            "bin/EngineEditor.exe",
+            "runtime/windows-x86_64/GameRuntime.exe",
+            "runtime/windows-x86_64/GameRuntime.pdb",
+            "tools/asset-cook.exe",
+            "tools/package-windows.ps1",
+            "sdk/EngineGameplay.dll",
+            "sdk/script-host/EngineScriptHost.exe",
+            "THIRD_PARTY_NOTICES.txt",
+        ];
+        for path in files {
+            std::fs::write(root.join(path), path.as_bytes()).unwrap();
+        }
+        let hashes = files
+            .into_iter()
+            .map(|path| {
+                (
+                    path.to_string(),
+                    format!(
+                        "{:x}",
+                        Sha256::digest(std::fs::read(root.join(path)).unwrap())
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let manifest = EngineInstallationManifest {
+            schema: ENGINE_INSTALLATION_SCHEMA.into(),
+            engine_version: "v-test".into(),
+            editor: "bin/EngineEditor.exe".into(),
+            windows_runtime: "runtime/windows-x86_64/GameRuntime.exe".into(),
+            windows_symbols: "runtime/windows-x86_64/GameRuntime.pdb".into(),
+            asset_cooker: "tools/asset-cook.exe".into(),
+            package_script: "tools/package-windows.ps1".into(),
+            managed_sdk: "sdk/EngineGameplay.dll".into(),
+            script_host: "sdk/script-host".into(),
+            notices: "THIRD_PARTY_NOTICES.txt".into(),
+            script_api: engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA.into(),
+            script_api_version: engine_script_api::GAMEPLAY_SCRIPT_API_VERSION.into(),
+            script_api_sha256: "a".repeat(64),
+            source_commit: "fixture".into(),
+            source_date_epoch: 1_700_000_000,
+            rustc: "rustc fixture".into(),
+            files: hashes,
+        };
+        std::fs::write(
+            root.join(ENGINE_INSTALLATION_FILE_NAME),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let installation = EngineInstallation::load(root).unwrap();
+        let service =
+            EditorBuildService::with_installed_powershell(installation, "powershell.exe").unwrap();
+        (directory, service)
     }
 
     fn argument_strings(plan: &ProcessPlan) -> Vec<String> {
@@ -1313,6 +1592,102 @@ mod tests {
     }
 
     #[test]
+    fn installed_package_plan_uses_project_local_output_and_prebuilt_toolchain() {
+        let (_installation, service) = installed_service();
+        let (_project, manifest_path) = project_fixture();
+        let project_root = manifest_path.parent().unwrap();
+        let plan = service
+            .plan(
+                &manifest_path,
+                EditorBuildOperation::PackageWindows(PackageWindowsOptions::new(
+                    "v-installed",
+                    "Dist",
+                )),
+            )
+            .unwrap();
+        let arguments = argument_strings(&plan);
+        assert_eq!(plan.working_directory, project_root);
+        assert!(arguments.iter().any(|argument| {
+            argument
+                .replace('\\', "/")
+                .ends_with("/tools/package-windows.ps1")
+        }));
+        assert!(arguments.windows(2).any(|arguments| {
+            arguments[0] == "-EngineInstallRoot"
+                && Path::new(&arguments[1])
+                    .join("engine.installation.json")
+                    .is_file()
+        }));
+        assert!(arguments.windows(2).any(|arguments| {
+            arguments[0] == "-OutputRoot" && Path::new(&arguments[1]) == project_root.join("Dist")
+        }));
+        assert!(!arguments.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "-CargoTargetDir" | "-SkipBuild" | "-AllowDirty"
+            )
+        }));
+
+        let outside_output = project_root.parent().unwrap().join("outside-dist");
+        let error = service
+            .plan(
+                &manifest_path,
+                EditorBuildOperation::PackageWindows(PackageWindowsOptions::new(
+                    "v-outside",
+                    outside_output,
+                )),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, EditorBuildFailureKind::InvalidRequest);
+        assert!(error.message.contains("inside the project workspace"));
+    }
+
+    #[test]
+    fn installed_package_plan_rejects_project_owned_build_directories() {
+        let (_installation, service) = installed_service();
+        let (_project, manifest_path) = scripted_project_fixture();
+        let project_root = manifest_path.parent().unwrap();
+
+        for (label, output) in [
+            ("cooked_assets", "build/cooked/package-output"),
+            ("script_assembly output", "build/scripts/package-output"),
+            ("managed script SDK", "build/script-sdk/package-output"),
+            ("managed script host", "build/script-host/package-output"),
+        ] {
+            let error = service
+                .plan(
+                    &manifest_path,
+                    EditorBuildOperation::PackageWindows(PackageWindowsOptions::new(
+                        "v-conflict",
+                        output,
+                    )),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind, EditorBuildFailureKind::InvalidRequest);
+            assert!(
+                error.message.contains(label),
+                "expected {label:?} in error for {output:?}: {}",
+                error.message
+            );
+        }
+
+        let safe = service
+            .plan(
+                &manifest_path,
+                EditorBuildOperation::PackageWindows(PackageWindowsOptions::new(
+                    "v-safe",
+                    "build/releases",
+                )),
+            )
+            .unwrap();
+        let arguments = argument_strings(&safe);
+        assert!(arguments.windows(2).any(|arguments| {
+            arguments[0] == "-OutputRoot"
+                && Path::new(&arguments[1]) == project_root.join("build/releases")
+        }));
+    }
+
+    #[test]
     fn dirty_and_skip_switches_require_explicit_options() {
         let (directory, manifest_path) = project_fixture();
         let mut options =
@@ -1336,6 +1711,7 @@ mod tests {
     #[test]
     fn validate_and_cook_plans_use_distinct_formal_cli_commands() {
         let (_directory, manifest_path) = project_fixture();
+        let project_root = manifest_path.parent().unwrap();
         let validate = service()
             .plan(&manifest_path, EditorBuildOperation::Validate)
             .unwrap();
@@ -1351,6 +1727,8 @@ mod tests {
             .any(|argument| argument == "--report"));
         assert_eq!(&cook_arguments[..2], &["project", "build"]);
         assert!(!cook_arguments.iter().any(|argument| argument == "--report"));
+        assert_eq!(validate.working_directory, project_root);
+        assert_eq!(cook.working_directory, project_root);
     }
 
     #[test]
@@ -1369,11 +1747,12 @@ mod tests {
             EditorBuildFailureKind::InvalidRequest
         );
 
+        let project_root = manifest_path.parent().unwrap();
         let root_output = service.plan(
             &manifest_path,
             EditorBuildOperation::PackageWindows(PackageWindowsOptions::new(
                 "safe-version",
-                workspace_root(),
+                project_root,
             )),
         );
         assert_eq!(

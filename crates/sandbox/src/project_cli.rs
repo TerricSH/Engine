@@ -24,6 +24,9 @@ pub struct ProjectRunRequest {
     pub headless: bool,
     pub frames: Option<u64>,
     pub report: Option<PathBuf>,
+    /// Internal hand-off from the editor after its build task has already
+    /// compiled the managed project. Normal CLI runs keep this false.
+    pub scripts_already_built: bool,
     /// Opt in to world-partition cell streaming (`--stream-cells`). Requires a
     /// `world.partition.json` at the project root.
     pub stream_cells: bool,
@@ -116,12 +119,14 @@ pub fn parse_run_request(args: &[String]) -> Result<ProjectRunRequest, String> {
     let mut headless = false;
     let mut frames = None;
     let mut report = None;
+    let mut scripts_already_built = false;
     let mut stream_cells = false;
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
         match argument.as_str() {
             "--headless" => headless = true,
+            "--scripts-already-built" => scripts_already_built = true,
             "--stream-cells" => stream_cells = true,
             "--frames" => {
                 index += 1;
@@ -171,6 +176,7 @@ pub fn parse_run_request(args: &[String]) -> Result<ProjectRunRequest, String> {
         headless,
         frames,
         report,
+        scripts_already_built,
         stream_cells,
     })
 }
@@ -637,6 +643,9 @@ pub(crate) fn create_project(
     requested_name: Option<&str>,
     with_csharp: bool,
 ) -> Result<(), String> {
+    if root.as_os_str().is_empty() {
+        return Err("project destination must not be empty".into());
+    }
     if root.exists() {
         if !root.is_dir() {
             return Err(format!(
@@ -676,6 +685,9 @@ pub(crate) fn create_project(
         .map_err(|error| format!("could not create project directories: {error}"))?;
     std::fs::create_dir_all(root.join("config"))
         .map_err(|error| format!("could not create project directories: {error}"))?;
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| format!("could not resolve created project root: {error}"))?;
+    let root = root.as_path();
 
     let scene = engine_scene::starter_scene("main", "Main");
     scene
@@ -710,7 +722,7 @@ pub(crate) fn create_project(
         )?;
         super::project_scripts::write_generated_script_api(root, &script_project)?;
     }
-    write_text(&root.join(".gitignore"), "/build/\n")?;
+    write_text(&root.join(".gitignore"), "/build/\n/Dist/\n")?;
     write_text(
         &root.join("README.md"),
         &format!(
@@ -727,6 +739,21 @@ pub(crate) fn create_project(
     let manifest_path = manifest
         .write_to_root(root)
         .map_err(|error| format!("could not write project manifest: {error}"))?;
+    if with_csharp {
+        let project = GameProject::load(&manifest_path)
+            .map_err(|error| format!("could not reopen created project: {error}"))?;
+        super::project_scripts::deploy_installed_project_script_runtime(&project).map_err(
+            |error| {
+                format!(
+                    "project files were created at {}, but the installed script SDK/host could \
+                     not be deployed: {error}. Repair the engine installation, then run \
+                     `sandbox project sync-script-api {}` to finish setup",
+                    root.display(),
+                    root.display()
+                )
+            },
+        )?;
+    }
 
     println!(
         "{}",
@@ -3458,7 +3485,15 @@ mod tests {
         assert!(request.headless);
         assert_eq!(request.frames, Some(4));
         assert_eq!(request.report, None);
+        assert!(!request.scripts_already_built);
         assert!(!request.stream_cells);
+    }
+
+    #[test]
+    fn parses_editor_run_handoff_without_changing_normal_run_defaults() {
+        let request =
+            parse_run_request(&["my-game".into(), "--scripts-already-built".into()]).unwrap();
+        assert!(request.scripts_already_built);
     }
 
     #[test]
@@ -3588,6 +3623,27 @@ mod tests {
             entity.name.as_deref() == Some("Directional Light")
                 && entity.components.contains_key("engine.light")
         }));
+    }
+
+    #[test]
+    fn scripted_project_creation_normalizes_a_parent_segment_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("holder")).unwrap();
+        let requested = temp
+            .path()
+            .join("holder")
+            .join("..")
+            .join("normalized-script-project");
+
+        create_project(&requested, Some("Normalized Script Project"), true).unwrap();
+
+        let normalized = temp.path().join("normalized-script-project");
+        let project = GameProject::load(&normalized).unwrap();
+        assert!(project.script_project.unwrap().is_file());
+        assert!(normalized
+            .join("scripts/GameScripts/EngineGameplay.contract.json")
+            .is_file());
+        assert!(!normalized.join("build/script-sdk-source").exists());
     }
 
     #[test]

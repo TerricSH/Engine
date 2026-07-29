@@ -67,7 +67,8 @@ tooling and the runtime. It owns the current schema and version identifiers and
 must not depend on ECS, renderer, editor, platform, or a game project.
 
 Projects created with `--with-csharp` keep game-authored code separate from the
-engine-owned SDK integration:
+engine-owned SDK integration. The installed-engine workspace normally has this
+shape:
 
 ```text
 scripts/GameScripts/
@@ -75,11 +76,10 @@ scripts/GameScripts/
   EngineGameplay.contract.json      # schema, SDK version, owner, SHA-256
   GameScripts.csproj                # game-owned build definition
   PlayerController.cs              # explicitly created game-owned behaviour
-build/script-sdk-source/
-  EngineGameplay.cs                 # generated SDK implementation
-  EngineGameplay.csproj             # generated SDK build definition
 build/script-sdk/
-  EngineGameplay.dll                # independently compiled engine SDK
+  EngineGameplay.dll                # verified SDK copied from the installation
+build/script-host/
+  *                                 # verified process host copied from installation
 build/scripts/
   EngineGameplay.dll                # runtime dependency copied with the game
   GameScripts.dll                   # game-authored assembly
@@ -89,11 +89,33 @@ build/scripts/
 engine API source into the game assembly. The process host loads the SDK into a
 shared managed load context before loading the game assembly.
 
+The installed editor validates `engine.installation.json`, every recorded file
+hash, and the project's API contract before copying the prebuilt SDK and host
+into the external project. Opening a project does not compile or execute
+game-authored C#; its managed-runtime setup only performs that safe deployment.
+A subsequent Rebuild, Play, Build, or `project build-scripts` compiles the game
+assembly against the deployed SDK. The installed path does not require the
+engine source tree and does not invoke Cargo, Rust, or Git.
+
+Source-tree development has an additional engine-owned cache:
+
+```text
+build/script-sdk-source/
+  EngineGameplay.cs                 # generated SDK implementation
+  EngineGameplay.csproj             # generated SDK build definition
+```
+
+In that explicitly gated development mode, the SDK and process host are built
+from engine sources before the game assembly. The generated source cache is
+materialized by source-development build/sync operations; it remains
+engine-owned. Installed create/sync/build operations deploy the distributed
+SDK and do not create or consume this cache.
+
 Each frame context carries the Script API schema. The SDK checks it before
-invoking game code. Script builds validate the generated MSBuild integration
-and sidecar, compile the SDK and game assembly transactionally, then copy the
-SDK runtime dependency beside the game DLL. After an engine upgrade, refresh
-the integration explicitly:
+invoking game code. Both build paths validate the generated MSBuild integration
+and sidecar, build the game assembly transactionally, then copy the SDK runtime
+dependency beside the game DLL. After an engine upgrade, refresh the
+integration explicitly:
 
 ```powershell
 sandbox project sync-script-api <project>
@@ -104,7 +126,9 @@ The build report records the Script API schema, concrete version, source
 SHA-256, and SDK assembly path so packaged diagnostics can identify the exact
 boundary used by a game assembly. `sync-script-api` also removes the legacy
 `scripts/GameScripts/EngineGameplay.cs` layout to prevent game projects from
-silently compiling engine implementation into their own assembly.
+silently compiling engine implementation into their own assembly. The .NET 8
+SDK is an authoring dependency for compiling C# game code; it is not a reason
+to place the project inside the engine checkout.
 
 ## Review gate
 

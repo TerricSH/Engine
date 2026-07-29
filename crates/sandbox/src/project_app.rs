@@ -13,9 +13,11 @@ pub fn run_project(request: ProjectRunRequest) -> Result<(), String> {
     // Authoring runs rebuild managed scripts before switching to the runtime
     // view of the project. Packaged projects intentionally have no source
     // asset/script requirements and skip this branch.
-    if let Ok(authoring_project) = GameProject::load(&request.project) {
-        if authoring_project.script_project.is_some() {
-            crate::project_scripts::build_project_scripts(&authoring_project)?;
+    if !request.scripts_already_built {
+        if let Ok(authoring_project) = GameProject::load(&request.project) {
+            if authoring_project.script_project.is_some() {
+                crate::project_scripts::build_project_scripts(&authoring_project)?;
+            }
         }
     }
     let project = GameProject::load_runtime(&request.project).map_err(|error| error.to_string())?;

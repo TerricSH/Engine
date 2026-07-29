@@ -1,6 +1,13 @@
 # Game projects
 
-Every authoring and runtime command is rooted by `game.project.json`. Paths in the manifest are relative to the manifest directory and may not be absolute or contain `..` traversal.
+Every authoring and runtime command is rooted by `game.project.json`. Its
+containing directory is the game-project workspace. Paths in the manifest are
+relative to that directory and may not be absolute or contain `..` traversal.
+
+The project workspace is independent of the engine installation. An installed
+editor may open a workspace on another drive or in another repository; game
+source, imported assets, generated project outputs, and exported releases are
+not written into the engine installation.
 
 ## Layout
 
@@ -14,13 +21,60 @@ MyGame/
     source/game.manifest
   config/input.actions.json
   scripts/GameScripts/       # optional C# authoring source
-  build/script-sdk/          # optional engine-owned EngineGameplay.dll
-  build/cooked/
-  build/scripts/             # optional game assembly plus managed dependencies
-  build/script-host/         # optional .NET protocol host
+  build/                     # generated, project-local, ignored by Git
+    script-sdk/              # optional copied/built EngineGameplay.dll
+    script-sdk-source/       # source-development mode only
+    cooked/
+    scripts/                 # optional game assembly plus managed dependencies
+    script-host/             # optional copied/built .NET protocol host
+  Dist/                      # installed-editor Windows package output
 ```
 
-`project new` creates the core layout and `main.scene.ron` as an immediately usable basic scene with a positioned Main Camera, a visible Cube, and a Directional Light; additional scene files appear after `project scene new`. It also creates an empty source manifest. `build/` is generated and ignored by Git.
+`project new` creates the core layout and `main.scene.ron` as an immediately
+usable basic scene with a positioned Main Camera, a visible Cube, and a
+Directional Light; additional scene files appear after `project scene new`. It
+also creates an empty source manifest. `build/` and `Dist/` are project-local
+outputs rather than engine-installation directories. `build/` is generated and
+ignored by Git. `Dist/` is created when a project is packaged and is also
+ignored by the generated project `.gitignore`.
+
+## Installed editor and workspace deployment
+
+An installed Windows editor discovers `engine.installation.json` by walking up
+from its executable (or from the explicit `ENGINE_INSTALL_ROOT` override).
+Before installed tools are used, the installation manifest, required paths,
+and recorded SHA-256 hashes are validated.
+
+When a valid scripted project is opened, the editor copies the installation's
+precompiled managed tools into the external project workspace:
+
+```text
+<engine-installation>/sdk/EngineGameplay.dll
+  -> <project>/build/script-sdk/EngineGameplay.dll
+
+<engine-installation>/sdk/script-host/*
+  -> <project>/build/script-host/*
+```
+
+The host directory is replaced transactionally when its contents differ and is
+reused when already identical, which also avoids replacing a running Windows
+host unnecessarily. During project opening, this managed-runtime deployment
+does not execute MSBuild or compile game-authored C# (the editor may still cook
+project assets as part of opening). Rebuild, Play, Build,
+`project build-scripts`, and `project build` are the explicit script-build
+paths.
+
+Installed script builds validate the project's generated API contract, copy
+the matching SDK and host from the installation, then invoke .NET only for the
+game project. They do not compile the engine SDK/host from source and do not
+search for an engine repository. A `.NET 8` SDK is therefore required for
+authoring a C# project, but Cargo, Rust, and Git are not. Non-scripted projects
+do not require .NET.
+
+`build/script-sdk-source/` is an engine-owned source-development cache. An
+installed engine does not create or consume it; a cache left by an earlier
+source-development run may remain under `build/`, but it is ignored by the
+installed build path. It is not game-authored source.
 
 ## Manifest
 
@@ -188,7 +242,11 @@ sandbox project run <project> [--headless] [--frames N] [--report PATH] [--strea
 sandbox project editor <project>
 ```
 
-`sandbox game` and `sandbox editor` are short aliases for the last two commands. A project path may be either the project directory or its manifest.
+`sandbox game` and `sandbox editor` are short aliases for the last two
+commands. A project path may be either the project directory or its manifest.
+In an installation, substitute the absolute
+`<engine-installation>\bin\EngineEditor.exe` path for `sandbox`; source-tree
+developers commonly use `cargo run -p sandbox --`.
 
 `project import` copies a supported source into the configured `asset_source`, adds it to `game.manifest`, cooks the project in an isolated staging directory, and installs validated cooked artifacts. A glTF/GLB import preserves normalized `JOINTS_0`/`WEIGHTS_0`, remaps joint indices into parent-before-child order, imports inverse-bind matrices and LINEAR/STEP/CUBICSPLINE translation/rotation/scale channels, and selects the skinned GPU vertex layout automatically. STEP tracks are converted to held linear keys; CUBICSPLINE tracks are deterministically baked at 60 Hz (with a bounded per-segment sample count), including component-wise quaternion Hermite evaluation followed by normalization. Multi-primitive files produce `<asset-id>`, `<asset-id>.mesh.1`, and later mesh IDs. Each skin produces `<asset-id>.skeleton.<skin-index>` and its matching clips produce `<asset-id>.animation.<skin-index>.<clip-index>`. Relative external buffer and image dependencies are copied without allowing paths to escape the source directory. Generated `.skel`/`.anim` sources keep subsequent `project cook` deterministic. Morph targets, animation compression, retargeting, and event tracks remain unsupported. Textures accept supported image formats such as PNG, JPEG, and PPM. `MaterialSource-v0` materials support metallic-roughness/emissive factors, base-color/normal/metallic-roughness/occlusion/emissive texture slots, opaque, alpha-masked, alpha-blended, and double-sided surfaces; see [`MATERIAL_SURFACES.md`](MATERIAL_SURFACES.md). Runtime subsystem assets also accept standalone WAV/MP3/OGG/FLAC audio, bincode `.anim` animation clips, bincode `.skel` skeletons, and bincode `.navmesh`/`.nav` navigation meshes. Prefab imports accept the canonical `Prefab-v0.1.0` RON source (`*.prefab.ron`), which is also the extension inferred when `--type` is omitted. Type inference is used only for unambiguous extensions; `--type material` can identify a plain `.json` material. Asset IDs are portable and case-insensitively unique. Existing source or cooked files are never overwritten, and a failed cook restores the manifest and removes every copied/generated source and cooked artifact.
 
@@ -218,13 +276,18 @@ if the active scene produces no visible draw calls.
 integration. It does not invent a script class or attach one to the scene.
 `sync-script-api` refreshes the engine-owned version/hash sidecar and MSBuild
 integration after an engine upgrade; game rules belong in behaviour sources
-created explicitly by the project author. The canonical `EngineGameplay.cs` is generated under
-`build/script-sdk-source`, not in the game source directory. `build-scripts`
-rejects a missing or modified integration, compiles `EngineGameplay.dll`
-independently, compiles the declared game DLL against that SDK, runs the managed
-gameplay-bridge self-test, and publishes the engine-owned process host. The SDK
-dependency is copied beside `GameScripts.dll` for runtime packaging. Authoring
-`game` and `editor` launches rebuild configured scripts automatically. Runtime
+created explicitly by the project author. In source-development mode, the
+canonical `EngineGameplay.cs` is generated under `build/script-sdk-source`,
+never in the game source directory. Installed mode deploys the SDK DLL instead.
+
+In an installed engine, `build-scripts` validates the integration, deploys the
+installation's matching `EngineGameplay.dll` and process host, compiles the
+declared game DLL against that SDK, and runs the managed gameplay-bridge
+self-test. In source-development mode it instead compiles the generated SDK
+and publishes the host from engine sources before compiling the game assembly.
+Both paths copy the SDK dependency beside `GameScripts.dll` for runtime
+packaging. An authoring `game` launch rebuilds configured scripts; the editor
+rebuilds on explicit Rebuild/Play/Build, not merely on project open. Runtime
 reports expose loaded assemblies, attached/started instances, script-entity
 translations, and script errors. See
 [`GAME_ENGINE_BOUNDARY.md`](GAME_ENGINE_BOUNDARY.md) for the enforced ownership
@@ -504,7 +567,12 @@ false and then true (or change its clip) to play it again. Headless and tooling
 builds can use `runtime-subsystems` without `runtime-audio-output`, so asset,
 component, cooking, and validation tests do not require an audio device.
 
-Project scenes remain portable RON files in this version. The Windows packager rewrites `cooked_assets` to `assets/cooked`, copies every cataloged scene, omits source assets, records each scene ID/path/hash in release metadata, and verifies the resulting package by launching it from its staging directory.
+Project scenes remain portable RON files in this version. The Windows packager
+rewrites `cooked_assets` to `assets/cooked`, copies every cataloged scene,
+omits source assets, records each scene ID/path/hash in release metadata, and
+verifies the resulting package by launching it from its staging directory. In
+installed mode the package output root defaults to the project's `Dist`
+directory and consumes only the verified prebuilt installation toolchain.
 
 ## Runtime physics gravity sources
 

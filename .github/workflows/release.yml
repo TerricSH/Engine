@@ -26,7 +26,7 @@ jobs:
   windows-package:
     name: Tested Windows package
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,6 +42,78 @@ jobs:
         run: >-
           ./.github/scripts/qa.ps1 -Configuration Release
           -ProjectPath ./examples/minimal-game/game.project.json
+      - name: Assemble installed editor and runtime toolchain
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+        run: >-
+          ./.github/scripts/build-engine-installation.ps1
+          -Version $env:RELEASE_VERSION
+      - name: Export an external workspace using only the installed toolchain
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+        run: |
+          $installRoot = (Resolve-Path "./artifacts/engine-installation/$env:RELEASE_VERSION/windows-x86_64").Path
+          $externalProject = Join-Path $env:RUNNER_TEMP ("engine-external-project-" + [Guid]::NewGuid().ToString("N"))
+          $sourcePath = $env:PATH
+          $dotnetHostPath = (Get-Command dotnet -ErrorAction Stop).Source
+          $sourceDotnetHostPath = $env:DOTNET_HOST_PATH
+          try {
+            $env:DOTNET_HOST_PATH = $dotnetHostPath
+            $env:PATH = "$env:SystemRoot\System32"
+            & "$installRoot/bin/EngineEditor.exe" project new $externalProject `
+              --name "Installed Workspace Smoke" --with-csharp
+            if (-not (Test-Path -LiteralPath (Join-Path $externalProject "build/script-sdk/EngineGameplay.dll") -PathType Leaf)) {
+              throw "Installed editor did not deploy EngineGameplay.dll into the project workspace"
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $externalProject "build/script-host/EngineScriptHost.exe") -PathType Leaf)) {
+              throw "Installed editor did not deploy EngineScriptHost.exe into the project workspace"
+            }
+            & "$installRoot/bin/EngineEditor.exe" project build-scripts $externalProject
+            if (-not (Test-Path -LiteralPath (Join-Path $externalProject "build/scripts/GameScripts.dll") -PathType Leaf)) {
+              throw "Installed editor did not compile the game script assembly in the project workspace"
+            }
+            & "$installRoot/tools/package-windows.ps1" `
+              -EngineInstallRoot $installRoot `
+              -ProjectPath (Join-Path $externalProject "game.project.json") `
+              -Version "installed-smoke" `
+              -SkipSmoke
+            $packageRoot = Join-Path $externalProject "Dist/installed-smoke/windows-x86_64"
+            $packagedScript = Join-Path $packageRoot "scripts/GameScripts.dll"
+            $packagedHost = Join-Path $packageRoot "binaries/script-host/EngineScriptHost.exe"
+            if (-not (Test-Path -LiteralPath $packagedScript -PathType Leaf)) {
+              throw "Installed package omitted the compiled game script assembly"
+            }
+            if (-not (Test-Path -LiteralPath $packagedHost -PathType Leaf)) {
+              throw "Installed package omitted the managed script host"
+            }
+            $packagedRunReport = Join-Path $externalProject "build/installed-package-run.json"
+            $sourceLogDirectory = $env:ENGINE_LOG_DIR
+            Push-Location $packageRoot
+            try {
+              $env:ENGINE_LOG_DIR = "off"
+              & (Join-Path $packageRoot "binaries/sandbox.exe") game game.project.json `
+                --headless --frames 3 --report $packagedRunReport
+            }
+            finally {
+              $env:ENGINE_LOG_DIR = $sourceLogDirectory
+              Pop-Location
+            }
+            $runReport = Get-Content -LiteralPath $packagedRunReport -Raw | ConvertFrom-Json
+            if (-not $runReport.passed -or
+                [long]$runReport.total_draw_calls -lt 1 -or
+                [long]$runReport.script_assemblies -lt 1 -or
+                [long]$runReport.script_errors -ne 0) {
+              throw "Installed package did not run its compiled C# assembly successfully"
+            }
+          }
+          finally {
+            $env:PATH = $sourcePath
+            $env:DOTNET_HOST_PATH = $sourceDotnetHostPath
+          }
+          $publishedSmoke = "./artifacts/external-project-release/installed-smoke"
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $publishedSmoke) | Out-Null
+          Copy-Item -LiteralPath (Join-Path $externalProject "Dist/installed-smoke") -Destination $publishedSmoke -Recurse
       - name: Build and package Vulkan desktop runtime
         env:
           RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
@@ -60,6 +132,8 @@ jobs:
         with:
           name: windows-${{ github.event_name == 'push' && github.ref_name || inputs.version }}
           path: |
+            artifacts/engine-installation/${{ github.event_name == 'push' && github.ref_name || inputs.version }}/
+            artifacts/external-project-release/installed-smoke/
             artifacts/release/${{ github.event_name == 'push' && github.ref_name || inputs.version }}/
             artifacts/qa/
             artifacts/reproducibility/${{ github.event_name == 'push' && github.ref_name || inputs.version }}/report.json

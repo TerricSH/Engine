@@ -63,7 +63,21 @@ static EDITOR_WEB_ASSETS: &[WebAsset] = &[
 
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    let mut command = std::process::Command::new("explorer.exe");
+    let mut command = {
+        let system_root = std::env::var_os("SystemRoot")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "Could not locate Windows Explorer because SystemRoot is unset".to_string()
+            })?;
+        let explorer = PathBuf::from(system_root).join("explorer.exe");
+        if !explorer.is_file() {
+            return Err(format!(
+                "Could not locate Windows Explorer at {}",
+                explorer.display()
+            ));
+        }
+        std::process::Command::new(explorer)
+    };
     #[cfg(target_os = "macos")]
     let mut command = std::process::Command::new("open");
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -84,6 +98,7 @@ fn launch_editor_window(project_path: &Path) -> Result<u32, String> {
     std::process::Command::new(executable)
         .arg("editor")
         .arg(&project.manifest_path)
+        .current_dir(&project.root)
         .spawn()
         .map(|child| child.id())
         .map_err(|error| {
@@ -1743,7 +1758,7 @@ impl EditorApp {
             run_after_build: false,
             build_output: String::new(),
             package_version: "0.1.0-dev".to_string(),
-            package_output_root: "dist/releases".to_string(),
+            package_output_root: "Dist".to_string(),
             project_settings_draft,
             scene_settings_draft: SceneSettings::default(),
             entity_clipboard: None,
@@ -2334,16 +2349,22 @@ impl EditorApp {
                 self.workspace_preferences.project_asset_folder =
                     self.asset_browser.current_folder().to_string();
             }
-            if let Err(error) = super::project_scripts::prepare_project_scripts(
-                &mut game_loop.runtime,
-                &self.project,
-            ) {
-                tracing::error!(%error, "editor: failed to prepare project scripts");
-                std::process::exit(1);
+            if self.project.script_project.is_some() {
+                let message =
+                    "Project scripts are not executed while opening a workspace. Use Rebuild \
+                     Scripts, Play, or Build when you are ready to trust and compile this project's \
+                     C# code.";
+                tracing::info!("{message}");
+                editor_diagnostics.push(Diagnostic::new(
+                    "EDSCRIPT_BUILD_REQUIRED",
+                    DiagnosticSeverity::Info,
+                    "editor.workspace",
+                    message,
+                ));
             }
             let (preview_scene, missing_diagnostics) =
                 editor_preview_scene(&game_loop.runtime, &scene);
-            editor_diagnostics = missing_diagnostics;
+            editor_diagnostics.extend(missing_diagnostics);
             if let Err(diagnostics) = game_loop.load_scene(preview_scene) {
                 for diagnostic in diagnostics {
                     tracing::error!(
@@ -3065,15 +3086,27 @@ impl EditorApp {
     }
 
     fn launch_project_player(&self) -> Result<u32, String> {
-        let executable = std::env::current_exe()
-            .map_err(|error| format!("could not resolve editor executable: {error}"))?;
-        std::process::Command::new(executable)
+        let executable =
+            match crate::engine_installation::EngineInstallation::discover_from_current_executable(
+            )? {
+                Some(installation) => installation.windows_runtime,
+                None => std::env::current_exe()
+                    .map_err(|error| format!("could not resolve editor executable: {error}"))?,
+            };
+        std::process::Command::new(&executable)
             .arg("project")
             .arg("run")
             .arg(&self.project.manifest_path)
+            .arg("--scripts-already-built")
+            .current_dir(&self.project.root)
             .spawn()
             .map(|child| child.id())
-            .map_err(|error| format!("could not launch project player: {error}"))
+            .map_err(|error| {
+                format!(
+                    "could not launch project player {}: {error}",
+                    executable.display()
+                )
+            })
     }
 
     fn cancel_editor_build(&mut self) {
@@ -4178,16 +4211,28 @@ pub fn run_editor(project_path: PathBuf) {
             std::process::exit(2);
         }
     };
+    let script_deployment_error =
+        super::project_scripts::deploy_installed_project_script_runtime(&project)
+            .err()
+            .map(|error| {
+                tracing::error!(
+                    path = %project_path.display(),
+                    %error,
+                    "installed project script runtime deployment failed"
+                );
+                error
+            });
     if let Err(error) = super::project_cli::cook_project(&project_path) {
         tracing::error!(path = %project_path.display(), %error, "editor project cook failed");
         std::process::exit(2);
     }
-    if let Err(error) = super::project_cli::build_project_scripts(&project_path, false) {
-        tracing::error!(path = %project_path.display(), %error, "editor project script build failed");
-        std::process::exit(2);
-    }
     let title = format!("{} - Engine Editor", project.manifest.name);
-    let app = EditorApp::new(project);
+    let mut app = EditorApp::new(project);
+    if let Some(error) = script_deployment_error {
+        app.build_status = Some(format!(
+            "Project opened, but the installed script SDK could not be deployed: {error}"
+        ));
+    }
     let mut config = EditorHostConfig::new(title, EDITOR_WEB_ASSETS)
         .with_initial_size(1600, 900)
         .with_minimum_size(1120, 680);
