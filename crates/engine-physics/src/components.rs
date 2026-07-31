@@ -83,6 +83,12 @@ pub enum ColliderShape {
         heights: Vec<f32>,
         scale: [f32; 3],
     },
+    /// Static triangle mesh used by curved streamed terrain. Vertices are
+    /// local to the collider entity and triangle indices must be in bounds.
+    TriMesh {
+        vertices: Vec<[f32; 3]>,
+        indices: Vec<[u32; 3]>,
+    },
 }
 
 // ── Collider ────────────────────────────────────────────────────────────────

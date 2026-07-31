@@ -261,6 +261,159 @@ internal static class EngineAPI
         out float y,
         out float z);
 
+    // Native planetary terrain queries
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern IntPtr planet_query_create(ref NativePlanetTerrainConfig config);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern void planet_query_destroy(IntPtr query);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern double planet_query_height(
+        IntPtr query, double directionX, double directionY, double directionZ);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool planet_query_surface_point(
+        IntPtr query, double directionX, double directionY, double directionZ,
+        out NativeVector3d output);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern double planet_query_altitude(
+        IntPtr query, double worldX, double worldY, double worldZ);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool planet_query_coordinates(
+        IntPtr query, double worldX, double worldY, double worldZ,
+        out NativePlanetCoordinates output);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool planet_query_world_from_coordinates(
+        IntPtr query, NativePlanetCoordinates coordinates, out NativeVector3d output);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool planet_query_tangent_frame(
+        IntPtr query, double directionX, double directionY, double directionZ,
+        out NativePlanetTangentFrame output);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern int planet_query_resolve_surface_placement(
+        IntPtr query,
+        NativePlanetSurfaceAnchor anchor,
+        out NativePlanetSurfacePlacement output);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern double planet_query_great_circle_distance(
+        IntPtr query,
+        double fromX, double fromY, double fromZ,
+        double toX, double toY, double toZ);
+
+    // Three-dimensional and spherical navigation
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern IntPtr space_nav_create(
+        float originX, float originY, float originZ,
+        uint cellsX, uint cellsY, uint cellsZ, float cellSize);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern void space_nav_destroy(IntPtr grid);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool space_nav_set_blocked(
+        IntPtr grid, int x, int y, int z, [MarshalAs(UnmanagedType.I1)] bool blocked);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern IntPtr space_nav_find_path(
+        IntPtr grid,
+        float fromX, float fromY, float fromZ,
+        float toX, float toY, float toZ);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern void space_path_destroy(IntPtr path);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern uint space_path_count(IntPtr path);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern float space_path_length(IntPtr path);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool space_path_point(
+        IntPtr path, uint index, out float x, out float y, out float z);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern IntPtr spherical_nav_create(
+        double centerX, double centerY, double centerZ,
+        double radius, uint nodeCount, uint neighborsPerNode);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern IntPtr spherical_nav_create_for_planet(
+        IntPtr planetQuery, uint nodeCount, uint neighborsPerNode);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern void spherical_nav_destroy(IntPtr graph);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern IntPtr spherical_nav_find_path(
+        IntPtr graph,
+        double fromX, double fromY, double fromZ,
+        double toX, double toY, double toZ);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool spherical_nav_upsert_obstacle(
+        IntPtr graph,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string obstacleId,
+        double directionX, double directionY, double directionZ,
+        double angularRadius);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool spherical_nav_remove_obstacle(
+        IntPtr graph,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string obstacleId);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool spherical_nav_upsert_traversal_area(
+        IntPtr graph,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string areaId,
+        double directionX, double directionY, double directionZ,
+        double angularRadius, double costMultiplier);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool spherical_nav_remove_traversal_area(
+        IntPtr graph,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string areaId);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool spherical_nav_clear_dynamic(IntPtr graph);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern ulong spherical_nav_dynamic_revision(IntPtr graph);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern void spherical_path_destroy(IntPtr path);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern uint spherical_path_count(IntPtr path);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    internal static extern double spherical_path_length(IntPtr path);
+
+    [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    internal static extern bool spherical_path_point(
+        IntPtr path, uint index, out double x, out double y, out double z);
+
     // IK target component
 
     [DllImport(NativeLibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

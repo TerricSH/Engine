@@ -1,8 +1,14 @@
 use crate::RhiError;
 use crate::{
-    BackendKind, BufferHandle, BufferUsage, ResourceHandle, ShaderFormat, TextureFormat,
-    TextureUsage,
+    BackendKind, BufferHandle, BufferUsage, IndexFormat, ResourceHandle, ShaderFormat,
+    TextureFormat, TextureUsage,
 };
+
+#[test]
+fn index_format_reports_packed_byte_size() {
+    assert_eq!(IndexFormat::U16.byte_size(), 2);
+    assert_eq!(IndexFormat::U32.byte_size(), 4);
+}
 
 #[test]
 fn rhi_error_codes_match_registry() {

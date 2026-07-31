@@ -45,6 +45,8 @@ layout(std430, set = 2, binding = 7) readonly buffer MorphTargetSSBO {
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec2 v_uv;
+layout(location = 3) out vec3 v_mapping_position;
+layout(location = 4) flat out vec3 v_mapping_parameters;
 
 void main() {
     vec3 morphed_position = in_position;
@@ -74,6 +76,8 @@ void main() {
     v_normal = normalize(mat3(model_skin) * normalize(morphed_normal));
 
     v_uv = in_uv;
+    v_mapping_position = vec3(0.0);
+    v_mapping_parameters = vec3(0.0);
 
     gl_Position = ubo.view_proj * world_pos;
 }

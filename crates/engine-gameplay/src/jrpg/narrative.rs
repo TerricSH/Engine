@@ -56,21 +56,12 @@ impl Default for QuestProgress {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoryState {
     #[serde(default)]
     pub flags: BTreeMap<String, StoryValue>,
     #[serde(default)]
     pub quests: BTreeMap<String, QuestProgress>,
-}
-
-impl Default for StoryState {
-    fn default() -> Self {
-        Self {
-            flags: BTreeMap::new(),
-            quests: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

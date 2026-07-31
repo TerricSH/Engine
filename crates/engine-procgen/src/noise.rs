@@ -143,6 +143,16 @@ fn lattice_hash_wide(seed: u64, dimension_tag: u64, x: i64, y: i64) -> u64 {
     splitmix64_finalize(hash)
 }
 
+fn lattice_hash_3d_wide(seed: u64, x: i64, y: i64, z: i64) -> u64 {
+    let mut hash = FNV1A64_OFFSET;
+    hash = (hash ^ seed).wrapping_mul(FNV1A64_PRIME);
+    hash = (hash ^ 3).wrapping_mul(FNV1A64_PRIME);
+    hash = mix_wide_coordinate(hash, x);
+    hash = mix_wide_coordinate(hash, y);
+    hash = mix_wide_coordinate(hash, z);
+    splitmix64_finalize(hash)
+}
+
 /// Quintic fade `6t^5 - 15t^4 + 10t^3` on a Q8 input, Q8 output.
 ///
 /// `t` must be in `0..=255`; every intermediate fits `i64` and stays
@@ -289,6 +299,47 @@ pub(crate) fn gradient_noise_3d(seed: u64, x: f32, y: f32, z: f32) -> f32 {
     value as f32 * OUTPUT_SCALE
 }
 
+/// Wide-coordinate 3D counterpart used by native planetary terrain.
+pub(crate) fn gradient_noise_3d_wide(seed: u64, x: f64, y: f64, z: f64) -> f32 {
+    let (Some(fixed_x), Some(fixed_y), Some(fixed_z)) = (
+        coordinate_to_fixed_wide(x),
+        coordinate_to_fixed_wide(y),
+        coordinate_to_fixed_wide(z),
+    ) else {
+        return 0.0;
+    };
+    let cell_x = fixed_x >> FRAC_BITS;
+    let cell_y = fixed_y >> FRAC_BITS;
+    let cell_z = fixed_z >> FRAC_BITS;
+    let frac_x = fixed_x & (FRAC_SCALE - 1);
+    let frac_y = fixed_y & (FRAC_SCALE - 1);
+    let frac_z = fixed_z & (FRAC_SCALE - 1);
+
+    let mut corners = [0i64; 8];
+    for (index, corner) in corners.iter_mut().enumerate() {
+        let dx = (index & 1) as i64;
+        let dy = ((index >> 1) & 1) as i64;
+        let dz = ((index >> 2) & 1) as i64;
+        *corner = gradient_dot_3d(
+            lattice_hash_3d_wide(seed, cell_x + dx, cell_y + dy, cell_z + dz),
+            frac_x - dx * FRAC_SCALE,
+            frac_y - dy * FRAC_SCALE,
+            frac_z - dz * FRAC_SCALE,
+        );
+    }
+
+    let fade_x = fade(frac_x);
+    let fade_y = fade(frac_y);
+    let fade_z = fade(frac_z);
+    let x00 = lerp(corners[0], corners[1], fade_x);
+    let x10 = lerp(corners[2], corners[3], fade_x);
+    let x01 = lerp(corners[4], corners[5], fade_x);
+    let x11 = lerp(corners[6], corners[7], fade_x);
+    let y0 = lerp(x00, x10, fade_y);
+    let y1 = lerp(x01, x11, fade_y);
+    lerp(y0, y1, fade_z) as f32 * OUTPUT_SCALE
+}
+
 fn assert_batch_length(coords: usize, out: usize) {
     assert_eq!(
         coords, out,
@@ -316,6 +367,12 @@ impl GradientNoise2D {
     /// Sample the field at `(x, y)`.
     pub fn sample(&self, x: f32, y: f32) -> f32 {
         gradient_noise_2d(self.seed.0, x, y)
+    }
+
+    /// Native wide-coordinate sample retaining the Q8 fraction in an i64
+    /// lattice. Script-facing f32 sampling remains version-compatible.
+    pub fn sample_wide(&self, x: f64, y: f64) -> f32 {
+        gradient_noise_2d_wide(self.seed.0, x, y)
     }
 
     /// Batch sampling for chunk-generation throughput.
@@ -347,6 +404,11 @@ impl GradientNoise3D {
     /// Sample the field at `(x, y, z)`.
     pub fn sample(&self, x: f32, y: f32, z: f32) -> f32 {
         gradient_noise_3d(self.seed.0, x, y, z)
+    }
+
+    /// Native wide-coordinate sample used by large-radius planetary recipes.
+    pub fn sample_wide(&self, x: f64, y: f64, z: f64) -> f32 {
+        gradient_noise_3d_wide(self.seed.0, x, y, z)
     }
 
     /// Batch sampling; bit-identical to per-coordinate [`Self::sample`].
@@ -410,6 +472,21 @@ mod tests {
         assert!(
             samples.len() > 1,
             "far coordinates must not collapse to one sample"
+        );
+    }
+
+    #[test]
+    fn wide_3d_noise_keeps_local_variation_at_large_logical_coordinates() {
+        let base = 1_000_000_000_000.0f64;
+        let samples = (0..16)
+            .map(|index| {
+                gradient_noise_3d_wide(17, base + f64::from(index) / 8.0, -base, base * 0.5)
+            })
+            .map(f32::to_bits)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            samples.len() > 1,
+            "far 3D coordinates must not collapse to one sample"
         );
     }
 

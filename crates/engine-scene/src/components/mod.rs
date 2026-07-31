@@ -9,6 +9,8 @@ mod lod_group;
 mod name;
 mod renderable;
 mod transform;
+mod triplanar_material_mapping;
+mod vertex_geomorph;
 
 pub use bounds::Bounds;
 pub use camera::{
@@ -34,6 +36,8 @@ pub use lod_group::{
 pub use name::Name;
 pub use renderable::Renderable;
 pub use transform::Transform;
+pub use triplanar_material_mapping::TriplanarMaterialMapping;
+pub use vertex_geomorph::VertexGeomorph;
 
 /// Extract an f32 from a scene [`engine_serialize::Value`], defaulting to 0.0.
 ///

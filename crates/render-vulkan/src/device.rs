@@ -47,7 +47,15 @@ impl Device {
         };
 
         let device_extensions = [swapchain::NAME.as_ptr()];
-        let features = vk::PhysicalDeviceFeatures::default();
+        // HDR/OIT pipelines use different blend equations per MRT attachment.
+        // Vulkan requires `independentBlend` to be explicitly enabled even
+        // when the physical device advertises it.
+        let supported_features =
+            unsafe { instance.get_physical_device_features(adapter.physical_device) };
+        if supported_features.independent_blend == vk::FALSE {
+            return Err(VulkanError::MissingFeature("independentBlend"));
+        }
+        let features = vk::PhysicalDeviceFeatures::default().independent_blend(true);
         let device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_extensions)

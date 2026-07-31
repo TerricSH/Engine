@@ -23,6 +23,8 @@ pub enum VulkanError {
     NoSuitableQueue,
     #[error("required vulkan extension missing: {0}")]
     MissingExtension(&'static str),
+    #[error("required vulkan device feature missing: {0}")]
+    MissingFeature(&'static str),
     #[error(
         "shader artifact `{0}` is empty; compile `shaders/{0}` to SPIR-V (see shaders/README.md)"
     )]
@@ -55,9 +57,11 @@ impl VulkanError {
                 detail: format!("allocation is not CPU mapped: {name}"),
             },
             Self::NoSuitableAdapter | Self::NoSuitableQueue => RhiError::UnsupportedBackend,
-            Self::MissingExtension(name) => RhiError::UnsupportedFeature {
-                feature: name.to_string(),
-            },
+            Self::MissingExtension(name) | Self::MissingFeature(name) => {
+                RhiError::UnsupportedFeature {
+                    feature: name.to_string(),
+                }
+            }
             Self::MissingShader(name) => RhiError::Backend {
                 detail: format!("missing shader artifact: {name}"),
             },

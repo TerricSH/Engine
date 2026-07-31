@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     TerrainChunkData, TerrainChunkGenerator, TerrainChunkRequest, TerrainCollisionData,
-    TerrainMeshData,
+    TerrainMeshData, TerrainTopology,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -19,7 +19,12 @@ enum HeightfieldError {
 
 impl TerrainChunkGenerator for HeightfieldGenerator {
     fn generate(&self, request: &TerrainChunkRequest) -> Result<TerrainChunkData, String> {
-        generate_heightfield(request).map_err(|error| error.to_string())
+        match request.volume.topology {
+            TerrainTopology::Planar => {
+                generate_heightfield(request).map_err(|error| error.to_string())
+            }
+            TerrainTopology::CubeSphere => crate::planet::generate_planet_chunk(request),
+        }
     }
 }
 
@@ -186,6 +191,7 @@ fn generate_heightfield(
         id: request.id,
         revision: request.revision,
         origin: [origin_x, 0.0, origin_z],
+        local_center: [span as f32 * 0.5, 0.0, span as f32 * 0.5],
         mesh: TerrainMeshData {
             positions,
             normals,
@@ -194,7 +200,9 @@ fn generate_heightfield(
             bounds_min: [0.0, min_height, 0.0],
             bounds_max: [span as f32, max_height, span as f32],
         },
+        geomorph: None,
         collision,
+        triangle_collision: None,
     })
 }
 

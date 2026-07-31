@@ -23,6 +23,8 @@ pub const AUDIO_SOURCE_COMPONENT: &str = "engine.audio_source";
 pub const IK_TARGET_COMPONENT: &str = "engine.ik_target";
 pub const NAV_AGENT_COMPONENT: &str = "engine.nav_agent";
 pub const TERRAIN_VOLUME_COMPONENT: &str = "engine.terrain_volume";
+pub const PLANET_SURFACE_ANCHOR_COMPONENT: &str = "engine.planet_surface_anchor";
+pub const PLANET_SCENE_TRANSITION_COMPONENT: &str = "engine.planet_scene_transition";
 pub const INTERACTABLE_COMPONENT: &str = "engine.interactable";
 pub const DESTRUCTIBLE_COMPONENT: &str = "engine.physics.destructible";
 
@@ -336,54 +338,29 @@ fn nav_agent(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
 
 fn terrain_volume(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
     let terrain = engine_terrain::TerrainVolume::default();
-    Ok(record(BTreeMap::from([
-        ("enabled".into(), Value::Bool(terrain.enabled)),
-        ("seed".into(), Value::UInt(terrain.seed)),
-        ("chunk_size".into(), Value::Float32(terrain.chunk_size)),
-        (
-            "base_resolution".into(),
-            Value::UInt(u64::from(terrain.base_resolution)),
-        ),
-        ("height_scale".into(), Value::Float32(terrain.height_scale)),
-        ("frequency".into(), Value::Float32(terrain.frequency)),
-        ("octaves".into(), Value::UInt(u64::from(terrain.octaves))),
-        ("lacunarity".into(), Value::Float32(terrain.lacunarity)),
-        ("gain".into(), Value::Float32(terrain.gain)),
-        (
-            "domain_warp_amplitude".into(),
-            Value::Float32(terrain.domain_warp_amplitude),
-        ),
-        (
-            "domain_warp_frequency".into(),
-            Value::Float32(terrain.domain_warp_frequency),
-        ),
-        ("skirt_depth".into(), Value::Float32(terrain.skirt_depth)),
-        (
-            "collision_enabled".into(),
-            Value::Bool(terrain.collision_enabled),
-        ),
-        (
-            "material_asset".into(),
-            Value::Asset(AssetId::new("mat-default")),
-        ),
-        (
-            "lod_distances".into(),
-            Value::List(
-                terrain
-                    .lod_distances
-                    .into_iter()
-                    .map(Value::Float32)
-                    .collect(),
-            ),
-        ),
-        (
-            "lod_hysteresis".into(),
-            Value::Float32(terrain.lod_hysteresis),
-        ),
-    ])))
+    let mut fields = engine_terrain::serialize_terrain_fields(&terrain);
+    fields.insert(
+        "material_asset".into(),
+        Value::Asset(AssetId::new("mat-default")),
+    );
+    Ok(record(fields))
 }
 
-const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 20] = [
+fn planet_surface_anchor(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
+    let anchor = engine_terrain::PlanetSurfaceAnchor::default();
+    Ok(record(
+        engine_terrain::serialize_planet_surface_anchor_fields(&anchor),
+    ))
+}
+
+fn planet_scene_transition(_: &EntityRecord) -> Result<ComponentRecord, EditorError> {
+    let transition = engine_terrain::PlanetSceneTransitionConfig::default();
+    Ok(record(
+        engine_terrain::serialize_planet_scene_transition_fields(&transition),
+    ))
+}
+
+const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 22] = [
     ComponentDescriptor {
         type_id: TRANSFORM_COMPONENT,
         display_name: "Transform",
@@ -549,6 +526,22 @@ const COMPONENT_DESCRIPTORS: [ComponentDescriptor; 20] = [
         removable: true,
         required_components: &[],
         factory: terrain_volume,
+    },
+    ComponentDescriptor {
+        type_id: PLANET_SURFACE_ANCHOR_COMPONENT,
+        display_name: "Planet Surface Anchor",
+        category: "Terrain",
+        removable: true,
+        required_components: &[TRANSFORM_COMPONENT],
+        factory: planet_surface_anchor,
+    },
+    ComponentDescriptor {
+        type_id: PLANET_SCENE_TRANSITION_COMPONENT,
+        display_name: "Planet Scene Transition",
+        category: "Terrain",
+        removable: true,
+        required_components: &[],
+        factory: planet_scene_transition,
     },
 ];
 
@@ -844,6 +837,8 @@ mod tests {
             IK_TARGET_COMPONENT,
             NAV_AGENT_COMPONENT,
             TERRAIN_VOLUME_COMPONENT,
+            PLANET_SURFACE_ANCHOR_COMPONENT,
+            PLANET_SCENE_TRANSITION_COMPONENT,
             INTERACTABLE_COMPONENT,
             DESTRUCTIBLE_COMPONENT,
         ] {

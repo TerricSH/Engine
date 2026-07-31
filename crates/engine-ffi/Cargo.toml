@@ -18,6 +18,7 @@ engine-nav = { path = "../engine-nav" }
 engine-physics = { path = "../engine-physics" }
 engine-serialize = { path = "../engine-serialize" }
 engine-scene = { path = "../engine-scene" }
+engine-terrain = { path = "../engine-terrain" }
 engine-ui = { path = "../engine-ui" }
 glam.workspace = true
 image.workspace = true

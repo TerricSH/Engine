@@ -262,6 +262,8 @@ pub fn extract_vfx(world: &World, input: &mut RenderFrameInput) {
             bounds,
             render_layer: decal.render_layer.clone(),
             cast_shadows: false,
+            radial_vertex_morph: None,
+            triplanar_material_mapping: None,
         });
         visible += 1;
     }

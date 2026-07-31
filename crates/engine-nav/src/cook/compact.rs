@@ -356,7 +356,7 @@ impl CompactHeightfield {
     }
 
     /// Count total walkable spans.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn walkable_count(&self) -> usize {
         self.areas.iter().filter(|&&a| a > 0).count()
     }

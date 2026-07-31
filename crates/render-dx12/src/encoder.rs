@@ -13,6 +13,15 @@ use render_core::{
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 use crate::device::Dx12Device;
 
+pub(crate) const CONSTANT_BUFFER_ALIGNMENT: u64 = 256;
+
+pub(crate) fn valid_constant_buffer_offset(buffer_size: u64, offset_bytes: u64) -> bool {
+    offset_bytes.is_multiple_of(CONSTANT_BUFFER_ALIGNMENT)
+        && offset_bytes
+            .checked_add(CONSTANT_BUFFER_ALIGNMENT)
+            .is_some_and(|end| end <= buffer_size)
+}
+
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 pub(crate) struct Dx12CommandEncoder {
     pub(crate) cmd_list: ID3D12GraphicsCommandList,
@@ -634,6 +643,15 @@ impl CommandEncoder for Dx12CommandEncoder {
         pipeline_layout: PipelineLayoutHandle,
         buffer: BufferHandle,
     ) -> bool {
+        self.bind_uniform_buffer_offset(pipeline_layout, buffer, 0)
+    }
+
+    fn bind_uniform_buffer_offset(
+        &mut self,
+        pipeline_layout: PipelineLayoutHandle,
+        buffer: BufferHandle,
+        offset_bytes: u64,
+    ) -> bool {
         unsafe {
             let device = &*self.device;
             let (_, layout_index) = Dx12Device::decode_handle(pipeline_layout.index);
@@ -647,9 +665,12 @@ impl CommandEncoder for Dx12CommandEncoder {
             let Some(buffer) = device.buffers.get(buffer_index) else {
                 return false;
             };
+            if !valid_constant_buffer_offset(buffer.size, offset_bytes) {
+                return false;
+            }
             self.cmd_list.SetGraphicsRootConstantBufferView(
                 parameter,
-                buffer.resource.GetGPUVirtualAddress(),
+                buffer.resource.GetGPUVirtualAddress() + offset_bytes,
             );
             true
         }

@@ -140,6 +140,9 @@ pub enum Value {
 pub mod logic;
 pub use logic::*;
 
+mod lighting;
+pub use lighting::LightKind;
+
 pub mod hot_update;
 
 // Re-export key hot_update types.

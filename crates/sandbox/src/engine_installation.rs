@@ -40,12 +40,13 @@ pub(crate) struct EngineInstallationManifest {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Individual installed capabilities are feature-gated per binary build.
 pub(crate) struct EngineInstallation {
+    #[cfg(any(test, all(feature = "tooling-editor", feature = "backend-vulkan")))]
     pub(crate) root: PathBuf,
     pub(crate) manifest: EngineInstallationManifest,
     pub(crate) editor: PathBuf,
     pub(crate) windows_runtime: PathBuf,
+    #[cfg(any(test, all(feature = "tooling-editor", feature = "backend-vulkan")))]
     pub(crate) package_script: PathBuf,
     pub(crate) managed_sdk: PathBuf,
     pub(crate) script_host: PathBuf,
@@ -114,7 +115,10 @@ impl EngineInstallation {
         let windows_runtime = resolve_file(&root, "windows_runtime", &manifest.windows_runtime)?;
         resolve_file(&root, "windows_symbols", &manifest.windows_symbols)?;
         resolve_file(&root, "asset_cooker", &manifest.asset_cooker)?;
+        #[cfg(any(test, all(feature = "tooling-editor", feature = "backend-vulkan")))]
         let package_script = resolve_file(&root, "package_script", &manifest.package_script)?;
+        #[cfg(not(any(test, all(feature = "tooling-editor", feature = "backend-vulkan"))))]
+        resolve_file(&root, "package_script", &manifest.package_script)?;
         let managed_sdk = resolve_file(&root, "managed_sdk", &manifest.managed_sdk)?;
         let script_host = resolve_directory(&root, "script_host", &manifest.script_host)?;
         resolve_file(&root, "notices", &manifest.notices)?;
@@ -136,10 +140,12 @@ impl EngineInstallation {
         require_hashed_directory_files(&manifest.files, &root, &manifest.script_host)?;
 
         Ok(Self {
+            #[cfg(any(test, all(feature = "tooling-editor", feature = "backend-vulkan")))]
             root,
             manifest,
             editor,
             windows_runtime,
+            #[cfg(any(test, all(feature = "tooling-editor", feature = "backend-vulkan")))]
             package_script,
             managed_sdk,
             script_host,

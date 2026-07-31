@@ -375,6 +375,33 @@ pub fn validate_post_process_settings(
     {
         return Some("vignette intensity/roundness must be in [0, 1] and smoothness in (0, 1]");
     }
+    let lens = settings.planetary_lens;
+    if !lens.altitude_fade_start.is_finite()
+        || !lens.altitude_fade_end.is_finite()
+        || lens.altitude_fade_start < 0.0
+        || lens.altitude_fade_end <= lens.altitude_fade_start
+    {
+        return Some(
+            "planetary lens altitude fade bounds must be finite/non-negative and end must be greater than start",
+        );
+    }
+    if !(-0.25..=0.25).contains(&lens.barrel_distortion)
+        || !(-0.2..=0.2).contains(&lens.horizon_curvature)
+        || !(0.0..=1.0).contains(&lens.atmosphere_intensity)
+        || !(0.0..=0.02).contains(&lens.chromatic_aberration)
+        || [
+            lens.barrel_distortion,
+            lens.horizon_curvature,
+            lens.atmosphere_intensity,
+            lens.chromatic_aberration,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite())
+    {
+        return Some(
+            "planetary lens distortion must be finite/in [-0.25, 0.25], curvature in [-0.2, 0.2], atmosphere in [0, 1], and chromatic aberration in [0, 0.02]",
+        );
+    }
     None
 }
 

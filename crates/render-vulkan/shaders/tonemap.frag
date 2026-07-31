@@ -12,11 +12,11 @@ layout(push_constant) uniform ToneMapPushConstants {
     uint effect_flags;
     vec4 bloom;                    // threshold, intensity, radius in pixels
     vec4 color_filter_saturation;  // rgb filter, saturation
-    vec4 contrast;
+    vec4 contrast;                 // contrast, lens barrel, curvature, atmosphere
     vec4 lift;
     vec4 gamma;
     vec4 gain;
-    vec4 vignette;                 // intensity, smoothness, roundness
+    vec4 vignette;                 // intensity, smoothness, roundness, chromatic aberration
 } tone_map;
 
 const uint TONE_MAP_ACES = 0u;
@@ -26,6 +26,7 @@ const uint EFFECT_BLOOM = 1u;
 const uint EFFECT_COLOR_GRADING = 2u;
 const uint EFFECT_VIGNETTE = 4u;
 const uint EFFECT_WEIGHTED_OIT = 8u;
+const uint EFFECT_PLANETARY_LENS = 16u;
 
 vec3 resolved_hdr(vec2 uv) {
     vec3 opaque = texture(hdr_input, uv).rgb;
@@ -38,6 +39,27 @@ vec3 resolved_hdr(vec2 uv) {
         accumulation.rgb / max(accumulation.a, 0.00001);
     float coverage = 1.0 - exp(-max(optical_depth, 0.0));
     return mix(opaque, transparent_color, clamp(coverage, 0.0, 1.0));
+}
+
+vec2 planetary_lens_uv(vec2 uv) {
+    vec2 centered = uv * 2.0 - 1.0;
+    float radius_squared = dot(centered, centered);
+    centered *= 1.0 + tone_map.contrast.y * radius_squared;
+    centered.y += tone_map.contrast.z
+        * centered.x * centered.x
+        * (1.0 - 0.25 * abs(centered.y));
+    return centered * 0.5 + 0.5;
+}
+
+vec3 resolved_planetary_lens(vec2 uv) {
+    vec2 centered = uv - 0.5;
+    vec2 chromatic_offset = centered * tone_map.vignette.w;
+    vec3 center_color = resolved_hdr(clamp(uv, vec2(0.0), vec2(1.0)));
+    return vec3(
+        resolved_hdr(clamp(uv + chromatic_offset, vec2(0.0), vec2(1.0))).r,
+        center_color.g,
+        resolved_hdr(clamp(uv - chromatic_offset, vec2(0.0), vec2(1.0))).b
+    );
 }
 
 vec3 aces_narkowicz(vec3 color) {
@@ -61,7 +83,11 @@ vec3 linear_to_srgb(vec3 color) {
 }
 
 void main() {
-    vec3 hdr_color = resolved_hdr(in_uv);
+    bool planetary_lens = (tone_map.effect_flags & EFFECT_PLANETARY_LENS) != 0u;
+    vec2 sample_uv = planetary_lens ? planetary_lens_uv(in_uv) : in_uv;
+    vec3 hdr_color = planetary_lens
+        ? resolved_planetary_lens(sample_uv)
+        : resolved_hdr(sample_uv);
     if ((tone_map.effect_flags & EFFECT_BLOOM) != 0u) {
         vec2 texel = tone_map.bloom.z / vec2(textureSize(hdr_input, 0));
         const vec2 OFFSETS[8] = vec2[](
@@ -71,13 +97,22 @@ void main() {
         );
         vec3 bloom_color = vec3(0.0);
         for (int sample_index = 0; sample_index < 8; ++sample_index) {
-            vec3 sample_color = resolved_hdr(in_uv + OFFSETS[sample_index] * texel);
+            vec3 sample_color = planetary_lens
+                ? resolved_planetary_lens(sample_uv + OFFSETS[sample_index] * texel)
+                : resolved_hdr(sample_uv + OFFSETS[sample_index] * texel);
             float brightness = max(max(sample_color.r, sample_color.g), sample_color.b);
             float contribution = max(brightness - tone_map.bloom.x, 0.0)
                                / max(brightness, 0.0001);
             bloom_color += sample_color * contribution;
         }
         hdr_color += bloom_color * (tone_map.bloom.y / 8.0);
+    }
+    if (planetary_lens) {
+        vec2 centered = in_uv * 2.0 - 1.0;
+        float limb = smoothstep(0.35, 1.15, length(centered));
+        hdr_color += vec3(0.08, 0.24, 0.55)
+            * tone_map.contrast.w
+            * limb;
     }
 
     vec3 color = max(hdr_color * tone_map.exposure, vec3(0.0));

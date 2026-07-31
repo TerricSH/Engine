@@ -157,7 +157,7 @@ impl EngineRuntime {
             #[cfg(feature = "subsystem-scripting-csharp")]
             script_engine_state: format!(
                 "{} coroutines={}",
-                crate::script_engine_state_summary(&self.script_engine),
+                crate::script_engine_state_summary(&self.scripting.engine),
                 engine_ffi::coroutine::active_managed_coroutine_count(),
             ),
             #[cfg(not(feature = "subsystem-scripting-csharp"))]
@@ -205,6 +205,7 @@ impl EngineRuntime {
             };
             if let Ok(input) = &mut result {
                 engine_vfx::extract_vfx(world, input);
+                resolve_planetary_lens_for_world(world, input);
             }
             result
         });
@@ -312,11 +313,21 @@ impl EngineRuntime {
                 .asset_registry
                 .get::<MaterialUpload>(id)
                 .ok_or_else(|| missing_registered_render_asset("material", id))?;
-            let upload = handle.get().clone();
-            validate_registered_asset_id("material", id, &upload.material_id)?;
-            for texture in upload.texture_references().into_iter().flatten() {
+            let registered = handle.get();
+            validate_registered_asset_id("material", id, &registered.material_id)?;
+            for texture in registered.texture_references().into_iter().flatten() {
                 texture_ids.insert(texture.id.clone(), texture.clone());
             }
+            let changed = self
+                .synced_render_resources
+                .materials
+                .get(id)
+                .is_none_or(|hash| hash != &registered.content_hash);
+            if !changed {
+                continue;
+            }
+            let upload = registered.clone();
+            validate_registered_asset_id("material", id, &upload.material_id)?;
             materials.push(upload);
         }
         for batch in &input.ui_batches {
@@ -331,7 +342,17 @@ impl EngineRuntime {
                 .asset_registry
                 .get::<TextureUpload>(id)
                 .ok_or_else(|| missing_registered_render_asset("texture", id))?;
-            let upload = handle.get().clone();
+            let registered = handle.get();
+            validate_registered_asset_id("texture", id, &registered.texture_id)?;
+            let changed = self
+                .synced_render_resources
+                .textures
+                .get(id)
+                .is_none_or(|hash| hash != &registered.content_hash);
+            if !changed {
+                continue;
+            }
+            let upload = registered.clone();
             validate_registered_asset_id("texture", id, &upload.texture_id)?;
             textures.push(upload);
         }
@@ -342,7 +363,17 @@ impl EngineRuntime {
                 .asset_registry
                 .get::<MeshUpload>(id)
                 .ok_or_else(|| missing_registered_render_asset("mesh", id))?;
-            let upload = handle.get().clone();
+            let registered = handle.get();
+            validate_registered_asset_id("mesh", id, &registered.mesh_id)?;
+            let changed = self
+                .synced_render_resources
+                .meshes
+                .get(id)
+                .is_none_or(|hash| hash != &registered.content_hash);
+            if !changed {
+                continue;
+            }
+            let upload = registered.clone();
             validate_registered_asset_id("mesh", id, &upload.mesh_id)?;
             meshes.push(upload);
         }
@@ -359,7 +390,17 @@ impl EngineRuntime {
                 .asset_registry
                 .get::<MorphTargetSetUpload>(id)
                 .ok_or_else(|| missing_registered_render_asset("morph target set", id))?;
-            let upload = handle.get().clone();
+            let registered = handle.get();
+            validate_registered_asset_id("morph target set", id, &registered.target_set_id)?;
+            let changed = self
+                .synced_render_resources
+                .morph_target_sets
+                .get(id)
+                .is_none_or(|hash| hash != &registered.content_hash);
+            if !changed {
+                continue;
+            }
+            let upload = registered.clone();
             validate_registered_asset_id("morph target set", id, &upload.target_set_id)?;
             morph_target_sets.push(upload);
         }
@@ -380,39 +421,62 @@ impl EngineRuntime {
                 .asset_registry
                 .get::<EnvironmentMapUpload>(id)
                 .ok_or_else(|| missing_registered_render_asset("environment map", id))?;
-            let upload = handle.get().clone();
+            let registered = handle.get();
+            validate_registered_asset_id("environment map", id, &registered.environment_id)?;
+            let changed = self
+                .synced_render_resources
+                .environment_maps
+                .get(id)
+                .is_none_or(|hash| hash != &registered.content_hash);
+            if !changed {
+                continue;
+            }
+            let upload = registered.clone();
             validate_registered_asset_id("environment map", id, &upload.environment_id)?;
             environment_maps.push(upload);
         }
 
         for upload in textures {
             let id = upload.texture_id.clone();
+            let content_hash = upload.content_hash;
             let receipt = self.renderer.upload_texture(upload)?;
-            self.synced_render_resources.textures.insert(id);
+            self.synced_render_resources
+                .textures
+                .insert(id, content_hash);
             self.collector.push_asset_diags(receipt.warnings);
         }
         for upload in materials {
             let id = upload.material_id.clone();
+            let content_hash = upload.content_hash;
             let receipt = self.renderer.upload_material(upload)?;
-            self.synced_render_resources.materials.insert(id);
+            self.synced_render_resources
+                .materials
+                .insert(id, content_hash);
             self.collector.push_asset_diags(receipt.warnings);
         }
         for upload in meshes {
             let id = upload.mesh_id.clone();
+            let content_hash = upload.content_hash;
             let receipt = self.renderer.upload_mesh(upload)?;
-            self.synced_render_resources.meshes.insert(id);
+            self.synced_render_resources.meshes.insert(id, content_hash);
             self.collector.push_asset_diags(receipt.warnings);
         }
         for upload in morph_target_sets {
             let id = upload.target_set_id.clone();
+            let content_hash = upload.content_hash;
             let receipt = self.renderer.upload_morph_target_set(upload)?;
-            self.synced_render_resources.morph_target_sets.insert(id);
+            self.synced_render_resources
+                .morph_target_sets
+                .insert(id, content_hash);
             self.collector.push_asset_diags(receipt.warnings);
         }
         for upload in environment_maps {
             let id = upload.environment_id.clone();
+            let content_hash = upload.content_hash;
             let receipt = self.renderer.upload_environment_map(upload)?;
-            self.synced_render_resources.environment_maps.insert(id);
+            self.synced_render_resources
+                .environment_maps
+                .insert(id, content_hash);
             self.collector.push_asset_diags(receipt.warnings);
         }
         Ok(())
@@ -427,7 +491,7 @@ impl EngineRuntime {
         removals.extend(
             self.synced_render_resources
                 .materials
-                .iter()
+                .keys()
                 .filter(|id| self.asset_registry.get::<MaterialUpload>(id).is_none())
                 .cloned()
                 .map(|resource_id| ResourceRemoval {
@@ -438,7 +502,7 @@ impl EngineRuntime {
         removals.extend(
             self.synced_render_resources
                 .meshes
-                .iter()
+                .keys()
                 .filter(|id| self.asset_registry.get::<MeshUpload>(id).is_none())
                 .cloned()
                 .map(|resource_id| ResourceRemoval {
@@ -449,7 +513,7 @@ impl EngineRuntime {
         removals.extend(
             self.synced_render_resources
                 .morph_target_sets
-                .iter()
+                .keys()
                 .filter(|id| {
                     self.asset_registry
                         .get::<MorphTargetSetUpload>(id)
@@ -464,7 +528,7 @@ impl EngineRuntime {
         removals.extend(
             self.synced_render_resources
                 .environment_maps
-                .iter()
+                .keys()
                 .filter(|id| {
                     self.asset_registry
                         .get::<EnvironmentMapUpload>(id)
@@ -479,7 +543,7 @@ impl EngineRuntime {
         removals.extend(
             self.synced_render_resources
                 .textures
-                .iter()
+                .keys()
                 .filter(|id| self.asset_registry.get::<TextureUpload>(id).is_none())
                 .cloned()
                 .map(|resource_id| ResourceRemoval {
@@ -522,7 +586,9 @@ impl EngineRuntime {
 
     fn refresh_generated_ui_assets(&mut self) {
         #[cfg(feature = "subsystem-ui")]
-        if let Some(upload) = engine_ui::font_atlas_texture_upload() {
+        if let Some((revision, upload)) =
+            engine_ui::font_atlas_texture_upload_since(self.generated_font_atlas_revision)
+        {
             let changed = self
                 .asset_registry
                 .get::<TextureUpload>(&upload.texture_id)
@@ -531,6 +597,57 @@ impl EngineRuntime {
                 self.asset_registry
                     .insert_typed(upload.texture_id.clone(), upload);
             }
+            self.generated_font_atlas_revision = revision;
         }
     }
+}
+
+fn resolve_planetary_lens_for_world(_world: &engine_scene::World, input: &mut RenderFrameInput) {
+    let lens = input.render_options.post_process.planetary_lens;
+    if lens.mode == engine_renderer::PlanetaryLensMode::Manual {
+        return;
+    }
+
+    #[cfg(feature = "subsystem-terrain")]
+    let camera_altitude = camera_altitude_above_planet(_world);
+    #[cfg(not(feature = "subsystem-terrain"))]
+    let camera_altitude = None;
+
+    input.render_options.post_process.planetary_lens =
+        lens.resolved_for_camera_altitude(camera_altitude);
+}
+
+#[cfg(feature = "subsystem-terrain")]
+fn camera_altitude_above_planet(world: &engine_scene::World) -> Option<f64> {
+    use engine_terrain::{
+        PlanetSurfaceVolumeKey, PlanetTerrainQuery, TerrainTopology, TerrainVolume,
+    };
+
+    let camera_relative = engine_scene::active_camera_world_position(world)?;
+    let origin = world.world_origin();
+    let camera_logical = [
+        origin[0] + f64::from(camera_relative.x),
+        origin[1] + f64::from(camera_relative.y),
+        origin[2] + f64::from(camera_relative.z),
+    ];
+    world
+        .query::<TerrainVolume>()
+        .filter(|(_, volume)| volume.enabled && volume.topology == TerrainTopology::CubeSphere)
+        .filter_map(|(entity, volume)| {
+            let stable_id = world.persistent_id(entity).map_or_else(
+                || PlanetSurfaceVolumeKey::from_runtime_entity(entity.index(), entity.generation()),
+                |id| PlanetSurfaceVolumeKey::Persistent(id.to_owned()),
+            );
+            let altitude = PlanetTerrainQuery::new(volume)
+                .ok()?
+                .altitude(camera_logical)
+                .abs();
+            altitude.is_finite().then_some((stable_id, altitude))
+        })
+        .min_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.cmp(&right.0))
+        })
+        .map(|(_, altitude)| altitude)
 }

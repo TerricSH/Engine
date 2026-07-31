@@ -11,6 +11,8 @@ layout(location = 6) in vec4 i_model_3;
 layout(location = 0) out vec3 v_world_pos;
 layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec2 v_uv;
+layout(location = 3) out vec3 v_mapping_position;
+layout(location = 4) flat out vec3 v_mapping_parameters;
 
 layout(binding = 0) uniform PerFrameUBO {
     mat4 model;
@@ -29,5 +31,7 @@ void main() {
     v_world_pos = world.xyz;
     v_normal = normalize(mat3(model) * a_normal);
     v_uv = a_uv;
+    v_mapping_position = vec3(0.0);
+    v_mapping_parameters = vec3(0.0);
     gl_Position = ubo.view_proj * world;
 }

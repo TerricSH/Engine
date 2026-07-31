@@ -306,6 +306,33 @@ pub(super) fn serialize_collider(component: &dyn std::any::Any) -> BTreeMap<Stri
             .into_iter()
             .collect(),
         ),
+        ColliderShape::TriMesh { vertices, indices } => (
+            "TriMesh",
+            vec![
+                (
+                    "vertices".into(),
+                    Value::List(vertices.iter().copied().map(Value::Vec3).collect()),
+                ),
+                (
+                    "indices".into(),
+                    Value::List(
+                        indices
+                            .iter()
+                            .map(|triangle| {
+                                Value::List(
+                                    triangle
+                                        .iter()
+                                        .map(|index| Value::UInt(u64::from(*index)))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
     };
 
     // Serialize shape as a map with "kind" and "params".
@@ -377,6 +404,38 @@ pub(super) fn deserialize_collider(fields: &BTreeMap<String, Value>) -> Box<dyn 
                         heights,
                         scale,
                     }
+                }
+                "TriMesh" => {
+                    let vertices = match params.get("vertices") {
+                        Some(Value::List(values)) => values
+                            .iter()
+                            .filter_map(|value| match value {
+                                Value::Vec3(position) => Some(*position),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    let indices = match params.get("indices") {
+                        Some(Value::List(values)) => values
+                            .iter()
+                            .filter_map(|value| {
+                                let Value::List(index_values) = value else {
+                                    return None;
+                                };
+                                let [a, b, c] = index_values.as_slice() else {
+                                    return None;
+                                };
+                                let index = |value: &Value| match value {
+                                    Value::UInt(value) => u32::try_from(*value).ok(),
+                                    _ => None,
+                                };
+                                Some([index(a)?, index(b)?, index(c)?])
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    ColliderShape::TriMesh { vertices, indices }
                 }
                 _ => ColliderShape::Cuboid {
                     hx: float_field(params, "hx").unwrap_or(0.5),

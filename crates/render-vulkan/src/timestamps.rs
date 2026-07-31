@@ -410,14 +410,26 @@ impl TimestampQueryPools {
         }
     }
 
-    /// Non-blocking read of the whole pool. Returns `None` when results are
-    /// not yet available or the read failed — never stalls.
-    pub(crate) fn read(&self, device: &ash::Device, slot: usize) -> Option<Vec<u64>> {
-        if !self.created {
+    /// Non-blocking read of the queries written for one frame. Reading the
+    /// entire pool would include reset-but-unwritten queries, causing Vulkan
+    /// to return `NOT_READY` forever for otherwise complete frame timings.
+    /// Returns `None` when written results are not yet available or the read
+    /// failed — never stalls.
+    pub(crate) fn read(
+        &self,
+        device: &ash::Device,
+        slot: usize,
+        query_count: u32,
+    ) -> Option<Vec<u64>> {
+        if !self.created || slot >= self.pools.len() || query_count > QUERIES_PER_POOL {
             return None;
         }
-        let mut data = vec![0u64; QUERIES_PER_POOL as usize];
-        // SAFETY: the pool is valid; `data` covers QUERIES_PER_POOL u64s and
+        if query_count == 0 {
+            return Some(Vec::new());
+        }
+        let mut data = vec![0u64; query_count as usize];
+        // SAFETY: the pool is valid; `data` covers exactly the written query
+        // prefix and
         // the WITH_AVAILABILITY flag is not set. Without the WAIT flag this
         // call never blocks.
         unsafe {

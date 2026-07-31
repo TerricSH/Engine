@@ -85,7 +85,7 @@ pub fn deserialize_interactable_fields(fields: &BTreeMap<String, Value>) -> Inte
 
 pub fn validate_interactable_fields(fields: &BTreeMap<String, Value>) -> Result<(), String> {
     let interactable = deserialize_interactable_fields(fields);
-    if interactable.prompt.as_bytes().len() > 256
+    if interactable.prompt.len() > 256
         || interactable
             .prompt
             .chars()

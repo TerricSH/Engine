@@ -101,6 +101,17 @@ impl DebugDrawProvider for PhysicsDebugDraw {
                         color,
                     );
                 }
+                ColliderShape::TriMesh { vertices, indices } => {
+                    for triangle in indices {
+                        let points = triangle.map(|index| {
+                            info.position
+                                + info.rotation * glam::Vec3::from_array(vertices[index as usize])
+                        });
+                        buffer.line(points[0], points[1], color);
+                        buffer.line(points[1], points[2], color);
+                        buffer.line(points[2], points[0], color);
+                    }
+                }
             }
         }
     }

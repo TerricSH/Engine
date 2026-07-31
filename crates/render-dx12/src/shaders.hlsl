@@ -28,6 +28,8 @@ struct PSInput {
     float2 uv : TEXCOORD0;
     float4 shadow_position : TEXCOORD1;
     float3 local_position : TEXCOORD2;
+    float3 mapping_position : TEXCOORD3;
+    float3 mapping_parameters : TEXCOORD4;
     float4 particle_color : COLOR0;
 };
 
@@ -65,19 +67,45 @@ SamplerState occlusion_sampler : register(s4);
 SamplerState emissive_sampler : register(s5);
 SamplerState environment_sampler : register(s6);
 
-cbuffer Bones : register(b1) {
+cbuffer VertexDraw : register(b1) {
+    // Same layout and semantics as Vulkan DrawPush/PC.
+    // x=factor, y=encoded normal-length delta scale, z=enabled.
+    float4 radial_morph;
+    float4 morph_origin;
+    // x=enabled, y=inverse world-space tile size, z=blend sharpness.
+    float4 material_mapping;
+    float4 mapping_origin;
     float4x4 bones[64];
 };
 
 float4 unpack_unorm_rgba8(uint packed_value);
 
+float3 radial_geomorph_position(float3 position, float3 encoded_normal) {
+    if (radial_morph.z <= 0.5 || radial_morph.x <= 0.0) {
+        return position;
+    }
+    float3 radial = position - morph_origin.xyz;
+    float radial_length = length(radial);
+    float encoded_normal_length = length(encoded_normal);
+    if (radial_length <= 1.0e-6 || encoded_normal_length <= 1.0e-6) {
+        return position;
+    }
+    float delta = (encoded_normal_length - 1.0)
+                * radial_morph.y
+                * saturate(radial_morph.x);
+    return position + radial * (delta / radial_length);
+}
+
 PSInput VSMain(VSInput input) {
     PSInput output;
-    output.position = mul(float4(input.position, 1.0), mvp);
+    float3 local_position = radial_geomorph_position(input.position, input.normal);
+    output.position = mul(float4(local_position, 1.0), mvp);
     output.normal = input.normal;
     output.uv = input.uv;
-    output.shadow_position = mul(float4(input.position, 1.0), light_mvp);
-    output.local_position = input.position;
+    output.shadow_position = mul(float4(local_position, 1.0), light_mvp);
+    output.local_position = local_position;
+    output.mapping_position = local_position - mapping_origin.xyz;
+    output.mapping_parameters = material_mapping.xyz;
     output.particle_color = 1.0.xxxx;
     return output;
 }
@@ -94,6 +122,8 @@ PSInput SkinnedVSMain(SkinnedVSInput input) {
     output.uv = input.uv;
     output.shadow_position = mul(local_position, light_mvp);
     output.local_position = local_position.xyz;
+    output.mapping_position = 0.0.xxx;
+    output.mapping_parameters = 0.0.xxx;
     output.particle_color = 1.0.xxxx;
     return output;
 }
@@ -117,6 +147,8 @@ PSInput ParticleVSMain(ParticleVSInput input) {
     output.uv = input.uv;
     output.shadow_position = 0.0.xxxx;
     output.local_position = world_position;
+    output.mapping_position = 0.0.xxx;
+    output.mapping_parameters = 0.0.xxx;
     output.particle_color = unpack_unorm_rgba8(input.instance_color);
     return output;
 }
@@ -259,6 +291,8 @@ PSInput GpuParticleVSMain(VSInput input, uint instance_id : SV_InstanceID) {
     output.uv = input.uv;
     output.shadow_position = 0.0.xxxx;
     output.local_position = world_position;
+    output.mapping_position = 0.0.xxx;
+    output.mapping_parameters = 0.0.xxx;
     output.particle_color = lerp(
         unpack_unorm_rgba8(colors_ordinals.x),
         unpack_unorm_rgba8(colors_ordinals.y),
@@ -268,7 +302,8 @@ PSInput GpuParticleVSMain(VSInput input, uint instance_id : SV_InstanceID) {
 }
 
 float4 ShadowVSMain(VSInput input) : SV_POSITION {
-    return mul(float4(input.position, 1.0), mvp);
+    float3 local_position = radial_geomorph_position(input.position, input.normal);
+    return mul(float4(local_position, 1.0), mvp);
 }
 
 float4 SkinnedShadowVSMain(SkinnedVSInput input) : SV_POSITION {
@@ -319,6 +354,99 @@ float3x3 cotangent_frame(float3 normal, float3 position, float2 uv) {
     float3 bitangent = dp2_perp * duv1.y + dp1_perp * duv2.y;
     float scale = rsqrt(max(max(dot(tangent, tangent), dot(bitangent, bitangent)), 1e-8));
     return float3x3(tangent * scale, bitangent * scale, normal);
+}
+
+float3 triplanar_weights(float3 normal, float sharpness) {
+    float3 weights = pow(
+        max(abs(normal), float3(1.0e-4, 1.0e-4, 1.0e-4)),
+        float3(
+            clamp(sharpness, 1.0, 32.0),
+            clamp(sharpness, 1.0, 32.0),
+            clamp(sharpness, 1.0, 32.0)
+        )
+    );
+    return weights / max(weights.x + weights.y + weights.z, 1.0e-5);
+}
+
+float projection_sign(float value) {
+    return value < 0.0 ? -1.0 : 1.0;
+}
+
+float2 triplanar_uv_x(float3 position, float3 normal) {
+    return float2(-projection_sign(normal.x) * position.z, position.y);
+}
+
+float2 triplanar_uv_y(float3 position, float3 normal) {
+    return float2(projection_sign(normal.y) * position.x, -position.z);
+}
+
+float2 triplanar_uv_z(float3 position, float3 normal) {
+    return float2(projection_sign(normal.z) * position.x, position.y);
+}
+
+float4 sample_triplanar(
+    Texture2D texture_map,
+    SamplerState texture_sampler,
+    float3 position,
+    float3 geometric_normal,
+    float3 weights
+) {
+    return texture_map.Sample(
+        texture_sampler,
+        triplanar_uv_x(position, geometric_normal)
+    ) * weights.x
+         + texture_map.Sample(
+            texture_sampler,
+            triplanar_uv_y(position, geometric_normal)
+        ) * weights.y
+         + texture_map.Sample(
+            texture_sampler,
+            triplanar_uv_z(position, geometric_normal)
+        ) * weights.z;
+}
+
+float3 sample_triplanar_normal(
+    Texture2D texture_map,
+    SamplerState texture_sampler,
+    float3 position,
+    float3 geometric_normal,
+    float3 weights
+) {
+    float sign_x = projection_sign(geometric_normal.x);
+    float sign_y = projection_sign(geometric_normal.y);
+    float sign_z = projection_sign(geometric_normal.z);
+    float3 tangent_x = texture_map.Sample(
+        texture_sampler,
+        triplanar_uv_x(position, geometric_normal)
+    ).xyz * 2.0 - 1.0;
+    float3 tangent_y = texture_map.Sample(
+        texture_sampler,
+        triplanar_uv_y(position, geometric_normal)
+    ).xyz * 2.0 - 1.0;
+    float3 tangent_z = texture_map.Sample(
+        texture_sampler,
+        triplanar_uv_z(position, geometric_normal)
+    ).xyz * 2.0 - 1.0;
+    float3 normal_x = float3(
+        sign_x * tangent_x.z,
+        tangent_x.y,
+        -sign_x * tangent_x.x
+    );
+    float3 normal_y = float3(
+        sign_y * tangent_y.x,
+        sign_y * tangent_y.z,
+        -tangent_y.y
+    );
+    float3 normal_z = float3(
+        sign_z * tangent_z.x,
+        tangent_z.y,
+        sign_z * tangent_z.z
+    );
+    float3 perturbation =
+        (normal_x - float3(sign_x, 0.0, 0.0)) * weights.x
+      + (normal_y - float3(0.0, sign_y, 0.0)) * weights.y
+      + (normal_z - float3(0.0, 0.0, sign_z)) * weights.z;
+    return normalize(geometric_normal + perturbation);
 }
 
 float4 unpack_unorm_rgba8(uint packed_value) {
@@ -519,13 +647,31 @@ ForwardOutput PSMain(PSInput input, bool front_face : SV_IsFrontFace) {
     if (!front_face) {
         normal = -normal;
     }
+    bool uses_triplanar = input.mapping_parameters.x > 0.5;
+    float3 mapping_position =
+        input.mapping_position * input.mapping_parameters.y;
+    float3 mapping_normal = normal;
+    float3 mapping_weights = triplanar_weights(
+        mapping_normal,
+        input.mapping_parameters.z
+    );
     uint texture_flags = (uint)(emissive.w + 0.5);
     if ((texture_flags & 2u) != 0u) {
-        float3 tangent_normal =
-            normal_map.Sample(normal_sampler, input.uv).xyz * 2.0 - 1.0;
-        normal = normalize(mul(tangent_normal, cotangent_frame(
-            normal, input.local_position, input.uv
-        )));
+        if (uses_triplanar) {
+            normal = sample_triplanar_normal(
+                normal_map,
+                normal_sampler,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            );
+        } else {
+            float3 tangent_normal =
+                normal_map.Sample(normal_sampler, input.uv).xyz * 2.0 - 1.0;
+            normal = normalize(mul(tangent_normal, cotangent_frame(
+                normal, input.local_position, input.uv
+            )));
+        }
     }
     float perceptual_roughness = max(roughness, 0.04);
     float4 sampled_base_color = base_color;
@@ -535,7 +681,15 @@ ForwardOutput PSMain(PSInput input, bool front_face : SV_IsFrontFace) {
     bool uses_texture = (surface_flags >= 1.0 && surface_flags < 2.0)
                      || surface_flags >= 3.0;
     if (uses_texture) {
-        sampled_base_color *= base_color_map.Sample(base_color_sampler, input.uv);
+        sampled_base_color *= uses_triplanar
+            ? sample_triplanar(
+                base_color_map,
+                base_color_sampler,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            )
+            : base_color_map.Sample(base_color_sampler, input.uv);
     }
     sampled_base_color *= input.particle_color;
     if (masked) {
@@ -547,16 +701,42 @@ ForwardOutput PSMain(PSInput input, bool front_face : SV_IsFrontFace) {
     float ao_value = ambient_occlusion;
     float3 emissive_color = emissive.rgb;
     if ((texture_flags & 4u) != 0u) {
-        float4 metallic_roughness_sample =
-            metallic_roughness_map.Sample(metallic_roughness_sampler, input.uv);
+        float4 metallic_roughness_sample = uses_triplanar
+            ? sample_triplanar(
+                metallic_roughness_map,
+                metallic_roughness_sampler,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            )
+            : metallic_roughness_map.Sample(
+                metallic_roughness_sampler,
+                input.uv
+            );
         roughness_value = max(roughness_value * metallic_roughness_sample.g, 0.04);
         metallic_value *= metallic_roughness_sample.b;
     }
     if ((texture_flags & 8u) != 0u) {
-        ao_value *= occlusion_map.Sample(occlusion_sampler, input.uv).r;
+        ao_value *= uses_triplanar
+            ? sample_triplanar(
+                occlusion_map,
+                occlusion_sampler,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            ).r
+            : occlusion_map.Sample(occlusion_sampler, input.uv).r;
     }
     if ((texture_flags & 16u) != 0u) {
-        emissive_color *= emissive_map.Sample(emissive_sampler, input.uv).rgb;
+        emissive_color *= uses_triplanar
+            ? sample_triplanar(
+                emissive_map,
+                emissive_sampler,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            ).rgb
+            : emissive_map.Sample(emissive_sampler, input.uv).rgb;
     }
     float3 light_direction = normalize(scene_light_direction.xyz);
     float n_dot_l = saturate(dot(normal, light_direction));

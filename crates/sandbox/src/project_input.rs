@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
-#[cfg(any(test, feature = "backend-vulkan"))]
+#[cfg(any(test, feature = "target-desktop"))]
 use std::collections::HashMap;
 
 use engine_asset::project::GameProject;
-#[cfg(any(test, feature = "backend-vulkan"))]
+#[cfg(any(test, feature = "target-desktop"))]
 use engine_gameplay::input::{resolve_action, set_current_value, RawInputEvent};
 #[cfg(test)]
 use engine_gameplay::input::{GamepadAxis, GamepadButton};
@@ -12,7 +12,7 @@ use engine_gameplay::input::{
     InputAction, InputActionMap, InputBinding, InputDevice, InputModifier, InputValue,
     InputValueType, KeyCode,
 };
-#[cfg(any(test, feature = "backend-vulkan"))]
+#[cfg(any(test, feature = "target-desktop"))]
 use platform::{MouseButton, PlatformEvent};
 use serde::{Deserialize, Serialize};
 
@@ -338,12 +338,12 @@ pub(crate) fn validate_input_map(map: &InputActionMap) -> Result<(), String> {
 
 /// Stateful bridge from platform press/release events to an action map.
 #[derive(Default)]
-#[cfg(any(test, feature = "backend-vulkan"))]
+#[cfg(any(test, feature = "target-desktop"))]
 pub(crate) struct ProjectInputState {
     held: HashMap<KeyCode, f32>,
 }
 
-#[cfg(any(test, feature = "backend-vulkan"))]
+#[cfg(any(test, feature = "target-desktop"))]
 impl ProjectInputState {
     #[cfg(all(feature = "tooling-editor", feature = "backend-vulkan"))]
     pub(crate) fn reset(&mut self, map: &mut InputActionMap) {
@@ -406,7 +406,7 @@ impl ProjectInputState {
     }
 }
 
-#[cfg(any(test, feature = "backend-vulkan"))]
+#[cfg(any(test, feature = "target-desktop"))]
 fn map_mouse_button(button: MouseButton) -> Option<KeyCode> {
     match button {
         MouseButton::Left => Some(KeyCode::MouseLeft),
@@ -416,7 +416,7 @@ fn map_mouse_button(button: MouseButton) -> Option<KeyCode> {
     }
 }
 
-#[cfg(any(test, feature = "backend-vulkan"))]
+#[cfg(any(test, feature = "target-desktop"))]
 fn map_platform_key(key: platform::KeyCode) -> Option<KeyCode> {
     use platform::KeyCode as P;
     Some(match key {

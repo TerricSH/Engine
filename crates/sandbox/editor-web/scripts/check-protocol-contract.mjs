@@ -4,7 +4,10 @@ import { fileURLToPath } from 'node:url'
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const rustProtocol = readFileSync(resolve(webRoot, '../src/editor_app/protocol.rs'), 'utf8')
-const rustDispatch = readFileSync(resolve(webRoot, '../src/editor_app/dispatch.rs'), 'utf8')
+const rustDispatch = readFileSync(
+  resolve(webRoot, '../src/editor_app/dispatch/router.rs'),
+  'utf8',
+)
 const tsProtocol = readFileSync(resolve(webRoot, 'src/bridge/protocol.ts'), 'utf8')
 const dockLayout = readFileSync(resolve(webRoot, 'src/layout/dockLayout.ts'), 'utf8')
 
@@ -26,9 +29,8 @@ if (decodedVariants.length !== rustMethods.size || aliasedVariants.length) {
 }
 
 const dispatchStart = rustDispatch.indexOf('fn dispatch_editor_request')
-const dispatchEnd = rustDispatch.indexOf('\n    fn require_editing', dispatchStart)
-if (dispatchStart < 0 || dispatchEnd < 0) throw new Error('Could not locate dispatch_editor_request')
-const dispatchBody = rustDispatch.slice(dispatchStart, dispatchEnd)
+if (dispatchStart < 0) throw new Error('Could not locate dispatch_editor_request')
+const dispatchBody = rustDispatch.slice(dispatchStart)
 const dispatchedVariants = new Set(
   [...dispatchBody.matchAll(/EditorRequest::([A-Za-z0-9_]+)/g)].map((match) => match[1]),
 )

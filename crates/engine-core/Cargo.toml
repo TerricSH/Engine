@@ -15,7 +15,6 @@ subsystem-ui = ["dep:engine-ui"]
 subsystem-physics = ["dep:engine-physics"]
 subsystem-gameplay = ["dep:engine-gameplay"]
 subsystem-terrain = ["dep:engine-terrain"]
-backend-vulkan = ["dep:render-vulkan", "dep:raw-window-handle"]
 # Compatibility profiles. New runtime code should gate against the leaf
 # subsystem features above instead of these aggregate aliases.
 runtime-subsystems = [
@@ -44,8 +43,6 @@ engine-gameplay = { path = "../engine-gameplay", optional = true }
 engine-vfx = { path = "../engine-vfx" }
 engine-ui = { path = "../engine-ui", optional = true }
 engine-terrain = { path = "../engine-terrain", optional = true }
-render-vulkan = { path = "../render-vulkan", optional = true }
-raw-window-handle = { workspace = true, optional = true }
 tracing.workspace = true
 glam.workspace = true
 bincode.workspace = true

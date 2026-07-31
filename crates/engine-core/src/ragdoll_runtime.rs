@@ -70,16 +70,12 @@ pub(crate) fn reconcile_before_physics(game_loop: &mut GameLoop) {
         for (body_index, entity) in graph.body_entities.iter().copied().enumerate() {
             let current_type = game_loop
                 .runtime
-                .with_world(|world| {
-                    world
-                        .get::<RigidBody>(entity)
-                        .map(|body| body.body_type.clone())
-                })
+                .with_world(|world| world.get::<RigidBody>(entity).map(|body| body.body_type))
                 .flatten();
             if current_type.as_ref() != Some(&desired_body_type) {
                 commands.push(PhysicsCommand::SetBodyType {
                     entity,
-                    body_type: desired_body_type.clone(),
+                    body_type: desired_body_type,
                 });
             }
             if ragdoll.mode == RagdollMode::Animated {
@@ -212,12 +208,16 @@ pub(crate) fn reconcile_after_physics(game_loop: &mut GameLoop, dt: f32) {
         }
 
         let mut final_globals = Vec::with_capacity(runtime_skeleton.bone_count());
-        for bone_index in 0..runtime_skeleton.bone_count() {
+        for (bone_index, local) in base_locals
+            .iter()
+            .copied()
+            .enumerate()
+            .take(runtime_skeleton.bone_count())
+        {
             if let Some(physical) = physical_globals.get(&bone_index) {
                 final_globals.push(*physical);
                 continue;
             }
-            let local = base_locals[bone_index];
             let global = match runtime_skeleton.parent_of(BoneIndex(bone_index as u16)) {
                 Some(parent) => final_globals[parent.0 as usize] * local,
                 None => local,

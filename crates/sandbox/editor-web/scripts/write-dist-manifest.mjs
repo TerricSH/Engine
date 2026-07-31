@@ -33,6 +33,9 @@ async function collectFiles(directory) {
 
 sourceFiles.push(...await collectFiles('editor-web/scripts'))
 sourceFiles.push(...await collectFiles('editor-web/src'))
+sourceFiles.push(...await collectFiles('src/editor_app/dispatch'))
+sourceFiles.push(...await collectFiles('src/editor_app/protocol'))
+sourceFiles.push(...await collectFiles('src/editor_app/snapshot'))
 const canonicalInputs = [...new Set(sourceFiles)].sort()
 const sourceHash = createHash('sha256')
 for (const path of canonicalInputs) {

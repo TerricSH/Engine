@@ -1,17 +1,27 @@
 //! Host bridge from `engine-terrain` CPU output to runtime meshes and ECS.
 
+mod anchors;
+mod material_mapping;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use engine_scene::components::{Bounds, Renderable, Transform};
-#[cfg(feature = "subsystem-physics")]
-use engine_terrain::TerrainCollisionData;
+use engine_scene::components::{Bounds, Renderable, Transform, VertexGeomorph};
 use engine_terrain::{
-    chunk_span, desired_chunks_hysteretic, HeightfieldGenerator, TerrainChunkData, TerrainChunkId,
-    TerrainDebugSnapshot, TerrainRuntime, TerrainRuntimeConfig, TerrainRuntimeEvent, TerrainVolume,
+    desired_terrain_chunks_for_volume_hysteretic, terrain_chunk_bounds, terrain_chunk_distance,
+    HeightfieldGenerator, PlanetSurfaceAnchor, PlanetSurfaceOccupancy, PlanetSurfaceVolumeKey,
+    TerrainChunkData, TerrainChunkId, TerrainDebugSnapshot, TerrainRuntime, TerrainRuntimeConfig,
+    TerrainRuntimeEvent, TerrainTopology, TerrainVolume, TerrainVolumeId,
 };
+#[cfg(feature = "subsystem-physics")]
+use engine_terrain::{TerrainCollisionData, TerrainTriangleCollisionData};
 use glam::{Vec2, Vec3};
 
 use crate::{EngineRuntime, RuntimeMeshDescriptor, RuntimeMeshHandle};
+use material_mapping::projected_material_mapping;
+
+pub(crate) fn runtime_entity_identity_label(entity: engine_scene::Entity) -> String {
+    format!("runtime:{}:{}", entity.index(), entity.generation())
+}
 
 struct ChunkBinding {
     mesh: RuntimeMeshHandle,
@@ -21,6 +31,8 @@ struct ChunkBinding {
     collision: Option<TerrainCollisionData>,
     #[cfg(feature = "subsystem-physics")]
     collision_span: f32,
+    #[cfg(feature = "subsystem-physics")]
+    triangle_collision: Option<TerrainTriangleCollisionData>,
     active: bool,
 }
 
@@ -28,6 +40,7 @@ impl ChunkBinding {
     #[cfg(feature = "subsystem-physics")]
     fn release_staged_collision(&mut self) {
         self.collision = None;
+        self.triangle_collision = None;
     }
 
     #[cfg(not(feature = "subsystem-physics"))]
@@ -38,30 +51,91 @@ type ChunkKey = (TerrainChunkId, u64);
 
 #[derive(Clone, Copy, Debug)]
 struct ChunkRegion {
-    min_x: f64,
-    min_z: f64,
-    max_x: f64,
-    max_z: f64,
+    min: [f64; 3],
+    max: [f64; 3],
+}
+
+#[derive(Clone, Debug)]
+struct TerrainVolumeCandidate {
+    volume_id: TerrainVolumeId,
+    identity_label: String,
+    occupancy_scope: PlanetSurfaceVolumeKey,
+    persistent_id: Option<String>,
+    volume: TerrainVolume,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveTerrainVolume {
+    occupancy_scope: PlanetSurfaceVolumeKey,
+    persistent_id: Option<String>,
+    volume: TerrainVolume,
+    material: String,
+}
+
+fn reject_colliding_volume_ids(
+    candidates: Vec<TerrainVolumeCandidate>,
+) -> (Vec<TerrainVolumeCandidate>, Vec<String>) {
+    let mut groups = BTreeMap::<TerrainVolumeId, Vec<TerrainVolumeCandidate>>::new();
+    for candidate in candidates {
+        groups
+            .entry(candidate.volume_id)
+            .or_default()
+            .push(candidate);
+    }
+    let mut unique = Vec::new();
+    let mut errors = Vec::new();
+    for (volume_id, mut group) in groups {
+        if group.len() == 1 {
+            unique.push(group.pop().expect("one candidate"));
+            continue;
+        }
+        group.sort_by(|left, right| left.identity_label.cmp(&right.identity_label));
+        errors.push(format!(
+            "terrain volume identity collision for {:016x}: {}",
+            volume_id.get(),
+            group
+                .iter()
+                .map(|candidate| candidate.identity_label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let mut occupancy_groups =
+        BTreeMap::<PlanetSurfaceVolumeKey, Vec<TerrainVolumeCandidate>>::new();
+    for candidate in unique {
+        occupancy_groups
+            .entry(candidate.occupancy_scope.clone())
+            .or_default()
+            .push(candidate);
+    }
+    let mut fully_unique = Vec::new();
+    for (_, mut group) in occupancy_groups {
+        if group.len() == 1 {
+            fully_unique.push(group.pop().expect("one candidate"));
+            continue;
+        }
+        group.sort_by(|left, right| left.identity_label.cmp(&right.identity_label));
+        errors.push(format!(
+            "terrain volume occupancy identity collision: {}",
+            group
+                .iter()
+                .map(|candidate| candidate.identity_label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    fully_unique.sort_by(|left, right| left.identity_label.cmp(&right.identity_label));
+    (fully_unique, errors)
 }
 
 impl ChunkRegion {
     fn from_request(id: TerrainChunkId, volume: &TerrainVolume) -> Self {
-        let span = chunk_span(volume, id.lod);
-        let min_x = id.x as f64 * span;
-        let min_z = id.z as f64 * span;
-        Self {
-            min_x,
-            min_z,
-            max_x: min_x + span,
-            max_z: min_z + span,
-        }
+        let (min, max) = terrain_chunk_bounds(volume, id);
+        Self { min, max }
     }
 
     fn overlaps(self, other: Self) -> bool {
-        self.min_x < other.max_x
-            && other.min_x < self.max_x
-            && self.min_z < other.max_z
-            && other.min_z < self.max_z
+        (0..3).all(|axis| self.min[axis] < other.max[axis] && other.min[axis] < self.max[axis])
     }
 }
 
@@ -77,7 +151,8 @@ fn binding_can_retire(
     let mut replacements = desired
         .iter()
         .filter_map(|(desired_key, desired_region)| {
-            region.overlaps(*desired_region).then_some(*desired_key)
+            (desired_key.0.volume_id == key.0.volume_id && region.overlaps(*desired_region))
+                .then_some(*desired_key)
         })
         .peekable();
     replacements.peek().is_none()
@@ -101,6 +176,7 @@ pub struct TerrainSystem {
     runtime: TerrainRuntime<HeightfieldGenerator>,
     chunks: BTreeMap<ChunkKey, ChunkBinding>,
     previous_desired: BTreeSet<TerrainChunkId>,
+    surface_occupancy: PlanetSurfaceOccupancy,
     stats: TerrainBindingStats,
     regeneration_epoch: u64,
 }
@@ -117,6 +193,7 @@ impl TerrainSystem {
             runtime: TerrainRuntime::new(HeightfieldGenerator, config),
             chunks: BTreeMap::new(),
             previous_desired: BTreeSet::new(),
+            surface_occupancy: PlanetSurfaceOccupancy::default(),
             stats: TerrainBindingStats::default(),
             regeneration_epoch: 0,
         }
@@ -132,16 +209,35 @@ impl TerrainSystem {
                 .query::<TerrainVolume>()
                 .filter(|(_, volume)| volume.enabled)
                 .map(|(entity, volume)| {
-                    (
-                        world
-                            .persistent_id(entity)
-                            .unwrap_or("<runtime-entity>")
-                            .to_string(),
-                        volume.clone(),
-                    )
+                    if let Some(persistent_id) = world.persistent_id(entity) {
+                        TerrainVolumeCandidate {
+                            volume_id: TerrainVolumeId::from_persistent_id(persistent_id),
+                            identity_label: persistent_id.to_string(),
+                            occupancy_scope: PlanetSurfaceVolumeKey::Persistent(
+                                persistent_id.to_string(),
+                            ),
+                            persistent_id: Some(persistent_id.to_string()),
+                            volume: volume.clone(),
+                        }
+                    } else {
+                        let identity_label = runtime_entity_identity_label(entity);
+                        TerrainVolumeCandidate {
+                            volume_id: TerrainVolumeId::from_runtime_entity(
+                                entity.index(),
+                                entity.generation(),
+                            ),
+                            occupancy_scope: PlanetSurfaceVolumeKey::from_runtime_entity(
+                                entity.index(),
+                                entity.generation(),
+                            ),
+                            identity_label,
+                            persistent_id: None,
+                            volume: volume.clone(),
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
-            volumes.sort_by(|left, right| left.0.cmp(&right.0));
+            volumes.sort_by(|left, right| left.identity_label.cmp(&right.identity_label));
             let origin = world.world_origin();
             let camera = engine_scene::active_camera_world_position(world).unwrap_or(Vec3::ZERO);
             (volumes, origin, camera)
@@ -149,63 +245,66 @@ impl TerrainSystem {
         let Some((volumes, world_origin, camera_relative)) = selected else {
             return false;
         };
-        let volume = match volumes.as_slice() {
-            [] => None,
-            [(_, volume)] => Some(volume.clone()),
-            _ => {
-                self.stats.last_error = Some(format!(
-                    "multiple enabled TerrainVolume components are not allowed: {}",
-                    volumes
-                        .iter()
-                        .map(|(entity_id, _)| entity_id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                None
-            }
-        };
-        if volumes.len() <= 1
-            && self
-                .stats
-                .last_error
-                .as_deref()
-                .is_some_and(|message| message.starts_with("multiple enabled TerrainVolume"))
-        {
-            self.stats.last_error = None;
-        }
         let focus = focus_logical.unwrap_or([
             world_origin[0] + f64::from(camera_relative.x),
             world_origin[1] + f64::from(camera_relative.y),
             world_origin[2] + f64::from(camera_relative.z),
         ]);
-        let (desired, material) = if let Some(volume) = volume {
-            let mut desired = match volume.validate() {
-                Ok(()) => {
-                    if self.stats.last_error.as_deref().is_some_and(|message| {
-                        message.starts_with("invalid terrain configuration:")
-                            || message.starts_with("multiple enabled TerrainVolume")
-                    }) {
-                        self.stats.last_error = None;
-                    }
-                    desired_chunks_hysteretic(&volume, [focus[0], focus[2]], &self.previous_desired)
-                }
-                Err(error) => {
-                    self.stats.last_error = Some(format!("invalid terrain configuration: {error}"));
-                    Vec::new()
-                }
-            };
-            for request in &mut desired {
-                request.revision ^= self.regeneration_epoch;
+        let mut active_volumes = BTreeMap::<TerrainVolumeId, ActiveTerrainVolume>::new();
+        let mut desired = Vec::new();
+        let (volumes, mut selection_errors) = reject_colliding_volume_ids(volumes);
+        for candidate in volumes {
+            let TerrainVolumeCandidate {
+                volume_id,
+                identity_label,
+                occupancy_scope,
+                persistent_id,
+                volume,
+            } = candidate;
+            if let Err(error) = volume.validate() {
+                selection_errors.push(format!(
+                    "terrain volume '{identity_label}' has invalid configuration: {error}"
+                ));
+                continue;
             }
             let material = if volume.material_asset.is_empty() {
                 "mat-default".to_string()
             } else {
-                volume.material_asset
+                volume.material_asset.clone()
             };
-            (desired, material)
+            let mut volume_desired = desired_terrain_chunks_for_volume_hysteretic(
+                volume_id,
+                &volume,
+                focus,
+                &self.previous_desired,
+            );
+            for request in &mut volume_desired {
+                request.revision ^= self.regeneration_epoch;
+            }
+            desired.extend(volume_desired);
+            active_volumes.insert(
+                volume_id,
+                ActiveTerrainVolume {
+                    occupancy_scope,
+                    persistent_id,
+                    volume,
+                    material,
+                },
+            );
+        }
+        if selection_errors.is_empty() {
+            if self.stats.last_error.as_deref().is_some_and(|message| {
+                message.starts_with("terrain volume '")
+                    || message.starts_with("terrain volume identity collision")
+                    || message.starts_with("terrain volume occupancy identity collision")
+                    || message.starts_with("invalid terrain configuration:")
+                    || message.starts_with("multiple enabled TerrainVolume")
+            }) {
+                self.stats.last_error = None;
+            }
         } else {
-            (Vec::new(), "mat-default".to_string())
-        };
+            self.stats.last_error = Some(selection_errors.join("; "));
+        }
         let next_desired = desired
             .iter()
             .map(|request| request.id)
@@ -228,20 +327,41 @@ impl TerrainSystem {
             match event {
                 TerrainRuntimeEvent::Ready(data) => {
                     let key = (data.id, data.revision);
+                    let Some(volume) = active_volumes.get(&data.id.volume_id) else {
+                        let message = format!(
+                            "terrain chunk {:?} completed without an active owning volume",
+                            data.id
+                        );
+                        let _ = self
+                            .runtime
+                            .commit_failed(data.id, data.revision, message.clone());
+                        self.stats.mesh_failures += 1;
+                        self.stats.last_error = Some(message);
+                        continue;
+                    };
                     let region = desired_regions.get(&key).copied().unwrap_or(ChunkRegion {
-                        min_x: data.origin[0],
-                        min_z: data.origin[2],
-                        max_x: data.origin[0] + f64::from(data.mesh.bounds_max[0]),
-                        max_z: data.origin[2] + f64::from(data.mesh.bounds_max[2]),
+                        min: std::array::from_fn(|axis| {
+                            data.origin[axis] + f64::from(data.mesh.bounds_min[axis])
+                        }),
+                        max: std::array::from_fn(|axis| {
+                            data.origin[axis] + f64::from(data.mesh.bounds_max[axis])
+                        }),
                     });
                     let stage = self.chunks.iter().any(|(existing_key, binding)| {
                         *existing_key != key
+                            && existing_key.0.volume_id == key.0.volume_id
                             && binding.active
                             && !desired_regions.contains_key(existing_key)
                             && binding.region.overlaps(region)
                     });
-                    match self.create_chunk_binding(engine, &data, &material, world_origin, !stage)
-                    {
+                    match self.create_chunk_binding(
+                        engine,
+                        &data,
+                        &volume.material,
+                        Some(&volume.volume),
+                        world_origin,
+                        !stage,
+                    ) {
                         Ok(binding) => {
                             if self.runtime.commit_succeeded(data.id, data.revision) {
                                 if let Some(replaced) = self.chunks.insert(key, binding) {
@@ -301,6 +421,7 @@ impl TerrainSystem {
                 }
                 let blockers_retire = self.chunks.iter().all(|(blocker_key, blocker)| {
                     !blocker.active
+                        || blocker_key.0.volume_id != key.0.volume_id
                         || desired_regions.contains_key(blocker_key)
                         || !blocker.region.overlaps(binding.region)
                         || retiring.contains(blocker_key)
@@ -314,6 +435,8 @@ impl TerrainSystem {
         for key in activating {
             physics_changed |= self.activate_chunk(engine, key);
         }
+        self.update_chunk_geomorph(engine, &active_volumes, focus);
+        physics_changed |= self.update_surface_anchors(engine, &active_volumes, world_origin);
         self.stats.live_chunks = self.chunks.len();
         physics_changed
     }
@@ -324,6 +447,12 @@ impl TerrainSystem {
 
     pub fn binding_stats(&self) -> &TerrainBindingStats {
         &self.stats
+    }
+
+    /// Current deterministic construction reservations rebuilt from authored
+    /// [`PlanetSurfaceAnchor`] components on the most recent terrain tick.
+    pub fn surface_occupancy(&self) -> &PlanetSurfaceOccupancy {
+        &self.surface_occupancy
     }
 
     /// Invalidate all current/in-flight chunks without changing authored
@@ -343,6 +472,7 @@ impl TerrainSystem {
         }
         let _ = self.runtime.set_desired(std::iter::empty());
         self.previous_desired.clear();
+        self.surface_occupancy = PlanetSurfaceOccupancy::default();
         self.stats.live_chunks = 0;
     }
 
@@ -351,27 +481,23 @@ impl TerrainSystem {
         engine: &mut EngineRuntime,
         data: &TerrainChunkData,
         material: &str,
+        volume: Option<&TerrainVolume>,
         world_origin: [f64; 3],
         active: bool,
     ) -> Result<ChunkBinding, String> {
+        #[cfg(feature = "subsystem-physics")]
         let collision_span = data
             .collision
             .as_ref()
             .map(|collision| collision.sample_spacing * collision.columns.saturating_sub(1) as f32)
             .unwrap_or(data.mesh.bounds_max[0] - data.mesh.bounds_min[0]);
-        let half_span = collision_span * 0.5;
+        let local_center = Vec3::from_array(data.local_center);
         let descriptor = RuntimeMeshDescriptor {
             positions: data
                 .mesh
                 .positions
                 .iter()
-                .map(|position| {
-                    Vec3::new(
-                        position[0] - half_span,
-                        position[1],
-                        position[2] - half_span,
-                    )
-                })
+                .map(|position| Vec3::from_array(*position) - local_center)
                 .collect(),
             normals: data
                 .mesh
@@ -389,16 +515,8 @@ impl TerrainSystem {
                 .collect(),
             indices: data.mesh.indices.clone(),
             bounds: Some((
-                Vec3::new(
-                    data.mesh.bounds_min[0] - half_span,
-                    data.mesh.bounds_min[1],
-                    data.mesh.bounds_min[2] - half_span,
-                ),
-                Vec3::new(
-                    data.mesh.bounds_max[0] - half_span,
-                    data.mesh.bounds_max[1],
-                    data.mesh.bounds_max[2] - half_span,
-                ),
+                Vec3::from_array(data.mesh.bounds_min) - local_center,
+                Vec3::from_array(data.mesh.bounds_max) - local_center,
             )),
         };
         let name = format!("terrain-{}-r{:016x}", data.id.label(), data.revision);
@@ -410,10 +528,11 @@ impl TerrainSystem {
             .expect("new terrain runtime mesh has an asset id")
             .id;
         let relative_center = Vec3::new(
-            (data.origin[0] + f64::from(half_span) - world_origin[0]) as f32,
-            (data.origin[1] - world_origin[1]) as f32,
-            (data.origin[2] + f64::from(half_span) - world_origin[2]) as f32,
+            (data.origin[0] + f64::from(local_center.x) - world_origin[0]) as f32,
+            (data.origin[1] + f64::from(local_center.y) - world_origin[1]) as f32,
+            (data.origin[2] + f64::from(local_center.z) - world_origin[2]) as f32,
         );
+        let material_mapping = projected_material_mapping(data, volume);
         let entity = match engine.with_world_mut(|world| {
             let entity = world.create_entity();
             world.add_component(
@@ -433,8 +552,8 @@ impl TerrainSystem {
                     render_layer: "default".to_string(),
                 },
             );
-            let min = Vec3::from_array(data.mesh.bounds_min) - Vec3::new(half_span, 0.0, half_span);
-            let max = Vec3::from_array(data.mesh.bounds_max) - Vec3::new(half_span, 0.0, half_span);
+            let min = Vec3::from_array(data.mesh.bounds_min) - local_center;
+            let max = Vec3::from_array(data.mesh.bounds_max) - local_center;
             world.add_component(
                 entity,
                 Bounds {
@@ -442,6 +561,20 @@ impl TerrainSystem {
                     half_extents: ((max - min) * 0.5).to_array(),
                 },
             );
+            if let Some(mapping) = material_mapping {
+                world.add_component(entity, mapping);
+            }
+            if let Some(geomorph) = data.geomorph {
+                world.add_component(
+                    entity,
+                    VertexGeomorph {
+                        factor: 0.0,
+                        delta_scale: geomorph.delta_scale,
+                        local_origin: (Vec3::from_array(geomorph.local_origin) - local_center)
+                            .to_array(),
+                    },
+                );
+            }
             #[cfg(feature = "subsystem-physics")]
             if active {
                 if let Some(collision) = &data.collision {
@@ -465,6 +598,31 @@ impl TerrainSystem {
                             ..engine_physics::Collider::default()
                         },
                     );
+                } else if let Some(collision) = &data.triangle_collision {
+                    world.add_component(
+                        entity,
+                        engine_physics::RigidBody {
+                            body_type: engine_physics::BodyType::Static,
+                            gravity_scale: 0.0,
+                            ..engine_physics::RigidBody::default()
+                        },
+                    );
+                    world.add_component(
+                        entity,
+                        engine_physics::Collider {
+                            shape: engine_physics::ColliderShape::TriMesh {
+                                vertices: collision
+                                    .positions
+                                    .iter()
+                                    .map(|position| {
+                                        (Vec3::from_array(*position) - local_center).to_array()
+                                    })
+                                    .collect(),
+                                indices: collision.triangles.clone(),
+                            },
+                            ..engine_physics::Collider::default()
+                        },
+                    );
                 }
             }
             entity
@@ -475,22 +633,89 @@ impl TerrainSystem {
                 return Err("cannot commit terrain without an active World".to_string());
             }
         };
-        let span = f64::from(collision_span);
         Ok(ChunkBinding {
             mesh,
             entity,
             region: ChunkRegion {
-                min_x: data.origin[0],
-                min_z: data.origin[2],
-                max_x: data.origin[0] + span,
-                max_z: data.origin[2] + span,
+                min: std::array::from_fn(|axis| {
+                    data.origin[axis] + f64::from(data.mesh.bounds_min[axis])
+                }),
+                max: std::array::from_fn(|axis| {
+                    data.origin[axis] + f64::from(data.mesh.bounds_max[axis])
+                }),
             },
             #[cfg(feature = "subsystem-physics")]
             collision: if active { None } else { data.collision.clone() },
             #[cfg(feature = "subsystem-physics")]
             collision_span,
+            #[cfg(feature = "subsystem-physics")]
+            triangle_collision: if active {
+                None
+            } else {
+                data.triangle_collision
+                    .as_ref()
+                    .map(|collision| TerrainTriangleCollisionData {
+                        positions: collision
+                            .positions
+                            .iter()
+                            .map(|position| (Vec3::from_array(*position) - local_center).to_array())
+                            .collect(),
+                        triangles: collision.triangles.clone(),
+                    })
+            },
             active,
         })
+    }
+
+    fn update_chunk_geomorph(
+        &self,
+        engine: &mut EngineRuntime,
+        volumes: &BTreeMap<TerrainVolumeId, ActiveTerrainVolume>,
+        focus: [f64; 3],
+    ) {
+        let updates = self
+            .chunks
+            .iter()
+            .map(|((id, _), binding)| {
+                let factor = volumes
+                    .get(&id.volume_id)
+                    .map(|volume| &volume.volume)
+                    .filter(|volume| {
+                        volume.geomorph_enabled
+                            && volume.topology == TerrainTopology::CubeSphere
+                            && id.face != engine_terrain::TerrainFace::Planar
+                            && id.lod < volume.planet_max_lod
+                    })
+                    .and_then(|volume| {
+                        volume.lod_distances.get(usize::from(id.lod)).map(|cutoff| {
+                            let cutoff = f64::from(*cutoff);
+                            let start = cutoff * f64::from(volume.geomorph_start_ratio);
+                            let width = (cutoff - start).max(f64::EPSILON);
+                            let t = ((terrain_chunk_distance(volume, *id, focus) - start) / width)
+                                .clamp(0.0, 1.0) as f32;
+                            t * t * (3.0 - 2.0 * t)
+                        })
+                    })
+                    .unwrap_or(0.0);
+                (binding.entity, factor)
+            })
+            .collect::<Vec<_>>();
+        let _ = engine.with_world_mut(|world| {
+            for (entity, factor) in updates {
+                if let Some(morph) = world.get_mut::<VertexGeomorph>(entity) {
+                    morph.factor = factor;
+                }
+            }
+        });
+    }
+
+    fn update_surface_anchors(
+        &mut self,
+        engine: &mut EngineRuntime,
+        volumes: &BTreeMap<TerrainVolumeId, ActiveTerrainVolume>,
+        world_origin: [f64; 3],
+    ) -> bool {
+        anchors::update_surface_anchors(self, engine, volumes, world_origin)
     }
 
     fn activate_chunk(&mut self, engine: &mut EngineRuntime, key: ChunkKey) -> bool {
@@ -505,6 +730,8 @@ impl TerrainSystem {
         let collision = binding.collision.clone();
         #[cfg(feature = "subsystem-physics")]
         let collision_span = binding.collision_span;
+        #[cfg(feature = "subsystem-physics")]
+        let triangle_collision = binding.triangle_collision.clone();
         let activated = engine
             .with_world_mut(|world| {
                 let Some(renderable) = world.get_mut::<Renderable>(entity) else {
@@ -529,6 +756,25 @@ impl TerrainSystem {
                                 columns: collision.columns,
                                 heights: collision.heights,
                                 scale: [collision_span, 1.0, collision_span],
+                            },
+                            ..engine_physics::Collider::default()
+                        },
+                    );
+                } else if let Some(collision) = triangle_collision {
+                    world.add_component(
+                        entity,
+                        engine_physics::RigidBody {
+                            body_type: engine_physics::BodyType::Static,
+                            gravity_scale: 0.0,
+                            ..engine_physics::RigidBody::default()
+                        },
+                    );
+                    world.add_component(
+                        entity,
+                        engine_physics::Collider {
+                            shape: engine_physics::ColliderShape::TriMesh {
+                                vertices: collision.positions,
+                                indices: collision.triangles,
                             },
                             ..engine_physics::Collider::default()
                         },
@@ -569,169 +815,5 @@ impl TerrainSystem {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use engine_scene::World;
-
-    use super::*;
-    use crate::EngineConfig;
-
-    #[test]
-    fn parent_retires_only_after_all_overlapping_children_commit() {
-        let volume = TerrainVolume {
-            chunk_size: 8.0,
-            lod_distances: vec![6.0, 16.0],
-            lod_hysteresis: 1.0,
-            ..TerrainVolume::default()
-        };
-        let parent_id = TerrainChunkId::new(0, 0, 1);
-        let parent_key = (parent_id, 1);
-        let parent_region = ChunkRegion::from_request(parent_id, &volume);
-        let desired = [(0, 0), (1, 0), (0, 1), (1, 1)]
-            .into_iter()
-            .map(|(x, z)| {
-                let id = TerrainChunkId::new(x, z, 0);
-                ((id, 2), ChunkRegion::from_request(id, &volume))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut committed = desired.keys().copied().collect::<BTreeSet<_>>();
-        let missing = *committed.first().expect("four children");
-        committed.remove(&missing);
-        assert!(!binding_can_retire(
-            parent_key,
-            parent_region,
-            &desired,
-            &committed
-        ));
-        committed.insert(missing);
-        assert!(binding_can_retire(
-            parent_key,
-            parent_region,
-            &desired,
-            &committed
-        ));
-    }
-
-    fn runtime_with_small_terrain() -> EngineRuntime {
-        let mut runtime = EngineRuntime::new(EngineConfig::default());
-        let mut world = World::new();
-        let entity = world.create_entity();
-        world.add_component(
-            entity,
-            TerrainVolume {
-                chunk_size: 8.0,
-                base_resolution: 9,
-                lod_distances: vec![6.0],
-                lod_hysteresis: 1.0,
-                ..TerrainVolume::default()
-            },
-        );
-        runtime.set_world(world);
-        runtime
-    }
-
-    fn tick_until_settled(terrain: &mut TerrainSystem, runtime: &mut EngineRuntime) {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            terrain.tick(runtime, Some([0.0; 3]));
-            let stats = terrain.debug_snapshot().stats;
-            if stats.queued + stats.generating + stats.ready_to_commit == 0 && stats.resident > 0 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "terrain integration timed out");
-            std::thread::yield_now();
-        }
-    }
-
-    #[test]
-    fn generated_chunk_uses_runtime_mesh_and_transient_ecs_entity() {
-        let mut runtime = runtime_with_small_terrain();
-        let mut terrain = TerrainSystem::new(TerrainRuntimeConfig {
-            worker_count: 1,
-            max_in_flight: 1,
-            ..TerrainRuntimeConfig::default()
-        });
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while terrain.binding_stats().live_chunks == 0 {
-            terrain.tick(&mut runtime, Some([0.0; 3]));
-            assert!(Instant::now() < deadline, "terrain integration timed out");
-            std::thread::yield_now();
-        }
-        assert!(runtime.runtime_mesh_memory().mesh_count > 0);
-        assert!(
-            runtime
-                .with_world(|world| world.query::<Renderable>().count())
-                .unwrap()
-                > 0
-        );
-        #[cfg(feature = "subsystem-physics")]
-        assert!(runtime
-            .with_world(|world| world
-                .query::<engine_physics::Collider>()
-                .any(|(_, collider)| {
-                    matches!(
-                        collider.shape,
-                        engine_physics::ColliderShape::HeightField { .. }
-                    )
-                }))
-            .unwrap());
-
-        runtime.with_world_mut(|world| {
-            for (_, volume) in world.query_mut::<TerrainVolume>() {
-                volume.enabled = false;
-            }
-        });
-        terrain.tick(&mut runtime, Some([0.0; 3]));
-        assert_eq!(terrain.binding_stats().live_chunks, 0);
-        assert_eq!(runtime.runtime_mesh_memory().mesh_count, 0);
-    }
-
-    #[test]
-    fn failed_replacement_keeps_the_previous_binding_active() {
-        let mut runtime = runtime_with_small_terrain();
-        let mut terrain = TerrainSystem::new(TerrainRuntimeConfig {
-            worker_count: 1,
-            max_in_flight: 1,
-            ..TerrainRuntimeConfig::default()
-        });
-        tick_until_settled(&mut terrain, &mut runtime);
-        let old_key = *terrain
-            .chunks
-            .keys()
-            .next()
-            .expect("resident terrain chunk");
-        assert!(terrain.chunks[&old_key].active);
-
-        let revised = runtime
-            .with_world_mut(|world| {
-                let (_, volume) = world
-                    .query_mut::<TerrainVolume>()
-                    .next()
-                    .expect("terrain volume");
-                volume.height_scale += 1.0;
-                volume.revision()
-            })
-            .expect("world");
-        let conflicting_name = format!("terrain-{}-r{revised:016x}", old_key.0.label());
-        let conflict = runtime
-            .create_runtime_mesh(
-                &conflicting_name,
-                RuntimeMeshDescriptor::new(vec![Vec3::ZERO, Vec3::X, Vec3::Y], vec![0, 1, 2]),
-            )
-            .expect("reserve replacement mesh name");
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while terrain.binding_stats().mesh_failures == 0 {
-            terrain.tick(&mut runtime, Some([0.0; 3]));
-            assert!(Instant::now() < deadline, "host failure was not observed");
-            std::thread::yield_now();
-        }
-        assert!(terrain.chunks.contains_key(&old_key));
-        assert!(terrain.chunks[&old_key].active);
-        assert!(!terrain.chunks.contains_key(&(old_key.0, revised)));
-        runtime
-            .destroy_runtime_mesh(conflict)
-            .expect("release reserved mesh name");
-    }
-}
+#[path = "terrain/tests.rs"]
+mod tests;

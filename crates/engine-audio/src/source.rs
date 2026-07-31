@@ -40,6 +40,24 @@ impl AudioSource {
     /// AudioSource instances are created by [`AudioEngine`]; there is no
     /// public constructor — the engine allocates voice IDs and command
     /// channels internally.
+    pub(crate) fn new(
+        clip: Arc<AudioClip>,
+        cmd_tx: crossbeam_channel::Sender<AudioCommand>,
+        id: u64,
+    ) -> Self {
+        Self {
+            clip,
+            cmd_tx,
+            id,
+            volume: 1.0,
+            loop_enabled: false,
+            playing: false,
+            paused: false,
+            position_secs: 0.0,
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Start or resume playback.
     pub fn play(&mut self) {
         if self.paused {

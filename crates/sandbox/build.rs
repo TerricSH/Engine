@@ -19,7 +19,13 @@ const FRONTEND_ROOT_FILES: &[&str] = &[
     "src/editor_app/snapshot.rs",
 ];
 
-const FRONTEND_DIRECTORIES: &[&str] = &["editor-web/scripts", "editor-web/src"];
+const FRONTEND_DIRECTORIES: &[&str] = &[
+    "editor-web/scripts",
+    "editor-web/src",
+    "src/editor_app/dispatch",
+    "src/editor_app/protocol",
+    "src/editor_app/snapshot",
+];
 
 const DIST_ASSETS: &[&str] = &[
     "editor-web/dist/index.html",

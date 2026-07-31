@@ -13,6 +13,8 @@
 3. 数据被汇总为 `RenderFrameInput`，随后注入渲染扩展和 UI；`sync_render_assets()` 以 `AssetRegistry` 为唯一所有权来源，通过 `Renderer::upload_*()` 创建或更新资源，并在已同步的 typed entry 被注销或改型时通过同一同步阶段移除后端资源。Mesh、Texture、Material、Environment Map 和 Morph Target Set 的生产者都不直接维护 GPU 删除队列。
 4. 帧绘制走另一条同样经过渲染前端的路径：`Renderer::draw_scene()` 校验输入、构建 Render Graph，并通过唯一的 `compile()` 完成拓扑排序、无用 Pass 剔除和 Barrier 推导。
 5. Vulkan `SceneRenderer` 构建 clustered-light 列表，合并可实例化的静态/粒子批次，并按编译顺序执行可选的 CSM 阴影、HDR PBR Forward+、环境 IBL、后处理/Tone Map 和 UI Overlay。
+
+Vulkan HDR Forward 支持相机请求的 1×/2×/4×/8× MSAA。后端取颜色与深度采样能力的交集作为设备上限；多采样 HDR、OIT accumulation、OIT optical-depth 和深度附件在 Forward pass 内 resolve 到单采样纹理，再交给 Tone Map，运行时切换采样数会安全重建这些附件与管线。
 6. `end_frame()` 结束命令缓冲区，随后执行 `queue_submit()` 与 `queue_present()`。
 
 所有 `BackendRenderer` 现在都强制执行 Render Graph 生命周期；`LegacySinglePass` 和整帧 `render_frame()` 后端兼容入口已经删除。
@@ -71,3 +73,28 @@ flowchart TB
     End --> Submit["queue_submit"]
     Submit --> Present["queue_present"]
 ```
+
+## Planet rendering contracts
+
+Cube-sphere CDLOD chunks expose renderer-neutral `VertexGeomorph` state on each
+extracted drawable. Both Vulkan and DX12 consume the same two `float4` values
+and run the same radial parent-surface displacement in forward and shadow
+vertex stages. Vulkan carries them as draw push constants; DX12 stores the
+32-byte geomorph block at the front of the 64-byte `VertexDraw` header (`b1`);
+the second 32 bytes carry optional triplanar mapping and the optional
+64-matrix bone palette follows both. Static headers are packed once per frame
+into one growable upload arena with 256-byte-aligned CBV offsets, then reused
+by shadow and every forward view. A missing geomorph binds a zeroed block, so
+ordinary static meshes remain unchanged.
+
+`PlanetaryLensSettings` supports two modes. `Manual` sends authored values
+unchanged. `CameraAltitude` is resolved during `EngineRuntime` render
+extraction: the base camera's origin-relative position is combined with the
+f64 floating world origin, and the nearest enabled cube-sphere
+`PlanetTerrainQuery` computes signed terrain altitude. “Nearest” is the
+smallest absolute distance to the displaced surface, with a stable typed
+identity as the exact-tie breaker. A smoothstep between
+`altitude_fade_start` and `altitude_fade_end` scales barrel distortion, horizon
+curvature, atmosphere, and chromatic aberration together. Missing valid planet
+data disables the automatic effect for that frame; no gameplay or scene state
+transition is involved.

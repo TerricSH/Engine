@@ -8,12 +8,42 @@ use engine_serialize::Value;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Serializable, game-authored heightfield parameter block.
+/// Geometric domain used by a terrain volume.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerrainTopology {
+    /// Infinite X/Z heightfield centered around the streaming focus.
+    #[default]
+    Planar,
+    /// Six independently streamed quadtree faces projected onto a sphere.
+    CubeSphere,
+}
+
+/// Coordinate system used to project authored material textures onto terrain.
 ///
-/// The engine does not prescribe values or derive a planet/biome recipe.
+/// This policy belongs to the terrain/rendering contract rather than gameplay:
+/// it does not choose textures or biome rules, it only defines how every PBR
+/// texture slot is sampled continuously across streamed chunk boundaries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerrainMaterialProjection {
+    /// Select world-relative triplanar for planar terrain and planet-relative
+    /// triplanar for cube-sphere terrain.
+    #[default]
+    Automatic,
+    /// Preserve the generated mesh UVs. Cube-sphere patches use independent
+    /// UV islands, so this mode is intended for explicitly patch-aware assets.
+    MeshUv,
+    /// Project from logical world coordinates with a stable repeating phase.
+    WorldTriplanar,
+    /// Project from coordinates relative to `planet_center`.
+    PlanetTriplanar,
+}
+
+/// Serializable, game-authored terrain parameter block.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerrainVolume {
     pub enabled: bool,
+    #[serde(default)]
+    pub topology: TerrainTopology,
     pub seed: u64,
     pub chunk_size: f32,
     /// Finest grid dimension. Must be `2^n + 1` in `3..=513`.
@@ -28,16 +58,73 @@ pub struct TerrainVolume {
     pub skirt_depth: f32,
     pub collision_enabled: bool,
     pub material_asset: String,
+    /// Coordinate policy shared by base-color, normal and all PBR texture
+    /// slots. Ordinary non-terrain renderables continue to use mesh UVs.
+    #[serde(default)]
+    pub material_projection: TerrainMaterialProjection,
+    /// World-space length covered by one repeat of a projected texture.
+    #[serde(default = "default_material_tile_size")]
+    pub material_tile_size: f32,
+    /// Exponent used to sharpen triplanar axis weights.
+    #[serde(default = "default_triplanar_blend_sharpness")]
+    pub triplanar_blend_sharpness: f32,
     /// Increasing world-space distance cutoffs, one per LOD.
     pub lod_distances: Vec<f32>,
     /// World-space dead band applied when splitting/merging CDLOD nodes.
     pub lod_hysteresis: f32,
+    /// Logical-space center used by [`TerrainTopology::CubeSphere`].
+    #[serde(default)]
+    pub planet_center: [f64; 3],
+    /// Base sea-level radius used by [`TerrainTopology::CubeSphere`].
+    #[serde(default = "default_planet_radius")]
+    pub planet_radius: f64,
+    /// Cube-face quadtree depth. LOD 0 is the finest level and this value is
+    /// the one-patch-per-face root level.
+    #[serde(default = "default_planet_max_lod")]
+    pub planet_max_lod: u8,
+    /// Reject cube-sphere nodes that are conservatively hidden beyond the
+    /// geometric horizon before they enter generation or render extraction.
+    #[serde(default = "default_true")]
+    pub horizon_culling: bool,
+    /// Encode a parent-compatible radial target in generated vertex normals
+    /// so the renderer can continuously morph between adjacent quadtree LODs.
+    #[serde(default = "default_true")]
+    pub geomorph_enabled: bool,
+    /// Fraction of an LOD cutoff at which morphing begins. `1.0` disables the
+    /// transition interval; lower values produce a wider continuous blend.
+    #[serde(default = "default_geomorph_start_ratio")]
+    pub geomorph_start_ratio: f32,
+}
+
+const fn default_planet_radius() -> f64 {
+    1_000.0
+}
+
+const fn default_planet_max_lod() -> u8 {
+    2
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_geomorph_start_ratio() -> f32 {
+    0.7
+}
+
+const fn default_material_tile_size() -> f32 {
+    16.0
+}
+
+const fn default_triplanar_blend_sharpness() -> f32 {
+    4.0
 }
 
 impl Default for TerrainVolume {
     fn default() -> Self {
         Self {
             enabled: true,
+            topology: TerrainTopology::Planar,
             seed: 0,
             chunk_size: 64.0,
             base_resolution: 65,
@@ -51,8 +138,17 @@ impl Default for TerrainVolume {
             skirt_depth: 4.0,
             collision_enabled: true,
             material_asset: String::new(),
+            material_projection: TerrainMaterialProjection::Automatic,
+            material_tile_size: default_material_tile_size(),
+            triplanar_blend_sharpness: default_triplanar_blend_sharpness(),
             lod_distances: vec![160.0, 320.0, 640.0],
             lod_hysteresis: 16.0,
+            planet_center: [0.0; 3],
+            planet_radius: default_planet_radius(),
+            planet_max_lod: default_planet_max_lod(),
+            horizon_culling: default_true(),
+            geomorph_enabled: default_true(),
+            geomorph_start_ratio: default_geomorph_start_ratio(),
         }
     }
 }
@@ -125,6 +221,18 @@ impl TerrainVolume {
                 "height_scale plus skirt_depth must remain finite",
             ));
         }
+        if !self.material_tile_size.is_finite() || self.material_tile_size <= 0.0 {
+            return Err(TerrainConfigError::Invalid(
+                "material_tile_size must be finite and positive",
+            ));
+        }
+        if !self.triplanar_blend_sharpness.is_finite()
+            || !(1.0..=32.0).contains(&self.triplanar_blend_sharpness)
+        {
+            return Err(TerrainConfigError::Invalid(
+                "triplanar_blend_sharpness must be finite and in [1, 32]",
+            ));
+        }
         if self.lod_distances.is_empty()
             || self.lod_distances.len() > 16
             || self
@@ -144,6 +252,38 @@ impl TerrainVolume {
             return Err(TerrainConfigError::Invalid(
                 "lod_hysteresis must be finite, non-negative, and smaller than the first LOD distance",
             ));
+        }
+        if !self.geomorph_start_ratio.is_finite()
+            || !(0.0..1.0).contains(&self.geomorph_start_ratio)
+        {
+            return Err(TerrainConfigError::Invalid(
+                "geomorph_start_ratio must be finite and in [0, 1)",
+            ));
+        }
+        if self.topology == TerrainTopology::CubeSphere {
+            if self.planet_center.iter().any(|value| !value.is_finite()) {
+                return Err(TerrainConfigError::Invalid(
+                    "planet_center must contain only finite values",
+                ));
+            }
+            if !self.planet_radius.is_finite()
+                || self.planet_radius <= f64::from(self.height_scale + self.skirt_depth)
+                || self.planet_radius > f64::from(f32::MAX / 4.0)
+            {
+                return Err(TerrainConfigError::Invalid(
+                    "planet_radius must be finite, greater than height_scale plus skirt_depth, and representable by local f32 patch geometry",
+                ));
+            }
+            if self.planet_max_lod > 15 {
+                return Err(TerrainConfigError::Invalid(
+                    "planet_max_lod must be in 0..=15",
+                ));
+            }
+            if self.lod_distances.len() != usize::from(self.planet_max_lod) + 1 {
+                return Err(TerrainConfigError::Invalid(
+                    "cube-sphere terrain requires one lod_distances entry per level (planet_max_lod + 1)",
+                ));
+            }
         }
         let max_span = f64::from(self.chunk_size)
             * 2.0f64.powi(self.lod_distances.len().saturating_sub(1) as i32);
@@ -166,6 +306,16 @@ impl TerrainVolume {
             }
         };
         mix(&self.seed.to_le_bytes());
+        mix(&[match self.topology {
+            TerrainTopology::Planar => 0,
+            TerrainTopology::CubeSphere => 1,
+        }]);
+        mix(&[match self.material_projection {
+            TerrainMaterialProjection::Automatic => 0,
+            TerrainMaterialProjection::MeshUv => 1,
+            TerrainMaterialProjection::WorldTriplanar => 2,
+            TerrainMaterialProjection::PlanetTriplanar => 3,
+        }]);
         for value in [
             self.chunk_size,
             self.height_scale,
@@ -176,12 +326,24 @@ impl TerrainVolume {
             self.domain_warp_frequency,
             self.skirt_depth,
             self.lod_hysteresis,
+            self.material_tile_size,
+            self.triplanar_blend_sharpness,
         ] {
             mix(&value.to_bits().to_le_bytes());
         }
         mix(&self.base_resolution.to_le_bytes());
         mix(&self.octaves.to_le_bytes());
         mix(&[self.collision_enabled as u8]);
+        for value in self.planet_center {
+            mix(&value.to_bits().to_le_bytes());
+        }
+        mix(&self.planet_radius.to_bits().to_le_bytes());
+        mix(&[
+            self.planet_max_lod,
+            self.horizon_culling as u8,
+            self.geomorph_enabled as u8,
+        ]);
+        mix(&self.geomorph_start_ratio.to_bits().to_le_bytes());
         for distance in &self.lod_distances {
             mix(&distance.to_bits().to_le_bytes());
         }
@@ -209,8 +371,9 @@ pub fn register_terrain_extensions(registry: &mut ComponentRegistry) {
         .is_ok();
     if registered {
         let _ = registry.register_fields_validator(TerrainVolume::TYPE_ID, validate_terrain_fields);
-        let _ = registry.register_singleton(TerrainVolume::TYPE_ID);
     }
+    crate::placement::register_planet_surface_anchor(registry);
+    crate::transition_component::register_planet_scene_transition(registry);
 }
 
 fn validate_terrain_fields(fields: &BTreeMap<String, Value>) -> Result<(), String> {
@@ -244,8 +407,26 @@ fn serialize_terrain(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
     let terrain = component
         .downcast_ref::<TerrainVolume>()
         .expect("TerrainVolume expected");
+    serialize_terrain_fields(terrain)
+}
+
+/// Serialize the canonical scene fields for an authored terrain volume.
+///
+/// Editor factories use this entry point so newly added terrain parameters
+/// cannot drift from the runtime component registry's defaults.
+pub fn serialize_terrain_fields(terrain: &TerrainVolume) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
     fields.insert("enabled".into(), Value::Bool(terrain.enabled));
+    fields.insert(
+        "topology".into(),
+        Value::Enum(
+            match terrain.topology {
+                TerrainTopology::Planar => "Planar",
+                TerrainTopology::CubeSphere => "CubeSphere",
+            }
+            .into(),
+        ),
+    );
     fields.insert("seed".into(), Value::UInt(terrain.seed));
     fields.insert("chunk_size".into(), Value::Float32(terrain.chunk_size));
     fields.insert(
@@ -275,6 +456,26 @@ fn serialize_terrain(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
         Value::Asset(engine_serialize::AssetId::new(&terrain.material_asset)),
     );
     fields.insert(
+        "material_projection".into(),
+        Value::Enum(
+            match terrain.material_projection {
+                TerrainMaterialProjection::Automatic => "Automatic",
+                TerrainMaterialProjection::MeshUv => "MeshUv",
+                TerrainMaterialProjection::WorldTriplanar => "WorldTriplanar",
+                TerrainMaterialProjection::PlanetTriplanar => "PlanetTriplanar",
+            }
+            .into(),
+        ),
+    );
+    fields.insert(
+        "material_tile_size".into(),
+        Value::Float32(terrain.material_tile_size),
+    );
+    fields.insert(
+        "triplanar_blend_sharpness".into(),
+        Value::Float32(terrain.triplanar_blend_sharpness),
+    );
+    fields.insert(
         "lod_distances".into(),
         Value::List(
             terrain
@@ -289,6 +490,36 @@ fn serialize_terrain(component: &dyn std::any::Any) -> BTreeMap<String, Value> {
         "lod_hysteresis".into(),
         Value::Float32(terrain.lod_hysteresis),
     );
+    fields.insert(
+        "planet_center".into(),
+        Value::List(
+            terrain
+                .planet_center
+                .into_iter()
+                .map(Value::Float64)
+                .collect(),
+        ),
+    );
+    fields.insert(
+        "planet_radius".into(),
+        Value::Float64(terrain.planet_radius),
+    );
+    fields.insert(
+        "planet_max_lod".into(),
+        Value::UInt(u64::from(terrain.planet_max_lod)),
+    );
+    fields.insert(
+        "horizon_culling".into(),
+        Value::Bool(terrain.horizon_culling),
+    );
+    fields.insert(
+        "geomorph_enabled".into(),
+        Value::Bool(terrain.geomorph_enabled),
+    );
+    fields.insert(
+        "geomorph_start_ratio".into(),
+        Value::Float32(terrain.geomorph_start_ratio),
+    );
     fields
 }
 
@@ -296,6 +527,12 @@ fn deserialize_terrain(fields: &BTreeMap<String, Value>) -> Box<dyn std::any::An
     let mut terrain = TerrainVolume::default();
     if let Some(Value::Bool(value)) = fields.get("enabled") {
         terrain.enabled = *value;
+    }
+    match fields.get("topology") {
+        Some(Value::Enum(value)) | Some(Value::Str(value)) if value == "CubeSphere" => {
+            terrain.topology = TerrainTopology::CubeSphere;
+        }
+        _ => {}
     }
     if let Some(Value::UInt(value)) = fields.get("seed") {
         terrain.seed = *value;
@@ -316,6 +553,9 @@ fn deserialize_terrain(fields: &BTreeMap<String, Value>) -> Box<dyn std::any::An
     float_field!("domain_warp_frequency", domain_warp_frequency);
     float_field!("skirt_depth", skirt_depth);
     float_field!("lod_hysteresis", lod_hysteresis);
+    float_field!("geomorph_start_ratio", geomorph_start_ratio);
+    float_field!("material_tile_size", material_tile_size);
+    float_field!("triplanar_blend_sharpness", triplanar_blend_sharpness);
     if let Some(Value::UInt(value)) = fields.get("base_resolution") {
         terrain.base_resolution = *value as u32;
     }
@@ -330,6 +570,18 @@ fn deserialize_terrain(fields: &BTreeMap<String, Value>) -> Box<dyn std::any::An
         Some(Value::Str(value)) => terrain.material_asset = value.clone(),
         _ => {}
     }
+    terrain.material_projection = match fields.get("material_projection") {
+        Some(Value::Enum(value)) | Some(Value::Str(value)) if value == "MeshUv" => {
+            TerrainMaterialProjection::MeshUv
+        }
+        Some(Value::Enum(value)) | Some(Value::Str(value)) if value == "WorldTriplanar" => {
+            TerrainMaterialProjection::WorldTriplanar
+        }
+        Some(Value::Enum(value)) | Some(Value::Str(value)) if value == "PlanetTriplanar" => {
+            TerrainMaterialProjection::PlanetTriplanar
+        }
+        _ => TerrainMaterialProjection::Automatic,
+    };
     if let Some(Value::List(values)) = fields.get("lod_distances") {
         terrain.lod_distances = values
             .iter()
@@ -338,6 +590,32 @@ fn deserialize_terrain(fields: &BTreeMap<String, Value>) -> Box<dyn std::any::An
                 _ => None,
             })
             .collect();
+    }
+    if let Some(Value::List(values)) = fields.get("planet_center") {
+        if let [x, y, z] = values.as_slice() {
+            let number = |value: &Value| match value {
+                Value::Float64(value) => Some(*value),
+                Value::Float32(value) => Some(f64::from(*value)),
+                _ => None,
+            };
+            if let (Some(x), Some(y), Some(z)) = (number(x), number(y), number(z)) {
+                terrain.planet_center = [x, y, z];
+            }
+        }
+    }
+    match fields.get("planet_radius") {
+        Some(Value::Float64(value)) => terrain.planet_radius = *value,
+        Some(Value::Float32(value)) => terrain.planet_radius = f64::from(*value),
+        _ => {}
+    }
+    if let Some(Value::UInt(value)) = fields.get("planet_max_lod") {
+        terrain.planet_max_lod = u8::try_from(*value).unwrap_or(u8::MAX);
+    }
+    if let Some(Value::Bool(value)) = fields.get("horizon_culling") {
+        terrain.horizon_culling = *value;
+    }
+    if let Some(Value::Bool(value)) = fields.get("geomorph_enabled") {
+        terrain.geomorph_enabled = *value;
     }
     Box::new(terrain)
 }
@@ -353,6 +631,12 @@ mod tests {
         let terrain = TerrainVolume {
             seed: 42,
             material_asset: "ground".into(),
+            material_projection: TerrainMaterialProjection::PlanetTriplanar,
+            material_tile_size: 128.0,
+            triplanar_blend_sharpness: 6.0,
+            topology: TerrainTopology::CubeSphere,
+            planet_center: [1.0e9, -2.0e9, 3.0e9],
+            planet_radius: 6_000_000.0,
             ..Default::default()
         };
         let fields = serialize_terrain(&terrain);
@@ -360,6 +644,26 @@ mod tests {
             .downcast::<TerrainVolume>()
             .expect("terrain type");
         assert_eq!(*restored, terrain);
+    }
+
+    #[test]
+    fn validation_rejects_invalid_projected_material_parameters() {
+        assert!(TerrainVolume {
+            material_tile_size: 0.0,
+            ..TerrainVolume::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("material_tile_size"));
+        assert!(TerrainVolume {
+            triplanar_blend_sharpness: 33.0,
+            ..TerrainVolume::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("triplanar_blend_sharpness"));
     }
 
     #[test]
@@ -395,6 +699,21 @@ mod tests {
     }
 
     #[test]
+    fn cube_sphere_validation_requires_a_complete_lod_chain() {
+        let terrain = TerrainVolume {
+            topology: TerrainTopology::CubeSphere,
+            planet_max_lod: 3,
+            lod_distances: vec![100.0, 200.0, 400.0],
+            ..TerrainVolume::default()
+        };
+        assert!(terrain
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("planet_max_lod + 1"));
+    }
+
+    #[test]
     fn registry_validator_rejects_invalid_or_lossy_fields() {
         let mut registry = ComponentRegistry::new();
         register_terrain_extensions(&mut registry);
@@ -419,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_multiple_terrain_volumes_in_one_scene() {
+    fn registry_allows_multiple_terrain_volumes_in_one_scene() {
         let mut registry = ComponentRegistry::new();
         register_terrain_extensions(&mut registry);
         let mut scene = engine_scene::sample_scene();
@@ -435,14 +754,8 @@ mod tests {
             .components
             .insert(TerrainVolume::TYPE_ID.to_string(), component);
 
-        let error =
-            match engine_scene::World::try_from_scene_with_registry(&scene, Arc::new(registry)) {
-                Ok(_) => panic!("duplicate singleton terrain must fail"),
-                Err(error) => error,
-            };
-        assert!(error.diagnostics.iter().any(|diagnostic| matches!(
-            diagnostic,
-            engine_scene::SceneLoadDiagnostic::DuplicateSingletonComponent { .. }
-        )));
+        let world = engine_scene::World::try_from_scene_with_registry(&scene, Arc::new(registry))
+            .expect("terrain volumes are ordinary per-entity components");
+        assert_eq!(world.query::<TerrainVolume>().count(), 2);
     }
 }

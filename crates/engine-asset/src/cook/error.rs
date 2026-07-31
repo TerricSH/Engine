@@ -3,7 +3,7 @@ use std::io;
 
 /// Errors that can occur during the asset cooking pipeline.
 #[derive(Debug)]
-pub enum CookError {
+pub enum AssetCookError {
     /// An I/O error (file not found, permission denied, etc.).
     Io(io::Error),
     /// A parse error when reading a source file (e.g. invalid JSON/glTF).
@@ -18,31 +18,34 @@ pub enum CookError {
     UnsupportedFormat(String),
 }
 
-impl fmt::Display for CookError {
+/// Backwards-compatible short name for [`AssetCookError`].
+pub type CookError = AssetCookError;
+
+impl fmt::Display for AssetCookError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CookError::Io(e) => write!(f, "I/O error: {e}"),
-            CookError::Parse(msg) => write!(f, "parse error: {msg}"),
-            CookError::Compile(msg) => write!(f, "shader compile error: {msg}"),
-            CookError::Reflection(msg) => write!(f, "reflection error: {msg}"),
-            CookError::InvalidAsset(msg) => write!(f, "invalid asset: {msg}"),
-            CookError::UnsupportedFormat(msg) => write!(f, "unsupported format: {msg}"),
+            AssetCookError::Io(e) => write!(f, "I/O error: {e}"),
+            AssetCookError::Parse(msg) => write!(f, "parse error: {msg}"),
+            AssetCookError::Compile(msg) => write!(f, "shader compile error: {msg}"),
+            AssetCookError::Reflection(msg) => write!(f, "reflection error: {msg}"),
+            AssetCookError::InvalidAsset(msg) => write!(f, "invalid asset: {msg}"),
+            AssetCookError::UnsupportedFormat(msg) => write!(f, "unsupported format: {msg}"),
         }
     }
 }
 
-impl std::error::Error for CookError {
+impl std::error::Error for AssetCookError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            CookError::Io(e) => Some(e),
+            AssetCookError::Io(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<io::Error> for CookError {
+impl From<io::Error> for AssetCookError {
     fn from(e: io::Error) -> Self {
-        CookError::Io(e)
+        AssetCookError::Io(e)
     }
 }
 
@@ -50,6 +53,14 @@ impl From<io::Error> for CookError {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+
+    #[test]
+    fn legacy_cook_error_is_the_asset_cook_error() {
+        assert_eq!(
+            std::any::TypeId::of::<CookError>(),
+            std::any::TypeId::of::<AssetCookError>()
+        );
+    }
 
     #[test]
     fn cook_error_io_display() {

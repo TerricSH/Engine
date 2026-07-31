@@ -1,17 +1,10 @@
 use crate::Component;
+pub use engine_serialize::LightKind;
 use engine_serialize::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use super::field_as_f32;
-
-/// Kind of light source.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LightKind {
-    Directional,
-    Point,
-    Spot,
-}
 
 /// Light component.
 #[derive(Clone, Debug, Serialize, Deserialize)]

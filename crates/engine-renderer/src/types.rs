@@ -1,7 +1,11 @@
 pub use engine_serialize::{
-    AssetId, ContractVersion, Diagnostic, DiagnosticSeverity, HashDigest, PersistentId,
+    AssetId, ContractVersion, Diagnostic, DiagnosticSeverity, HashDigest, LightKind, PersistentId,
 };
+pub use render_core::IndexFormat;
 use serde::{Deserialize, Serialize};
+
+mod renderables;
+pub use renderables::{RadialVertexMorph, RenderableItem, SkinnedItem, TriplanarMaterialMapping};
 
 pub const RENDERER_INPUT_CONTRACT: &str = "RendererInput-v0.2.0";
 pub const IDENTITY_MAT4: Mat4 = [
@@ -147,39 +151,6 @@ pub enum ViewCompose {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RenderableItem {
-    pub entity: Option<PersistentId>,
-    pub mesh: AssetId,
-    pub material: AssetId,
-    pub world_transform: Mat4,
-    pub bounds: AxisAlignedBox,
-    pub render_layer: String,
-    pub cast_shadows: bool,
-    pub sort_key: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SkinnedItem {
-    pub entity: Option<PersistentId>,
-    pub mesh: AssetId,
-    pub material: AssetId,
-    pub skeleton: AssetId,
-    pub bone_palette: Vec<Mat4>,
-    pub bone_palette_layout: BonePaletteLayout,
-    /// Optional GPU morph-target set applied before skeletal skinning.
-    #[serde(default)]
-    pub morph_target_set: Option<AssetId>,
-    /// Per-target weights in asset order (up to eight).
-    #[serde(default)]
-    pub morph_weights: Vec<f32>,
-    pub world_transform: Mat4,
-    pub bounds: AxisAlignedBox,
-    pub render_layer: String,
-    pub cast_shadows: bool,
-    pub sort_key: u64,
-}
-
 /// One compact billboard instance. Position is already relative to the
 /// frame's render origin; size is the full authored billboard scale.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -274,13 +245,6 @@ pub struct LightItem {
     pub shadow_mode: ShadowMode,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LightKind {
-    Directional,
-    Point,
-    Spot,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SpotAngles {
     pub inner: f32,
@@ -338,27 +302,33 @@ pub enum Transparency {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MeshBinding {
     pub mesh_id: AssetId,
-    pub vertex_layout: VertexLayout,
+    pub vertex_layout: MeshVertexLayout,
     pub index_format: IndexFormat,
     pub submeshes: Vec<Submesh>,
     pub bounds: AxisAlignedBox,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VertexLayout {
+pub struct MeshVertexLayout {
     pub stride_bytes: u32,
-    pub attributes: Vec<VertexAttribute>,
+    pub attributes: Vec<MeshVertexAttribute>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VertexAttribute {
-    pub semantic: VertexSemantic,
-    pub format: VertexAttributeFormat,
+pub struct MeshVertexAttribute {
+    pub semantic: MeshVertexSemantic,
+    pub format: MeshVertexAttributeFormat,
     pub offset_bytes: u32,
 }
 
+/// Compatibility name for the renderer's typed mesh-binding layout. RHI
+/// pipeline layouts are canonically owned by `render-core::VertexLayout`.
+pub type VertexLayout = MeshVertexLayout;
+/// Compatibility name for [`MeshVertexAttribute`].
+pub type VertexAttribute = MeshVertexAttribute;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VertexSemantic {
+pub enum MeshVertexSemantic {
     Position,
     Normal,
     Tangent,
@@ -370,28 +340,17 @@ pub enum VertexSemantic {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VertexAttributeFormat {
+pub enum MeshVertexAttributeFormat {
     Float32x2,
     Float32x3,
     Float32x4,
     Uint16x4,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IndexFormat {
-    U16,
-    U32,
-}
-
-impl IndexFormat {
-    /// Size of one packed index in bytes.
-    pub const fn byte_size(self) -> usize {
-        match self {
-            Self::U16 => 2,
-            Self::U32 => 4,
-        }
-    }
-}
+/// Compatibility name for [`MeshVertexSemantic`].
+pub type VertexSemantic = MeshVertexSemantic;
+/// Compatibility name for [`MeshVertexAttributeFormat`].
+pub type VertexAttributeFormat = MeshVertexAttributeFormat;
 
 /// The first portable mesh format supported by the renderer upload contract.
 ///
@@ -727,6 +686,9 @@ pub struct UiVertex {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RenderOptions {
     pub tone_mapping: ToneMapping,
+    /// Absolute photographic EV100. Backends calibrate this against the
+    /// engine's default physical camera so artist-scale lighting remains
+    /// neutral at f/16, 1/60 s, ISO 100.
     pub exposure_ev100: Option<f32>,
     /// Strategy used for alpha-blended geometry. Weighted blended OIT avoids
     /// per-object sorting and scales to dense transparent effects while the
@@ -815,6 +777,8 @@ pub struct PostProcessSettings {
     pub bloom: BloomSettings,
     pub color_grading: ColorGradingSettings,
     pub vignette: VignetteSettings,
+    /// Screen-space high-altitude curvature and atmospheric lens model.
+    pub planetary_lens: PlanetaryLensSettings,
 }
 
 impl Default for PostProcessSettings {
@@ -824,8 +788,99 @@ impl Default for PostProcessSettings {
             bloom: BloomSettings::default(),
             color_grading: ColorGradingSettings::default(),
             vignette: VignetteSettings::default(),
+            planetary_lens: PlanetaryLensSettings::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanetaryLensSettings {
+    pub enabled: bool,
+    /// Radial barrel distortion. Positive values expand the apparent horizon.
+    pub barrel_distortion: f32,
+    /// Vertical bow applied across the image to suggest a curved horizon.
+    pub horizon_curvature: f32,
+    /// Rayleigh-like blue haze added toward the view perimeter.
+    pub atmosphere_intensity: f32,
+    /// Radial RGB separation in normalized screen coordinates.
+    pub chromatic_aberration: f32,
+    /// Selects whether authored values are used directly or faded from the
+    /// active camera's signed altitude above cube-sphere terrain.
+    pub mode: PlanetaryLensMode,
+    /// Altitude at or below which automatic mode contributes no lens effect.
+    pub altitude_fade_start: f64,
+    /// Altitude at or above which automatic mode contributes the full effect.
+    pub altitude_fade_end: f64,
+}
+
+impl Default for PlanetaryLensSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            barrel_distortion: 0.025,
+            horizon_curvature: 0.018,
+            atmosphere_intensity: 0.06,
+            chromatic_aberration: 0.001,
+            mode: PlanetaryLensMode::Manual,
+            altitude_fade_start: 1_000.0,
+            altitude_fade_end: 20_000.0,
+        }
+    }
+}
+
+impl PlanetaryLensSettings {
+    /// Compute the smooth altitude weight used by [`PlanetaryLensMode::CameraAltitude`].
+    ///
+    /// Manual mode always returns full strength. Automatic mode fails closed
+    /// when no valid planet altitude is available, which prevents a stale
+    /// high-altitude distortion from leaking into unrelated scenes.
+    pub fn altitude_intensity(&self, camera_altitude: Option<f64>) -> f32 {
+        if self.mode == PlanetaryLensMode::Manual {
+            return 1.0;
+        }
+        let Some(altitude) = camera_altitude.filter(|altitude| altitude.is_finite()) else {
+            return 0.0;
+        };
+        if !self.altitude_fade_start.is_finite()
+            || !self.altitude_fade_end.is_finite()
+            || self.altitude_fade_end <= self.altitude_fade_start
+        {
+            return 0.0;
+        }
+        let linear = ((altitude - self.altitude_fade_start)
+            / (self.altitude_fade_end - self.altitude_fade_start))
+            .clamp(0.0, 1.0);
+        (linear * linear * (3.0 - 2.0 * linear)) as f32
+    }
+
+    /// Resolve authored settings into the backend-facing values for one frame.
+    ///
+    /// This deliberately leaves manual settings byte-for-byte unchanged.
+    pub fn resolved_for_camera_altitude(self, camera_altitude: Option<f64>) -> Self {
+        if self.mode == PlanetaryLensMode::Manual {
+            return self;
+        }
+        let strength = self.altitude_intensity(camera_altitude);
+        Self {
+            enabled: self.enabled && strength > 0.0,
+            barrel_distortion: self.barrel_distortion * strength,
+            horizon_curvature: self.horizon_curvature * strength,
+            atmosphere_intensity: self.atmosphere_intensity * strength,
+            chromatic_aberration: self.chromatic_aberration * strength,
+            ..self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanetaryLensMode {
+    /// Use the authored effect values without runtime modification.
+    #[default]
+    Manual,
+    /// Smoothly fade the authored values according to the active camera's
+    /// altitude above the single enabled cube-sphere terrain volume.
+    CameraAltitude,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -899,7 +954,7 @@ impl Default for VignetteSettings {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct FrameStats {
+pub struct RendererFrameStats {
     pub visible_drawables: u32,
     pub culled_drawables: u32,
     pub visible_lights: u32,
@@ -921,3 +976,6 @@ pub struct FrameStats {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpu_pass_times: Vec<crate::frame_timing::GpuPassTime>,
 }
+
+/// Backwards-compatible short name for [`RendererFrameStats`].
+pub type FrameStats = RendererFrameStats;

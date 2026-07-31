@@ -17,8 +17,7 @@
 //!   → polymesh_to_navmesh               (output conversion)
 //! ```
 
-use crate::cook::config::CookError;
-pub use crate::cook::config::NavMeshCookConfig;
+pub use crate::cook::config::{CookError, NavMeshBakeError, NavMeshCookConfig};
 use crate::cook::{compact, contour, convert, heightfield, polymesh, region};
 use crate::navmesh::NavMesh;
 use glam::Vec3;
@@ -56,8 +55,8 @@ impl NavMeshCooker {
         vertices: &[Vec3],
         indices: &[u32],
         config: &NavMeshCookConfig,
-    ) -> Result<NavMesh, CookError> {
-        config.validate().map_err(CookError::InvalidConfig)?;
+    ) -> Result<NavMesh, NavMeshBakeError> {
+        config.validate().map_err(NavMeshBakeError::InvalidConfig)?;
 
         // 1. Voxelise.
         let mut hf = heightfield::Heightfield::alloc(config);
@@ -83,16 +82,16 @@ impl NavMeshCooker {
 
         let _num_reg =
             region::build_regions(&mut chf, config.min_region_area, config.merge_region_area)
-                .map_err(|_| CookError::RegionGenerationFailed)?;
+                .map_err(|_| NavMeshBakeError::RegionGenerationFailed)?;
 
         // 5. Contours.
         let cs =
             contour::build_contours(&chf, config.max_simplification_error, config.max_edge_len)
-                .map_err(|e| CookError::ContourGenerationFailed(e.to_string()))?;
+                .map_err(|e| NavMeshBakeError::ContourGenerationFailed(e.to_string()))?;
 
         // 6. Polygon mesh.
         let pm = polymesh::build_poly_mesh(&cs, config.max_verts_per_poly)
-            .map_err(|e| CookError::PolyMeshGenerationFailed(e.to_string()))?;
+            .map_err(|e| NavMeshBakeError::PolyMeshGenerationFailed(e.to_string()))?;
 
         // 7. Convert to NavMesh.
         Ok(convert::polymesh_to_navmesh(&pm))

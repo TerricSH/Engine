@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod backend_shared;
 mod clustered_lighting;
 pub mod debug_draw;
 pub mod frame_timing;

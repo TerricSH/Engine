@@ -19,7 +19,7 @@ mod session;
 pub use combat::{
     AbilityDefinition, ActiveStatus, BattleCommand, BattleEffect, BattleError, BattleEvent,
     BattleFormula, BattlePhase, BattleSession, BattleSide, BattleUnit, ClassicBattleFormula,
-    DamageKind, Element, StatusDefinition, TargetRule,
+    CombatDamageKind, DamageKind, Element, StatusDefinition, TargetRule,
 };
 pub use database::{ActorDefinition, DatabaseError, EnemyDefinition, JrpgDatabase};
 pub use encounter::{EncounterError, EncounterMeter, EncounterTable, EnemyFormation};

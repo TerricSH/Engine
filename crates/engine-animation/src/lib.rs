@@ -23,11 +23,14 @@ pub mod ragdoll;
 pub mod root_motion;
 pub mod state_machine;
 
-pub use clip::{AnimationClip as RuntimeAnimationClip, Keyframe as RuntimeKeyframe};
+pub use clip::{RuntimeAnimationClip, RuntimeKeyframe};
 pub use pose::Pose;
-pub use skeleton::{AnimationError, BoneIndex, BoneTransform};
+pub use skeleton::{AnimationError, BoneIndex, BoneTransform, RuntimeSkeleton};
 
-pub use assets::{AnimationChannel, AnimationClip, Joint, JointTransform, Keyframe, Skeleton};
+pub use assets::{
+    AnimationChannel, AnimationClip, AnimationClipAsset, AssetKeyframe, Joint, JointTransform,
+    Keyframe, Skeleton, SkeletonAsset,
+};
 pub use blend_space::*;
 pub use locomotion_clips::*;
 

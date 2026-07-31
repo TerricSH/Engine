@@ -1,7 +1,7 @@
 use engine_scene::WorldSlot;
 use engine_serialize::Diagnostic;
 
-use crate::script_component_diagnostic;
+use crate::runtime::script_component_diagnostic;
 
 #[cfg_attr(not(feature = "subsystem-animation"), allow(dead_code))]
 pub(crate) enum ScriptAnimationCommand {

@@ -1,9 +1,9 @@
 {
   "schema": 1,
-  "sourceHash": "0685dec5eb3f6a933511a3ea1e3acfbaf5d8e8cb1a04e770b36925eb364a5b29",
+  "sourceHash": "fbbdf5fdb9e57ade3b2abec322ce68d095c18ab85462ec51147a529082db85ee",
   "assets": {
     "index.html": "4dbec092533916f22ed12cb169c88a048bda1ea757101f32fbd3268e7522de06",
-    "assets/editor.js": "350b027e4a33191960da153e65ef9bb3e8a0be4c67617fb5e6b4dcbbce2ba263",
+    "assets/editor.js": "d84f0a2cf9383b817f4b8107c10f44997836a687f377c8783c524664cd872628",
     "assets/editor.css": "161aa2f6386b8aa3f7ca8c9c56d1f2f3c1f818fcd042be7a575d671602e6f614"
   }
 }

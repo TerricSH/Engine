@@ -242,7 +242,7 @@ impl PhysicsWorld {
                 }
                 PhysicsCommand::SetBodyType { entity, body_type } => {
                     if let Some(component) = world.get_mut::<RigidBody>(entity) {
-                        component.body_type = body_type.clone();
+                        component.body_type = body_type;
                     }
                     self.backend.set_body_type(entity, body_type);
                 }

@@ -16,11 +16,17 @@ pub enum BattleSide {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DamageKind {
+pub enum CombatDamageKind {
     Physical,
     Magical,
     Direct,
 }
+
+/// Backwards-compatible name for [`CombatDamageKind`].
+///
+/// New code should use the domain-qualified name to distinguish combat
+/// formula selection from physics/destruction damage sources.
+pub type DamageKind = CombatDamageKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,7 +58,7 @@ pub enum TargetRule {
 pub enum BattleEffect {
     Damage {
         power: i32,
-        kind: DamageKind,
+        kind: CombatDamageKind,
         #[serde(default = "neutral_element")]
         element: Element,
     },
@@ -298,7 +304,13 @@ pub enum BattleError {
 
 /// Strategy boundary for a project's damage formula.
 pub trait BattleFormula {
-    fn damage(&self, attacker: StatBlock, target: StatBlock, power: i32, kind: DamageKind) -> i32;
+    fn damage(
+        &self,
+        attacker: StatBlock,
+        target: StatBlock,
+        power: i32,
+        kind: CombatDamageKind,
+    ) -> i32;
 
     fn healing(&self, caster: StatBlock, power: i32) -> i32;
 }
@@ -307,13 +319,19 @@ pub trait BattleFormula {
 pub struct ClassicBattleFormula;
 
 impl BattleFormula for ClassicBattleFormula {
-    fn damage(&self, attacker: StatBlock, target: StatBlock, power: i32, kind: DamageKind) -> i32 {
+    fn damage(
+        &self,
+        attacker: StatBlock,
+        target: StatBlock,
+        power: i32,
+        kind: CombatDamageKind,
+    ) -> i32 {
         let (offense, defense) = match kind {
-            DamageKind::Physical => (attacker.attack, target.defense),
-            DamageKind::Magical => (attacker.magic, target.resistance),
-            DamageKind::Direct => (power, 0),
+            CombatDamageKind::Physical => (attacker.attack, target.defense),
+            CombatDamageKind::Magical => (attacker.magic, target.resistance),
+            CombatDamageKind::Direct => (power, 0),
         };
-        if kind == DamageKind::Direct {
+        if kind == CombatDamageKind::Direct {
             return power.max(0);
         }
         offense
@@ -794,6 +812,18 @@ impl BattleSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_damage_kind_is_the_combat_damage_kind() {
+        assert_eq!(
+            std::any::TypeId::of::<DamageKind>(),
+            std::any::TypeId::of::<CombatDamageKind>()
+        );
+        assert_eq!(
+            serde_json::to_string(&CombatDamageKind::Physical).unwrap(),
+            "\"physical\""
+        );
+    }
 
     fn stats(attack: i32, defense: i32, speed: i32) -> StatBlock {
         StatBlock {

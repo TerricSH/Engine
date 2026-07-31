@@ -35,7 +35,7 @@ subsystem crates      engine-script contract
     |
 engine-renderer backend abstraction
     |
-backend crates (Vulkan, future backends)
+application-selected backend crates (Vulkan, DX12, future backends)
 ```
 
 ## Feature model
@@ -52,12 +52,16 @@ Leaf features are the supported unit of conditional compilation:
 | `subsystem-gameplay` | gameplay state/input orchestration |
 | `subsystem-terrain` | terrain streaming and rendering |
 | `subsystem-scripting-csharp` | managed-script host and command contract |
-| `backend-vulkan` | Vulkan backend construction |
-
 `runtime-subsystems`, `gameplay`, and `terrain` remain compatibility aliases for
 existing applications. New `#[cfg]` expressions inside `engine-core` must use
 leaf features. Cross-subsystem code uses the exact conjunction it needs, such
 as `subsystem-animation + subsystem-physics` for ragdolls.
+
+Backend selection is intentionally not an `engine-core` feature. Native window
+handles and device creation stay at the application/backend adapter boundary;
+for example, `render-vulkan::create_backend_renderer` constructs the Vulkan
+implementation and the application installs it through the backend-neutral
+renderer contract.
 
 CI checks every leaf independently and checks the cross-feature pairs that own
 an adapter or integration path. Add a pair to `.github/scripts/ci.ps1` whenever
@@ -67,13 +71,23 @@ new code requires two optional capabilities.
 
 ```text
 engine-core/src/
-  lib.rs                    public types and composition root
+  lib.rs                    bounded public facade and re-exports
   runtime/
+    mod.rs                  runtime facade
+    assets.rs               asset registration and synchronization helpers
+    builder.rs              composition and subsystem registration
     rendering.rs            rendering facade and asset synchronization
+    scripting.rs            managed-script runtime adapter
+    state.rs                EngineRuntime state and lifecycle
   script_commands/
     animation.rs            script-to-animation adapter
     ui.rs                   script-to-retained-UI adapter
-  game_loop.rs              application loop orchestration
+  game_loop.rs              bounded application-loop facade
+  game_loop/
+    frame.rs                ordered frame stages
+    navigation.rs           navigation integration
+    physics.rs              physics integration
+    ...                     one module per optional subsystem
   terrain.rs                terrain integration facade
   tests.rs                  crate-root tests
 ```
@@ -82,3 +96,6 @@ When a block in `lib.rs` owns its own state transitions, validation, or domain
 mapping, extract it behind a private module first. Create another crate only
 when the code has a useful public API and can be compiled/tested without
 `EngineRuntime`.
+
+Architecture tests keep `lib.rs`, `game_loop.rs`, and the sandbox composition
+facades within explicit line and conditional-compilation budgets.

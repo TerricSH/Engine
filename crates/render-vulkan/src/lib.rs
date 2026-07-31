@@ -11,6 +11,7 @@ pub mod device_impl;
 mod error;
 mod instance;
 mod instance_data;
+mod platform_surface;
 pub mod scene_renderer;
 mod surface;
 mod swapchain;
@@ -47,7 +48,7 @@ impl VulkanBackend {
     /// surface-aware entry point is therefore the supported Vulkan device
     /// construction path until that contract grows a native-surface context.
     /// The selected adapter is available through [`Device::adapter_info`].
-    pub fn create_device_for_surface(
+    fn create_device_for_surface(
         &self,
         display_handle: RawDisplayHandle,
         window_handle: RawWindowHandle,
@@ -93,6 +94,45 @@ impl Backend for VulkanBackend {
 
 pub fn backend() -> VulkanBackend {
     VulkanBackend::new()
+}
+
+/// Create the engine renderer for a native Vulkan presentation surface.
+///
+/// Native handles and backend construction deliberately stay in this crate:
+/// `engine-core` only coordinates the backend-neutral renderer contract.
+fn create_backend_renderer(
+    display_handle: RawDisplayHandle,
+    window_handle: RawWindowHandle,
+    width: u32,
+    height: u32,
+    enable_validation: bool,
+    cache_dir: Option<&Path>,
+) -> Result<Box<dyn engine_renderer::BackendRenderer>, VulkanError> {
+    let device = VulkanBackend::new().create_device_for_surface(
+        display_handle,
+        window_handle,
+        width,
+        height,
+        enable_validation,
+        cache_dir,
+    )?;
+    Ok(Box::new(scene_renderer::SceneRenderer::new(
+        device, width, height,
+    )))
+}
+
+/// Create the Vulkan renderer from the platform crate's opaque surface.
+///
+/// Applications never import native handle crates; the platform snapshot is
+/// converted only inside this concrete backend adapter.
+pub fn create_backend_renderer_for_surface(
+    surface: platform::PlatformSurface,
+    width: u32,
+    height: u32,
+    enable_validation: bool,
+    cache_dir: Option<&Path>,
+) -> Result<Box<dyn engine_renderer::BackendRenderer>, VulkanError> {
+    platform_surface::create_renderer(surface, width, height, enable_validation, cache_dir)
 }
 
 #[cfg(test)]

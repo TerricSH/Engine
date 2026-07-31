@@ -58,12 +58,15 @@ impl JointTransform {
 
 /// A skeleton asset — joints in hierarchy order plus inverse bind matrices.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Skeleton {
+pub struct SkeletonAsset {
     pub joints: Vec<Joint>,
     pub inverse_bind_matrices: Vec<[[f32; 4]; 4]>,
 }
 
-impl Skeleton {
+/// Backwards-compatible asset name for [`SkeletonAsset`].
+pub type Skeleton = SkeletonAsset;
+
+impl SkeletonAsset {
     /// Number of joints in this skeleton.
     pub fn joint_count(&self) -> usize {
         self.joints.len()
@@ -121,10 +124,13 @@ impl Skeleton {
 
 /// A single keyframe storing a value at a specific time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Keyframe<T> {
+pub struct AssetKeyframe<T> {
     pub time: f32,
     pub value: T,
 }
+
+/// Backwards-compatible asset name for [`AssetKeyframe`].
+pub type Keyframe<T> = AssetKeyframe<T>;
 
 // ---------------------------------------------------------------------------
 // AnimationChannel
@@ -134,9 +140,9 @@ pub struct Keyframe<T> {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AnimationChannel {
     pub joint_index: u32,
-    pub translations: Vec<Keyframe<[f32; 3]>>,
-    pub rotations: Vec<Keyframe<[f32; 4]>>,
-    pub scales: Vec<Keyframe<[f32; 3]>>,
+    pub translations: Vec<AssetKeyframe<[f32; 3]>>,
+    pub rotations: Vec<AssetKeyframe<[f32; 4]>>,
+    pub scales: Vec<AssetKeyframe<[f32; 3]>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +151,7 @@ pub struct AnimationChannel {
 
 /// An animation clip asset — a named collection of channels plus duration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AnimationClip {
+pub struct AnimationClipAsset {
     pub name: String,
     pub duration: f32,
     pub channels: Vec<AnimationChannel>,
@@ -153,7 +159,10 @@ pub struct AnimationClip {
     pub joint_indices: Vec<u32>,
 }
 
-impl AnimationClip {
+/// Backwards-compatible asset name for [`AnimationClipAsset`].
+pub type AnimationClip = AnimationClipAsset;
+
+impl AnimationClipAsset {
     /// Total duration in seconds.
     pub fn duration(&self) -> f32 {
         self.duration
@@ -188,7 +197,7 @@ impl AnimationClip {
 }
 
 fn validate_keyframe_times<T>(
-    keyframes: &[Keyframe<T>],
+    keyframes: &[AssetKeyframe<T>],
     duration: f32,
     channel_index: usize,
     track_name: &str,
@@ -212,7 +221,7 @@ fn validate_keyframe_times<T>(
 }
 
 fn validate_vec3_track(
-    keyframes: &[Keyframe<[f32; 3]>],
+    keyframes: &[AssetKeyframe<[f32; 3]>],
     duration: f32,
     channel_index: usize,
     track_name: &str,
@@ -230,7 +239,7 @@ fn validate_vec3_track(
 }
 
 fn validate_quat_track(
-    keyframes: &[Keyframe<[f32; 4]>],
+    keyframes: &[AssetKeyframe<[f32; 4]>],
     duration: f32,
     channel_index: usize,
     track_name: &str,

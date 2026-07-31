@@ -8,16 +8,25 @@ mod cooker;
 pub mod debug;
 mod navmesh;
 mod pathfinding;
+mod space;
+mod spherical;
 
 pub use agent::{AgentUpdate, MovementIntent, NavAgent};
 pub use behavior::{AiBehavior, AiState, BehaviorAsset};
 pub use components::{
     register_nav_extensions, update_ai_agent, update_ai_agent_with_world_origin, AiAgent,
 };
-pub use cooker::NavMeshCooker;
+pub use cooker::{CookError, NavMeshBakeError, NavMeshCookConfig, NavMeshCooker};
 pub use debug::NavMeshDebugDraw;
 pub use navmesh::{NavError, NavMesh, PolygonIndex, VertexIndex};
 pub use pathfinding::{Path, PathPoint, Pathfinder};
+pub use space::{SpaceCell, SpaceNavConfig, SpaceNavError, SpaceNavGrid, SpacePath};
+pub use spherical::{
+    SphericalAgentId, SphericalAgentStatus, SphericalNavAgent, SphericalNavBuildConfig,
+    SphericalNavError, SphericalNavGraph, SphericalNavNode, SphericalNavObstacle,
+    SphericalNavRuntimeConfig, SphericalNavTick, SphericalNavigationRuntime, SphericalPath,
+    SphericalSurfaceSample, SphericalTraversalArea,
+};
 
 #[cfg(test)]
 mod tests {

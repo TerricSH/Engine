@@ -568,7 +568,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::{TerrainCollisionData, TerrainMeshData, TerrainVolume};
+    use crate::{TerrainCollisionData, TerrainMeshData, TerrainVolume, TerrainVolumeId};
 
     #[derive(Clone)]
     struct StubGenerator;
@@ -579,6 +579,7 @@ mod tests {
                 id: request.id,
                 revision: request.revision,
                 origin: [0.0; 3],
+                local_center: [0.0; 3],
                 mesh: TerrainMeshData {
                     positions: vec![[0.0; 3]; 4],
                     normals: vec![[0.0, 1.0, 0.0]; 4],
@@ -587,12 +588,14 @@ mod tests {
                     bounds_min: [0.0; 3],
                     bounds_max: [1.0; 3],
                 },
+                geomorph: None,
                 collision: Some(TerrainCollisionData {
                     rows: 2,
                     columns: 2,
                     heights: vec![0.0; 4],
                     sample_spacing: 1.0,
                 }),
+                triangle_collision: None,
             })
         }
     }
@@ -600,6 +603,19 @@ mod tests {
     fn request(x: i64, revision: u64, priority: u32) -> TerrainChunkRequest {
         TerrainChunkRequest {
             id: TerrainChunkId::new(x, 0, 0),
+            revision,
+            priority,
+            volume: TerrainVolume::default(),
+        }
+    }
+
+    fn request_for_volume(
+        volume_id: TerrainVolumeId,
+        revision: u64,
+        priority: u32,
+    ) -> TerrainChunkRequest {
+        TerrainChunkRequest {
+            id: TerrainChunkId::for_volume(volume_id, 0, 0, 0),
             revision,
             priority,
             volume: TerrainVolume::default(),
@@ -646,6 +662,56 @@ mod tests {
         acknowledge_ready(&mut runtime, &events);
         assert_eq!(runtime.snapshot().stats.resident, 1);
         assert_eq!(runtime.snapshot().stats.committed, 1);
+    }
+
+    #[test]
+    fn identical_coordinates_from_two_volumes_stream_and_unload_independently() {
+        let first_id = TerrainVolumeId::from_persistent_id("planet:first");
+        let second_id = TerrainVolumeId::from_persistent_id("planet:second");
+        let first = request_for_volume(first_id, 1, 0);
+        let second = request_for_volume(second_id, 1, 1);
+        let mut runtime = TerrainRuntime::new(
+            StubGenerator,
+            TerrainRuntimeConfig {
+                worker_count: 1,
+                max_in_flight: 2,
+                cache_budget_bytes: 1,
+                ..TerrainRuntimeConfig::default()
+            },
+        );
+
+        runtime.set_desired([first.clone(), second.clone()]);
+        let ready = tick_until(&mut runtime, 2);
+        assert_eq!(
+            ready
+                .iter()
+                .filter_map(|event| match event {
+                    TerrainRuntimeEvent::Ready(data) => Some(data.id.volume_id),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_id, second_id])
+        );
+        acknowledge_ready(&mut runtime, &ready);
+        runtime.tick();
+        let resident = runtime.snapshot();
+        assert_eq!(resident.stats.resident, 2);
+        assert_eq!(resident.stats.resident_bytes, 0);
+
+        let events = runtime.set_desired([second]);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    TerrainRuntimeEvent::Unload(id) => Some(id.volume_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [first_id]
+        );
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.stats.resident, 1);
+        assert_eq!(snapshot.chunks[0].id.volume_id, second_id);
     }
 
     #[test]

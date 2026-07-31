@@ -25,4 +25,6 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+engine-renderer = { path = "../engine-renderer" }
+render-core = { path = "../render-core" }
 tempfile = "3"

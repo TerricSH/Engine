@@ -125,7 +125,8 @@ impl VulkanDevice {
                 1,
             ),
             "depth_stencil" => (
-                self.depth_image
+                self.hdr_msaa_depth_image
+                    .or(self.depth_image)
                     .ok_or_else(|| "depth graph resource is not initialized".to_owned())?,
                 vk::ImageAspectFlags::DEPTH,
                 1,

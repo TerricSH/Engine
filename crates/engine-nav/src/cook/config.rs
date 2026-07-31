@@ -100,7 +100,7 @@ impl NavMeshCookConfig {
 }
 
 #[derive(Debug)]
-pub enum CookError {
+pub enum NavMeshBakeError {
     InvalidConfig(String),
     NoWalkableSurfaces,
     RegionGenerationFailed,
@@ -108,22 +108,34 @@ pub enum CookError {
     ContourGenerationFailed(String),
 }
 
-impl std::fmt::Display for CookError {
+/// Backwards-compatible short name for [`NavMeshBakeError`].
+pub type CookError = NavMeshBakeError;
+
+impl std::fmt::Display for NavMeshBakeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CookError::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
-            CookError::NoWalkableSurfaces => write!(f, "no walkable surfaces found"),
-            CookError::RegionGenerationFailed => write!(f, "region generation failed"),
-            CookError::PolyMeshGenerationFailed(msg) => write!(f, "polymesh: {msg}"),
-            CookError::ContourGenerationFailed(msg) => write!(f, "contour: {msg}"),
+            NavMeshBakeError::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
+            NavMeshBakeError::NoWalkableSurfaces => write!(f, "no walkable surfaces found"),
+            NavMeshBakeError::RegionGenerationFailed => write!(f, "region generation failed"),
+            NavMeshBakeError::PolyMeshGenerationFailed(msg) => write!(f, "polymesh: {msg}"),
+            NavMeshBakeError::ContourGenerationFailed(msg) => write!(f, "contour: {msg}"),
         }
     }
 }
-impl std::error::Error for CookError {}
+impl std::error::Error for NavMeshBakeError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_cook_error_is_the_navmesh_bake_error() {
+        assert_eq!(
+            std::any::TypeId::of::<CookError>(),
+            std::any::TypeId::of::<NavMeshBakeError>()
+        );
+    }
+
     #[test]
     fn config_defaults() {
         let cfg = NavMeshCookConfig::default();

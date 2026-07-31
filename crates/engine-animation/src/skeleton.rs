@@ -95,12 +95,15 @@ struct BoneData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Skeleton {
+pub struct RuntimeSkeleton {
     name: String,
     bones: Vec<BoneData>,
 }
 
-impl Skeleton {
+/// Backwards-compatible runtime name for [`RuntimeSkeleton`].
+pub type Skeleton = RuntimeSkeleton;
+
+impl RuntimeSkeleton {
     /// Create an empty skeleton with a human-readable name.
     pub fn new(name: String) -> Self {
         tracing::debug!(skeleton = %name, "Skeleton created");

@@ -4,14 +4,17 @@
 //! pure functions separate leaves `Dx12SceneRenderer` responsible for resource
 //! lifetime and pass orchestration instead of material/post-process policy.
 
+use engine_renderer::backend_shared::{prepare_tone_map_plan, ToneMapPlanOptions};
 use engine_renderer::{
-    AdvancedMaterialParameters, Diagnostic, DiagnosticSeverity, EnvironmentSettings,
-    MaterialUpload, RenderFrameInput, ToneMapping, Transparency, TransparencyMode,
+    AdvancedMaterialParameters, Diagnostic, DiagnosticSeverity, MaterialUpload, RadialVertexMorph,
+    RenderFrameInput, Transparency, TransparencyMode, TriplanarMaterialMapping,
 };
-use engine_serialize::AssetId;
 use glam::{Mat4, Vec3};
 
+use crate::encoder::CONSTANT_BUFFER_ALIGNMENT;
 use crate::scene_renderer::Dx12ShadowFrameData;
+
+pub(crate) const VERTEX_DRAW_CONSTANT_STRIDE: usize = CONSTANT_BUFFER_ALIGNMENT as usize;
 
 pub(crate) fn default_material_constants() -> [u8; 32] {
     material_constants([0.8, 0.6, 0.4, 1.0], 0.0, 1.0, 1.0)
@@ -44,6 +47,104 @@ pub(crate) fn float4_bytes(values: [f32; 4]) -> [u8; 16] {
     bytes
 }
 
+/// Pack the DX12 `VertexDraw` cbuffer header. It mirrors Vulkan's two
+/// geomorph push-constant vectors exactly.
+pub(crate) fn radial_morph_constants(morph: Option<&RadialVertexMorph>) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    let Some(morph) = morph else {
+        return bytes;
+    };
+    bytes[..16].copy_from_slice(&float4_bytes([morph.factor, morph.delta_scale, 1.0, 0.0]));
+    bytes[16..].copy_from_slice(&float4_bytes([
+        morph.local_origin[0],
+        morph.local_origin[1],
+        morph.local_origin[2],
+        0.0,
+    ]));
+    bytes
+}
+
+pub(crate) fn triplanar_mapping_constants(mapping: Option<&TriplanarMaterialMapping>) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    let Some(mapping) = mapping.filter(|mapping| {
+        mapping.meters_per_tile.is_finite()
+            && mapping.meters_per_tile > 0.0
+            && mapping.blend_sharpness.is_finite()
+            && mapping.local_origin.into_iter().all(f32::is_finite)
+    }) else {
+        return bytes;
+    };
+    bytes[..16].copy_from_slice(&float4_bytes([
+        1.0,
+        mapping.meters_per_tile.recip(),
+        mapping.blend_sharpness.clamp(1.0, 32.0),
+        0.0,
+    ]));
+    bytes[16..].copy_from_slice(&float4_bytes([
+        mapping.local_origin[0],
+        mapping.local_origin[1],
+        mapping.local_origin[2],
+        0.0,
+    ]));
+    bytes
+}
+
+/// Pack the static `VertexDraw` header shared by forward and shadow draws.
+pub(crate) fn vertex_draw_constants(
+    morph: Option<&RadialVertexMorph>,
+    mapping: Option<&TriplanarMaterialMapping>,
+) -> [u8; 64] {
+    let mut bytes = [0_u8; 64];
+    bytes[..32].copy_from_slice(&radial_morph_constants(morph));
+    bytes[32..].copy_from_slice(&triplanar_mapping_constants(mapping));
+    bytes
+}
+
+/// Build one 256-byte-aligned CBV record per extracted static drawable.
+///
+/// Shadow and every forward view bind offsets into this same immutable frame
+/// arena, so one terrain patch owns one header regardless of pass count.
+pub(crate) fn vertex_draw_arena_constants<'a>(
+    draws: impl IntoIterator<
+        Item = (
+            Option<&'a RadialVertexMorph>,
+            Option<&'a TriplanarMaterialMapping>,
+        ),
+    >,
+) -> Vec<u8> {
+    let draws = draws.into_iter();
+    let mut bytes = Vec::with_capacity(
+        draws
+            .size_hint()
+            .0
+            .saturating_mul(VERTEX_DRAW_CONSTANT_STRIDE),
+    );
+    for (morph, mapping) in draws {
+        let offset = bytes.len();
+        bytes.resize(offset + VERTEX_DRAW_CONSTANT_STRIDE, 0);
+        bytes[offset..offset + 64].copy_from_slice(&vertex_draw_constants(morph, mapping));
+    }
+    bytes
+}
+
+pub(crate) fn vertex_draw_constant_offset(drawable_index: usize) -> Option<u64> {
+    (drawable_index as u64).checked_mul(CONSTANT_BUFFER_ALIGNMENT)
+}
+
+/// Pack `VertexDraw` for skinned draws. The first 64 bytes deliberately
+/// disable radial geomorph and triplanar projection; the 64-matrix palette
+/// starts at HLSL cbuffer register `c4`.
+pub(crate) fn bone_palette_constants(palette: &[[f32; 16]]) -> Vec<u8> {
+    let mut bytes = vec![0_u8; 64];
+    for matrix in palette {
+        for value in matrix {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    bytes.resize(4_352, 0);
+    bytes
+}
+
 pub(crate) fn shadow_scene_constants(
     shadow: Option<Dx12ShadowFrameData>,
     world: Mat4,
@@ -71,33 +172,6 @@ pub(crate) fn shadow_scene_constants(
         float4_bytes(parameters),
         float4_bytes([direction.x, direction.y, direction.z, 0.0]),
     )
-}
-
-pub(crate) fn select_environment_map(
-    settings: &EnvironmentSettings,
-    camera_position: Vec3,
-) -> Option<&AssetId> {
-    settings
-        .reflection_probes
-        .iter()
-        .filter_map(|probe| {
-            let position = Vec3::from_array(probe.position);
-            let extents =
-                Vec3::from_array(probe.half_extents) + Vec3::splat(probe.blend_distance.max(0.0));
-            let offset = (camera_position - position).abs();
-            (offset.cmple(extents).all()).then(|| {
-                let normalized_distance =
-                    (offset / extents.max(Vec3::splat(0.0001))).length_squared();
-                (probe, normalized_distance)
-            })
-        })
-        .max_by(|(left, left_distance), (right, right_distance)| {
-            left.priority
-                .cmp(&right.priority)
-                .then_with(|| right_distance.total_cmp(left_distance))
-        })
-        .map(|(probe, _)| &probe.environment_map)
-        .or(settings.environment_map.as_ref())
 }
 
 pub(crate) fn material_constants_from_upload(upload: &MaterialUpload) -> [u8; 32] {
@@ -267,88 +341,24 @@ pub(crate) fn material_constants(
 }
 
 pub(crate) fn tone_map_constants(input: &RenderFrameInput) -> Result<[u8; 128], Vec<Diagnostic>> {
-    let mode = match input.render_options.tone_mapping {
-        ToneMapping::Aces => 0_u32,
-        ToneMapping::Reinhard => 1,
-        ToneMapping::None => 2,
-    };
-    let exposure = match input.render_options.exposure_ev100 {
-        None => 1.0,
-        Some(ev100) if ev100.is_finite() => (-ev100).exp2(),
-        Some(ev100) => {
-            return Err(vec![Diagnostic::new(
-                "DX1258",
-                DiagnosticSeverity::Error,
-                "scene_renderer",
-                format!("exposure_ev100 must be finite, received {ev100}"),
-            )]);
-        }
-    };
-    if !exposure.is_finite() {
-        return Err(vec![Diagnostic::new(
+    prepare_tone_map_plan(
+        input.render_options.tone_mapping,
+        input.render_options.exposure_ev100,
+        input.render_options.post_process,
+        ToneMapPlanOptions {
+            // The DX12 swapchain target is BGRA8_UNORM, not an sRGB view.
+            output_is_srgb: false,
+            weighted_oit_resolve: input.render_options.transparency_mode
+                == TransparencyMode::WeightedBlendedOit,
+        },
+    )
+    .map(|plan| plan.to_bytes())
+    .map_err(|error| {
+        vec![Diagnostic::new(
             "DX1258",
             DiagnosticSeverity::Error,
             "scene_renderer",
-            "exposure_ev100 produced a non-finite multiplier",
-        )]);
-    }
-    let post = input.render_options.post_process;
-    let effect_flags = u32::from(post.enabled && post.bloom.enabled)
-        | (u32::from(post.enabled && post.color_grading.enabled) << 1)
-        | (u32::from(post.enabled && post.vignette.enabled) << 2)
-        | (u32::from(
-            input.render_options.transparency_mode == TransparencyMode::WeightedBlendedOit,
-        ) << 3);
-    let mut bytes = Vec::with_capacity(128);
-    bytes.extend_from_slice(&mode.to_ne_bytes());
-    bytes.extend_from_slice(&exposure.to_ne_bytes());
-    // The DX12 swapchain target is BGRA8_UNORM, not an sRGB view.
-    bytes.extend_from_slice(&0_u32.to_ne_bytes());
-    bytes.extend_from_slice(&effect_flags.to_ne_bytes());
-    for vector in [
-        [
-            post.bloom.threshold,
-            post.bloom.intensity,
-            post.bloom.radius,
-            0.0,
-        ],
-        [
-            post.color_grading.color_filter[0],
-            post.color_grading.color_filter[1],
-            post.color_grading.color_filter[2],
-            post.color_grading.saturation,
-        ],
-        [post.color_grading.contrast, 0.0, 0.0, 0.0],
-        [
-            post.color_grading.lift[0],
-            post.color_grading.lift[1],
-            post.color_grading.lift[2],
-            0.0,
-        ],
-        [
-            post.color_grading.gamma[0],
-            post.color_grading.gamma[1],
-            post.color_grading.gamma[2],
-            0.0,
-        ],
-        [
-            post.color_grading.gain[0],
-            post.color_grading.gain[1],
-            post.color_grading.gain[2],
-            0.0,
-        ],
-        [
-            post.vignette.intensity,
-            post.vignette.smoothness,
-            post.vignette.roundness,
-            0.0,
-        ],
-    ] {
-        for value in vector {
-            bytes.extend_from_slice(&value.to_ne_bytes());
-        }
-    }
-    Ok(bytes
-        .try_into()
-        .expect("DX12 tone-map constant layout is exactly 128 bytes"))
+            error.to_string(),
+        )]
+    })
 }

@@ -124,13 +124,13 @@ function Invoke-FeatureCheck {
         "--features",
         "backend-vulkan,backend-dx12,tooling-editor,target-desktop,subsystem-scripting-csharp"
     )
-    Invoke-Native "engine-core Vulkan/C#/gameplay feature check" "cargo" @(
+    Invoke-Native "engine-core C#/gameplay/terrain feature check" "cargo" @(
         "check",
         "--locked",
         "-p",
         "engine-core",
         "--features",
-        "backend-vulkan,subsystem-scripting-csharp,gameplay,terrain"
+        "subsystem-scripting-csharp,gameplay,terrain"
     )
 }
 
@@ -370,6 +370,20 @@ function Invoke-ManagedChecks {
             "--features",
             "subsystem-scripting-csharp",
             "--",
+            "--nocapture"
+        )
+        Invoke-Native "C# project managed lifecycle" "cargo" @(
+            "test",
+            "--locked",
+            "-p",
+            "sandbox",
+            "--test",
+            "project_workflow",
+            "--features",
+            "subsystem-scripting-csharp,subsystem-physics",
+            "csharp_project_builds_and_runs_managed_lifecycle",
+            "--",
+            "--exact",
             "--nocapture"
         )
     }

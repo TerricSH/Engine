@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{Component, Entity, World};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub enum DamageKind {
+pub enum DestructionDamageKind {
     #[default]
     Generic,
     Impact,
@@ -13,6 +13,12 @@ pub enum DamageKind {
     Blast,
     Fire,
 }
+
+/// Backwards-compatible name for [`DestructionDamageKind`].
+///
+/// The qualified name distinguishes physical destruction sources from combat
+/// formula categories owned by `engine-gameplay`.
+pub type DamageKind = DestructionDamageKind;
 
 /// Serializable health and fracture policy for a breakable entity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -87,7 +93,7 @@ impl Destructible {
 pub struct DamageRequest {
     pub source: Option<Entity>,
     pub amount: f32,
-    pub kind: DamageKind,
+    pub kind: DestructionDamageKind,
     pub hit_position: Option<[f32; 3]>,
     pub impulse: [f32; 3],
 }
@@ -118,7 +124,7 @@ impl DamageRequest {
 pub struct DestructibleDamageEvent {
     pub target: Entity,
     pub source: Option<Entity>,
-    pub kind: DamageKind,
+    pub kind: DestructionDamageKind,
     pub raw_damage: f32,
     pub applied_damage: f32,
     pub remaining_health: f32,

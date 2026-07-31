@@ -113,6 +113,7 @@ pub struct FontAtlas {
     font: Option<FontArc>,
     availability: FontAtlasAvailability,
     diagnostic_pending: bool,
+    revision: u64,
 }
 
 impl FontAtlas {
@@ -161,6 +162,8 @@ impl FontAtlas {
             font,
             availability,
             diagnostic_pending: !is_ready,
+            // A ready atlas needs one initial upload even before glyphs exist.
+            revision: u64::from(is_ready),
         }
     }
 
@@ -255,6 +258,7 @@ impl FontAtlas {
                         self.pixels[idx + 3] = (cover * 255.0) as u8;
                     }
                 });
+                self.revision = self.revision.wrapping_add(1).max(1);
                 CachedGlyph {
                     uv: [
                         ax as f32 / self.width as f32,
@@ -397,6 +401,23 @@ pub fn font_atlas_texture_upload() -> Option<TextureUpload> {
     let atlas = FONT_ATLAS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    atlas_texture_upload(&atlas)
+}
+
+/// Snapshot the global atlas only when glyph pixels changed after
+/// `known_revision`. This avoids cloning and hashing the full RGBA atlas once
+/// per rendered frame.
+pub fn font_atlas_texture_upload_since(known_revision: u64) -> Option<(u64, TextureUpload)> {
+    let atlas = FONT_ATLAS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !atlas.is_ready || atlas.revision == known_revision {
+        return None;
+    }
+    atlas_texture_upload(&atlas).map(|upload| (atlas.revision, upload))
+}
+
+fn atlas_texture_upload(atlas: &FontAtlas) -> Option<TextureUpload> {
     if !atlas.is_ready {
         return None;
     }

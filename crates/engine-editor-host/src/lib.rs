@@ -11,7 +11,7 @@ mod protocol;
 use std::path::PathBuf;
 
 use protocol::AssetRouter;
-use raw_window_handle::{HandleError, RawDisplayHandle, RawWindowHandle};
+use raw_window_handle::HandleError;
 use tao::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{Event, WindowEvent},
@@ -187,12 +187,11 @@ fn validate_development_url(url: &str) -> Result<DevelopmentUrl, HostError> {
 /// Native events delivered synchronously on the editor UI thread.
 #[derive(Debug)]
 pub enum HostEvent {
-    /// The render surface is alive. Raw handles remain valid until `run_editor_host` returns and
-    /// must never be used from another thread unless the target graphics API explicitly permits
-    /// it. On Linux these identify the lower GTK DrawingArea, not the WebView overlay.
+    /// The render surface is alive. The opaque surface remains valid until
+    /// `run_editor_host` returns and must stay on this UI thread. On Linux it
+    /// identifies the lower GTK DrawingArea, not the WebView overlay.
     SurfaceReady {
-        window_handle: RawWindowHandle,
-        display_handle: RawDisplayHandle,
+        surface: ::platform::PlatformSurface,
         size: PhysicalSize<u32>,
         scale_factor: f64,
     },
@@ -358,8 +357,7 @@ where
     let mut client = client;
     let mut runtime_error = None;
     let initial_directive = client.on_host_event(HostEvent::SurfaceReady {
-        window_handle: native_surface.window_handle,
-        display_handle: native_surface.display_handle,
+        surface: native_surface.surface,
         size: initial_size,
         scale_factor: window.scale_factor(),
     });

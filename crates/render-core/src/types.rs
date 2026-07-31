@@ -39,6 +39,16 @@ pub enum IndexFormat {
     U32,
 }
 
+impl IndexFormat {
+    /// Size of one packed index in bytes.
+    pub const fn byte_size(self) -> usize {
+        match self {
+            Self::U16 => 2,
+            Self::U32 => 4,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TextureFormat {

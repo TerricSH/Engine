@@ -75,6 +75,61 @@ pub(crate) fn prepare_particle_instances(
 
 pub(crate) const STATIC_INSTANCE_STRIDE: u64 = 64;
 
+/// Pack the complete static-surface push block consumed by `forward.vert`.
+///
+/// The final two vectors are deliberately per draw rather than per material:
+/// one material may be shared by many terrain chunks with different local
+/// projection origins.
+pub(crate) fn static_draw_push_constants(drawable: &RenderableItem) -> [u8; 128] {
+    let mut bytes = [0_u8; 128];
+    let mut write_values = |offset: usize, values: &[f32]| {
+        for (index, value) in values.iter().copied().enumerate() {
+            let start = offset + index * std::mem::size_of::<f32>();
+            bytes[start..start + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    };
+    write_values(0, &drawable.world_transform);
+    if let Some(morph) = &drawable.radial_vertex_morph {
+        write_values(64, &[morph.factor, morph.delta_scale, 1.0, 0.0]);
+        write_values(
+            80,
+            &[
+                morph.local_origin[0],
+                morph.local_origin[1],
+                morph.local_origin[2],
+                0.0,
+            ],
+        );
+    }
+    if let Some(mapping) = &drawable.triplanar_material_mapping {
+        if mapping.meters_per_tile.is_finite()
+            && mapping.meters_per_tile > 0.0
+            && mapping.blend_sharpness.is_finite()
+            && mapping.local_origin.into_iter().all(f32::is_finite)
+        {
+            write_values(
+                96,
+                &[
+                    1.0,
+                    mapping.meters_per_tile.recip(),
+                    mapping.blend_sharpness.clamp(1.0, 32.0),
+                    0.0,
+                ],
+            );
+            write_values(
+                112,
+                &[
+                    mapping.local_origin[0],
+                    mapping.local_origin[1],
+                    mapping.local_origin[2],
+                    0.0,
+                ],
+            );
+        }
+    }
+    bytes
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedStaticDraw {
     pub(crate) first_drawable: usize,
@@ -108,6 +163,10 @@ pub(crate) fn prepare_static_instances(
         while end < drawables.len()
             && drawables[end].mesh == first.mesh
             && drawables[end].material == first.material
+            && first.radial_vertex_morph.is_none()
+            && drawables[end].radial_vertex_morph.is_none()
+            && first.triplanar_material_mapping.is_none()
+            && drawables[end].triplanar_material_mapping.is_none()
         {
             end += 1;
         }

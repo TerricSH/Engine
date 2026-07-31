@@ -51,6 +51,20 @@ point. Only the final scale by 2^-9 is floating point, and it is exact.
   `[0, 1]`, finite offsets. `0` octaves is a validation error, not a silent
   zero.
 
+### Native wide-coordinate path
+
+`GradientNoise2D/3D`, `Fbm2D/3D`, and both warped fBm samplers also expose
+`sample_wide(...)` for native engine systems. This path accepts `f64`
+coordinates, snaps to a Q55.8 `i64` lattice, and mixes significant high words
+into the lattice hash. It retains sub-unit variation at large floating-world
+coordinates and at large planetary radii instead of first narrowing input to
+an `f32` mantissa.
+
+The original `sample(f32, ...)` algorithm and its Rust/C# golden vectors are
+unchanged. Wide sampling is a native extension used by terrain generation and
+`PlanetTerrainQuery`; it is tested independently for large-coordinate local
+variation.
+
 ## Versioning policy
 
 - `PROCGEN_SCHEMA` (currently `PROCGEN-v1`) tags the whole algorithm family:

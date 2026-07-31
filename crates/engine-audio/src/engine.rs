@@ -6,6 +6,7 @@ use crate::clip::AudioClip;
 use crate::handle::AudioHandle;
 #[cfg(feature = "subsystem-audio-cpal")]
 use crate::mixer::MixerState;
+use crate::source::AudioSource;
 use crate::{AudioCommand, AudioEmitter, AudioError, AudioListener, MixerGroup};
 
 #[cfg(feature = "subsystem-audio-cpal")]
@@ -199,6 +200,16 @@ impl AudioEngine {
     // Public API
     // ------------------------------------------------------------------
 
+    /// Create a controllable source without starting playback.
+    ///
+    /// The returned source owns its playback state and can be started,
+    /// paused, resumed, sought, or looped independently.
+    pub fn create_source(&mut self, clip: Arc<AudioClip>) -> AudioSource {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        AudioSource::new(clip, self.cmd_tx.clone(), id)
+    }
+
     /// Play a clip and return a handle for controlling it.
     ///
     /// The clip is played once at full volume without looping and without
@@ -369,14 +380,3 @@ impl Drop for AudioEngine {
         tracing::info!("audio engine shutting down");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-// TODO: Add AudioSource creation from engine (future).
-// The AudioSource::new() is crate-internal; external users create sounds via
-// engine.play() / play_spatial() which return AudioHandle.
-//
-// If a full AudioSource (with play/pause/seek) is needed, the engine will
-// expose a `create_source()` method in a future pass.

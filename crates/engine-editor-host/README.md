@@ -2,8 +2,9 @@
 
 `engine-editor-host` owns the production desktop editor window and its single
 transparent React WebView. The game engine remains native: the `SurfaceReady`
-event gives the caller the raw-window-handle 0.6 handles used to create the
-renderer surface.
+event gives the caller an opaque `platform::PlatformSurface` used to create the
+renderer surface. Raw native handles stay inside this host's Tao/GTK adapter
+and the concrete renderer backend.
 
 The host deliberately has no dependency on `sandbox` or editor domain crates.
 Commands cross the boundary as JSON strings over Wry IPC; the caller owns

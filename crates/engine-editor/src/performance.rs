@@ -9,16 +9,16 @@ use tracing;
 use engine_animation::components::AnimationPlayer;
 use engine_nav::components::AiAgent;
 use engine_physics::components::RigidBody;
-use engine_renderer::FrameStats as RendererFrameStats;
+use engine_renderer::RendererFrameStats;
 use engine_scene::World;
 
 // ---------------------------------------------------------------------------
-// FrameStats
+// EditorPerformanceSnapshot
 // ---------------------------------------------------------------------------
 
 /// Per-frame performance statistics snapshot.
 #[derive(Clone, Debug)]
-pub struct FrameStats {
+pub struct EditorPerformanceSnapshot {
     /// Total frame time in milliseconds.
     pub frame_time_ms: f32,
     /// Number of draw calls submitted to the GPU this frame.
@@ -35,7 +35,7 @@ pub struct FrameStats {
     pub asset_count: u32,
 }
 
-impl FrameStats {
+impl EditorPerformanceSnapshot {
     /// All-zero placeholder.
     pub const ZERO: Self = Self {
         frame_time_ms: 0.0,
@@ -64,11 +64,14 @@ impl FrameStats {
     }
 }
 
-impl Default for FrameStats {
+impl Default for EditorPerformanceSnapshot {
     fn default() -> Self {
         Self::ZERO
     }
 }
+
+/// Backwards-compatible short name for [`EditorPerformanceSnapshot`].
+pub type FrameStats = EditorPerformanceSnapshot;
 
 // ---------------------------------------------------------------------------
 // PerformancePanel
@@ -165,6 +168,14 @@ pub fn record_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_frame_stats_is_the_editor_performance_snapshot() {
+        assert_eq!(
+            std::any::TypeId::of::<FrameStats>(),
+            std::any::TypeId::of::<EditorPerformanceSnapshot>()
+        );
+    }
 
     // ── FrameStats defaults ──────────────────────────────────────────────
 

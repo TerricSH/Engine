@@ -50,6 +50,14 @@ $sources = @(
         Where-Object { $_.Extension.ToLowerInvariant() -in @(".vert", ".frag", ".comp") } |
         Sort-Object Name
 )
+$variants = @(
+    @{
+        Name = "vfx_billboard.frag"
+        Source = "forward.frag"
+        Artifact = "vfx_billboard.frag.spv"
+        Arguments = @("-DVFX_PARTICLE=1", "-S", "frag")
+    }
+)
 if ($sources.Count -eq 0) {
     throw "No GLSL shader sources were found in $shaderDirectory"
 }
@@ -96,7 +104,59 @@ try {
             $checkedInArtifact
         ) "validate checked-in $($source.Name).spv"
     }
-    Write-Host "Validated $($sources.Count) GLSL sources and their checked-in SPIR-V artifacts."
+
+    foreach ($variant in $variants) {
+        Write-Host "==> $($variant.Name) (variant of $($variant.Source))"
+        $source = Join-Path $shaderDirectory $variant.Source
+        $freshArtifact = Join-Path $tempDirectory ($variant.Name + ".spv")
+        $checkedInArtifact = Join-Path $shaderDirectory $variant.Artifact
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Shader variant source is missing: $source"
+        }
+        if (-not (Test-Path -LiteralPath $checkedInArtifact -PathType Leaf)) {
+            throw "Checked-in shader variant is missing: $checkedInArtifact"
+        }
+        if ((Get-Item -LiteralPath $checkedInArtifact).Length -eq 0) {
+            throw "Checked-in shader variant is empty: $checkedInArtifact"
+        }
+
+        $compileArguments = @(
+            "-V",
+            "--target-env",
+            "vulkan1.2"
+        ) + $variant.Arguments + @(
+            $source,
+            "-o",
+            $freshArtifact
+        )
+        Invoke-ShaderTool $compiler $compileArguments "compile $($variant.Name)"
+        Invoke-ShaderTool $validator @(
+            "--target-env",
+            "vulkan1.2",
+            $freshArtifact
+        ) "validate freshly compiled $($variant.Name)"
+        Invoke-ShaderTool $validator @(
+            "--target-env",
+            "vulkan1.2",
+            $checkedInArtifact
+        ) "validate checked-in $($variant.Artifact)"
+    }
+
+    $expectedArtifacts = @(
+        $sources | ForEach-Object { $_.Name + ".spv" }
+        $variants | ForEach-Object { $_.Artifact }
+    )
+    $orphanedArtifacts = @(
+        Get-ChildItem -LiteralPath $shaderDirectory -File -Filter "*.spv" |
+            Where-Object { $_.Name -notin $expectedArtifacts } |
+            Sort-Object Name
+    )
+    if ($orphanedArtifacts.Count -ne 0) {
+        throw "SPIR-V artifacts without a verified source recipe: $($orphanedArtifacts.Name -join ', ')"
+    }
+
+    $artifactCount = $sources.Count + $variants.Count
+    Write-Host "Validated $artifactCount GLSL recipes and every checked-in SPIR-V artifact."
 }
 finally {
     $cleanupPath = [System.IO.Path]::GetFullPath($tempDirectory)

@@ -22,8 +22,9 @@
 //! * **Ready** — runtime initialized, accepting script operations.
 //! * **Error** — runtime failed to initialize or crashed.
 
-use std::ffi::c_void;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::host::{ScriptError, ScriptHandle, ScriptHost, ScriptInstance};
 use crate::value::ScriptValue;
@@ -77,8 +78,6 @@ type FfiShutdown = extern "C" fn() -> i32;
 
 /// Opaque handle to the managed ILRuntime runtime.
 struct ManagedRuntime {
-    #[expect(dead_code)]
-    lib_handle: *mut c_void,
     load_assembly: FfiLoadAssembly,
     instantiate: FfiInstantiate,
     call_method: FfiCallMethod,
@@ -86,33 +85,72 @@ struct ManagedRuntime {
     get_field: FfiGetField,
     destroy_instance: FfiDestroyInstance,
     shutdown: FfiShutdown,
+    // Keep the library alive until all copied function pointers are dropped.
+    _library: libloading::Library,
 }
-
-// SAFETY: The function pointers are loaded from a shared library that
-// lives for the duration of the process. All calls are serialized
-// through &mut self on ScriptHost.
-unsafe impl Send for ManagedRuntime {}
-unsafe impl Sync for ManagedRuntime {}
 
 impl ManagedRuntime {
     /// Load the managed ILRuntime bridge DLL and resolve all FFI symbols.
     fn load(library_path: &str) -> Result<Self, ScriptError> {
-        // In a real implementation, this would use `libloading` or similar
-        // to load the managed runtime DLL and resolve symbols.
-        //
-        // For now, this returns an error — the actual loading requires the
-        // managed C# runtime project to be built first.
-        let _ = library_path;
-        Err(ScriptError::HostError(
-            "ILRuntime managed runtime not yet loaded (stub)".into(),
-        ))
+        let path = Path::new(library_path);
+        if !path.is_file() {
+            return Err(ScriptError::HostError(format!(
+                "ILRuntime bridge library does not exist: {}",
+                path.display()
+            )));
+        }
+
+        // SAFETY: Loading a native library may execute platform loader hooks.
+        // The caller explicitly selected this bridge path, and `library` is
+        // retained for at least as long as every symbol copied from it.
+        let library = unsafe { libloading::Library::new(path) }.map_err(|error| {
+            ScriptError::HostError(format!(
+                "failed to load ILRuntime bridge '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+        macro_rules! resolve {
+            ($name:literal, $ty:ty) => {{
+                // SAFETY: The managed bridge ABI defines this exact export
+                // name and C signature. ManagedRuntime owns the Library, so
+                // the copied function pointer cannot outlive its code.
+                unsafe { library.get::<$ty>(concat!($name, "\0").as_bytes()) }
+                    .map(|symbol| *symbol)
+                    .map_err(|error| {
+                        ScriptError::HostError(format!(
+                            "ILRuntime bridge '{}' is missing export '{}': {error}",
+                            path.display(),
+                            $name
+                        ))
+                    })?
+            }};
+        }
+
+        let load_assembly = resolve!("ilruntime_load_assembly", FfiLoadAssembly);
+        let instantiate = resolve!("ilruntime_instantiate", FfiInstantiate);
+        let call_method = resolve!("ilruntime_call_method", FfiCallMethod);
+        let set_field = resolve!("ilruntime_set_field", FfiSetField);
+        let get_field = resolve!("ilruntime_get_field", FfiGetField);
+        let destroy_instance = resolve!("ilruntime_destroy_instance", FfiDestroyInstance);
+        let shutdown = resolve!("ilruntime_shutdown", FfiShutdown);
+
+        Ok(Self {
+            load_assembly,
+            instantiate,
+            call_method,
+            set_field,
+            get_field,
+            destroy_instance,
+            shutdown,
+            _library: library,
+        })
     }
 }
 
 impl Drop for ManagedRuntime {
     fn drop(&mut self) {
         let _ = (self.shutdown)();
-        // TODO: unload library when libloading is integrated
     }
 }
 
@@ -123,7 +161,7 @@ impl Drop for ManagedRuntime {
 /// A script instance hosted in the ILRuntime AppDomain.
 pub struct ILRuntimeInstance {
     instance_id: String,
-    runtime: *mut ManagedRuntime,
+    runtime: Option<Arc<ManagedRuntime>>,
 }
 
 impl std::fmt::Debug for ILRuntimeInstance {
@@ -134,18 +172,12 @@ impl std::fmt::Debug for ILRuntimeInstance {
     }
 }
 
-// SAFETY: The ManagedRuntime is Send+Sync. All operations go through FFI
-// and are externally synchronized by ScriptHost's &mut self.
-unsafe impl Send for ILRuntimeInstance {}
-
 impl ScriptInstance for ILRuntimeInstance {
     fn call(&mut self, function: &str, args: &[ScriptValue]) -> Result<ScriptValue, ScriptError> {
-        if self.runtime.is_null() {
-            return Err(ScriptError::HostError("ILRuntime not initialized".into()));
-        }
-        // SAFETY: `self.runtime` was checked non-null above; it was allocated by
-        // the ILRuntime initializer and is only destroyed in `Drop`.
-        let rt = unsafe { &*self.runtime };
+        let rt = self
+            .runtime
+            .as_deref()
+            .ok_or_else(|| ScriptError::HostError("ILRuntime not initialized".into()))?;
 
         // Serialize args to JSON for the FFI call
         let args_json = serde_json::to_string(args)
@@ -192,12 +224,10 @@ impl ScriptInstance for ILRuntimeInstance {
     }
 
     fn set_field(&mut self, name: &str, value: ScriptValue) -> Result<(), ScriptError> {
-        if self.runtime.is_null() {
-            return Err(ScriptError::HostError("ILRuntime not initialized".into()));
-        }
-        // SAFETY: `self.runtime` checked non-null above; allocated by ILRuntime
-        // initializer, destroyed only in `Drop`.
-        let rt = unsafe { &*self.runtime };
+        let rt = self
+            .runtime
+            .as_deref()
+            .ok_or_else(|| ScriptError::HostError("ILRuntime not initialized".into()))?;
 
         let value_json = serde_json::to_string(&value)
             .map_err(|e| ScriptError::ExecutionError(format!("Failed to serialize value: {e}")))?;
@@ -220,12 +250,7 @@ impl ScriptInstance for ILRuntimeInstance {
     }
 
     fn get_field(&self, name: &str) -> Option<ScriptValue> {
-        if self.runtime.is_null() {
-            return None;
-        }
-        // SAFETY: `self.runtime` checked non-null above; allocated by ILRuntime
-        // initializer, destroyed only in `Drop`.
-        let rt = unsafe { &*self.runtime };
+        let rt = self.runtime.as_deref()?;
 
         let mut result_buf = [0u8; 4096];
         let result_code = (rt.get_field)(
@@ -255,6 +280,17 @@ impl ScriptInstance for ILRuntimeInstance {
     }
 }
 
+impl Drop for ILRuntimeInstance {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.as_deref() {
+            let _ = (runtime.destroy_instance)(
+                self.instance_id.as_ptr(),
+                self.instance_id.len() as u32,
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ILRuntime host
 // ---------------------------------------------------------------------------
@@ -272,7 +308,7 @@ impl ScriptInstance for ILRuntimeInstance {
 /// ```
 pub struct ILRuntimeHost {
     name: String,
-    runtime: Option<ManagedRuntime>,
+    runtime: Option<Arc<ManagedRuntime>>,
     /// Track loaded assemblies for unload
     assemblies: Vec<(ScriptHandle, String)>,
     next_instance_id: u64,
@@ -301,7 +337,7 @@ impl ILRuntimeHost {
     pub fn load_runtime(&mut self, library_path: &str) -> Result<(), ScriptError> {
         let runtime = ManagedRuntime::load(library_path)?;
         self.initialized.store(true, Ordering::SeqCst);
-        self.runtime = Some(runtime);
+        self.runtime = Some(Arc::new(runtime));
         Ok(())
     }
 
@@ -331,7 +367,7 @@ impl ScriptHost for ILRuntimeHost {
         assembly_data: &[u8],
     ) -> Result<ScriptHandle, ScriptError> {
         self.require_runtime()?;
-        let rt = self.runtime.as_ref().unwrap();
+        let rt = self.runtime.as_deref().expect("runtime checked above");
 
         let result_code = (rt.load_assembly)(
             id.as_ptr(),
@@ -357,7 +393,7 @@ impl ScriptHost for ILRuntimeHost {
         class_name: &str,
     ) -> Result<Box<dyn ScriptInstance>, ScriptError> {
         self.require_runtime()?;
-        let rt = self.runtime.as_ref().unwrap();
+        let rt = self.runtime.as_deref().expect("runtime checked above");
 
         let instance_id = format!("inst-{:04x}", self.next_instance_id);
         self.next_instance_id += 1;
@@ -379,23 +415,13 @@ impl ScriptHost for ILRuntimeHost {
             )));
         }
 
-        // Store a raw pointer to the runtime so instances can call back
-        let runtime_ptr: *mut ManagedRuntime = self
-            .runtime
-            .as_mut()
-            .map(|r| r as *mut ManagedRuntime)
-            .unwrap();
-
         Ok(Box::new(ILRuntimeInstance {
             instance_id,
-            runtime: runtime_ptr,
+            runtime: self.runtime.clone(),
         }))
     }
 
     fn unload(&mut self, handle: &ScriptHandle) -> Result<(), ScriptError> {
-        if let Some(rt) = &self.runtime {
-            let _ = (rt.destroy_instance)(handle.id().as_ptr(), handle.id().len() as u32);
-        }
         self.assemblies.retain(|(h, _)| h.id() != handle.id());
         Ok(())
     }
@@ -453,7 +479,7 @@ mod tests {
     fn ilruntime_instance_call_fails_without_runtime() {
         let mut inst = ILRuntimeInstance {
             instance_id: "test".into(),
-            runtime: std::ptr::null_mut(),
+            runtime: None,
         };
         let result = inst.call("Foo", &[]);
         assert!(result.is_err());
@@ -463,7 +489,7 @@ mod tests {
     fn ilruntime_instance_field_fails_without_runtime() {
         let inst = ILRuntimeInstance {
             instance_id: "test".into(),
-            runtime: std::ptr::null_mut(),
+            runtime: None,
         };
         assert!(inst.get_field("x").is_none());
     }

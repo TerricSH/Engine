@@ -24,6 +24,12 @@ SamplerState hdr_sampler : register(s0);
 SamplerState oit_accumulation_sampler : register(s1);
 SamplerState oit_optical_depth_sampler : register(s2);
 
+static const uint EFFECT_BLOOM = 1u;
+static const uint EFFECT_COLOR_GRADING = 2u;
+static const uint EFFECT_VIGNETTE = 4u;
+static const uint EFFECT_WEIGHTED_OIT = 8u;
+static const uint EFFECT_PLANETARY_LENS = 16u;
+
 ToneMapOutput ToneMapVSMain(uint vertex_id : SV_VertexID) {
     ToneMapOutput output;
     float2 position = float2(
@@ -57,7 +63,7 @@ float3 linear_to_srgb(float3 color) {
 
 float3 resolved_hdr(float2 uv) {
     float3 opaque = hdr_color.SampleLevel(hdr_sampler, uv, 0.0).rgb;
-    if ((effect_flags & 8u) == 0u) {
+    if ((effect_flags & EFFECT_WEIGHTED_OIT) == 0u) {
         return opaque;
     }
     float4 accumulation = oit_accumulation.SampleLevel(
@@ -76,7 +82,34 @@ float3 resolved_hdr(float2 uv) {
     return lerp(opaque, transparent_color, saturate(coverage));
 }
 
-float3 bloom_neighborhood(float2 uv) {
+float2 planetary_lens_uv(float2 uv) {
+    float2 centered = uv * 2.0 - 1.0;
+    float radius_squared = dot(centered, centered);
+    centered *= 1.0 + contrast.y * radius_squared;
+    centered.y += contrast.z
+        * centered.x * centered.x
+        * (1.0 - 0.25 * abs(centered.y));
+    return centered * 0.5 + 0.5;
+}
+
+float3 resolved_planetary_lens(float2 uv) {
+    float2 centered = uv - 0.5;
+    float2 chromatic_offset = centered * vignette.w;
+    float3 center_color = resolved_hdr(saturate(uv));
+    return float3(
+        resolved_hdr(saturate(uv + chromatic_offset)).r,
+        center_color.g,
+        resolved_hdr(saturate(uv - chromatic_offset)).b
+    );
+}
+
+float3 resolved_source(float2 uv, bool planetary_lens) {
+    return planetary_lens
+        ? resolved_planetary_lens(uv)
+        : resolved_hdr(uv);
+}
+
+float3 bloom_neighborhood(float2 uv, bool planetary_lens) {
     uint width;
     uint height;
     hdr_color.GetDimensions(width, height);
@@ -91,8 +124,9 @@ float3 bloom_neighborhood(float2 uv) {
     float3 accumulated = 0.0.xxx;
     [unroll]
     for (uint index = 0; index < 8; ++index) {
-        float3 sample_color = resolved_hdr(
-            saturate(uv + offsets[index] * radius)
+        float3 sample_color = resolved_source(
+            saturate(uv + offsets[index] * radius),
+            planetary_lens
         );
         float contribution = saturate(luminance(sample_color) - bloom.x);
         accumulated += sample_color * contribution;
@@ -101,11 +135,21 @@ float3 bloom_neighborhood(float2 uv) {
 }
 
 float4 ToneMapPSMain(ToneMapOutput input) : SV_TARGET {
-    float3 color = resolved_hdr(input.uv) * exposure;
-    if ((effect_flags & 1u) != 0u) {
-        color += bloom_neighborhood(input.uv) * exposure;
+    bool planetary_lens = (effect_flags & EFFECT_PLANETARY_LENS) != 0u;
+    float2 sample_uv = planetary_lens
+        ? planetary_lens_uv(input.uv)
+        : input.uv;
+    float3 hdr = resolved_source(sample_uv, planetary_lens);
+    if ((effect_flags & EFFECT_BLOOM) != 0u) {
+        hdr += bloom_neighborhood(sample_uv, planetary_lens);
     }
-    if ((effect_flags & 2u) != 0u) {
+    if (planetary_lens) {
+        float2 centered = input.uv * 2.0 - 1.0;
+        float limb = smoothstep(0.35, 1.15, length(centered));
+        hdr += float3(0.08, 0.24, 0.55) * contrast.w * limb;
+    }
+    float3 color = hdr * exposure;
+    if ((effect_flags & EFFECT_COLOR_GRADING) != 0u) {
         color = max(color + lift.rgb, 0.0.xxx);
         color = pow(color, 1.0 / max(gamma.rgb, 0.0001.xxx)) * gain.rgb;
         float gray = luminance(color);
@@ -118,7 +162,7 @@ float4 ToneMapPSMain(ToneMapOutput input) : SV_TARGET {
     } else if (tone_map_mode == 1u) {
         color = color / (1.0 + color);
     }
-    if ((effect_flags & 4u) != 0u) {
+    if ((effect_flags & EFFECT_VIGNETTE) != 0u) {
         float2 centered = abs(input.uv * 2.0 - 1.0);
         float radial = lerp(max(centered.x, centered.y), length(centered), vignette.z);
         float edge = smoothstep(

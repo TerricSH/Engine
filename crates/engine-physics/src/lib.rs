@@ -18,6 +18,7 @@ pub use convert::{from_rapier_vec, to_rapier_vec};
 pub use debug::{ColliderDebugInfo, PhysicsDebugDraw};
 pub use destruction::{
     apply_damage, DamageError, DamageKind, DamageRequest, Destructible, DestructibleDamageEvent,
+    DestructionDamageKind,
 };
 pub use events::{
     CollisionEvent, CollisionEventKind, JointBreakEvent, PhysicsEvents, TriggerEvent,

@@ -10,7 +10,10 @@
 layout(location = 0) in vec3 v_world_pos;
 layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec2 v_uv;
-#ifdef VFX_PARTICLE
+#ifndef VFX_PARTICLE
+layout(location = 3) in vec3 v_mapping_position;
+layout(location = 4) flat in vec3 v_mapping_parameters;
+#else
 layout(location = 3) in vec4 v_particle_color;
 #endif
 
@@ -148,6 +151,90 @@ mat3 cotangent_frame(vec3 N, vec3 position, vec2 uv) {
     return mat3(T * scale, B * scale, N);
 }
 
+vec3 triplanar_weights(vec3 normal, float sharpness) {
+    vec3 weights = pow(
+        max(abs(normal), vec3(1.0e-4)),
+        vec3(clamp(sharpness, 1.0, 32.0))
+    );
+    return weights / max(weights.x + weights.y + weights.z, 1.0e-5);
+}
+
+float projection_sign(float value) {
+    return value < 0.0 ? -1.0 : 1.0;
+}
+
+vec2 triplanar_uv_x(vec3 position, vec3 normal) {
+    float sign_x = projection_sign(normal.x);
+    return vec2(-sign_x * position.z, position.y);
+}
+
+vec2 triplanar_uv_y(vec3 position, vec3 normal) {
+    float sign_y = projection_sign(normal.y);
+    return vec2(sign_y * position.x, -position.z);
+}
+
+vec2 triplanar_uv_z(vec3 position, vec3 normal) {
+    float sign_z = projection_sign(normal.z);
+    return vec2(sign_z * position.x, position.y);
+}
+
+vec4 sample_triplanar(
+    sampler2D texture_sampler,
+    vec3 position,
+    vec3 geometric_normal,
+    vec3 weights
+) {
+    return texture(texture_sampler, triplanar_uv_x(position, geometric_normal)) * weights.x
+         + texture(texture_sampler, triplanar_uv_y(position, geometric_normal)) * weights.y
+         + texture(texture_sampler, triplanar_uv_z(position, geometric_normal)) * weights.z;
+}
+
+vec3 sample_triplanar_normal(
+    sampler2D texture_sampler,
+    vec3 position,
+    vec3 geometric_normal,
+    vec3 weights
+) {
+    float sign_x = projection_sign(geometric_normal.x);
+    float sign_y = projection_sign(geometric_normal.y);
+    float sign_z = projection_sign(geometric_normal.z);
+    mat3 frame_x = mat3(
+        vec3(0.0, 0.0, -sign_x),
+        vec3(0.0, 1.0, 0.0),
+        vec3(sign_x, 0.0, 0.0)
+    );
+    mat3 frame_y = mat3(
+        vec3(sign_y, 0.0, 0.0),
+        vec3(0.0, 0.0, -1.0),
+        vec3(0.0, sign_y, 0.0)
+    );
+    mat3 frame_z = mat3(
+        vec3(sign_z, 0.0, 0.0),
+        vec3(0.0, 1.0, 0.0),
+        vec3(0.0, 0.0, sign_z)
+    );
+    vec3 normal_x = texture(
+        texture_sampler,
+        triplanar_uv_x(position, geometric_normal)
+    ).xyz * 2.0 - 1.0;
+    vec3 normal_y = texture(
+        texture_sampler,
+        triplanar_uv_y(position, geometric_normal)
+    ).xyz * 2.0 - 1.0;
+    vec3 normal_z = texture(
+        texture_sampler,
+        triplanar_uv_z(position, geometric_normal)
+    ).xyz * 2.0 - 1.0;
+    // Blend perturbations around the actual geometric normal. A flat
+    // (0.5, 0.5, 1.0) normal map must reproduce the curved planet normal,
+    // rather than snapping it toward the dominant projection axis.
+    vec3 perturbation =
+        ((frame_x * normal_x) - frame_x[2]) * weights.x
+      + ((frame_y * normal_y) - frame_y[2]) * weights.y
+      + ((frame_z * normal_z) - frame_z[2]) * weights.z;
+    return normalize(geometric_normal + perturbation);
+}
+
 /// Sample the CSM shadow map at the given light-space position and cascade layer.
 float sample_cascade_shadow(vec4 light_pos, int cascade) {
     vec3 proj = light_pos.xyz / light_pos.w;
@@ -226,21 +313,57 @@ void main() {
     if (!gl_FrontFacing) {
         N = -N;
     }
+    vec3 mapping_normal = N;
+#ifdef VFX_PARTICLE
+    bool uses_triplanar = false;
+    vec3 mapping_position = vec3(0.0);
+    vec3 mapping_weights = vec3(0.0);
+#else
+    bool uses_triplanar = v_mapping_parameters.x > 0.5;
+    vec3 mapping_position = v_mapping_position * v_mapping_parameters.y;
+    vec3 mapping_weights = triplanar_weights(mapping_normal, v_mapping_parameters.z);
+#endif
     mat3 surface_frame = cotangent_frame(N, v_world_pos, v_uv);
     uint texture_flags = uint(material.emissive.a + 0.5);
     if ((texture_flags & 2u) != 0u) {
-        vec3 tangent_normal = texture(u_normal_texture, v_uv).xyz * 2.0 - 1.0;
-        N = normalize(surface_frame * tangent_normal);
+        if (uses_triplanar) {
+            N = sample_triplanar_normal(
+                u_normal_texture,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            );
+        } else {
+            vec3 tangent_normal = texture(u_normal_texture, v_uv).xyz * 2.0 - 1.0;
+            N = normalize(surface_frame * tangent_normal);
+        }
     }
-    vec3 T = normalize(surface_frame[0]);
-    vec3 B = normalize(cross(N, T));
-    T = normalize(cross(B, N));
+    vec3 T;
+    vec3 B;
+    if (uses_triplanar) {
+        vec3 reference_axis = abs(N.y) < 0.999
+            ? vec3(0.0, 1.0, 0.0)
+            : vec3(1.0, 0.0, 0.0);
+        T = normalize(cross(reference_axis, N));
+        B = normalize(cross(N, T));
+    } else {
+        T = normalize(surface_frame[0]);
+        B = normalize(cross(N, T));
+        T = normalize(cross(B, N));
+    }
     vec3 V = normalize(ubo.camera_pos.xyz - v_world_pos);
 
     // A valid descriptor is always bound. Materials without a texture use the
     // renderer's 1x1 white fallback, so black texture data stays black.
-    vec4 sampled_base_color = material.base_color
-                            * texture(u_base_color_texture, v_uv);
+    vec4 base_color_texel = uses_triplanar
+        ? sample_triplanar(
+            u_base_color_texture,
+            mapping_position,
+            mapping_normal,
+            mapping_weights
+        )
+        : texture(u_base_color_texture, v_uv);
+    vec4 sampled_base_color = material.base_color * base_color_texel;
 #ifdef VFX_PARTICLE
     sampled_base_color *= v_particle_color;
 #endif
@@ -253,16 +376,37 @@ void main() {
     float ao_value = material.ao;
     vec3 emissive_color = material.emissive.rgb;
     if ((texture_flags & 4u) != 0u) {
-        vec4 metallic_roughness = texture(u_metallic_roughness_texture, v_uv);
+        vec4 metallic_roughness = uses_triplanar
+            ? sample_triplanar(
+                u_metallic_roughness_texture,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            )
+            : texture(u_metallic_roughness_texture, v_uv);
         roughness_value *= metallic_roughness.g;
         metallic_value *= metallic_roughness.b;
     }
     roughness_value = clamp(roughness_value, 0.04, 1.0);
     if ((texture_flags & 8u) != 0u) {
-        ao_value *= texture(u_occlusion_texture, v_uv).r;
+        ao_value *= uses_triplanar
+            ? sample_triplanar(
+                u_occlusion_texture,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            ).r
+            : texture(u_occlusion_texture, v_uv).r;
     }
     if ((texture_flags & 16u) != 0u) {
-        emissive_color *= texture(u_emissive_texture, v_uv).rgb;
+        emissive_color *= uses_triplanar
+            ? sample_triplanar(
+                u_emissive_texture,
+                mapping_position,
+                mapping_normal,
+                mapping_weights
+            ).rgb
+            : texture(u_emissive_texture, v_uv).rgb;
     }
 
     vec3 F0 = mix(vec3(0.04), base_color, metallic_value);

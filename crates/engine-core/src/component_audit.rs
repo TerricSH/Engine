@@ -240,6 +240,30 @@ const AUDIT_ANNOTATIONS: &[(&str, AuditAnnotation)] = &[
         },
     ),
     (
+        "engine.terrain_volume",
+        AuditAnnotation {
+            reconciler: "per terrain tick (LOD selection and chunk generation re-read the enabled volume)",
+            caveat: "write takes effect live; affected chunks reconcile on the next terrain tick",
+            decision: "ReadWrite — authored terrain recipe and streaming policy are validated and re-read each terrain tick",
+        },
+    ),
+    (
+        "engine.planet_surface_anchor",
+        AuditAnnotation {
+            reconciler: "per terrain tick (surface placement and occupancy are rebuilt from authored anchors)",
+            caveat: "write takes effect live; transform and occupancy update on the next terrain tick",
+            decision: "ReadWrite — authored placement constraints are validated and resolved by engine-owned planetary math",
+        },
+    ),
+    (
+        "engine.planet_scene_transition",
+        AuditAnnotation {
+            reconciler: "per frame (active-camera f64 altitude drives a host-acknowledged scene transaction)",
+            caveat: "n/a — not script-accessible",
+            decision: "None — engine-owned scene policy; project hosts commit or reject transactional loads instead of gameplay scripts mutating transition state",
+        },
+    ),
+    (
         "engine.vfx.particle_emitter",
         AuditAnnotation {
             reconciler: "per frame (CPU simulation and render extraction)",
@@ -434,6 +458,9 @@ mod tests {
             ("engine.skeleton", ScriptAccess::None),
             ("engine.ik_target", ScriptAccess::None),
             ("engine.nav_agent", ScriptAccess::ReadWrite),
+            ("engine.terrain_volume", ScriptAccess::ReadWrite),
+            ("engine.planet_surface_anchor", ScriptAccess::ReadWrite),
+            ("engine.planet_scene_transition", ScriptAccess::None),
             ("engine.vfx.particle_emitter", ScriptAccess::ReadWrite),
             ("engine.vfx.decal", ScriptAccess::ReadWrite),
         ] {
@@ -461,6 +488,8 @@ mod tests {
         assert!(document.contains("| `engine.transform` | DedicatedApi | no | no |"));
         assert!(document.contains("| `engine.character_controller` | ReadOnly | no | no |"));
         assert!(document.contains("| `engine.nav_agent` | ReadWrite | no | no |"));
+        assert!(document.contains("| `engine.terrain_volume` | ReadWrite | no | no |"));
+        assert!(document.contains("| `engine.planet_surface_anchor` | ReadWrite | no | no |"));
         assert!(document.contains("SCRIPT_COMPONENT_READ_ONLY"));
         // Rows are sorted by type key.
         let camera = document.find("`engine.audio_listener`").unwrap();

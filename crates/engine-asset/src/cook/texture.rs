@@ -13,7 +13,7 @@ use super::{write_cooked_artifact, AssetType, CookResult};
 
 /// Supported texture pixel formats for cooked output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TextureFormat {
+pub enum CookedTextureFormat {
     Rgba8Unorm,
     R8Unorm,
     Rg8Unorm,
@@ -30,7 +30,7 @@ pub struct CookedTexture {
     /// Number of mip levels.
     pub mip_count: u8,
     /// Pixel format.
-    pub format: TextureFormat,
+    pub format: CookedTextureFormat,
     /// Pixel data: all mip levels concatenated (base level first).
     pub data: Vec<u8>,
 }
@@ -59,7 +59,7 @@ pub fn cook_texture(source: &Path, output: &Path) -> Result<CookResult, CookErro
         width,
         height,
         mip_count,
-        format: TextureFormat::Rgba8Unorm,
+        format: CookedTextureFormat::Rgba8Unorm,
         data: mip_data,
     };
 
@@ -180,7 +180,7 @@ mod tests {
             width: 64,
             height: 64,
             mip_count: 7,
-            format: TextureFormat::Rgba8Unorm,
+            format: CookedTextureFormat::Rgba8Unorm,
             data: vec![128u8; 64 * 64 * 4],
         };
 
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(restored.width, 64);
         assert_eq!(restored.height, 64);
         assert_eq!(restored.mip_count, 7);
-        assert_eq!(restored.format, TextureFormat::Rgba8Unorm);
+        assert_eq!(restored.format, CookedTextureFormat::Rgba8Unorm);
     }
 
     #[test]

@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-backend-vulkan = ["dep:render-vulkan", "engine-core/backend-vulkan"]
+backend-vulkan = ["dep:render-vulkan"]
 backend-opengl = ["dep:render-opengl"]
 backend-dx12 = ["dep:render-dx12"]
 subsystem-animation = ["engine-core/subsystem-animation"]
@@ -67,7 +67,6 @@ glam.workspace = true
 gltf.workspace = true
 render-core = { path = "../render-core" }
 platform = { path = "../platform" }
-raw-window-handle.workspace = true
 ron.workspace = true
 render-vulkan = { path = "../render-vulkan", optional = true }
 render-opengl = { path = "../render-opengl", optional = true }
@@ -83,6 +82,7 @@ tempfile = "3"
 [dev-dependencies]
 engine-audio = { path = "../engine-audio" }
 engine-nav = { path = "../engine-nav" }
+engine-terrain = { path = "../engine-terrain" }
 engine-ui = { path = "../engine-ui" }
 engine-vfx = { path = "../engine-vfx" }
 

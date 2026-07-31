@@ -34,6 +34,7 @@ if (!string.IsNullOrWhiteSpace(nativeLibraryPath))
     Assert(EngineAPI.ffi_registry_abi_version() == 3, "native ABI version P/Invoke");
     Assert(EngineAPI.ffi_registry_struct_size() > 0, "native registry size P/Invoke");
     RunNativeCoroutineSmoke();
+    RunNativePlanetAndSpatialNavigationSmoke();
 }
 
 var taggedJson = Encoding.UTF8.GetBytes(
@@ -161,6 +162,59 @@ static void RunNativeCoroutineSmoke()
     EngineAPI.ffi_coroutine_tick(0.01f); // exception becomes MoveFailed, never crosses FFI
     Assert(failureReleases == 1, "managed exception releases root without crossing FFI");
     Assert(EngineAPI.ffi_coroutine_active_count() == 0, "managed failure removes coroutine");
+}
+
+static void RunNativePlanetAndSpatialNavigationSmoke()
+{
+    using var planet = new PlanetTerrainQuery(PlanetTerrainSettings.Default);
+    var surface = planet.SurfacePoint(new Vector3d(0.0, 1.0, 0.0));
+    Assert(surface.Y > 975.0 && surface.Y < 1025.0, "native planet surface");
+    Assert(Math.Abs(planet.Altitude(surface)) < 1.0e-7, "native planet altitude");
+    var coordinates = planet.Coordinates(surface);
+    var roundTrip = planet.WorldFromCoordinates(coordinates);
+    Assert(Math.Abs(roundTrip.Y - surface.Y) < 1.0e-7, "native planet coordinates");
+    var placement = planet.ResolveSurfacePlacement(new PlanetSurfaceAnchorSettings(
+        new Vector3d(0.0, 1.0, 0.0),
+        0.3,
+        2.0,
+        0.0,
+        Math.PI / 2.0,
+        100.0,
+        12));
+    Assert(placement.Position.Y > surface.Y, "native construction placement altitude");
+    Assert(Math.Abs(placement.AngularRadius) < double.Epsilon,
+        "native construction footprint diagnostics");
+    Assert(Math.Abs(
+        placement.Right.X * placement.Normal.X
+        + placement.Right.Y * placement.Normal.Y
+        + placement.Right.Z * placement.Normal.Z) < 1.0e-9,
+        "native construction placement basis");
+
+    using var space = new SpaceNavigationGrid(new Vector3(0, 0, 0), 8, 8, 8, 1.0f);
+    var spacePath = space.FindPath(new Vector3(0.5f, 0.5f, 0.5f), new Vector3(7.5f, 7.5f, 7.5f));
+    Assert(spacePath is { Waypoints.Count: 2 }, "native 3D path");
+
+    var largeCenter = new Vector3d(1.0e12, -2.0e12, 3.0e12);
+    using var sphere = new SphericalSurfaceNavigation(largeCenter, 100.0, 256, 8);
+    var surfacePath = sphere.FindPath(
+        new Vector3d(largeCenter.X + 100.0, largeCenter.Y, largeCenter.Z),
+        new Vector3d(largeCenter.X - 100.0, largeCenter.Y, largeCenter.Z));
+    Assert(surfacePath is { Waypoints.Count: > 3 }, "native spherical path");
+    Assert(Math.Abs(surfacePath!.Waypoints[0].X - largeCenter.X - 100.0) < 1.0e-7,
+        "native spherical path keeps f64 world coordinates");
+    Assert(sphere.UpsertObstacle("landing-pad", new Vector3d(1.0, 0.0, 0.0), 0.05),
+        "dynamic spherical obstacle");
+    Assert(sphere.FindPath(
+        new Vector3d(largeCenter.X + 100.0, largeCenter.Y, largeCenter.Z),
+        new Vector3d(largeCenter.X - 100.0, largeCenter.Y, largeCenter.Z)) is null,
+        "dynamic obstacle blocks covered endpoint");
+    Assert(sphere.RemoveObstacle("landing-pad"), "dynamic spherical obstacle removal");
+
+    using var terrainSphere = planet.CreateSurfaceNavigation(256, 8);
+    var terrainPath = terrainSphere.FindPath(
+        new Vector3d(1000, 0, 0),
+        new Vector3d(-1000, 0, 0));
+    Assert(terrainPath is { Waypoints.Count: > 3 }, "native terrain-projected spherical path");
 }
 
 static IEnumerator<YieldInstruction> NaturalRoutine(

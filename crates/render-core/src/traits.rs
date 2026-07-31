@@ -100,14 +100,27 @@ pub trait CommandEncoder: Send {
         false
     }
     /// Bind a uniform buffer through a backend root/descriptor binding used by
-    /// the portable skinning path. Returns `false` if the layout does not
-    /// declare a compatible binding.
+    /// portable per-draw and skinning paths. Returns `false` if the layout does
+    /// not declare a compatible binding.
     fn bind_uniform_buffer(
         &mut self,
         _pipeline_layout: PipelineLayoutHandle,
         _buffer: BufferHandle,
     ) -> bool {
         false
+    }
+    /// Bind a uniform-buffer view beginning at `offset_bytes`.
+    ///
+    /// Backends with dynamic CBV/UBO addressing override this method. The
+    /// default preserves compatibility for zero-offset users and fails closed
+    /// for offsets the backend cannot represent.
+    fn bind_uniform_buffer_offset(
+        &mut self,
+        pipeline_layout: PipelineLayoutHandle,
+        buffer: BufferHandle,
+        offset_bytes: u64,
+    ) -> bool {
+        offset_bytes == 0 && self.bind_uniform_buffer(pipeline_layout, buffer)
     }
     fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min_depth: f32, max_depth: f32);
     fn set_scissor(&mut self, x: i32, y: i32, w: u32, h: u32);

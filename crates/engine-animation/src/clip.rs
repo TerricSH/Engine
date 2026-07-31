@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::skeleton::Skeleton;
+use crate::skeleton::RuntimeSkeleton;
 use crate::{BoneIndex, BoneTransform, Pose};
 
 // ---------------------------------------------------------------------------
@@ -8,10 +8,13 @@ use crate::{BoneIndex, BoneTransform, Pose};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Keyframe {
+pub struct RuntimeKeyframe {
     pub time: f32,
     pub transform: BoneTransform,
 }
+
+/// Backwards-compatible runtime name for [`RuntimeKeyframe`].
+pub type Keyframe = RuntimeKeyframe;
 
 // ---------------------------------------------------------------------------
 // AnimationClip — set of channels (one per animated bone) plus duration.
@@ -20,17 +23,20 @@ pub struct Keyframe {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Channel {
     bone: BoneIndex,
-    keyframes: Vec<Keyframe>,
+    keyframes: Vec<RuntimeKeyframe>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnimationClip {
+pub struct RuntimeAnimationClip {
     name: String,
     duration_seconds: f32,
     channels: Vec<Channel>,
 }
 
-impl AnimationClip {
+/// Backwards-compatible runtime name for [`RuntimeAnimationClip`].
+pub type AnimationClip = RuntimeAnimationClip;
+
+impl RuntimeAnimationClip {
     /// Create a new clip with the given name and duration (in seconds).
     pub fn new(name: String, duration_seconds: f32) -> Self {
         tracing::debug!(
@@ -47,7 +53,7 @@ impl AnimationClip {
 
     /// Add a channel that animates `bone` with the provided sorted keyframes.
     /// Keyframes should be sorted by time in ascending order.
-    pub fn add_channel(&mut self, bone: BoneIndex, keyframes: Vec<Keyframe>) {
+    pub fn add_channel(&mut self, bone: BoneIndex, keyframes: Vec<RuntimeKeyframe>) {
         self.channels.push(Channel { bone, keyframes });
     }
 
@@ -55,7 +61,7 @@ impl AnimationClip {
     ///
     /// Starts with the skeleton's rest pose, then overrides each animated bone
     /// with the interpolated channel value.
-    pub fn sample(&self, time: f32, skeleton: &Skeleton) -> Pose {
+    pub fn sample(&self, time: f32, skeleton: &RuntimeSkeleton) -> Pose {
         let mut pose = Pose::new(skeleton);
         for channel in &self.channels {
             let bone_idx = channel.bone.0 as usize;
@@ -87,7 +93,7 @@ impl AnimationClip {
 /// - Before the first keyframe: held constant (first keyframe value).
 /// - After the last keyframe: held constant (last keyframe value).
 /// - Between two keyframes: LERP for translation/scale, SLERP for rotation.
-fn sample_keyframes(keyframes: &[Keyframe], time: f32) -> BoneTransform {
+fn sample_keyframes(keyframes: &[RuntimeKeyframe], time: f32) -> BoneTransform {
     match keyframes.len() {
         0 => return BoneTransform::IDENTITY,
         1 => return keyframes[0].transform,

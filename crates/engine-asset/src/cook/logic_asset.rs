@@ -1,319 +1,67 @@
-//! Gate 7 Logic Asset Model.
+//! Logic-asset cooking and runtime loading.
 //!
-//! Defines the first mobile-safe hot-updatable logic asset type: behavior graphs,
-//! state machines, skill graphs, and quest/dialogue trees.  These are pure data
-//! structures — no runtime interpreter is provided by this module.
-//!
-//! # Architecture
-//!
-//! ```text
-//! LogicAsset  ──→  validate()  ──→  cook_logic_asset()
-//!                                         │
-//!                                    CookedAssetHeader
-//!                                         │
-//!                                    .cooked artifact
-//! ```
+//! The data model is owned by `engine-serialize`. This module intentionally
+//! contains only the asset-pipeline adapter plus compatibility re-exports for
+//! callers that used the former `engine_asset::cook::logic_asset` paths.
 
-use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use engine_serialize::{AssetId, SchemaVersion};
-use serde::{Deserialize, Serialize};
+pub use engine_serialize::{
+    decode_logic_asset_cooked_compatible, encode_logic_asset_cooked_v2,
+    parse_logic_asset_json_compatible, CompareOp, ComparisonOp, LogicAsset, LogicAssetKind,
+    LogicAssetMigration, LogicAssetMigrationError, LogicAssetSourceSchema, LogicCondition,
+    LogicKind, LogicMetadata, LogicNode, LogicParam, LogicParamType, LogicParameter,
+    LogicParameterType, LogicTransition, LogicValue, LOGIC_ASSET_COOKED_V2_MAGIC,
+    LOGIC_ASSET_SCHEMA_V1, LOGIC_ASSET_SCHEMA_V2,
+};
 
 use super::error::CookError;
 use super::{write_cooked_artifact, AssetType, CookResult};
 
 pub const LOGIC_ASSET_TYPE_ID: &str = "logic";
 
-// ── Top-level container ───────────────────────────────────────────────────
-
-/// Top-level logic asset container.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LogicAsset {
-    /// Schema version for forward-compatibility.
-    pub schema_version: SchemaVersion,
-    /// Human-readable asset identifier.
-    pub asset_id: String,
-    /// Kind of logic graph this asset represents.
-    pub kind: LogicAssetKind,
-    /// Nodes in the graph.
-    pub nodes: Vec<LogicNode>,
-    /// Named parameters exposed by this logic asset.
-    pub parameters: BTreeMap<String, LogicParam>,
-    /// Metadata (author, description, tags, version).
-    pub metadata: LogicMetadata,
+fn parse_and_validate(source: &[u8]) -> Result<LogicAsset, String> {
+    let migration = parse_logic_asset_json_compatible(source).map_err(|error| error.to_string())?;
+    validate_asset(migration.asset)
 }
 
-// ── LogicAssetKind ────────────────────────────────────────────────────────
-
-/// Kind of logic asset.
-///
-/// This enum is `#[non_exhaustive]` so new kinds can be added without a
-/// breaking change.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum LogicAssetKind {
-    /// A behaviour tree (composite/decorator/action nodes).
-    BehaviorTree,
-    /// A hierarchical or flat state machine.
-    StateMachine,
-    /// A skill/ability graph (e.g. for an ability system).
-    SkillGraph,
-    /// A quest or dialogue tree.
-    QuestDialogue,
+fn decode_and_validate(cooked: &[u8]) -> Result<LogicAsset, String> {
+    let migration =
+        decode_logic_asset_cooked_compatible(cooked).map_err(|error| error.to_string())?;
+    validate_asset(migration.asset)
 }
 
-// ── Nodes ─────────────────────────────────────────────────────────────────
-
-/// A single node in the logic graph.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LogicNode {
-    /// Unique identifier for this node within the asset.
-    pub id: String,
-    /// Type discriminator (e.g. "sequence", "selector", "state", "action", …).
-    pub node_type: String,
-    /// Optional human-readable label.
-    pub label: Option<String>,
-    /// Outgoing transitions/links to other nodes.
-    pub transitions: Vec<LogicTransition>,
-    /// Node-scoped properties.
-    pub properties: BTreeMap<String, LogicValue>,
-    /// Child node IDs (for hierarchical graphs like behaviour trees).
-    pub children: Vec<String>,
-}
-
-// ── Transitions ───────────────────────────────────────────────────────────
-
-/// A transition between nodes (for state machines) or a sequence link (for
-/// behaviour trees).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LogicTransition {
-    /// The target node identifier.
-    pub target_node: String,
-    /// Optional condition that must be satisfied for the transition to fire.
-    pub condition: Option<LogicCondition>,
-    /// Priority for resolving conflicting transitions (higher = preferred).
-    pub priority: i32,
-}
-
-// ── Conditions ────────────────────────────────────────────────────────────
-
-/// A condition that gates a transition.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum LogicCondition {
-    /// Always fires.
-    Always,
-    /// Never fires.
-    Never,
-    /// Evaluate a boolean parameter by name.
-    BoolParam(String),
-    /// Compare a parameter against a value.
-    Comparison {
-        param: String,
-        op: ComparisonOp,
-        value: LogicValue,
-    },
-    /// Logical AND of sub-conditions.
-    And(Vec<LogicCondition>),
-    /// Logical OR of sub-conditions.
-    Or(Vec<LogicCondition>),
-    /// Logical NOT of a sub-condition.
-    Not(Box<LogicCondition>),
-}
-
-/// Comparison operators for conditions.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub enum ComparisonOp {
-    Equal,
-    NotEqual,
-    Less,
-    LessOrEqual,
-    Greater,
-    GreaterOrEqual,
-}
-
-// ── Values ────────────────────────────────────────────────────────────────
-
-/// A typed parameter value.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum LogicValue {
-    /// Boolean.
-    Bool(bool),
-    /// Signed 64-bit integer.
-    Int(i64),
-    /// 64-bit floating point.
-    Float(f64),
-    /// UTF-8 string.
-    String(String),
-    /// Reference to another asset by its [`AssetId`].
-    AssetRef(AssetId),
-    /// Reference to an entity by string identifier.
-    EntityRef(String),
-}
-
-// ── Parameters ────────────────────────────────────────────────────────────
-
-/// A named parameter declaration for a logic asset.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LogicParam {
-    /// Parameter name.
-    pub name: String,
-    /// The type of the parameter.
-    pub param_type: LogicParamType,
-    /// Optional default value.
-    pub default: Option<LogicValue>,
-    /// Optional human-readable description.
-    pub description: Option<String>,
-}
-
-/// Supported parameter types.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum LogicParamType {
-    Bool,
-    Int,
-    Float,
-    String,
-    AssetRef,
-    EntityRef,
-}
-
-// ── Metadata ──────────────────────────────────────────────────────────────
-
-/// Metadata attached to a logic asset.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LogicMetadata {
-    /// Author name or identifier.
-    pub author: Option<String>,
-    /// Human-readable description.
-    pub description: Option<String>,
-    /// Search/filter tags.
-    pub tags: Vec<String>,
-    /// Asset version string (semver recommended).
-    pub version: String,
-}
-
-// ── Validation ────────────────────────────────────────────────────────────
-
-impl LogicAsset {
-    /// Validate the logic asset structure.
-    ///
-    /// Returns a list of human-readable error strings.  An empty `Vec` means
-    /// the asset is structurally valid.
-    pub fn validate(&self) -> Vec<String> {
-        let mut errors: Vec<String> = Vec::new();
-
-        // Collect all node IDs.
-        let mut node_ids: HashSet<&str> = HashSet::new();
-        for node in &self.nodes {
-            if !node_ids.insert(node.id.as_str()) {
-                errors.push(format!("Duplicate node ID: '{}'", node.id));
-            }
-        }
-
-        // Collect all parameter names.
-        let param_names: HashSet<&str> = self.parameters.keys().map(|s| s.as_str()).collect();
-
-        // Check each node's transitions target existing nodes.
-        for node in &self.nodes {
-            for (i, transition) in node.transitions.iter().enumerate() {
-                if !node_ids.contains(transition.target_node.as_str()) {
-                    errors.push(format!(
-                        "Node '{}', transition {}: target node '{}' does not exist",
-                        node.id, i, transition.target_node
-                    ));
-                }
-
-                // Check condition parameters reference existing parameters.
-                if let Some(ref cond) = transition.condition {
-                    self.collect_param_refs(cond, &mut errors, &param_names, &node.id);
-                }
-            }
-
-            // Check child node IDs exist.
-            for child_id in &node.children {
-                if !node_ids.contains(child_id.as_str()) {
-                    errors.push(format!(
-                        "Node '{}': child node '{}' does not exist",
-                        node.id, child_id
-                    ));
-                }
-            }
-        }
-
-        errors
-    }
-
-    /// Recursively collect parameter references from a condition tree and
-    /// emit errors for any that don't exist in `param_names`.
-    fn collect_param_refs(
-        &self,
-        cond: &LogicCondition,
-        errors: &mut Vec<String>,
-        param_names: &HashSet<&str>,
-        node_id: &str,
-    ) {
-        match cond {
-            LogicCondition::BoolParam(name) => {
-                if !param_names.contains(name.as_str()) {
-                    errors.push(format!(
-                        "Node '{}': condition references undefined bool parameter '{}'",
-                        node_id, name
-                    ));
-                }
-            }
-            LogicCondition::Comparison { param, .. } => {
-                if !param_names.contains(param.as_str()) {
-                    errors.push(format!(
-                        "Node '{}': condition references undefined parameter '{}'",
-                        node_id, param
-                    ));
-                }
-            }
-            LogicCondition::And(conds) | LogicCondition::Or(conds) => {
-                for c in conds {
-                    self.collect_param_refs(c, errors, param_names, node_id);
-                }
-            }
-            LogicCondition::Not(inner) => {
-                self.collect_param_refs(inner, errors, param_names, node_id);
-            }
-            // Always / Never have no parameter references.
-            LogicCondition::Always | LogicCondition::Never => {}
-        }
+fn validate_asset(asset: LogicAsset) -> Result<LogicAsset, String> {
+    let errors = asset.validate();
+    if errors.is_empty() {
+        Ok(asset)
+    } else {
+        Err(format!(
+            "LogicAsset validation failed: {}",
+            errors.join("; ")
+        ))
     }
 }
 
 /// Registry cooker used by tooling that routes source bytes through the
 /// extension pipeline.
+///
+/// Both former V1 JSON layouts are migrated explicitly. Output is always the
+/// canonical V2 cooked layout and carries the V2 magic prefix.
 pub fn logic_asset_cooker(source: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
-    let asset: LogicAsset = serde_json::from_slice(source)
-        .map_err(|error| format!("LogicAsset JSON is invalid: {error}"))?;
-    let errors = asset.validate();
-    if !errors.is_empty() {
-        return Err(format!(
-            "LogicAsset validation failed: {}",
-            errors.join("; ")
-        ));
-    }
-    output.extend(
-        bincode::serialize(&asset)
-            .map_err(|error| format!("LogicAsset serialization failed: {error}"))?,
-    );
+    let asset = parse_and_validate(source)?;
+    let payload = encode_logic_asset_cooked_v2(&asset).map_err(|error| error.to_string())?;
+    output.extend_from_slice(&payload);
     Ok(())
 }
 
-/// Runtime loader for cooked logic graphs.
+/// Runtime loader for canonical V2 cooked logic graphs.
+///
+/// Exact legacy production-V1 bincode payloads are migrated by
+/// `engine-serialize`; malformed V2-prefixed data never falls back to the
+/// legacy decoder.
 pub fn logic_asset_loader(cooked: &[u8]) -> Result<Box<dyn std::any::Any + Send + Sync>, String> {
-    let asset: LogicAsset =
-        bincode::deserialize(cooked).map_err(|error| format!("LogicAsset load failed: {error}"))?;
-    let errors = asset.validate();
-    if !errors.is_empty() {
-        return Err(format!(
-            "LogicAsset validation failed: {}",
-            errors.join("; ")
-        ));
-    }
-    Ok(Box::new(asset))
+    Ok(Box::new(decode_and_validate(cooked)?))
 }
 
 pub fn register_logic_asset_type(registry: &mut engine_scene::registry::AssetTypeRegistry) {
@@ -330,472 +78,222 @@ pub fn register_logic_asset_type(registry: &mut engine_scene::registry::AssetTyp
     });
 }
 
-// ── Cook entry point ─────────────────────────────────────────────────────
-
-/// Cook a logic asset from a JSON source file.
+/// Cook a logic asset source into a standard engine cooked artifact.
 ///
-/// 1. Load [`LogicAsset`] from a JSON source file.
-/// 2. Validate the asset structure.
-/// 3. Serialize with bincode and write a cooked artifact.
-///
-/// # Parameters
-///
-/// * `source` – path to the JSON source file.
-/// * `output` – path for the cooked `.cooked` file.
-///
-/// # Returns
-///
-/// A [`CookResult`] on success, or a [`CookError`] on failure.
+/// Source may use canonical V2 JSON or either explicitly recognized V1 JSON
+/// layout. The artifact header and payload are always written as V2.
 pub fn cook_logic_asset(source: &Path, output: &Path) -> Result<CookResult, CookError> {
-    // 1. Load LogicAsset from JSON source.
-    let source_bytes = std::fs::read_to_string(source)?;
-    let asset: LogicAsset = serde_json::from_str(&source_bytes)
-        .map_err(|e| CookError::Parse(format!("failed to parse logic asset JSON: {e}")))?;
+    let source_bytes = std::fs::read(source)?;
+    let asset = parse_logic_asset_json_compatible(&source_bytes)
+        .map_err(|error| CookError::Parse(error.to_string()))?
+        .asset;
 
-    // 2. Validate.
     let validation_errors = asset.validate();
     if !validation_errors.is_empty() {
-        let msg = format!(
+        return Err(CookError::InvalidAsset(format!(
             "logic asset '{}' validation failed:\n  - {}",
             asset.asset_id,
             validation_errors.join("\n  - ")
-        );
-        return Err(CookError::InvalidAsset(msg));
+        )));
     }
 
-    // 3. Serialize with bincode.
-    let payload = bincode::serialize(&asset)
-        .map_err(|e| CookError::InvalidAsset(format!("bincode serialization failed: {e}")))?;
-
-    // 4. Write cooked artifact with header.
-    let result = write_cooked_artifact(
+    let payload = encode_logic_asset_cooked_v2(&asset)
+        .map_err(|error| CookError::InvalidAsset(error.to_string()))?;
+    write_cooked_artifact(
         output,
         AssetType::Logic.kind_code(),
         &payload,
-        asset.schema_version,
-    )?;
-
-    Ok(result)
+        LOGIC_ASSET_SCHEMA_V2,
+    )
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use crate::cook::read_cooked_artifact;
+    use engine_serialize::{AssetId, SchemaVersion};
+    use std::collections::BTreeMap;
 
-    // ── Helpers ────────────────────────────────────────────────────────
-
-    fn sample_behavior_tree() -> LogicAsset {
+    fn canonical_asset() -> LogicAsset {
         LogicAsset {
-            schema_version: SchemaVersion::new(0, 1, 0),
-            asset_id: "bt_enemy_patrol".into(),
-            kind: LogicAssetKind::BehaviorTree,
-            nodes: vec![
-                LogicNode {
-                    id: "root".into(),
-                    node_type: "sequence".into(),
-                    label: Some("Patrol Sequence".into()),
-                    transitions: vec![],
-                    properties: BTreeMap::new(),
-                    children: vec!["move_to_point".into(), "wait".into()],
-                },
-                LogicNode {
-                    id: "move_to_point".into(),
-                    node_type: "action".into(),
-                    label: Some("Move to Patrol Point".into()),
-                    transitions: vec![LogicTransition {
-                        target_node: "root".into(),
-                        condition: Some(LogicCondition::Always),
-                        priority: 0,
-                    }],
-                    properties: {
-                        let mut m = BTreeMap::new();
-                        m.insert("speed".into(), LogicValue::Float(2.5));
-                        m
-                    },
-                    children: vec![],
-                },
-                LogicNode {
-                    id: "wait".into(),
-                    node_type: "action".into(),
-                    label: Some("Wait at Point".into()),
-                    transitions: vec![LogicTransition {
-                        target_node: "root".into(),
-                        condition: Some(LogicCondition::BoolParam("has_waited".into())),
-                        priority: 0,
-                    }],
-                    properties: {
-                        let mut m = BTreeMap::new();
-                        m.insert("duration".into(), LogicValue::Float(3.0));
-                        m
-                    },
-                    children: vec![],
-                },
-            ],
-            parameters: {
-                let mut m = BTreeMap::new();
-                m.insert(
-                    "has_waited".into(),
-                    LogicParam {
-                        name: "has_waited".into(),
-                        param_type: LogicParamType::Bool,
-                        default: Some(LogicValue::Bool(false)),
-                        description: Some("Whether the wait action completed".into()),
-                    },
-                );
-                m
-            },
-            metadata: LogicMetadata {
-                author: Some("Engine Team".into()),
-                description: Some("Enemy patrol behaviour tree".into()),
-                tags: vec!["enemy".into(), "patrol".into(), "ai".into()],
-                version: "1.0.0".into(),
-            },
+            schema_version: LOGIC_ASSET_SCHEMA_V2,
+            asset_id: "logic.canonical".into(),
+            kind: LogicKind::BehaviorTree,
+            nodes: vec![LogicNode {
+                id: "root".into(),
+                node_type: "action".into(),
+                label: None,
+                transitions: Vec::new(),
+                properties: BTreeMap::from([(
+                    "target".into(),
+                    LogicValue::AssetRef(AssetId::new("asset.target")),
+                )]),
+                children: Vec::new(),
+            }],
+            entry_node: Some("root".into()),
+            parameters: BTreeMap::new(),
+            metadata: LogicMetadata::default(),
         }
     }
 
-    fn sample_state_machine() -> LogicAsset {
-        LogicAsset {
-            schema_version: SchemaVersion::new(0, 1, 0),
-            asset_id: "fsm_door".into(),
-            kind: LogicAssetKind::StateMachine,
-            nodes: vec![
-                LogicNode {
-                    id: "closed".into(),
-                    node_type: "state".into(),
-                    label: Some("Closed".into()),
-                    transitions: vec![LogicTransition {
-                        target_node: "opening".into(),
-                        condition: Some(LogicCondition::BoolParam("button_pressed".into())),
-                        priority: 0,
-                    }],
-                    properties: BTreeMap::new(),
-                    children: vec![],
-                },
-                LogicNode {
-                    id: "opening".into(),
-                    node_type: "state".into(),
-                    label: Some("Opening".into()),
-                    transitions: vec![LogicTransition {
-                        target_node: "open".into(),
-                        condition: Some(LogicCondition::Always),
-                        priority: 0,
-                    }],
-                    properties: BTreeMap::new(),
-                    children: vec![],
-                },
-                LogicNode {
-                    id: "open".into(),
-                    node_type: "state".into(),
-                    label: Some("Open".into()),
-                    transitions: vec![LogicTransition {
-                        target_node: "closing".into(),
-                        condition: Some(LogicCondition::Comparison {
-                            param: "open_time".into(),
-                            op: ComparisonOp::GreaterOrEqual,
-                            value: LogicValue::Float(5.0),
-                        }),
-                        priority: 0,
-                    }],
-                    properties: BTreeMap::new(),
-                    children: vec![],
-                },
-                LogicNode {
-                    id: "closing".into(),
-                    node_type: "state".into(),
-                    label: Some("Closing".into()),
-                    transitions: vec![LogicTransition {
-                        target_node: "closed".into(),
-                        condition: Some(LogicCondition::Always),
-                        priority: 0,
-                    }],
-                    properties: BTreeMap::new(),
-                    children: vec![],
-                },
-            ],
-            parameters: {
-                let mut m = BTreeMap::new();
-                m.insert(
-                    "button_pressed".into(),
-                    LogicParam {
-                        name: "button_pressed".into(),
-                        param_type: LogicParamType::Bool,
-                        default: Some(LogicValue::Bool(false)),
-                        description: Some("Whether the door button was pressed".into()),
-                    },
-                );
-                m.insert(
-                    "open_time".into(),
-                    LogicParam {
-                        name: "open_time".into(),
-                        param_type: LogicParamType::Float,
-                        default: Some(LogicValue::Float(0.0)),
-                        description: Some("Seconds the door has been open".into()),
-                    },
-                );
-                m
-            },
-            metadata: LogicMetadata {
-                author: Some("Engine Team".into()),
-                description: Some("Door state machine".into()),
-                tags: vec!["door".into(), "fsm".into()],
-                version: "1.0.0".into(),
-            },
-        }
-    }
-
-    // ── Round-trip tests ───────────────────────────────────────────────
-
-    #[test]
-    fn logic_asset_serde_roundtrip() {
-        let asset = sample_behavior_tree();
-        let json = serde_json::to_string_pretty(&asset).unwrap();
-        let restored: LogicAsset = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.asset_id, "bt_enemy_patrol");
-        assert!(matches!(restored.kind, LogicAssetKind::BehaviorTree));
-        assert_eq!(restored.nodes.len(), 3);
-        assert_eq!(restored.parameters.len(), 1);
-        assert_eq!(restored.metadata.author.as_deref(), Some("Engine Team"));
-
-        // Verify a property round-trip.
-        let move_node = restored
-            .nodes
-            .iter()
-            .find(|n| n.id == "move_to_point")
-            .expect("move_to_point node missing");
-        let speed = move_node.properties.get("speed").expect("speed property");
-        assert!(matches!(speed, LogicValue::Float(v) if (*v - 2.5).abs() < 1e-10));
-    }
-
-    #[test]
-    fn state_machine_serde_roundtrip() {
-        let asset = sample_state_machine();
-        let json = serde_json::to_string_pretty(&asset).unwrap();
-        let restored: LogicAsset = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.asset_id, "fsm_door");
-        assert!(matches!(restored.kind, LogicAssetKind::StateMachine));
-        assert_eq!(restored.nodes.len(), 4);
-        assert_eq!(restored.parameters.len(), 2);
-    }
-
-    // ── Validation tests ───────────────────────────────────────────────
-
-    #[test]
-    fn valid_behavior_tree_passes_validation() {
-        let asset = sample_behavior_tree();
-        let errors = asset.validate();
-        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
-    }
-
-    #[test]
-    fn valid_state_machine_passes_validation() {
-        let asset = sample_state_machine();
-        let errors = asset.validate();
-        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
-    }
-
-    #[test]
-    fn broken_transition_target_detected() {
-        let mut asset = sample_behavior_tree();
-        // Point the "move_to_point" transition to a non-existent node.
-        asset.nodes[1].transitions[0].target_node = "non_existent_node".into();
-        let errors = asset.validate();
-        assert!(
-            errors.iter().any(|e| e.contains("non_existent_node")),
-            "expected error about missing target node, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn duplicate_node_id_detected() {
-        let mut asset = sample_behavior_tree();
-        // Add a duplicate "root" node.
-        asset.nodes.push(LogicNode {
-            id: "root".into(),
-            node_type: "action".into(),
-            label: None,
-            transitions: vec![],
-            properties: BTreeMap::new(),
-            children: vec![],
-        });
-        let errors = asset.validate();
-        assert!(
-            errors.iter().any(|e| e.contains("Duplicate node ID")),
-            "expected error about duplicate node ID, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn undefined_parameter_in_condition_detected() {
-        let mut asset = sample_behavior_tree();
-        // Reference a param that does not exist.
-        asset.nodes[2].transitions[0].condition =
-            Some(LogicCondition::BoolParam("nonexistent_param".into()));
-        let errors = asset.validate();
-        assert!(
-            errors.iter().any(|e| e.contains("nonexistent_param")),
-            "expected error about undefined parameter, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn broken_child_reference_detected() {
-        let mut asset = sample_behavior_tree();
-        asset.nodes[0].children.push("missing_child".into());
-        let errors = asset.validate();
-        assert!(
-            errors.iter().any(|e| e.contains("missing_child")),
-            "expected error about missing child node, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn state_machine_cycle_allowed() {
-        let mut asset = sample_state_machine();
-        // State machines are expected to support revisiting earlier states.
-        asset.nodes[1].transitions[0].target_node = "closed".into();
-        let errors = asset.validate();
-        assert!(
-            errors.is_empty(),
-            "expected FSM cycles to be allowed, got: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn non_state_machine_cycle_allowed() {
-        // Behavior trees may have loops (they're not strictly acyclic).
-        let asset = sample_behavior_tree();
-        // Both move_to_point and wait already link back to root — that's fine.
-        let errors = asset.validate();
-        assert!(
-            errors.is_empty(),
-            "expected no errors for BT with back-edges, got: {errors:?}"
-        );
-    }
-
-    // ── Cook tests ─────────────────────────────────────────────────────
-
-    #[test]
-    fn cook_logic_asset_writes_valid_artifact() {
-        let dir = std::env::temp_dir().join("cook_test_logic_asset");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let source_path = dir.join("bt_enemy_patrol.json");
-        let cooked_path = dir.join("bt_enemy_patrol.cooked");
-
-        // Write source JSON.
-        let asset = sample_behavior_tree();
-        let json = serde_json::to_string_pretty(&asset).unwrap();
-        std::fs::write(&source_path, &json).unwrap();
-
-        // Cook.
-        let result = cook_logic_asset(&source_path, &cooked_path).unwrap();
-        assert!(result.success);
-        assert_eq!(result.asset_type, AssetType::Logic);
-
-        // Read back and verify header + payload.
-        let mut file = std::fs::File::open(&cooked_path).unwrap();
-        let mut file_bytes = Vec::new();
-        file.read_to_end(&mut file_bytes).unwrap();
-
-        let header: crate::cook::CookedAssetHeader = bincode::deserialize(&file_bytes[..]).unwrap();
-        assert!(header.is_valid());
-        assert_eq!(header.asset_kind, AssetType::Logic.kind_code());
-
-        // Deserialize payload.
-        let header_size = bincode::serialized_size(&header).unwrap() as usize;
-        let payload = &file_bytes[header_size..];
-        let restored: LogicAsset = bincode::deserialize(payload).unwrap();
-        assert_eq!(restored.asset_id, "bt_enemy_patrol");
-        assert_eq!(restored.nodes.len(), 3);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cook_invalid_logic_asset_returns_error() {
-        let dir = std::env::temp_dir().join("cook_test_invalid_logic");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let source_path = dir.join("invalid.json");
-        let cooked_path = dir.join("invalid.cooked");
-
-        // Write an asset with a broken transition target.
-        let mut asset = sample_behavior_tree();
-        asset.nodes[1].transitions[0].target_node = "ghost".into();
-        let json = serde_json::to_string_pretty(&asset).unwrap();
-        std::fs::write(&source_path, &json).unwrap();
-
-        // Cooking should fail validation.
-        let result = cook_logic_asset(&source_path, &cooked_path);
-        assert!(result.is_err(), "expected cook to fail for invalid asset");
-        match result {
-            Err(CookError::InvalidAsset(msg)) => {
-                assert!(msg.contains("ghost"), "error should mention missing node");
+    fn production_v1_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": {"major": 0, "minor": 1, "patch": 0},
+            "asset_id": "logic.production-v1",
+            "kind": "BehaviorTree",
+            "nodes": [{
+                "id": "root",
+                "node_type": "action",
+                "label": null,
+                "transitions": [],
+                "properties": {"enabled": {"Bool": true}},
+                "children": []
+            }],
+            "parameters": {},
+            "metadata": {
+                "author": null,
+                "description": null,
+                "tags": ["legacy"],
+                "version": "1.0.0"
             }
-            other => panic!("expected InvalidAsset error, got: {other:?}"),
-        }
+        }))
+        .unwrap()
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    fn serialize_v1_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": {"major": 0, "minor": 1, "patch": 0},
+            "kind": "AITree",
+            "nodes": [{
+                "id": "root",
+                "node_type": "sense",
+                "parameters": [{"name": "radius", "value": {"Float": 25.0}}],
+                "transitions": [{
+                    "target_node": "root",
+                    "condition": {"HasAsset": {
+                        "asset": {"id": "asset.sensor", "logical_path": null}
+                    }}
+                }],
+                "children": []
+            }],
+            "entry_node": "root"
+        }))
+        .unwrap()
     }
 
     #[test]
-    fn logic_asset_kind_display() {
-        // Verify the kinds serialize/deserialize with their variant names.
-        let kinds = vec![
-            LogicAssetKind::BehaviorTree,
-            LogicAssetKind::StateMachine,
-            LogicAssetKind::SkillGraph,
-            LogicAssetKind::QuestDialogue,
-        ];
-        for kind in kinds {
-            let json = serde_json::to_string(&kind).unwrap();
-            let restored: LogicAssetKind = serde_json::from_str(&json).unwrap();
-            // Can't easily assert variant equality without PartialEq,
-            // but we can serialize again and verify the string matches.
-            let json2 = serde_json::to_string(&restored).unwrap();
-            assert_eq!(json, json2, "kind roundtrip mismatch");
-        }
-    }
-
-    #[test]
-    fn logic_value_variants_roundtrip() {
-        let values = vec![
-            LogicValue::Bool(true),
-            LogicValue::Int(-42),
-            LogicValue::Float(std::f64::consts::PI),
-            LogicValue::String("hello".into()),
-            LogicValue::AssetRef(AssetId::new("some_asset")),
-            LogicValue::EntityRef("player".into()),
-        ];
-
-        for value in values {
-            let json = serde_json::to_string(&value).unwrap();
-            let restored: LogicValue = serde_json::from_str(&json).unwrap();
-            let json2 = serde_json::to_string(&restored).unwrap();
-            assert_eq!(json, json2, "LogicValue roundtrip mismatch");
-        }
-    }
-
-    #[test]
-    fn registered_logic_loader_roundtrips_validated_runtime_asset() {
-        let source = serde_json::to_vec(&sample_behavior_tree()).unwrap();
+    fn canonical_source_cooks_and_loads_as_engine_serialize_type() {
+        let source = serde_json::to_vec(&canonical_asset()).unwrap();
         let mut cooked = Vec::new();
         logic_asset_cooker(&source, &mut cooked).unwrap();
-        let loaded = logic_asset_loader(&cooked).unwrap();
-        let loaded = loaded.downcast_ref::<LogicAsset>().unwrap();
-        assert_eq!(loaded.asset_id, "bt_enemy_patrol");
+        assert!(cooked.starts_with(LOGIC_ASSET_COOKED_V2_MAGIC));
 
+        let loaded = logic_asset_loader(&cooked).unwrap();
+        let loaded = loaded
+            .downcast_ref::<engine_serialize::LogicAsset>()
+            .expect("loader must return the canonical engine-serialize type");
+        assert_eq!(loaded.asset_id, "logic.canonical");
+        assert_eq!(loaded.schema_version, LOGIC_ASSET_SCHEMA_V2);
+    }
+
+    #[test]
+    fn both_v1_json_layouts_are_migrated_before_cooking() {
+        for (source, expected_schema, expected_kind) in [
+            (
+                production_v1_json(),
+                LogicAssetSourceSchema::ProductionV1,
+                LogicKind::BehaviorTree,
+            ),
+            (
+                serialize_v1_json(),
+                LogicAssetSourceSchema::SerializeV1,
+                LogicKind::AITree,
+            ),
+        ] {
+            let migration = parse_logic_asset_json_compatible(&source).unwrap();
+            assert_eq!(migration.source_schema, expected_schema);
+            assert_eq!(migration.asset.kind, expected_kind);
+
+            let mut cooked = Vec::new();
+            logic_asset_cooker(&source, &mut cooked).unwrap();
+            let loaded = logic_asset_loader(&cooked).unwrap();
+            let loaded = loaded
+                .downcast_ref::<engine_serialize::LogicAsset>()
+                .unwrap();
+            assert_eq!(loaded.schema_version, LOGIC_ASSET_SCHEMA_V2);
+            assert!(loaded.validate().is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_v2_payload_rejects_legacy_fallback() {
+        let mut corrupt = LOGIC_ASSET_COOKED_V2_MAGIC.to_vec();
+        corrupt.extend([1, 2, 3]);
+        let error = logic_asset_loader(&corrupt).unwrap_err();
+        assert!(error.contains("bincode"));
+    }
+
+    #[test]
+    fn invalid_graph_is_rejected_before_cooking() {
+        let mut asset = canonical_asset();
+        asset.nodes[0].transitions.push(LogicTransition {
+            target_node: "missing".into(),
+            condition: None,
+            priority: 0,
+        });
+        let source = serde_json::to_vec(&asset).unwrap();
+        let error = logic_asset_cooker(&source, &mut Vec::new()).unwrap_err();
+        assert!(error.contains("target node 'missing' does not exist"));
+    }
+
+    #[test]
+    fn file_cooker_writes_v2_header_and_prefixed_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("sample.logic.json");
+        let output = directory.path().join("sample.cooked");
+        std::fs::write(&source, production_v1_json()).unwrap();
+
+        cook_logic_asset(&source, &output).unwrap();
+        let artifact = read_cooked_artifact(&output).unwrap();
+        assert_eq!(artifact.header.asset_kind, AssetType::Logic.kind_code());
+        assert_eq!(artifact.header.schema_version, LOGIC_ASSET_SCHEMA_V2);
+        assert!(artifact.payload.starts_with(LOGIC_ASSET_COOKED_V2_MAGIC));
+
+        let loaded = logic_asset_loader(&artifact.payload).unwrap();
+        let loaded = loaded
+            .downcast_ref::<engine_serialize::LogicAsset>()
+            .unwrap();
+        assert_eq!(loaded.asset_id, "logic.production-v1");
+    }
+
+    #[test]
+    fn compatibility_names_are_aliases_not_parallel_types() {
+        use std::any::TypeId;
+
+        assert_eq!(
+            TypeId::of::<LogicAsset>(),
+            TypeId::of::<engine_serialize::LogicAsset>()
+        );
+        assert_eq!(TypeId::of::<LogicAssetKind>(), TypeId::of::<LogicKind>());
+        assert_eq!(TypeId::of::<LogicParam>(), TypeId::of::<LogicParameter>());
+        assert_eq!(
+            TypeId::of::<LogicParamType>(),
+            TypeId::of::<LogicParameterType>()
+        );
+        assert_eq!(TypeId::of::<CompareOp>(), TypeId::of::<ComparisonOp>());
+    }
+
+    #[test]
+    fn registration_exposes_canonical_cooker_and_loader() {
         let mut registry = engine_scene::registry::AssetTypeRegistry::new();
         register_logic_asset_type(&mut registry);
         let extension = registry.get(LOGIC_ASSET_TYPE_ID).unwrap();
-        assert!(extension.loader.is_some());
         assert!(extension.cooker.is_some());
+        assert!(extension.loader.is_some());
+    }
+
+    #[test]
+    fn public_v1_schema_constant_preserves_the_old_contract() {
+        assert_eq!(LOGIC_ASSET_SCHEMA_V1, SchemaVersion::new(0, 1, 0));
     }
 }

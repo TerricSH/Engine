@@ -28,8 +28,8 @@ mod types;
 pub use canvas::{register_ui_extensions, Canvas};
 pub use color::Color;
 pub use font::{
-    font_atlas_availability, font_atlas_texture_upload, take_font_atlas_diagnostics,
-    FontAtlasAvailability, FONT_ATLAS_ASSET,
+    font_atlas_availability, font_atlas_texture_upload, font_atlas_texture_upload_since,
+    take_font_atlas_diagnostics, FontAtlasAvailability, FONT_ATLAS_ASSET,
 };
 pub use input::{
     hit_test, hit_test_interactive, UiClickEvent, UiInputState, UiPointerEvent, UiValue,
