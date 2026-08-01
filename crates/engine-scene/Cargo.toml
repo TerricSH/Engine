@@ -17,4 +17,3 @@ serde_json.workspace = true
 thiserror.workspace = true
 glam.workspace = true
 ron.workspace = true
-indexmap.workspace = true

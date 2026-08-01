@@ -38,6 +38,8 @@ impl VulkanDevice {
 
         // The command buffer was never submitted and the device is idle, so it
         // can return to the initial state regardless of where recording failed.
+        // SAFETY: `wait_idle_checked` completed above; `frame.command_buffer`
+        // belongs to a reset-capable pool and was never submitted this frame.
         unsafe {
             device
                 .reset_command_buffer(
@@ -47,6 +49,8 @@ impl VulkanDevice {
                 .map_err(|result| VulkanError::vk("abort_reset_command_buffer", result))?;
         }
 
+        // SAFETY: `device` is live; the default fence create-info contains no
+        // borrowed storage and SIGNALED restores the pre-acquire frame state.
         let replacement_fence = unsafe {
             device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -55,17 +59,25 @@ impl VulkanDevice {
         }
         .map_err(|result| VulkanError::vk("abort_create_fence", result))?;
         let replacement_image_available =
+            // SAFETY: `device` is live and the default create-info creates an
+            // unowned binary semaphore suitable for image acquisition.
             match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
                 Ok(semaphore) => semaphore,
                 Err(result) => {
+                    // SAFETY: the replacement fence was just created by this
+                    // device and cannot have been submitted or shared.
                     unsafe { device.destroy_fence(replacement_fence, None) };
                     return Err(VulkanError::vk("abort_create_image_semaphore", result));
                 }
             };
         let replacement_render_finished =
+            // SAFETY: `device` is live and this fresh binary semaphore is not
+            // yet referenced by a submission or present operation.
             match unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) } {
                 Ok(semaphore) => semaphore,
                 Err(result) => {
+                    // SAFETY: both replacement handles were created in this
+                    // transaction and have never been submitted or exposed.
                     unsafe {
                         device.destroy_semaphore(replacement_image_available, None);
                         device.destroy_fence(replacement_fence, None);
@@ -80,6 +92,8 @@ impl VulkanDevice {
             std::mem::replace(&mut frame.image_available, replacement_image_available);
         let old_render_finished =
             std::mem::replace(&mut frame.render_finished, replacement_render_finished);
+        // SAFETY: the device is idle; replacement above removed these handles
+        // from frame state, giving this path exclusive ownership for destruction.
         unsafe {
             device.destroy_fence(old_fence, None);
             device.destroy_semaphore(old_image_available, None);
@@ -157,6 +171,8 @@ impl VulkanDevice {
         // valid VkSwapchainKHR; `image_available` is a binary semaphore as
         // required by `vkAcquireNextImageKHR`; timeout parameters are standard.
         let image_available = self.frame_sync[fi].image_available;
+        // SAFETY: the swapchain/semaphore contract above holds and the returned
+        // image index is consumed before either object can be retired.
         let (ii, sub) = unsafe {
             sc.loader
                 .acquire_next_image(sc.swapchain, u64::MAX, image_available, vk::Fence::null())
@@ -303,6 +319,8 @@ impl VulkanDevice {
                     return Err(VulkanError::vk("create_image_available", r));
                 }
             };
+            // SAFETY: `d` is live and `si` creates a fresh binary semaphore;
+            // it has no submission/present owner before being stored below.
             let render_finished = match unsafe { d.create_semaphore(&si, None) } {
                 Ok(semaphore) => semaphore,
                 Err(r) => {

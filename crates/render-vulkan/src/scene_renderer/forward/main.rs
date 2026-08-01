@@ -151,6 +151,8 @@ impl SceneRenderer {
             d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
         }
 
+        // SAFETY: `cmd` records inside the pass with dynamic viewport/scissor;
+        // both call-scoped values match the render area.
         unsafe {
             d.cmd_set_viewport(cmd, 0, &[scene_viewport.viewport]);
             d.cmd_set_scissor(cmd, 0, &[scene_viewport.scissor]);
@@ -172,10 +174,12 @@ impl SceneRenderer {
                     "HDR skybox pipeline is unavailable",
                 )]
             })?;
+            // SAFETY: the skybox pipeline is live and compatible with the active HDR pass.
             unsafe {
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, skybox_pipeline);
             }
             if let Some(desc_set) = self.device.frame_descriptor_set(fi) {
+                // SAFETY: set/layout are compatible live handles and `cmd` records this pass.
                 unsafe {
                     d.cmd_bind_descriptor_sets(
                         cmd,
@@ -188,6 +192,7 @@ impl SceneRenderer {
                 }
             }
             if let Some(desc_set) = self.device.shadow_desc_set {
+                // SAFETY: the live shadow set matches set=1; the pass remains recording.
                 unsafe {
                     d.cmd_bind_descriptor_sets(
                         cmd,
@@ -205,6 +210,7 @@ impl SceneRenderer {
         }
 
         // Bind HDR forward pipeline
+        // SAFETY: `hdr_pl` is live and compatible with the active HDR render pass.
         unsafe {
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, hdr_pl);
         }
@@ -212,6 +218,7 @@ impl SceneRenderer {
         // Bind UBO descriptor set (set=0)
         if let Some(desc_set) = self.device.frame_descriptor_set(fi) {
             let sets = [desc_set];
+            // SAFETY: the live frame set matches set=0 and its slice is call-scoped.
             unsafe {
                 d.cmd_bind_descriptor_sets(
                     cmd,
@@ -230,6 +237,7 @@ impl SceneRenderer {
         // the binding remains compatible after set=0 is rebound above.
         if let Some(desc_set) = self.device.shadow_desc_set {
             let sets = [desc_set];
+            // SAFETY: the live shadow set matches set=1 and its slice is call-scoped.
             unsafe {
                 d.cmd_bind_descriptor_sets(
                     cmd,
@@ -376,6 +384,8 @@ impl SceneRenderer {
                     })?;
                     let mut material_ubo = Self::parse_material_ubo(&material.uniforms.bytes);
                     material_ubo.emissive[3] = Self::material_texture_flags(&material);
+                    // SAFETY: `MaterialUBO` is fully initialized `repr(C)`
+                    // all-`f32` storage; the byte slice cannot outlive it.
                     let material_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(
                             &material_ubo as *const _ as *const u8,
@@ -389,6 +399,8 @@ impl SceneRenderer {
                         &material,
                         material_set,
                     )?;
+                    // SAFETY: handles are live/compatible, validated buffers cover
+                    // the instance ranges, and `cmd` records the active pass.
                     unsafe {
                         d.cmd_bind_pipeline(
                             cmd,
@@ -468,6 +480,8 @@ impl SceneRenderer {
                         // Bind VB/IB
                         let vbs = [cached_vb];
                         let offsets = [0u64];
+                        // SAFETY: generation-checked buffers are live and both
+                        // binding slices remain valid through command recording.
                         unsafe {
                             d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
                             d.cmd_bind_index_buffer(cmd, cached_ib, 0, cached_idx_ty);
@@ -532,6 +546,7 @@ impl SceneRenderer {
                         )]);
                     }
                     if next_pipeline != current_material_pipeline {
+                        // SAFETY: `next_pipeline` is non-null/live and compatible with this pass.
                         unsafe {
                             d.cmd_bind_pipeline(
                                 cmd,
@@ -547,6 +562,8 @@ impl SceneRenderer {
                         material_ubo.alpha_cutoff = -2.0;
                     }
                     material_ubo.emissive[3] = Self::material_texture_flags(&material);
+                    // SAFETY: this fully initialized `repr(C)` all-`f32` value
+                    // has no padding and the byte view is locally bounded.
                     let ubo_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(
                             &material_ubo as *const _ as *const u8,
@@ -557,6 +574,7 @@ impl SceneRenderer {
                         self.get_or_create_material_desc_set(material_id, ubo_bytes)?;
                     self.bind_material_texture_if_changed(material_id, &material, mat_desc_set)?;
                     let sets = [mat_desc_set];
+                    // SAFETY: the live material set matches set=2; its slice is call-scoped.
                     unsafe {
                         d.cmd_bind_descriptor_sets(
                             cmd,
@@ -573,11 +591,13 @@ impl SceneRenderer {
                 // Push constants: world transform, radial geomorph, then the
                 // per-chunk continuous material projection (128 B total).
                 let pc_bytes = static_draw_push_constants(drawable);
+                // SAFETY: this byte range fits the declared vertex push-constant range.
                 unsafe {
                     d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
                 }
 
                 // Draw indexed
+                // SAFETY: compatible pipeline/descriptors and validated mesh buffers are bound.
                 unsafe {
                     d.cmd_draw_indexed(cmd, cached_index_count, 1, 0, 0, 0);
                 }
@@ -655,6 +675,8 @@ impl SceneRenderer {
                             last_skinned_mesh = Some(mesh_id.as_str());
                             let vbs = [skinned_cached_vb];
                             let offsets = [0u64];
+                            // SAFETY: generation-checked skinned buffers are live;
+                            // binding slices remain valid for the recording call.
                             unsafe {
                                 d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
                                 d.cmd_bind_index_buffer(
@@ -722,6 +744,7 @@ impl SceneRenderer {
                     )]);
                 }
                 if next_pipeline != current_material_pipeline {
+                    // SAFETY: the selected non-null pipeline is live and pass-compatible.
                     unsafe {
                         d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, next_pipeline);
                     }
@@ -732,6 +755,8 @@ impl SceneRenderer {
                     material_ubo.alpha_cutoff = -2.0;
                 }
                 material_ubo.emissive[3] = Self::material_texture_flags(&material);
+                // SAFETY: `MaterialUBO` is fully initialized `repr(C)` all-`f32`
+                // storage and this byte view is bounded by its local lifetime.
                 let ubo_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
                         &material_ubo as *const _ as *const u8,
@@ -802,6 +827,7 @@ impl SceneRenderer {
                     skinned_desc_set,
                 )?;
                 let sets = [skinned_desc_set];
+                // SAFETY: the live skinned set matches set=2 and the slice is call-scoped.
                 unsafe {
                     d.cmd_bind_descriptor_sets(
                         cmd,
@@ -827,6 +853,8 @@ impl SceneRenderer {
                     pc_bytes.extend_from_slice(&value.to_ne_bytes());
                 }
                 pc_bytes.resize(128, 0);
+                // SAFETY: the 128-byte range matches the layout; compatible
+                // pipeline/descriptors and validated indexed buffers are bound.
                 unsafe {
                     d.cmd_push_constants(cmd, hdr_pll, vk::ShaderStageFlags::VERTEX, 0, &pc_bytes);
                     d.cmd_draw_indexed(cmd, skinned_cached_index_count, 1, 0, 0, 0);
@@ -847,6 +875,7 @@ impl SceneRenderer {
         }
 
         // End HDR render pass
+        // SAFETY: this function began the still-active pass on recording `cmd`.
         unsafe {
             d.cmd_end_render_pass(cmd);
         }

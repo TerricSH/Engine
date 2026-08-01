@@ -10,7 +10,6 @@ default = []
 
 [dependencies]
 bincode.workspace = true
-crossbeam-channel.workspace = true
 engine-asset = { path = "../engine-asset" }
 engine-serialize = { path = "../engine-serialize" }
 fs2 = "0.4.3"

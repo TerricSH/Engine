@@ -18,7 +18,10 @@ pub struct AdapterSelection {
 }
 
 /// # Safety
-/// `instance` / `surface_loader` / `surface` must remain valid.
+///
+/// `surface_loader` must have been created from `instance`; `surface` must be a
+/// live surface owned by that instance. All three must remain valid throughout
+/// selection and until the returned physical-device selection is consumed.
 pub unsafe fn select(
     instance: &AshInstance,
     surface_loader: &surface::Instance,
@@ -47,6 +50,12 @@ pub unsafe fn select(
         .ok_or(VulkanError::NoSuitableAdapter)
 }
 
+/// Evaluate one physical device against a presentation surface.
+///
+/// # Safety
+///
+/// `physical_device` must have been enumerated from `instance`; `surface_loader`
+/// and the live `surface` must belong to that same instance and outlive this call.
 unsafe fn evaluate_device(
     instance: &AshInstance,
     surface_loader: &surface::Instance,

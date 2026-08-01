@@ -181,6 +181,8 @@ pub(in super::super) unsafe fn mk_sm(d: &AshDevice, spv: &[u8]) -> VkResult<vk::
     for (i, c) in spv.chunks_exact(4).enumerate() {
         code[i] = u32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
     }
+    // SAFETY: the caller guarantees `d` is live and the checks/conversion above
+    // provide a word-aligned SPIR-V slice that remains alive for the call.
     unsafe { d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }
         .map_err(|r| VulkanError::vk("sm", r))
 }

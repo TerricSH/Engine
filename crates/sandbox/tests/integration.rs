@@ -4,7 +4,7 @@ use engine_renderer::{
     LightKind, RenderFrameInput, RenderView, ShadowMode, ViewCompose, IDENTITY_MAT4,
 };
 use engine_scene::{sample_scene, validate_scene};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Default)]
 struct ContractTrace {
@@ -19,6 +19,12 @@ struct ContractBackend {
     trace: Arc<Mutex<ContractTrace>>,
 }
 
+fn lock_trace(trace: &Mutex<ContractTrace>) -> MutexGuard<'_, ContractTrace> {
+    trace
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn backend_error(code: &str, message: &str) -> Vec<Diagnostic> {
     vec![Diagnostic::new(
         code,
@@ -30,7 +36,7 @@ fn backend_error(code: &str, message: &str) -> Vec<Diagnostic> {
 
 impl BackendRenderer for ContractBackend {
     fn begin_frame(&mut self, _input: &RenderFrameInput) -> Result<(), Vec<Diagnostic>> {
-        let mut trace = self.trace.lock().unwrap();
+        let mut trace = lock_trace(&self.trace);
         if trace.frame_active {
             return Err(backend_error(
                 "SBX_TEST_DOUBLE_BEGIN",
@@ -57,7 +63,7 @@ impl BackendRenderer for ContractBackend {
         pass: &engine_renderer::render_graph2::PassNode,
         stats: &mut FrameStats,
     ) -> Result<(), Vec<Diagnostic>> {
-        let mut trace = self.trace.lock().unwrap();
+        let mut trace = lock_trace(&self.trace);
         if !trace.frame_active {
             return Err(backend_error(
                 "SBX_TEST_EXECUTE_WITHOUT_BEGIN",
@@ -73,7 +79,7 @@ impl BackendRenderer for ContractBackend {
     }
 
     fn end_frame(&mut self, _stats: &mut FrameStats) -> Result<(), Vec<Diagnostic>> {
-        let mut trace = self.trace.lock().unwrap();
+        let mut trace = lock_trace(&self.trace);
         if !trace.frame_active {
             return Err(backend_error(
                 "SBX_TEST_END_WITHOUT_BEGIN",
@@ -86,7 +92,7 @@ impl BackendRenderer for ContractBackend {
     }
 
     fn abort_frame(&mut self) -> Result<(), Vec<Diagnostic>> {
-        let mut trace = self.trace.lock().unwrap();
+        let mut trace = lock_trace(&self.trace);
         if !trace.frame_active {
             return Err(backend_error(
                 "SBX_TEST_ABORT_WITHOUT_BEGIN",
@@ -131,7 +137,7 @@ fn runtime_with_contract_backend() -> (EngineRuntime, Arc<Mutex<ContractTrace>>)
 }
 
 fn assert_completed_contract_frame(trace: &Arc<Mutex<ContractTrace>>) {
-    let trace = trace.lock().unwrap();
+    let trace = lock_trace(trace);
     assert_eq!(trace.begin_count, 1);
     assert!(!trace.executed_passes.is_empty());
     assert_eq!(trace.end_count, 1);

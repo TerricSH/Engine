@@ -23,6 +23,8 @@ impl VulkanDevice {
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        // SAFETY: `d` is live and `layout_info` references a local binding array
+        // for the duration of the call.
         let ds_layout = unsafe { d.create_descriptor_set_layout(&layout_info, None) }
             .map_err(|r| VulkanError::vk("create_ds_layout", r))?;
 
@@ -34,6 +36,8 @@ impl VulkanDevice {
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(2)
             .pool_sizes(&pool_sizes);
+        // SAFETY: `d` is live and the pool sizes referenced by `pool_info`
+        // remain valid for the call.
         let pool = unsafe { d.create_descriptor_pool(&pool_info, None) }
             .map_err(|r| VulkanError::vk("create_ds_pool", r))?;
 
@@ -42,6 +46,8 @@ impl VulkanDevice {
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
+        // SAFETY: `pool` and both layout handles were created by `d`, and the
+        // referenced layout array lives through allocation.
         let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
             .map_err(|r| VulkanError::vk("alloc_ds", r))?;
 
@@ -54,19 +60,24 @@ impl VulkanDevice {
                 .size(self.ubo_size)
                 .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            // SAFETY: `d` is live and `bi` is a complete uniform-buffer create
+            // description with a non-zero configured UBO size.
             let buf = unsafe { d.create_buffer(&bi, None) }
                 .map_err(|r| VulkanError::vk("create_ubo", r))?;
+            // SAFETY: `buf` was just created by `d` and remains live.
             let req = unsafe { d.get_buffer_memory_requirements(buf) };
             self.ubo_alignment = req.alignment;
             let allocation = allocator
                 .lock()
-                .unwrap()
+                .map_err(|error| VulkanError::Loader(format!("UBO allocator lock: {error}")))?
                 .allocate(&crate::allocator::AllocationCreateDesc {
                     name: ["frame-ubo-0", "frame-ubo-1"][i],
                     requirements: req,
                     location: crate::allocator::MemoryLocation::CpuToGpu,
                 })
                 .map_err(|e| VulkanError::Allocation(e.to_string()))?;
+            // SAFETY: `allocation` was selected from `buf`'s requirements and
+            // belongs to the same device; neither resource is concurrently used.
             unsafe { d.bind_buffer_memory(buf, allocation.memory(), allocation.offset()) }
                 .map_err(|r| VulkanError::vk("bind_ubo", r))?;
             ubos.push(buf);
@@ -84,6 +95,8 @@ impl VulkanDevice {
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(&buf_info)];
+            // SAFETY: `ds` is allocated from this device and `buf_info` points
+            // at a live UBO; all referenced slices outlive the update call.
             unsafe {
                 d.update_descriptor_sets(&writes, &[]);
             }
@@ -251,6 +264,8 @@ impl VulkanDevice {
                 .stage_flags(vk::ShaderStageFlags::VERTEX),
         ];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        // SAFETY: `d` is live and the material bindings slice remains valid
+        // throughout descriptor-layout creation.
         let ds_layout = unsafe { d.create_descriptor_set_layout(&layout_info, None) }
             .map_err(|r| VulkanError::vk("create_material_ds_layout", r))?;
 
@@ -274,6 +289,8 @@ impl VulkanDevice {
             .max_sets(320)
             .pool_sizes(&pool_sizes)
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET);
+        // SAFETY: the pool description references live local storage and its
+        // counts cover the engine's bounded material descriptor capacity.
         let pool = unsafe { d.create_descriptor_pool(&pool_info, None) }
             .map_err(|r| VulkanError::vk("create_material_ds_pool", r))?;
 
@@ -304,6 +321,8 @@ impl VulkanDevice {
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
+        // SAFETY: `pool` and `layout` are live handles from `d`; `layouts`
+        // remains alive for the allocation call.
         let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
             .map_err(|r| VulkanError::vk("alloc_material_ds", r))?;
         let desc_set = desc_sets.first().copied().ok_or_else(|| {
@@ -413,6 +432,8 @@ impl VulkanDevice {
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(pool)
             .set_layouts(&layouts);
+        // SAFETY: the free-capable material pool and layout are live handles
+        // owned by `d`, and the input slice outlives this call.
         let desc_sets = unsafe { d.allocate_descriptor_sets(&alloc_info) }
             .map_err(|r| VulkanError::vk("alloc_skinned_material_ds", r))?;
         let desc_set = desc_sets.first().copied().ok_or_else(|| {
@@ -578,6 +599,8 @@ impl VulkanDevice {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&buffer_infos[2..3]),
         ];
+        // SAFETY: `descriptor_set` and all three storage buffers are live and
+        // owned by this device; descriptor-info slices outlive the update.
         unsafe {
             self.logical_device
                 .device
@@ -604,8 +627,11 @@ impl VulkanDevice {
             .size(size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `device` is live and `buffer_info` describes a non-zero
+        // exclusive storage buffer.
         let buffer = unsafe { device.create_buffer(&buffer_info, None) }
             .map_err(|result| VulkanError::vk("create_cluster_storage_buffer", result))?;
+        // SAFETY: `buffer` was just created by `device` and remains live.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
         let allocation = match self
             .logical_device
@@ -619,12 +645,20 @@ impl VulkanDevice {
             }) {
             Ok(allocation) => allocation,
             Err(error) => {
+                // SAFETY: allocation failed, so `buffer` is unbound, unused,
+                // and still exclusively owned by this function.
                 unsafe { device.destroy_buffer(buffer, None) };
                 return Err(VulkanError::Allocation(error.to_string()));
             }
         };
+        // SAFETY: the allocation was selected from `buffer`'s requirements and
+        // both handles belong to `device`; no use begins before binding succeeds.
         if let Err(result) =
-            unsafe { device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset()) }
+            // SAFETY: same contract as above; this comment is adjacent to the
+            // unsafe expression used as the conditional scrutinee.
+            unsafe {
+                device.bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+            }
         {
             self.destroy_host_storage_buffer(buffer, allocation);
             return Err(VulkanError::vk("bind_cluster_storage_buffer", result));
@@ -637,6 +671,8 @@ impl VulkanDevice {
         buffer: vk::Buffer,
         mut allocation: crate::allocator::Allocation,
     ) {
+        // SAFETY: `buffer` is exclusively owned here, belongs to this device,
+        // and callers stop its use before entering the destroy path.
         unsafe {
             self.logical_device.device.destroy_buffer(buffer, None);
         }
@@ -687,20 +723,37 @@ impl VulkanDevice {
 
     pub(crate) fn destroy_descriptor_infra(&mut self) {
         let d = &self.logical_device.device;
-        for mut a in self.ubo_allocations.drain(..) {
-            self.logical_device.allocator().lock().unwrap().free(&mut a);
-        }
+        // Vulkan requires buffers to be destroyed before their bound memory.
         for buf in self.frame_ubos.drain(..) {
+            // SAFETY: every frame UBO was created by `d`; frame teardown waits
+            // for in-flight work before descriptor infrastructure is destroyed.
             unsafe {
                 d.destroy_buffer(buf, None);
             }
         }
+        for mut a in self.ubo_allocations.drain(..) {
+            let allocator = self.logical_device.allocator();
+            match allocator.lock() {
+                Ok(mut guard) => guard.free(&mut a),
+                Err(poisoned) => {
+                    tracing::error!(
+                        target: "vulkan::descriptor",
+                        "allocator mutex was poisoned while freeing a frame UBO allocation"
+                    );
+                    poisoned.into_inner().free(&mut a);
+                }
+            };
+        }
         if let Some(pool) = self.desc_pool.take() {
+            // SAFETY: `pool` belongs to `d`; destroying it invalidates its sets,
+            // which are no longer referenced after frame teardown.
             unsafe {
                 d.destroy_descriptor_pool(pool, None);
             }
         }
         if let Some(layout) = self.desc_set_layout_0.take() {
+            // SAFETY: descriptor sets/pool using this layout were destroyed
+            // above and `layout` is exclusively owned by this device.
             unsafe {
                 d.destroy_descriptor_set_layout(layout, None);
             }

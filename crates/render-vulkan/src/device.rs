@@ -50,6 +50,8 @@ impl Device {
         // HDR/OIT pipelines use different blend equations per MRT attachment.
         // Vulkan requires `independentBlend` to be explicitly enabled even
         // when the physical device advertises it.
+        // SAFETY: the selected physical-device handle was enumerated from
+        // `instance` and remains valid for the caller-guaranteed instance life.
         let supported_features =
             unsafe { instance.get_physical_device_features(adapter.physical_device) };
         if supported_features.independent_blend == vk::FALSE {

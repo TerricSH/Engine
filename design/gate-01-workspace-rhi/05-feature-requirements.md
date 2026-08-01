@@ -12,7 +12,9 @@ None. Gate 1 is the contract origin point. Sessions must comply with these cross
 
 ## Gate Objective
 
-Create the Rust workspace, crate ownership boundaries, feature flags, and `RHI-v0` contract that all renderer backend work depends on. This gate is about contracts and compile boundaries, not real rendering.
+Create the Rust workspace, crate ownership boundaries, composition features, and `RHI-v0` contract that all renderer backend work depends on. This gate is about contracts and compile boundaries, not real rendering.
+
+> **Current topology note (2026-08-01):** the original Gate 1 feature list is historical. `sandbox` now wires only `backend-vulkan`; `render-opengl` and `render-dx12` are standalone backend packages, with `backend-dx12` local to the DirectX 12 crate.
 
 ## Required Features
 
@@ -32,19 +34,20 @@ Do not overbuild:
 - Do not implement subsystem logic inside placeholder crates.
 - Do not add heavy dependencies before the owning gate needs them.
 
-### G1-F02 Feature Flag Baseline
+### G1-F02 Backend Selection And Optional Feature Baseline
 
 Required behavior:
-- Define additive feature flags for backend and optional system families.
-- Include at least `backend-vulkan`, `backend-opengl`, `backend-dx12`, `tooling-editor`, `subsystem-scripting-csharp`, `tooling-hot-reload`, and `target-mobile`.
+- Define additive features for optional system families and backend adapters actually wired into a composition root.
+- Keep `sandbox/backend-vulkan` as the only sandbox backend feature; select OpenGL as `render-opengl` and keep `backend-dx12` local to `render-dx12`.
+- Preserve the `tooling-*`, `subsystem-*`, and `target-*` feature families for optional engine systems.
 - Keep default features minimal.
 
 Minimum output:
 - Feature definitions are documented.
-- Enabling unrelated feature combinations does not create immediate conflicts.
+- Enabling unrelated composition-feature combinations does not create immediate conflicts, and standalone backend packages compile independently.
 
 Do not overbuild:
-- Do not make mutually exclusive features that break under Cargo feature unification.
+- Do not add mutually exclusive composition features that break under Cargo feature unification.
 - Do not require DirectX SDK on non-Windows checks.
 
 ### G1-F03 RHI-v0 Core Contract
@@ -73,7 +76,7 @@ Required behavior:
 - DirectX 12 code is Windows-gated.
 
 Minimum output:
-- Vulkan/OpenGL/DX12 backend crates compile behind their feature flags.
+- Vulkan/OpenGL/DX12 backend crates compile through package-scoped checks; use `--all-features` for `render-dx12`.
 - Stubs validate that `RHI-v0` can be consumed without importing another backend.
 
 Do not overbuild:

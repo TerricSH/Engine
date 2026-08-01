@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use bincode::Options;
 use engine_serialize::{AssetId, SchemaVersion};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,7 @@ const LEGACY_SURFACE_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new
 const LEGACY_EMISSIVE_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 3, 0);
 const LEGACY_TEXTURE_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 4, 0);
 const LEGACY_ADVANCED_MATERIAL_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(0, 5, 0);
+const MAX_COOKED_MATERIAL_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -342,18 +344,21 @@ pub fn decode_cooked_material(artifact: &CookedArtifact) -> Result<CookedMateria
         )));
     }
 
-    if artifact.header.schema_version == COOKED_MATERIAL_SCHEMA_VERSION
+    if artifact.payload.len() > MAX_COOKED_MATERIAL_PAYLOAD_BYTES {
+        return Err(CookError::InvalidAsset(format!(
+            "cooked material payload is too large: {} bytes (limit: {MAX_COOKED_MATERIAL_PAYLOAD_BYTES})",
+            artifact.payload.len()
+        )));
+    }
+
+    let material = if artifact.header.schema_version == COOKED_MATERIAL_SCHEMA_VERSION
         || artifact.header.schema_version == LEGACY_ADVANCED_MATERIAL_SCHEMA_VERSION
     {
-        bincode::deserialize(&artifact.payload).map_err(|error| {
-            CookError::InvalidAsset(format!("invalid cooked material payload: {error}"))
-        })
+        deserialize_material_payload(&artifact.payload, "cooked material")?
     } else if artifact.header.schema_version == LEGACY_TEXTURE_MATERIAL_SCHEMA_VERSION {
         let legacy: LegacyTextureCookedMaterial =
-            bincode::deserialize(&artifact.payload).map_err(|error| {
-                CookError::InvalidAsset(format!("invalid legacy texture material payload: {error}"))
-            })?;
-        Ok(CookedMaterial {
+            deserialize_material_payload(&artifact.payload, "legacy texture material")?;
+        CookedMaterial {
             base_color: legacy.base_color,
             metallic: legacy.metallic,
             roughness: legacy.roughness,
@@ -367,13 +372,11 @@ pub fn decode_cooked_material(artifact: &CookedArtifact) -> Result<CookedMateria
             advanced: AdvancedMaterialSource::default(),
             transparency: legacy.transparency,
             double_sided: legacy.double_sided,
-        })
+        }
     } else if artifact.header.schema_version == LEGACY_EMISSIVE_MATERIAL_SCHEMA_VERSION {
-        let legacy: LegacyEmissiveCookedMaterial = bincode::deserialize(&artifact.payload)
-            .map_err(|error| {
-                CookError::InvalidAsset(format!("invalid legacy cooked material payload: {error}"))
-            })?;
-        Ok(CookedMaterial {
+        let legacy: LegacyEmissiveCookedMaterial =
+            deserialize_material_payload(&artifact.payload, "legacy emissive material")?;
+        CookedMaterial {
             base_color: legacy.base_color,
             metallic: legacy.metallic,
             roughness: legacy.roughness,
@@ -387,13 +390,11 @@ pub fn decode_cooked_material(artifact: &CookedArtifact) -> Result<CookedMateria
             advanced: AdvancedMaterialSource::default(),
             transparency: legacy.transparency,
             double_sided: legacy.double_sided,
-        })
+        }
     } else {
         let legacy: LegacyCookedMaterial =
-            bincode::deserialize(&artifact.payload).map_err(|error| {
-                CookError::InvalidAsset(format!("invalid legacy cooked material payload: {error}"))
-            })?;
-        Ok(CookedMaterial {
+            deserialize_material_payload(&artifact.payload, "legacy material")?;
+        CookedMaterial {
             base_color: legacy.base_color,
             metallic: legacy.metallic,
             roughness: legacy.roughness,
@@ -407,14 +408,95 @@ pub fn decode_cooked_material(artifact: &CookedArtifact) -> Result<CookedMateria
             advanced: AdvancedMaterialSource::default(),
             transparency: legacy.transparency,
             double_sided: legacy.double_sided,
-        })
+        }
+    };
+
+    validate_decoded_material(&material)?;
+    Ok(material)
+}
+
+fn deserialize_material_payload<T>(payload: &[u8], label: &str) -> Result<T, CookError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_COOKED_MATERIAL_PAYLOAD_BYTES as u64)
+        .deserialize(payload)
+        .map_err(|error| CookError::InvalidAsset(format!("invalid {label} payload: {error}")))
+}
+
+fn validate_decoded_material(material: &CookedMaterial) -> Result<(), CookError> {
+    for (index, value) in material.base_color.iter().copied().enumerate() {
+        validate_unit_value(&format!("base_color[{index}]"), value)?;
     }
+    validate_unit_value("metallic", material.metallic)?;
+    validate_unit_value("roughness", material.roughness)?;
+    validate_unit_value("ambient_occlusion", material.ambient_occlusion)?;
+    for (index, value) in material.emissive.iter().copied().enumerate() {
+        validate_unit_value(&format!("emissive[{index}]"), value)?;
+    }
+    for (field, value) in [
+        ("advanced.clearcoat", material.advanced.clearcoat),
+        (
+            "advanced.clearcoat_roughness",
+            material.advanced.clearcoat_roughness,
+        ),
+        ("advanced.subsurface", material.advanced.subsurface),
+    ] {
+        validate_unit_value(field, value)?;
+    }
+    for (field, values) in [
+        (
+            "advanced.subsurface_color",
+            material.advanced.subsurface_color,
+        ),
+        ("advanced.sheen_color", material.advanced.sheen_color),
+        ("advanced.rim_color", material.advanced.rim_color),
+    ] {
+        for (index, value) in values.into_iter().enumerate() {
+            validate_unit_value(&format!("{field}[{index}]"), value)?;
+        }
+    }
+    if !material.advanced.anisotropy.is_finite()
+        || !(-1.0..=1.0).contains(&material.advanced.anisotropy)
+    {
+        return Err(CookError::InvalidAsset(
+            "material field 'advanced.anisotropy' must be finite and in the range -1..=1".into(),
+        ));
+    }
+    if !material.advanced.rim_power.is_finite()
+        || !(0.01..=32.0).contains(&material.advanced.rim_power)
+    {
+        return Err(CookError::InvalidAsset(
+            "material field 'advanced.rim_power' must be finite and in the range 0.01..=32".into(),
+        ));
+    }
+    if let MaterialTransparency::Masked { cutoff } = material.transparency {
+        validate_unit_value("transparency.cutoff", cutoff)?;
+    }
+    for (field, texture) in [
+        ("base_color_texture", &material.base_color_texture),
+        ("normal_texture", &material.normal_texture),
+        (
+            "metallic_roughness_texture",
+            &material.metallic_roughness_texture,
+        ),
+        ("occlusion_texture", &material.occlusion_texture),
+        ("emissive_texture", &material.emissive_texture),
+    ] {
+        if let Some(texture) = texture {
+            validate_texture_id(field, &texture.id)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cook::{read_cooked_artifact, write_cooked_artifact};
+    use crate::cook::{read_cooked_artifact, write_cooked_artifact, CookedAssetHeader};
 
     fn source_json(overrides: serde_json::Value) -> serde_json::Value {
         let mut source = serde_json::json!({
@@ -694,5 +776,152 @@ mod tests {
             decode_cooked_material(&read_cooked_artifact(&wrong_schema).unwrap()).unwrap_err();
         assert!(error.to_string().contains("schema 9.0.0"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn decoded_material_rejects_invalid_runtime_values_and_oversized_payloads() {
+        let material = CookedMaterial {
+            base_color: [1.0; 4],
+            metallic: f32::NAN,
+            roughness: 0.5,
+            ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
+            base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
+            advanced: AdvancedMaterialSource::default(),
+            transparency: MaterialTransparency::Opaque,
+            double_sided: false,
+        };
+        let payload = bincode::serialize(&material).unwrap();
+        let invalid_values = CookedArtifact {
+            header: CookedAssetHeader::new(
+                AssetType::Material.kind_code(),
+                COOKED_MATERIAL_SCHEMA_VERSION,
+                [0; 32],
+                payload.len() as u64,
+            ),
+            payload,
+        };
+        let error = decode_cooked_material(&invalid_values).unwrap_err();
+        assert!(error.to_string().contains("metallic"));
+
+        let oversized = CookedArtifact {
+            header: CookedAssetHeader::new(
+                AssetType::Material.kind_code(),
+                COOKED_MATERIAL_SCHEMA_VERSION,
+                [0; 32],
+                (MAX_COOKED_MATERIAL_PAYLOAD_BYTES + 1) as u64,
+            ),
+            payload: vec![0; MAX_COOKED_MATERIAL_PAYLOAD_BYTES + 1],
+        };
+        let error = decode_cooked_material(&oversized).unwrap_err();
+        assert!(error.to_string().contains("payload is too large"));
+    }
+
+    #[test]
+    fn legacy_surface_and_texture_payloads_preserve_their_supported_fields() {
+        let surface = LegacyCookedMaterial {
+            base_color: [0.2, 0.3, 0.4, 0.5],
+            metallic: 0.25,
+            roughness: 0.75,
+            ambient_occlusion: 0.8,
+            base_color_texture: Some(AssetId::new("legacy-surface-base")),
+            transparency: MaterialTransparency::Masked { cutoff: 0.4 },
+            double_sided: true,
+        };
+        let surface_payload = bincode::serialize(&surface).unwrap();
+        let surface_artifact = CookedArtifact {
+            header: CookedAssetHeader::new(
+                AssetType::Material.kind_code(),
+                LEGACY_SURFACE_MATERIAL_SCHEMA_VERSION,
+                [0; 32],
+                surface_payload.len() as u64,
+            ),
+            payload: surface_payload,
+        };
+        let decoded = decode_cooked_material(&surface_artifact).unwrap();
+        assert_eq!(decoded.base_color, surface.base_color);
+        assert_eq!(decoded.base_color_texture, surface.base_color_texture);
+        assert_eq!(decoded.transparency, surface.transparency);
+
+        let textures = LegacyTextureCookedMaterial {
+            base_color: [0.6, 0.7, 0.8, 1.0],
+            metallic: 0.35,
+            roughness: 0.65,
+            ambient_occlusion: 0.9,
+            emissive: [0.1, 0.2, 0.3],
+            base_color_texture: Some(AssetId::new("legacy-base")),
+            normal_texture: Some(AssetId::new("legacy-normal")),
+            metallic_roughness_texture: Some(AssetId::new("legacy-metallic-roughness")),
+            occlusion_texture: Some(AssetId::new("legacy-occlusion")),
+            emissive_texture: Some(AssetId::new("legacy-emissive")),
+            transparency: MaterialTransparency::Blend,
+            double_sided: false,
+        };
+        let texture_payload = bincode::serialize(&textures).unwrap();
+        let texture_artifact = CookedArtifact {
+            header: CookedAssetHeader::new(
+                AssetType::Material.kind_code(),
+                LEGACY_TEXTURE_MATERIAL_SCHEMA_VERSION,
+                [0; 32],
+                texture_payload.len() as u64,
+            ),
+            payload: texture_payload,
+        };
+        let decoded = decode_cooked_material(&texture_artifact).unwrap();
+        assert_eq!(decoded.base_color_texture, textures.base_color_texture);
+        assert_eq!(decoded.normal_texture, textures.normal_texture);
+        assert_eq!(
+            decoded.metallic_roughness_texture,
+            textures.metallic_roughness_texture
+        );
+        assert_eq!(decoded.occlusion_texture, textures.occlusion_texture);
+        assert_eq!(decoded.emissive_texture, textures.emissive_texture);
+        assert_eq!(decoded.advanced, AdvancedMaterialSource::default());
+    }
+
+    #[test]
+    fn material_payload_limit_keeps_legacy_trailing_byte_compatibility() {
+        let material = CookedMaterial {
+            base_color: [1.0; 4],
+            metallic: 0.0,
+            roughness: 1.0,
+            ambient_occlusion: 1.0,
+            emissive: [0.0; 3],
+            base_color_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            occlusion_texture: None,
+            emissive_texture: None,
+            advanced: AdvancedMaterialSource::default(),
+            transparency: MaterialTransparency::Opaque,
+            double_sided: false,
+        };
+        let mut payload = bincode::serialize(&material).unwrap();
+        payload.resize(MAX_COOKED_MATERIAL_PAYLOAD_BYTES, 0xa5);
+        let artifact = CookedArtifact {
+            header: CookedAssetHeader::new(
+                AssetType::Material.kind_code(),
+                COOKED_MATERIAL_SCHEMA_VERSION,
+                [0; 32],
+                payload.len() as u64,
+            ),
+            payload,
+        };
+
+        assert_eq!(decode_cooked_material(&artifact).unwrap(), material);
+    }
+
+    #[test]
+    fn material_runtime_has_no_unwrap_or_expect_calls() {
+        let source = include_str!("material.rs");
+        let runtime = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(runtime, _)| runtime);
+        assert!(!runtime.contains(".unwrap()"), "runtime unwrap found");
+        assert!(!runtime.contains(".expect("), "runtime expect found");
     }
 }

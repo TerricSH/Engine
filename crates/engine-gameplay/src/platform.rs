@@ -1,4 +1,16 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!("recovering platform state from a poisoned mutex");
+            let guard = poisoned.into_inner();
+            mutex.clear_poison();
+            guard
+        }
+    }
+}
 
 /// Performance mode hint for the runtime environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,29 +113,29 @@ impl MockPlatform {
 
     /// Returns the (duration_ms, intensity) of the most recent `vibrate` call.
     pub fn last_vibrate(&self) -> Option<(u32, f32)> {
-        *self.last_vibrate.lock().unwrap()
+        *lock_or_recover(&self.last_vibrate)
     }
 
     /// Returns the current performance mode stored by the mock.
     pub fn current_performance_mode(&self) -> PerformanceMode {
-        *self.perf_mode.lock().unwrap()
+        *lock_or_recover(&self.perf_mode)
     }
 }
 
 impl PlatformFacade for MockPlatform {
     fn capabilities(&self) -> PlatformCapabilities {
         let mut caps = self.base_caps.clone();
-        caps.performance_mode = *self.perf_mode.lock().unwrap();
+        caps.performance_mode = *lock_or_recover(&self.perf_mode);
         caps
     }
 
     fn vibrate(&self, duration_ms: u32, intensity: f32) -> Result<(), String> {
-        *self.last_vibrate.lock().unwrap() = Some((duration_ms, intensity));
+        *lock_or_recover(&self.last_vibrate) = Some((duration_ms, intensity));
         Ok(())
     }
 
     fn set_performance_mode(&self, mode: PerformanceMode) -> Result<(), String> {
-        *self.perf_mode.lock().unwrap() = mode;
+        *lock_or_recover(&self.perf_mode) = mode;
         Ok(())
     }
 
@@ -267,6 +279,31 @@ mod tests {
             mock.capabilities().performance_mode,
             PerformanceMode::PowerSave
         );
+        assert_eq!(mock.current_performance_mode(), PerformanceMode::PowerSave);
+    }
+
+    #[test]
+    fn mock_platform_recovers_poisoned_state() {
+        let mock = MockPlatform::new(PlatformCapabilities {
+            has_touch: false,
+            has_gamepad: false,
+            has_keyboard: true,
+            has_vibration: false,
+            is_mobile: false,
+            max_resolution: (1920, 1080),
+            performance_mode: PerformanceMode::Balanced,
+        });
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = mock.perf_mode.lock().unwrap();
+            panic!("poison test mutex");
+        });
+        assert!(poisoned.is_err());
+
+        assert_eq!(mock.current_performance_mode(), PerformanceMode::Balanced);
+        assert!(!mock.perf_mode.is_poisoned());
+        assert!(mock
+            .set_performance_mode(PerformanceMode::PowerSave)
+            .is_ok());
         assert_eq!(mock.current_performance_mode(), PerformanceMode::PowerSave);
     }
 

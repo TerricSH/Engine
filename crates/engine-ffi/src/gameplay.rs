@@ -250,9 +250,12 @@ pub unsafe extern "C" fn gameplay_subscribe(
     >,
     user_data: u64,
 ) -> u64 {
-    if bus.is_null() || callback.is_none() {
+    if bus.is_null() {
         return 0;
     }
+    let Some(cb) = callback else {
+        return 0;
+    };
     // SAFETY: Null-checked above; caller guarantees valid pointers or null.
     let bus = &mut *(bus as *mut EventBus);
     let et = if event_type_str.is_null() {
@@ -262,8 +265,6 @@ pub unsafe extern "C" fn gameplay_subscribe(
             .to_string_lossy()
             .into_owned()
     };
-
-    let cb = callback.unwrap();
 
     let id = bus.subscribe(
         if et.is_empty() { "*" } else { &et },

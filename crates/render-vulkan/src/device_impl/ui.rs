@@ -104,6 +104,8 @@ impl VulkanDevice {
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dependency_flags(vk::DependencyFlags::BY_REGION),
         ];
+        // SAFETY: `d` is live; attachment/subpass/dependency arrays remain
+        // borrowed through creation and form a valid single-color render pass.
         let render_pass = unsafe {
             d.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
@@ -121,6 +123,7 @@ impl VulkanDevice {
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        // SAFETY: the live device consumes the call-scoped valid binding array.
         let descriptor_layout = unsafe {
             d.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_bindings),
@@ -134,6 +137,8 @@ impl VulkanDevice {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             descriptor_count: MAX_UI_TEXTURE_DESCRIPTORS as u32,
         }];
+        // SAFETY: pool counts are bounded/non-zero and the referenced local
+        // pool-size array remains alive through the device call.
         let descriptor_pool = unsafe {
             d.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -152,6 +157,8 @@ impl VulkanDevice {
             offset: 0,
             size: 8,
         }];
+        // SAFETY: descriptor layout is live; referenced layout/range arrays are
+        // valid and remain alive through pipeline-layout creation.
         let pipeline_layout = unsafe {
             d.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -168,10 +175,14 @@ impl VulkanDevice {
         if vertex_spv.is_empty() || fragment_spv.is_empty() {
             return Err(VulkanError::MissingShader("ui_overlay"));
         }
+        // SAFETY: `d` is live and `mk_sm` validates the static vertex SPIR-V.
         let vertex_module = unsafe { mk_sm(d, vertex_spv)? };
+        // SAFETY: `d` is live and `mk_sm` validates the static fragment SPIR-V.
         let fragment_module = match unsafe { mk_sm(d, fragment_spv) } {
             Ok(module) => module,
             Err(error) => {
+                // SAFETY: fragment creation failed before publication; the
+                // vertex module is exclusively owned and unused.
                 unsafe { d.destroy_shader_module(vertex_module, None) };
                 return Err(error);
             }
@@ -253,8 +264,12 @@ impl VulkanDevice {
             .layout(pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
+        // SAFETY: pipeline state references live compatible handles and all
+        // local state arrays remain alive through the batch creation call.
         let pipeline_result =
             unsafe { d.create_graphics_pipelines(self.pipeline_cache, &[pipeline_info], None) };
+        // SAFETY: pipeline creation has returned; compiled pipelines do not
+        // retain shader modules, both of which are exclusively owned here.
         unsafe {
             d.destroy_shader_module(fragment_module, None);
             d.destroy_shader_module(vertex_module, None);
@@ -265,6 +280,8 @@ impl VulkanDevice {
 
         for image_view in image_views {
             let attachments = [image_view];
+            // SAFETY: pass/view are live and compatible; dimensions match the
+            // swapchain and the attachment array lives through creation.
             let framebuffer = unsafe {
                 d.create_framebuffer(
                     &vk::FramebufferCreateInfo::default()
@@ -310,6 +327,8 @@ impl VulkanDevice {
             VulkanError::Loader("UI overlay descriptor pool is not initialized".into())
         })?;
         let layouts = [descriptor_layout];
+        // SAFETY: pool/layout are live device handles with remaining capacity;
+        // the layout slice remains alive through this allocation.
         let descriptor_set = unsafe {
             self.logical_device.device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
@@ -339,6 +358,8 @@ impl VulkanDevice {
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_info)];
+        // SAFETY: set/view/sampler are live compatible device handles and the
+        // descriptor-info slices remain alive through the update.
         unsafe {
             self.logical_device
                 .device
@@ -383,6 +404,8 @@ impl VulkanDevice {
                 "UI descriptor cache outlived its descriptor pool".into(),
             ));
         };
+        // SAFETY: the pool was created with FREE_DESCRIPTOR_SET and this cached
+        // set was allocated from it; removal gives exclusive host ownership.
         if let Err(result) = unsafe {
             self.logical_device
                 .device
@@ -401,22 +424,33 @@ impl VulkanDevice {
     pub(crate) fn destroy_ui_overlay_resources(&mut self) {
         let d = &self.logical_device.device;
         for framebuffer in self.ui_overlay_framebuffers.drain(..) {
+            // SAFETY: resize/drop synchronization makes the device idle; drained
+            // framebuffers belong exclusively to `d`.
             unsafe { d.destroy_framebuffer(framebuffer, None) };
         }
         if let Some(pipeline) = self.ui_overlay_pipeline.take() {
+            // SAFETY: no submission uses this taken device-created pipeline.
             unsafe { d.destroy_pipeline(pipeline, None) };
         }
         if let Some(layout) = self.ui_overlay_pipeline_layout.take() {
+            // SAFETY: the dependent pipeline was destroyed above and this
+            // device-created layout is exclusively owned.
             unsafe { d.destroy_pipeline_layout(layout, None) };
         }
         self.ui_overlay_desc_sets.clear();
         if let Some(pool) = self.ui_overlay_desc_pool.take() {
+            // SAFETY: the idle device owns the pool; destroying it releases all
+            // descriptor sets after the host cache was cleared.
             unsafe { d.destroy_descriptor_pool(pool, None) };
         }
         if let Some(layout) = self.ui_overlay_desc_layout.take() {
+            // SAFETY: pipeline layout/pool users are gone; this device-created
+            // descriptor layout is exclusively owned.
             unsafe { d.destroy_descriptor_set_layout(layout, None) };
         }
         if let Some(render_pass) = self.ui_overlay_rp.take() {
+            // SAFETY: framebuffer/pipeline users were destroyed above and the
+            // taken pass belongs exclusively to idle `d`.
             unsafe { d.destroy_render_pass(render_pass, None) };
         }
     }

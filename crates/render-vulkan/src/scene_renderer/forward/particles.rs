@@ -206,6 +206,7 @@ impl SceneRenderer {
                         (true, false, false) => gpu_particle_pipeline,
                     };
                 if next_particle_pipeline != current_particle_pipeline {
+                    // SAFETY: selected particle pipeline is live and compatible with the active pass.
                     unsafe {
                         d.cmd_bind_pipeline(
                             cmd,
@@ -220,6 +221,8 @@ impl SceneRenderer {
                     material_ubo.alpha_cutoff = -2.0;
                 }
                 material_ubo.emissive[3] = Self::material_texture_flags(&material);
+                // SAFETY: `MaterialUBO` is fully initialized `repr(C)` all-`f32`
+                // storage; this byte view cannot outlive the local value.
                 let material_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
                         &material_ubo as *const _ as *const u8,
@@ -229,6 +232,8 @@ impl SceneRenderer {
                 let (material_set, _) =
                     self.get_or_create_material_desc_set(&batch.material.id, material_bytes)?;
                 self.bind_material_texture_if_changed(&batch.material.id, &material, material_set)?;
+                // SAFETY: push range, compatible descriptors/pipeline, and all
+                // generation-checked draw buffers are valid while `cmd` records.
                 unsafe {
                     let particle_push = gpu_simulation
                         .map(engine_renderer::GpuParticleSimulation::parameter_bytes)

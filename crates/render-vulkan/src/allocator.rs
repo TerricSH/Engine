@@ -66,6 +66,9 @@ mod inner {
         }
         pub fn mapped_slice_mut(&mut self) -> Option<&mut [u8]> {
             let ptr = self.mapped_ptr?;
+            // SAFETY: `mapped_ptr` comes from `vkMapMemory` for this allocation's
+            // full `size`, remains mapped until `free`, and `&mut self` prevents
+            // safe callers from creating overlapping mutable slices.
             Some(unsafe { std::slice::from_raw_parts_mut(ptr, self.size as usize) })
         }
     }
@@ -100,6 +103,8 @@ mod inner {
                 .allocation_size(size)
                 .memory_type_index(mt);
 
+            // SAFETY: `self.device` is live and `info` selects a memory type
+            // advertised by that device with a non-zero Vulkan-required size.
             let memory = unsafe {
                 self.device
                     .allocate_memory(&info, None)
@@ -112,12 +117,16 @@ mod inner {
                     // If mapping fails, ownership has not reached an
                     // `Allocation` yet, so roll back the successful Vulkan
                     // allocation before returning the error.
+                    // SAFETY: `memory` is owned by this allocator, host-visible
+                    // by `find_memory_type`, and the mapped range is within it.
                     let map_result = unsafe {
                         self.device
                             .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
                     };
-                    let p = rollback_on_error(map_result, || unsafe {
-                        self.device.free_memory(memory, None);
+                    let p = rollback_on_error(map_result, || {
+                        // SAFETY: mapping failed, so no pointer escaped; this is
+                        // the sole owner of `memory` and may release it now.
+                        unsafe { self.device.free_memory(memory, None) };
                     })
                     .map_err(|e| format!("vkMapMemory({}): {:?}", desc.name, e))?;
                     Some(p as *mut u8)
@@ -136,6 +145,9 @@ mod inner {
         /// Free memory.
         pub fn free(&mut self, alloc: &mut Allocation) {
             if alloc.memory != vk::DeviceMemory::null() {
+                // SAFETY: `alloc.memory` was allocated by `self.device`, is
+                // exclusively owned by `alloc`, and callers destroy bound
+                // resources before releasing their allocation.
                 unsafe {
                     self.device.free_memory(alloc.memory, None);
                 }

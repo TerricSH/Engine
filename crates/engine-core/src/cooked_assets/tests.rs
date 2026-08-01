@@ -4,7 +4,13 @@ use std::path::{Path, PathBuf};
 #[cfg(not(feature = "subsystem-audio"))]
 use std::any::Any;
 
-use engine_asset::cook::{registered_asset_type_id, AssetType};
+#[cfg(all(
+    feature = "subsystem-animation",
+    feature = "subsystem-audio",
+    feature = "subsystem-navigation"
+))]
+use engine_asset::cook::registered_asset_type_id;
+use engine_asset::cook::AssetType;
 use engine_renderer::{
     AssetId, ColorSpace, MaterialUpload, MeshUpload, MeshVertexFormat, SamplerDescriptor,
     TextureMipLevel, TextureUpload, TextureUploadFormat, Transparency,

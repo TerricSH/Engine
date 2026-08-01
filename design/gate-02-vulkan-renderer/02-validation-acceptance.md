@@ -4,6 +4,8 @@
 
 Gate 2 is accepted only when Vulkan proves `RHI-v0` with a visible triangle and textured object, while OpenGL and DirectX 12 stubs continue compiling against the same contract.
 
+Backend validation is package-scoped: `sandbox` is the Vulkan composition root, while OpenGL and DirectX 12 are checked directly as backend packages.
+
 ## Verification Goals
 
 - Prove the Vulkan backend can create a window surface, select a device, create a swapchain, submit command buffers, and present frames.
@@ -29,10 +31,10 @@ Gate 2 is accepted only when Vulkan proves `RHI-v0` with a visible triangle and 
 ## Automated Checks
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan`
+- `cargo check -p sandbox --features backend-vulkan`
 - `cargo run -p sandbox --features backend-vulkan`
-- `cargo check --workspace --features backend-opengl`
-- Windows only: `cargo check --workspace --features backend-dx12`
+- `cargo check -p render-opengl`
+- `cargo check -p render-dx12 --all-features`
 
 ## Manual Validation
 
@@ -59,4 +61,3 @@ Gate 2 is accepted only when Vulkan proves `RHI-v0` with a visible triangle and 
 - Gate owner:
 - Date:
 - Approved to proceed to Gate 3: yes/no
-

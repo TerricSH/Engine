@@ -299,11 +299,14 @@ macro_rules! vulkan_device_resource_methods {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `d` is live and the validated RHI descriptor was translated
+        // into a complete image create-info with supported dimensions/usage.
         let image = unsafe { d.create_image(&image_info, None) }.map_err(|result| {
             render_core::RhiError::Backend {
                 detail: format!("create texture image: {result:?}"),
             }
         })?;
+        // SAFETY: `image` was just created by `d` and remains live.
         let requirements = unsafe { d.get_image_memory_requirements(image) };
         let allocator = self.logical_device.allocator();
         let allocation_result = match allocator.lock() {
@@ -313,6 +316,8 @@ macro_rules! vulkan_device_resource_methods {
                 location: MemoryLocation::GpuOnly,
             }),
             Err(error) => {
+                // SAFETY: allocator locking failed before memory was bound;
+                // `image` is unused and exclusively owned by this function.
                 unsafe { d.destroy_image(image, None) };
                 return Err(render_core::RhiError::Backend {
                     detail: format!("texture allocator lock: {error}"),
@@ -322,13 +327,21 @@ macro_rules! vulkan_device_resource_methods {
         let mut allocation = match allocation_result {
             Ok(allocation) => allocation,
             Err(error) => {
+                // SAFETY: allocation failed, leaving the newly-created image
+                // unbound and exclusively owned here.
                 unsafe { d.destroy_image(image, None) };
                 return Err(render_core::RhiError::Backend { detail: error });
             }
         };
+        // SAFETY: `allocation` was selected from the queried requirements;
+        // image and memory belong to `d` and no GPU use has begun.
         if let Err(result) =
+            // SAFETY: same contract as above; this annotation is adjacent to
+            // the unsafe conditional expression.
             unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
         {
+            // SAFETY: binding failed and no GPU command can reference `image`;
+            // destroy it before freeing the still-owned allocation.
             unsafe { d.destroy_image(image, None) };
             match allocator.lock() {
                 Ok(mut guard) => guard.free(&mut allocation),
@@ -358,9 +371,13 @@ macro_rules! vulkan_device_resource_methods {
                 base_array_layer: 0,
                 layer_count: desc.depth_or_layers,
             });
+        // SAFETY: the bound image is live; format/view type/aspect and
+        // mip/layer range were derived from its validated descriptor.
         let view = match unsafe { d.create_image_view(&view_info, None) } {
             Ok(view) => view,
             Err(result) => {
+                // SAFETY: view creation failed, so the image has no dependent
+                // view and has never been submitted; it is exclusively owned.
                 unsafe { d.destroy_image(image, None) };
                 match allocator.lock() {
                     Ok(mut guard) => guard.free(&mut allocation),
@@ -372,6 +389,8 @@ macro_rules! vulkan_device_resource_methods {
             }
         };
         let sampler = if desc.usage_flags.0 & TextureUsage::SAMPLED.0 != 0 {
+            // SAFETY: `d` is live and the sampler description contains valid
+            // finite Vulkan enum/range values without external pointers.
             match unsafe {
                 d.create_sampler(
                     &vk::SamplerCreateInfo::default()
@@ -387,6 +406,8 @@ macro_rules! vulkan_device_resource_methods {
             } {
                 Ok(sampler) => Some(sampler),
                 Err(result) => {
+                    // SAFETY: both handles were created by `d`, remain
+                    // exclusively owned here, and no command uses them yet.
                     unsafe {
                         d.destroy_image_view(view, None);
                         d.destroy_image(image, None);
@@ -455,6 +476,8 @@ macro_rules! vulkan_device_resource_methods {
             });
         }
         let d = &self.logical_device.device;
+        // SAFETY: `d` is live and `mk_sm` validates the supplied byte length;
+        // the shader bytes remain borrowed for the duration of the call.
         let sm = (unsafe { mk_sm(d, &desc.source_bytes) }).map_err(|e| {
             render_core::RhiError::Backend {
                 detail: format!("create_shader_module: {e}"),
@@ -471,6 +494,8 @@ macro_rules! vulkan_device_resource_methods {
 
     fn destroy_shader_module(&mut self, module: ShaderModuleHandle) {
         if let Some((shader, _)) = self.shader_modules.remove(module.index, module.generation) {
+            // SAFETY: slab removal gives exclusive ownership; pipelines retain
+            // compiled code rather than the module, so this live handle can die.
             unsafe {
                 self.logical_device
                     .device

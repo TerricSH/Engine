@@ -148,7 +148,7 @@ struct GeneratedScriptApiManifest {
 
 #[cfg(any(feature = "tooling-editor", test))]
 mod authoring;
-mod build;
+mod compilation;
 mod filesystem;
 mod inspection;
 mod runtime;
@@ -156,7 +156,7 @@ mod sdk;
 
 #[cfg(any(feature = "tooling-editor", test))]
 pub(crate) use authoring::*;
-pub(crate) use build::*;
+pub(crate) use compilation::*;
 pub(crate) use filesystem::*;
 pub(crate) use inspection::*;
 pub(crate) use runtime::*;

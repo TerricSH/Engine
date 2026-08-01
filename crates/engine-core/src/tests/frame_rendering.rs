@@ -343,6 +343,36 @@ fn ffi_component_table_changes_only_when_a_runtime_activates() {
 }
 
 #[test]
+fn ffi_test_scope_is_not_clobbered_by_an_unscoped_parallel_runtime() {
+    let _guard = serial_ffi_world_test();
+    let mut builder = EngineRuntimeBuilder::default();
+    register_a_only(builder.component_registry_mut());
+    let mut scoped_runtime = builder.build();
+    scoped_runtime.set_world(World::new());
+
+    let activated = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let worker_activated = std::sync::Arc::clone(&activated);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut unrelated_runtime = EngineRuntime::new(EngineConfig::default());
+        unrelated_runtime.set_world(World::new());
+        worker_activated.wait();
+        let _ = release_rx.recv();
+    });
+    activated.wait();
+
+    let scoped_table_remained_active =
+        engine_ffi::component::lookup_component_type("A Only").is_some();
+    let _ = release_tx.send(());
+    worker.join().expect("parallel runtime worker");
+
+    assert!(
+        scoped_table_remained_active,
+        "an unscoped parallel unit test replaced the scoped FFI table"
+    );
+}
+
+#[test]
 fn ffi_component_ids_are_stable_across_active_registry_order_and_membership() {
     let _guard = serial_ffi_world_test();
     let mut first_builder = EngineRuntimeBuilder::default();

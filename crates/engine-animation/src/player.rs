@@ -336,8 +336,12 @@ fn evaluate_blend_space_1d(
         };
     }
 
-    let first = &bs.clips[0];
-    let last = bs.clips.last().unwrap();
+    let Some(first) = bs.clips.first() else {
+        return skel.rest_pose();
+    };
+    let Some(last) = bs.clips.last() else {
+        return skel.rest_pose();
+    };
 
     if param <= first.threshold {
         // Below range → sample first clip.

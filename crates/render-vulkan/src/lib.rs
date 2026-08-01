@@ -4,6 +4,8 @@
 //! canonical [`scene_renderer::SceneRenderer`]. Full frames are driven
 //! exclusively by `EngineRuntime -> Renderer -> SceneRenderer`.
 
+#![deny(clippy::missing_safety_doc, clippy::undocumented_unsafe_blocks)]
+
 mod adapter;
 pub(crate) mod allocator;
 mod device;
@@ -94,31 +96,6 @@ impl Backend for VulkanBackend {
 
 pub fn backend() -> VulkanBackend {
     VulkanBackend::new()
-}
-
-/// Create the engine renderer for a native Vulkan presentation surface.
-///
-/// Native handles and backend construction deliberately stay in this crate:
-/// `engine-core` only coordinates the backend-neutral renderer contract.
-fn create_backend_renderer(
-    display_handle: RawDisplayHandle,
-    window_handle: RawWindowHandle,
-    width: u32,
-    height: u32,
-    enable_validation: bool,
-    cache_dir: Option<&Path>,
-) -> Result<Box<dyn engine_renderer::BackendRenderer>, VulkanError> {
-    let device = VulkanBackend::new().create_device_for_surface(
-        display_handle,
-        window_handle,
-        width,
-        height,
-        enable_validation,
-        cache_dir,
-    )?;
-    Ok(Box::new(scene_renderer::SceneRenderer::new(
-        device, width, height,
-    )))
 }
 
 /// Create the Vulkan renderer from the platform crate's opaque surface.

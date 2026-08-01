@@ -283,7 +283,9 @@ fn trace_contour_corners(in_region: &[bool], width: usize, height: usize) -> Vec
     // Start from any corner, follow edges (each corner has degree 2,
     // so we simply exit via the edge we didn't enter through).
 
-    let start = *adj.keys().next().unwrap();
+    let Some(&start) = adj.keys().next() else {
+        return Vec::new();
+    };
     let mut path = Vec::new();
     let mut current = start;
     let mut prev: Option<(u32, u32)> = None;
@@ -296,22 +298,15 @@ fn trace_contour_corners(in_region: &[bool], width: usize, height: usize) -> Vec
         path.push(current);
 
         // Find the next connected corner (the one that is NOT prev).
-        let neighbors = adj.get(&current).expect("corner missing from adjacency");
-        let next = if neighbors.len() == 1 {
-            // Dead-end — shouldn't happen for a closed contour, but handle.
-            neighbors[0]
-        } else {
-            // Take the first neighbor that isn't where we came from.
-            match prev {
-                None => neighbors[0],
-                Some(p) => {
-                    if neighbors[0] == p && neighbors.len() > 1 {
-                        neighbors[1]
-                    } else {
-                        neighbors[0]
-                    }
-                }
-            }
+        let Some(neighbors) = adj.get(&current) else {
+            break;
+        };
+        let Some((&first, remaining)) = neighbors.split_first() else {
+            break;
+        };
+        let next = match prev {
+            Some(previous) if first == previous => remaining.first().copied().unwrap_or(first),
+            _ => first,
         };
 
         prev = Some(current);

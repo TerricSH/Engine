@@ -79,7 +79,7 @@ Recommended root responsibilities:
 
 - Declare all workspace members up front.
 - Centralize shared dependency versions with workspace dependencies where practical.
-- Keep backend feature flags additive because Cargo feature unification can enable multiple features at once.
+- Keep composition-root features additive. Validate standalone backend crates by package so Cargo feature unification does not pretend that every backend is wired into the same executable.
 - Keep default features minimal; do not silently require Vulkan SDK, DirectX SDK, editor UI, C# runtime, or mobile toolchains for every check.
 
 ### RHI Contract Shape
@@ -109,7 +109,7 @@ Backend references show that OpenGL, Vulkan, and DirectX 12 have different conce
 - Does every public RHI type have a backend-neutral name?
 - Can `render-opengl` and `render-dx12` compile without `render-vulkan`?
 - Can future systems depend on `render-core` without linking platform-specific SDKs?
-- Are all feature flags additive and documented?
+- Are all composition features additive and documented, and are standalone backends checked by package?
 - Can unsupported backend features be represented as capability failures instead of compile-time surprises?
 
 ## Implementation Flowcharts
@@ -121,7 +121,7 @@ flowchart TB
    Request[New crate or feature needed] --> Owner{Root workspace change?}
    Owner -->|Yes| Integration[Integration session edits root Cargo.toml]
    Owner -->|No| Workstream[Workstream edits owned crate only]
-   Integration --> Check[cargo check workspace features]
+   Integration --> Check[cargo check workspace and backend packages]
    Workstream --> Check
    Check --> Merge{Checks pass?}
    Merge -->|Yes| Frozen[Gate 1 contract remains stable]

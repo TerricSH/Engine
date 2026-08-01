@@ -263,12 +263,12 @@ macro_rules! vulkan_device_frame_methods {
                     staging_alloc.offset(),
                 )
             } {
-                // SAFETY: buffer/allocation were just created and are not in use
-                // after the failed bind; cleanup is safe.
+                // SAFETY: binding failed before submission; the buffer remains
+                // exclusively owned and must be destroyed before its memory.
+                unsafe { device.destroy_buffer(staging_buffer, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
                     guard.free(&mut staging_alloc);
                 }
-                unsafe { device.destroy_buffer(staging_buffer, None) };
                 return Err(render_core::RhiError::Backend {
                     detail: format!("bind staging: {r:?}"),
                 });
@@ -288,11 +288,11 @@ macro_rules! vulkan_device_frame_methods {
                 )
             }
             .map_err(|r| {
+                // SAFETY: cleanup only happen on error; all handles are valid.
+                unsafe { device.destroy_buffer(staging_buffer, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
                     guard.free(&mut staging_alloc);
                 }
-                // SAFETY: cleanup only happen on error; all handles are valid.
-                unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
                     detail: format!("create pool: {r:?}"),
                 }
@@ -311,10 +311,12 @@ macro_rules! vulkan_device_frame_methods {
             .map_err(|r| {
                 // SAFETY: cleanup only on error; all handles created so far are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
+                // SAFETY: allocation failed before recording/submission; this
+                // buffer is unused and exclusively owned by the error path.
+                unsafe { device.destroy_buffer(staging_buffer, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
                     guard.free(&mut staging_alloc);
                 }
-                unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
                     detail: format!("alloc cb: {r:?}"),
                 }
@@ -335,10 +337,12 @@ macro_rules! vulkan_device_frame_methods {
             .map_err(|r| {
                 // SAFETY: cleanup only on error; all handles created so far are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
+                // SAFETY: begin failed before submission; no queue references
+                // this staging buffer, which remains exclusively owned here.
+                unsafe { device.destroy_buffer(staging_buffer, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
                     guard.free(&mut staging_alloc);
                 }
-                unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
                     detail: format!("begin cb: {r:?}"),
                 }
@@ -447,10 +451,12 @@ macro_rules! vulkan_device_frame_methods {
             unsafe { device.end_command_buffer(cmd_buffer) }.map_err(|r| {
                 // SAFETY: cleanup only on error; all handles created so far are valid.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
+                // SAFETY: ending failed before queue submission; the staging
+                // buffer has no GPU users and remains exclusively owned.
+                unsafe { device.destroy_buffer(staging_buffer, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
                     guard.free(&mut staging_alloc);
                 }
-                unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
                     detail: format!("end cb: {r:?}"),
                 }
@@ -465,10 +471,12 @@ macro_rules! vulkan_device_frame_methods {
                 .map_err(|r| {
                     // SAFETY: cleanup only on error; all handles are valid.
                     unsafe { device.destroy_command_pool(cmd_pool, None) };
+                    // SAFETY: fence creation failed before submission; destroy
+                    // the unused buffer before releasing its bound memory.
+                    unsafe { device.destroy_buffer(staging_buffer, None) };
                     if let Ok(mut guard) = alloc_handle.lock() {
                         guard.free(&mut staging_alloc);
                     }
-                    unsafe { device.destroy_buffer(staging_buffer, None) };
                     render_core::RhiError::Backend {
                         detail: format!("create fence: {r:?}"),
                     }
@@ -480,13 +488,18 @@ macro_rules! vulkan_device_frame_methods {
             // state; fence is valid and unsignaled; submit info is correctly
             // structured.
             unsafe { device.queue_submit(d.queue, &[submit_info], fence) }.map_err(|r| {
-                // SAFETY: cleanup only on error; all handles are valid.
+                // SAFETY: failed submission leaves these synchronization and
+                // command handles exclusively owned by this path.
                 unsafe { device.destroy_fence(fence, None) };
+                // SAFETY: submission failed, so the transient pool and its
+                // command buffer have no queue owner.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
+                // SAFETY: no submission references the buffer; destroy it before
+                // releasing the memory selected for its requirements.
+                unsafe { device.destroy_buffer(staging_buffer, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
                     guard.free(&mut staging_alloc);
                 }
-                unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
                     detail: format!("queue submit: {r:?}"),
                 }
@@ -495,13 +508,18 @@ macro_rules! vulkan_device_frame_methods {
             // SAFETY: fence is valid and associated with the submitted work;
             // waiting with `u64::MAX` timeout and `true` (waitAll) is standard.
             unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|r| {
-                // SAFETY: cleanup only on error; all handles are valid.
+                // SAFETY: an infinite wait can fail only terminally; the
+                // readback is abandoned and these handles have no host owners.
                 unsafe { device.destroy_fence(fence, None) };
+                // SAFETY: the terminal wait error abandons the submission; this
+                // one-shot command pool remains owned by the readback path.
                 unsafe { device.destroy_command_pool(cmd_pool, None) };
+                // SAFETY: after a terminal device/synchronization failure the
+                // temporary buffer can be destroyed before releasing memory.
+                unsafe { device.destroy_buffer(staging_buffer, None) };
                 if let Ok(mut guard) = alloc_handle.lock() {
                     guard.free(&mut staging_alloc);
                 }
-                unsafe { device.destroy_buffer(staging_buffer, None) };
                 render_core::RhiError::Backend {
                     detail: format!("wait fence: {r:?}"),
                 }
@@ -519,10 +537,12 @@ macro_rules! vulkan_device_frame_methods {
                 None => {
                     // SAFETY: cleanup only on error; all handles are valid.
                     unsafe { device.destroy_command_pool(cmd_pool, None) };
+                    // SAFETY: the completion fence was observed, so no command
+                    // uses this buffer; destroy it before its allocation.
+                    unsafe { device.destroy_buffer(staging_buffer, None) };
                     if let Ok(mut guard) = alloc_handle.lock() {
                         guard.free(&mut staging_alloc);
                     }
-                    unsafe { device.destroy_buffer(staging_buffer, None) };
                     return Err(render_core::RhiError::Backend {
                         detail: "staging buffer is not CPU mapped".into(),
                     });
@@ -551,10 +571,12 @@ macro_rules! vulkan_device_frame_methods {
             // SAFETY: all objects were created from this device and are no longer
             // in use after fence wait; reverse order of creation is respected.
             unsafe { device.destroy_command_pool(cmd_pool, None) };
+            // SAFETY: the completion fence guarantees no queued command uses the
+            // staging buffer; destroy it before releasing its bound memory.
+            unsafe { device.destroy_buffer(staging_buffer, None) };
             if let Ok(mut guard) = alloc_handle.lock() {
                 guard.free(&mut staging_alloc);
             }
-            unsafe { device.destroy_buffer(staging_buffer, None) };
 
             Ok(result)
         }

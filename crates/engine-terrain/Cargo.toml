@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+
 [dependencies]
 crossbeam-channel.workspace = true
 bincode.workspace = true
@@ -17,3 +20,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[[bench]]
+name = "planet_runtime"
+harness = false

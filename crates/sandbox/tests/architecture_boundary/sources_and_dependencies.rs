@@ -109,3 +109,80 @@ fn script_api_contract_crate_remains_data_only() {
         "engine-script-api must not acquire runtime, renderer, ECS, editor, or platform dependencies"
     );
 }
+
+#[test]
+fn retired_direct_dependencies_and_ambiguous_script_module_cannot_reenter() {
+    let root = workspace_root();
+    for (crate_name, retired) in [
+        (
+            "engine-messaging",
+            &["engine-serialize", "serde", "tracing"][..],
+        ),
+        ("engine-script", &["crossbeam-channel"][..]),
+        ("engine-scene", &["indexmap"][..]),
+        ("engine-gameplay", &["engine-serialize"][..]),
+        ("engine-hot-update", &["crossbeam-channel"][..]),
+        ("engine-ffi", &["engine-serialize"][..]),
+        ("engine-editor", &["engine-script", "sha2"][..]),
+        (
+            "sandbox",
+            &["render-core", "render-opengl", "render-dx12"][..],
+        ),
+    ] {
+        let manifest = fs::read_to_string(root.join("crates").join(crate_name).join("Cargo.toml"))
+            .unwrap_or_else(|error| panic!("could not read {crate_name} manifest: {error}"));
+        let direct_dependencies = manifest
+            .split_once("[dependencies]")
+            .map(|(_, dependencies)| dependencies)
+            .unwrap_or_default()
+            .split('\n')
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim()))
+            .collect::<Vec<_>>();
+        for dependency in retired {
+            assert!(
+                !direct_dependencies.contains(dependency),
+                "{crate_name} reintroduced retired direct dependency '{dependency}'"
+            );
+        }
+    }
+
+    let sandbox_manifest =
+        fs::read_to_string(root.join("crates/sandbox/Cargo.toml")).expect("sandbox manifest");
+    for retired_feature in ["backend-opengl =", "backend-dx12 ="] {
+        assert!(
+            !sandbox_manifest.contains(retired_feature),
+            "sandbox must not advertise a backend feature without a runtime adapter: {retired_feature}"
+        );
+    }
+    for crate_name in ["engine-vfx", "engine-procgen", "engine-terrain"] {
+        let manifest = fs::read_to_string(root.join("crates").join(crate_name).join("Cargo.toml"))
+            .unwrap_or_else(|error| panic!("could not read {crate_name} manifest: {error}"));
+        let features = manifest
+            .split_once("[features]")
+            .map(|(_, features)| features)
+            .unwrap_or_default()
+            .split('\n')
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            features.lines().any(|line| line.trim() == "default = []"),
+            "{crate_name} must declare an explicit empty default feature set"
+        );
+    }
+    let editor_manifest =
+        fs::read_to_string(root.join("crates/engine-editor/Cargo.toml")).expect("editor manifest");
+    assert!(
+        editor_manifest.contains("dep:engine-audio"),
+        "engine-editor features must use explicit dep: syntax for optional audio"
+    );
+
+    let scripts = root.join("crates/sandbox/src/project_scripts");
+    assert!(!scripts.join("build.rs").exists());
+    assert!(scripts.join("compilation.rs").is_file());
+    let facade = fs::read_to_string(root.join("crates/sandbox/src/project_scripts.rs"))
+        .expect("project scripts facade");
+    assert!(facade.contains("mod compilation;"));
+    assert!(!facade.contains("mod build;"));
+}

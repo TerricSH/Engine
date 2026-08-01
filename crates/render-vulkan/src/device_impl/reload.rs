@@ -493,6 +493,8 @@ impl VulkanDevice {
         // SAFETY: the queue-family index belongs to the logical device.
         pending.command_pool = unsafe { d.create_command_pool(&pool_info, None) }
             .map_err(|result| VulkanError::vk("create_cp (reload)", result))?;
+        // SAFETY: the just-created pool belongs to `d`; allocation info requests
+        // one primary buffer and its create-info lives through the call.
         let command_buffers = unsafe {
             d.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()

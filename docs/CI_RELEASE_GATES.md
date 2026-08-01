@@ -7,16 +7,21 @@ listens to both the current `master` branch and a future `main` branch.
 ## Enforced checks
 
 - `cargo fmt --all -- --check`.
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`.
-- Windows feature wiring for Vulkan, DX12, editor, C# scripting, and gameplay.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D
+  warnings`, followed by a production-only `--lib --bins` pass that also
+  denies `clippy::unwrap_used`.
+- Windows feature wiring for the Vulkan sandbox, the package-scoped OpenGL and
+  DX12 backends, editor, C# scripting, terrain, and gameplay.
 - `cargo test --workspace --locked`.
 - Linux core gates (`rust-quality-linux`, ubuntu-latest): format check,
   `cargo clippy --workspace --exclude engine-editor-host --all-targets
-  --locked -- -D warnings`, and `cargo test --workspace --exclude
-  engine-editor-host --locked`. Everything except `engine-editor-host` builds
-  and tests headlessly on Linux; the editor-host crate is excluded because it
-  requires wry/tao + webkit2gtk. Vulkan device tests, DirectX, the editor
-  feature set, and the managed (C#) gates remain Windows-only.
+  --locked -- -D warnings`, a production `unwrap_used` pass, terrain/gameplay
+  feature tests plus their panic-safety Clippy pass, and `cargo test
+  --workspace --exclude engine-editor-host --locked`. Everything except
+  `engine-editor-host` builds and tests headlessly on Linux; the editor-host
+  crate is excluded because it requires wry/tao + webkit2gtk. Vulkan device
+  tests, DirectX, the editor feature set, and the managed (C#) gates remain
+  Windows-only.
 - A fresh-directory project workflow that creates `GameProject-v0`, validates
   it, runs three GameLoop frames with visible draws, and cooks its asset set.
 - The fixed `assets/models/resource-chain.gltf` resource-chain test, including
@@ -115,7 +120,10 @@ The Linux gates run the same locked toolchain:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --exclude engine-editor-host --all-targets --locked -- -D warnings
+cargo clippy --workspace --exclude engine-editor-host --lib --bins --locked -- -D warnings -D clippy::unwrap_used
 cargo test --workspace --exclude engine-editor-host --locked
+cargo test -p engine-core --features terrain,gameplay --locked
+cargo clippy -p engine-core --features terrain,gameplay --lib --locked -- -D warnings -D clippy::unwrap_used
 ```
 
 A longer local soak (report at `target/soak/soak-report.json`):

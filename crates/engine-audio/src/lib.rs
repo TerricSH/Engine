@@ -1,8 +1,10 @@
 //! Engine audio system using cpal for output and symphonia for decoding.
 //!
-//! Per FD-035 policy, this crate is excepted from `#![forbid(unsafe_code)]`
-//! because cpal's audio callback requires unsafe for FFI with platform audio APIs.
-//! Every `unsafe` block carries a `// SAFETY:` comment.
+//! The cpal backend owns platform audio resources behind cpal's safe API.
+//! [`AudioEngine`] remains main-thread-bound because cpal deliberately makes
+//! streams `!Send + !Sync` for its cross-platform contract; [`AudioHandle`]
+//! obtains its thread-safe auto traits structurally. This crate has no manual
+//! unsafe trait implementations.
 //!
 //! # Architecture
 //!
@@ -18,7 +20,8 @@
 //! - Core types (`AudioClip`, `AudioSource`, `AudioHandle`, `AudioEmitter`, `AudioListener`,
 //!   `AudioError`) are always available.
 
-// No #![forbid(unsafe_code)] — excepted per FD-035 policy (cpal audio callback requires unsafe)
+#![forbid(unsafe_code)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

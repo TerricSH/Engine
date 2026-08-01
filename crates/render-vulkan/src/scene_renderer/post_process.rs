@@ -127,10 +127,14 @@ impl SceneRenderer {
                 },
             })
             .clear_values(&swapchain_clear);
+        // SAFETY: `cmd` is recording outside a pass; tone pass/framebuffer and
+        // clear/render-area inputs are live and compatible.
         unsafe {
             d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
         }
 
+        // SAFETY: the pass is active; dynamic states are enabled, values match
+        // the target, and `tone_pl` is a live compatible pipeline.
         unsafe {
             d.cmd_set_viewport(
                 cmd,
@@ -154,6 +158,8 @@ impl SceneRenderer {
 
         if tone_ds != vk::DescriptorSet::null() {
             let sets = [tone_ds];
+            // SAFETY: the live descriptor set matches set=0 of `tone_pll` and
+            // its slice remains alive through the recording call.
             unsafe {
                 d.cmd_bind_descriptor_sets(
                     cmd,
@@ -166,6 +172,7 @@ impl SceneRenderer {
             }
         }
 
+        // SAFETY: push bytes fit the declared fragment range of the live layout.
         unsafe {
             d.cmd_push_constants(
                 cmd,
@@ -176,6 +183,8 @@ impl SceneRenderer {
             );
         }
 
+        // SAFETY: compatible pipeline/descriptors are bound in the active pass;
+        // this records one draw and the matching end exactly once.
         unsafe {
             d.cmd_draw(cmd, 3, 1, 0, 0);
             d.cmd_end_render_pass(cmd);
@@ -352,6 +361,9 @@ impl SceneRenderer {
                     height: self.height,
                 },
             });
+        // SAFETY: command buffer/pass/framebuffer/pipeline/layout and raw vertex
+        // buffer are live/compatible; prepared ranges/scissors were validated,
+        // and this block records one balanced UI render pass.
         unsafe {
             d.cmd_begin_render_pass(command_buffer, &begin_info, vk::SubpassContents::INLINE);
             d.cmd_set_viewport(

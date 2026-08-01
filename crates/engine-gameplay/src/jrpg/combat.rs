@@ -496,6 +496,7 @@ impl BattleSession {
         let ability = abilities
             .get(&command.ability_id)
             .ok_or_else(|| BattleError::UnknownAbility(command.ability_id.clone()))?;
+        ability.validate()?;
         let actor = self
             .units
             .get(&command.actor_id)
@@ -506,7 +507,26 @@ impl BattleSession {
         let actor_stats = actor.resolved_stats(statuses);
         let actor_id = actor.id.clone();
         let mp_cost = ability.mp_cost;
-        self.units.get_mut(&actor_id).unwrap().mp -= mp_cost;
+        let available_mp = actor.mp;
+        let remaining_mp =
+            available_mp
+                .checked_sub(mp_cost)
+                .ok_or_else(|| BattleError::InsufficientMp {
+                    unit: actor_id.clone(),
+                    required: mp_cost,
+                    available: available_mp,
+                })?;
+        if remaining_mp < 0 {
+            return Err(BattleError::InsufficientMp {
+                unit: actor_id,
+                required: mp_cost,
+                available: available_mp,
+            });
+        }
+        self.units
+            .get_mut(&actor_id)
+            .ok_or_else(|| BattleError::UnknownUnit(actor_id.clone()))?
+            .mp = remaining_mp;
 
         let mut events = if mp_cost == 0 {
             Vec::new()
@@ -900,6 +920,46 @@ mod tests {
             vec![BattleEvent::UnitReady {
                 unit_id: "hero".into()
             }]
+        );
+    }
+
+    #[test]
+    fn execution_revalidates_mp_after_a_command_is_queued() {
+        let mut battle = BattleSession::new([
+            BattleUnit::new("hero", "hero", BattleSide::Party, stats(20, 5, 10)),
+            BattleUnit::new("slime", "slime", BattleSide::Enemy, stats(5, 4, 5)),
+        ])
+        .unwrap();
+        let ability = AbilityDefinition {
+            mp_cost: 10,
+            ..attack()
+        };
+        let abilities = BTreeMap::from([("attack".into(), ability)]);
+        battle.grant_turn("hero").unwrap();
+        battle
+            .queue_command(
+                BattleCommand {
+                    actor_id: "hero".into(),
+                    ability_id: "attack".into(),
+                    target_ids: vec!["slime".into()],
+                },
+                &abilities,
+            )
+            .unwrap();
+        battle.units.get_mut("hero").unwrap().mp = 0;
+
+        assert_eq!(
+            battle.execute_next(
+                &abilities,
+                &BTreeMap::new(),
+                &ClassicBattleFormula,
+                &mut DeterministicRng::new(1),
+            ),
+            Err(BattleError::InsufficientMp {
+                unit: "hero".into(),
+                required: 10,
+                available: 0,
+            })
         );
     }
 

@@ -47,10 +47,6 @@ pub struct AudioEngine {
     active_handles: HashMap<u64, AudioHandle>,
 }
 
-// SAFETY: AudioEngine is Send because all fields are Send.
-// The cpal Stream is Send, the channel sender is Send.
-unsafe impl Send for AudioEngine {}
-
 impl AudioEngine {
     /// Create a new audio engine.
     ///

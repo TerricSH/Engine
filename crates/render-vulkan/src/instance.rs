@@ -149,6 +149,13 @@ fn validation_layer_present(entry: &Entry) -> VkResult<bool> {
     Ok(false)
 }
 
+/// Vulkan validation callback registered by [`Instance::new`].
+///
+/// # Safety
+///
+/// Vulkan must call this with either null pointers or callback data valid for
+/// the duration of the call. Non-null `user_data` must be the `AtomicUsize`
+/// pointer installed while the owning `Instance` and messenger remain alive.
 unsafe extern "system" fn debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _msg_type: vk::DebugUtilsMessageTypeFlagsEXT,

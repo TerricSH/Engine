@@ -1,5 +1,11 @@
 fn read_f32(bytes: &[u8], offset: usize) -> f32 {
-    f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    let Some(chunk) = bytes.get(offset..offset.saturating_add(4)) else {
+        panic!("test constant buffer has no f32 at byte offset {offset}");
+    };
+    let Ok(array) = <[u8; 4]>::try_from(chunk) else {
+        panic!("test constant buffer has a partial f32 at byte offset {offset}");
+    };
+    f32::from_ne_bytes(array)
 }
 
 #[test]

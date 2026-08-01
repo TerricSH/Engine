@@ -20,11 +20,6 @@ pub struct AudioHandle {
     finished: Arc<AtomicBool>,
 }
 
-// SAFETY: AudioHandle contains only Send types (u64, crossbeam sender, Arc<AtomicBool>).
-unsafe impl Send for AudioHandle {}
-// SAFETY: All methods take &self or &mut self, no interior mutability beyond `finished`.
-unsafe impl Sync for AudioHandle {}
-
 impl AudioHandle {
     /// Create a new handle.
     pub(crate) fn new(
@@ -86,5 +81,17 @@ impl Clone for AudioHandle {
             cmd_tx: self.cmd_tx.clone(),
             finished: self.finished.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_trait_tests {
+    use super::AudioHandle;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn audio_handle_is_send_and_sync_without_unsafe_overrides() {
+        assert_send_sync::<AudioHandle>();
     }
 }

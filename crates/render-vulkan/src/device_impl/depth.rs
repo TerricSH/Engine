@@ -32,19 +32,24 @@ impl VulkanDevice {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `d` is live and `image_info` describes a supported 2D depth
+        // attachment whose dimensions were taken from the current swapchain.
         let image = unsafe { d.create_image(&image_info, None) }
             .map_err(|r| VulkanError::vk("create_depth_image", r))?;
+        // SAFETY: `image` was just created by `d` and has not been destroyed.
         let req = unsafe { d.get_image_memory_requirements(image) };
         let allocator = self.logical_device.allocator();
         let allocation = allocator
             .lock()
-            .unwrap()
+            .map_err(|error| VulkanError::Loader(format!("depth allocator lock: {error}")))?
             .allocate(&crate::allocator::AllocationCreateDesc {
                 name: "depth-buffer",
                 requirements: req,
                 location: crate::allocator::MemoryLocation::GpuOnly,
             })
             .map_err(|e| VulkanError::Allocation(e.to_string()))?;
+        // SAFETY: the allocation satisfies `image`'s queried requirements and
+        // both the image and memory belong to this logical device.
         unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
             .map_err(|r| VulkanError::vk("bind_depth_image", r))?;
 
@@ -59,6 +64,8 @@ impl VulkanDevice {
                 base_array_layer: 0,
                 layer_count: 1,
             });
+        // SAFETY: `image` is a live D32 image and `view_info` selects its only
+        // mip/layer using the matching depth aspect and format.
         let image_view = unsafe { d.create_image_view(&view_info, None) }
             .map_err(|r| VulkanError::vk("create_depth_image_view", r))?;
 
@@ -71,17 +78,31 @@ impl VulkanDevice {
     pub(crate) fn destroy_depth_texture(&mut self) {
         let d = &self.logical_device.device;
         if let Some(iv) = self.depth_image_view.take() {
+            // SAFETY: this device created and exclusively owns `iv`; callers
+            // synchronize resize/drop before destroying depth resources.
             unsafe {
                 d.destroy_image_view(iv, None);
             }
         }
         if let Some(img) = self.depth_image.take() {
+            // SAFETY: the dependent view was destroyed above, `img` belongs to
+            // this device, and resize/drop synchronization prevents GPU use.
             unsafe {
                 d.destroy_image(img, None);
             }
         }
         if let Some(mut a) = self.depth_allocation.take() {
-            self.logical_device.allocator().lock().unwrap().free(&mut a);
+            let allocator = self.logical_device.allocator();
+            match allocator.lock() {
+                Ok(mut guard) => guard.free(&mut a),
+                Err(poisoned) => {
+                    tracing::error!(
+                        target: "vulkan::depth",
+                        "allocator mutex was poisoned while freeing the depth allocation"
+                    );
+                    poisoned.into_inner().free(&mut a);
+                }
+            };
         }
     }
 }

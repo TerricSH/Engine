@@ -16,6 +16,8 @@ impl VulkanDevice {
     /// command buffer invalid before the shader can branch on the light count.
     fn initialize_shadow_image_layout(&self, image: vk::Image, layer_count: u32) -> VkResult<()> {
         let d = &self.logical_device.device;
+        // SAFETY: `d` is live and the selected graphics queue-family index is
+        // valid; the transient pool is owned locally until final cleanup.
         let pool = unsafe {
             d.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
@@ -27,6 +29,8 @@ impl VulkanDevice {
         .map_err(|result| VulkanError::vk("create_shadow_init_command_pool", result))?;
 
         let result = (|| {
+            // SAFETY: `pool` was just created by `d`; the create-info requests
+            // one primary buffer and its temporary storage lives through call.
             let command_buffer = unsafe {
                 d.allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
@@ -44,6 +48,8 @@ impl VulkanDevice {
                 )
             })?;
 
+            // SAFETY: the newly allocated command buffer is in initial state;
+            // the one-shot begin info is valid and call-scoped.
             unsafe {
                 d.begin_command_buffer(
                     command_buffer,
@@ -65,6 +71,9 @@ impl VulkanDevice {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+            // SAFETY: the command buffer is recording; `image` is a live D32
+            // array with at least `layer_count` layers, and barrier ranges/stages
+            // match the declared layout transition. It is ended exactly once.
             unsafe {
                 d.cmd_pipeline_barrier(
                     command_buffer,
@@ -79,23 +88,37 @@ impl VulkanDevice {
             }
             .map_err(|result| VulkanError::vk("end_shadow_init_command_buffer", result))?;
 
+            // SAFETY: `d` is live and the default create-info produces a fresh
+            // unsignaled fence owned by this local transaction.
             let fence = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }
                 .map_err(|result| VulkanError::vk("create_shadow_init_fence", result))?;
             let command_buffers = [command_buffer];
             let submit = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
             let completion =
+                // SAFETY: the queue belongs to `d`; the command buffer ended,
+                // submit arrays live through the call, and `fence` is unsignaled.
                 match unsafe { d.queue_submit(self.logical_device.queue, &submit, fence) } {
-                    Ok(()) => unsafe { d.wait_for_fences(&[fence], true, u64::MAX) }
+                    Ok(()) => {
+                        // SAFETY: `fence` tracks the submission above and remains
+                        // live; an infinite wait observes completion before cleanup.
+                        unsafe { d.wait_for_fences(&[fence], true, u64::MAX) }
+                    }
                         .map_err(|result| VulkanError::vk("wait_shadow_init_fence", result)),
                     Err(result) => Err(VulkanError::vk("submit_shadow_init", result)),
                 };
             if completion.is_err() {
+                // SAFETY: the queue is a live queue from `d`; waiting idle is the
+                // conservative rollback before destroying transaction resources.
                 let _ = unsafe { d.queue_wait_idle(self.logical_device.queue) };
             }
+            // SAFETY: successful completion or the idle fallback above ensures
+            // the transaction's device-created fence has no pending owner.
             unsafe { d.destroy_fence(fence, None) };
             completion
         })();
 
+        // SAFETY: all work from command buffers allocated by `pool` completed or
+        // the queue-idle fallback ran; the local pool is exclusively owned.
         unsafe { d.destroy_command_pool(pool, None) };
         result
     }
@@ -257,7 +280,11 @@ impl VulkanDevice {
             .map_err(|r| VulkanError::vk("cpl_shadow", r))?;
 
         // ---- 7. Depth-only pipeline (no color attachments) ----
+        // SAFETY: `d` is live and `mk_sm` validates the checked-in vertex SPIR-V;
+        // the embedded byte slice is static.
         let vm = unsafe { mk_sm(d, crate::shaders_embedded::SHADOW_VERT_SPV)? };
+        // SAFETY: `d` is live and `mk_sm` validates the checked-in fragment
+        // SPIR-V; the embedded byte slice is static.
         let fm = unsafe { mk_sm(d, crate::shaders_embedded::SHADOW_FRAG_SPV)? };
         let main = c"main";
         let sr = [

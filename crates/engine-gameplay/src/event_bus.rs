@@ -133,10 +133,24 @@ impl EventHistory {
         if self.capacity == 0 {
             return;
         }
+        if self.write_index >= self.capacity {
+            self.write_index = 0;
+        }
         if self.buffer.len() < self.capacity {
             self.buffer.push(event.clone());
+        } else if let Some(slot) = self.buffer.get_mut(self.write_index) {
+            *slot = event.clone();
         } else {
-            self.buffer[self.write_index] = event.clone();
+            // The fields are private and ordinary operation keeps this index
+            // in range. Recover defensively if a future state migration or
+            // internal refactor violates that invariant instead of aborting a
+            // release build on an indexing panic.
+            self.write_index = 0;
+            if let Some(slot) = self.buffer.first_mut() {
+                *slot = event.clone();
+            } else {
+                self.buffer.push(event.clone());
+            }
         }
         self.write_index = (self.write_index + 1) % self.capacity;
         self.count = self.count.saturating_add(1);
@@ -150,7 +164,7 @@ impl EventHistory {
 
         let cap = self.buffer.len();
         let start = if self.count > cap {
-            self.write_index // oldest is at write_index when full
+            self.write_index % cap // oldest is at write_index when full
         } else {
             0
         };
@@ -160,7 +174,9 @@ impl EventHistory {
             // Only emit events that have been written (when ring isn't full yet,
             // buffer may have uninitialised slots — but we only push, so all
             // slots are valid).
-            target(&self.buffer[idx]);
+            if let Some(event) = self.buffer.get(idx) {
+                target(event);
+            }
         }
     }
 
@@ -480,6 +496,36 @@ mod tests {
         let mut bus = EventBus::new(0);
         bus.publish(GameplayEvent::ScoreChanged(10));
         assert_eq!(bus.history().count(), 0);
+    }
+
+    #[test]
+    fn history_recovers_from_an_invalid_internal_write_index() {
+        let mut history = EventHistory::new(2);
+        history.record(&GameplayEvent::ScoreChanged(10));
+        history.record(&GameplayEvent::ScoreChanged(20));
+        history.write_index = usize::MAX;
+
+        history.record(&GameplayEvent::ScoreChanged(30));
+
+        let mut replayed = Vec::new();
+        history.replay(&mut |event| replayed.push(event.clone()));
+        assert_eq!(
+            replayed,
+            vec![
+                GameplayEvent::ScoreChanged(20),
+                GameplayEvent::ScoreChanged(30)
+            ]
+        );
+    }
+
+    #[test]
+    fn event_bus_runtime_has_no_unwrap_or_expect_calls() {
+        let source = include_str!("event_bus.rs");
+        let runtime = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(runtime, _)| runtime);
+        assert!(!runtime.contains(".unwrap()"), "runtime unwrap found");
+        assert!(!runtime.contains(".expect("), "runtime expect found");
     }
 
     // -- Custom events ------------------------------------------------------

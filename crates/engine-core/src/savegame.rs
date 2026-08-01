@@ -191,18 +191,16 @@ pub fn decode_save_game(bytes: &[u8]) -> Result<SaveGameSnapshot, SaveGameError>
         return Err(SaveGameError::InvalidMagic);
     }
     let mut cursor = SAVE_MAGIC.len();
-    let version = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap());
-    cursor += 2;
+    let version = u16::from_le_bytes(read_fixed(bytes, &mut cursor)?);
     if version != SAVE_GAME_SCHEMA_VERSION {
         return Err(SaveGameError::UnsupportedVersion(version));
     }
-    let payload_len = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()) as usize;
-    cursor += 8;
+    let declared_payload_len = u64::from_le_bytes(read_fixed(bytes, &mut cursor)?);
+    let payload_len = usize::try_from(declared_payload_len).map_err(|_| SaveGameError::TooLarge)?;
     if payload_len > MAX_SAVE_GAME_BYTES {
         return Err(SaveGameError::TooLarge);
     }
-    let expected_hash = &bytes[cursor..cursor + 32];
-    cursor += 32;
+    let expected_hash = read_fixed::<32>(bytes, &mut cursor)?;
     let expected_end = cursor
         .checked_add(payload_len)
         .ok_or(SaveGameError::TooLarge)?;
@@ -213,13 +211,25 @@ pub fn decode_save_game(bytes: &[u8]) -> Result<SaveGameSnapshot, SaveGameError>
         return Err(SaveGameError::TrailingBytes);
     }
     let payload = &bytes[cursor..expected_end];
-    if Sha256::digest(payload).as_slice() != expected_hash {
+    let actual_hash: [u8; 32] = Sha256::digest(payload).into();
+    if actual_hash != expected_hash {
         return Err(SaveGameError::ChecksumMismatch);
     }
     let snapshot: SaveGameSnapshot =
         bincode::deserialize(payload).map_err(|error| SaveGameError::Decode(error.to_string()))?;
     snapshot.validate()?;
     Ok(snapshot)
+}
+
+fn read_fixed<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N], SaveGameError> {
+    let end = cursor.checked_add(N).ok_or(SaveGameError::Truncated)?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or(SaveGameError::Truncated)?
+        .try_into()
+        .map_err(|_| SaveGameError::Truncated)?;
+    *cursor = end;
+    Ok(value)
 }
 
 /// Transactionally replace a save file in its destination directory.
@@ -422,6 +432,30 @@ mod tests {
         assert!(matches!(
             encode_save_game(&invalid),
             Err(SaveGameError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn every_truncated_header_prefix_is_rejected_without_panicking() {
+        let bytes = encode_save_game(&snapshot()).unwrap();
+        for prefix_len in 0..HEADER_BYTES {
+            assert!(matches!(
+                decode_save_game(&bytes[..prefix_len]),
+                Err(SaveGameError::Truncated)
+            ));
+        }
+    }
+
+    #[test]
+    fn oversized_declared_payload_is_rejected_before_payload_access() {
+        let mut bytes = encode_save_game(&snapshot()).unwrap();
+        let length_offset = SAVE_MAGIC.len() + std::mem::size_of::<u16>();
+        bytes[length_offset..length_offset + std::mem::size_of::<u64>()]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+
+        assert!(matches!(
+            decode_save_game(&bytes),
+            Err(SaveGameError::TooLarge)
         ));
     }
 }

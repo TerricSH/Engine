@@ -8,8 +8,8 @@ pub use cooked_assets::*;
 pub mod runtime_mesh;
 pub use runtime_mesh::*;
 pub mod asset_stream;
-mod runtime;
 pub use asset_stream::*;
+mod runtime;
 pub(crate) use runtime::{
     install_builtin_render_assets, missing_registered_render_asset, scene_load_diagnostic,
     validate_registered_asset_id, SyncedRenderResources,

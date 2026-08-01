@@ -8,8 +8,6 @@ license.workspace = true
 [features]
 default = []
 backend-vulkan = ["dep:render-vulkan"]
-backend-opengl = ["dep:render-opengl"]
-backend-dx12 = ["dep:render-dx12"]
 subsystem-animation = ["engine-core/subsystem-animation"]
 subsystem-audio = ["engine-core/subsystem-audio"]
 subsystem-navigation = ["engine-core/subsystem-navigation"]
@@ -65,12 +63,9 @@ engine-serialize = { path = "../engine-serialize" }
 bincode.workspace = true
 glam.workspace = true
 gltf.workspace = true
-render-core = { path = "../render-core" }
 platform = { path = "../platform" }
 ron.workspace = true
 render-vulkan = { path = "../render-vulkan", optional = true }
-render-opengl = { path = "../render-opengl", optional = true }
-render-dx12 = { path = "../render-dx12", optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 urlencoding.workspace = true

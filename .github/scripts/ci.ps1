@@ -56,14 +56,28 @@ function Invoke-Format {
 }
 
 function Invoke-Clippy {
-    Invoke-Native "cargo clippy --workspace --all-targets -D warnings" "cargo" @(
+    Invoke-Native "cargo clippy --workspace --all-targets --all-features -D warnings" "cargo" @(
         "clippy",
         "--workspace",
         "--all-targets",
+        "--all-features",
         "--locked",
         "--",
         "-D",
         "warnings"
+    )
+    Invoke-Native "production crates deny clippy::unwrap_used" "cargo" @(
+        "clippy",
+        "--workspace",
+        "--lib",
+        "--bins",
+        "--all-features",
+        "--locked",
+        "--",
+        "-D",
+        "warnings",
+        "-D",
+        "clippy::unwrap_used"
     )
 }
 
@@ -114,15 +128,30 @@ function Invoke-FeatureCheck {
         "--lib",
         "--",
         "-D",
-        "warnings"
+        "warnings",
+        "-D",
+        "clippy::unwrap_used"
     )
-    Invoke-Native "sandbox desktop backend feature check" "cargo" @(
+    Invoke-Native "sandbox Vulkan desktop feature check" "cargo" @(
         "check",
         "--locked",
         "-p",
         "sandbox",
         "--features",
-        "backend-vulkan,backend-dx12,tooling-editor,target-desktop,subsystem-scripting-csharp"
+        "backend-vulkan,tooling-editor,target-desktop,subsystem-scripting-csharp"
+    )
+    Invoke-Native "OpenGL backend crate check" "cargo" @(
+        "check",
+        "--locked",
+        "-p",
+        "render-opengl"
+    )
+    Invoke-Native "DX12 backend crate check" "cargo" @(
+        "check",
+        "--locked",
+        "-p",
+        "render-dx12",
+        "--all-features"
     )
     Invoke-Native "engine-core C#/gameplay/terrain feature check" "cargo" @(
         "check",

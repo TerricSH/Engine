@@ -42,6 +42,8 @@ impl<'a> PendingToneMappingResources<'a> {
     fn finish(mut self) -> ToneMappingResources {
         // Shader modules are no longer needed after successful pipeline
         // creation. Remove them before disarming the persistent resources.
+        // SAFETY: both optional modules were created by `self.device`, remain
+        // exclusively guard-owned, and compiled pipelines no longer need them.
         unsafe {
             if let Some(module) = self.vertex_module.take() {
                 self.device.destroy_shader_module(module, None);
@@ -231,6 +233,8 @@ impl VulkanDevice {
         // SAFETY: `d` is a valid AshDevice; SPIR-V bytecode is valid.
         let vm = unsafe { mk_sm(d, vert_spv)? };
         pending.vertex_module = Some(vm);
+        // SAFETY: `d` is live; the embedded fragment SPIR-V is validated by
+        // `mk_sm` and remains borrowed through module creation.
         let fm = unsafe { mk_sm(d, frag_spv)? };
         pending.fragment_module = Some(fm);
 
@@ -288,6 +292,8 @@ impl VulkanDevice {
                 Err((partial_pipelines, result)) => {
                     // Ash returns any handles Vulkan created before reporting
                     // the batch failure; those handles are caller-owned.
+                    // SAFETY: every non-null partial handle was created by `d`
+                    // in this failed transaction and was never published/used.
                     unsafe {
                         for pipeline in partial_pipelines {
                             if pipeline != vk::Pipeline::null() {
@@ -300,6 +306,8 @@ impl VulkanDevice {
             };
         let pipeline_count = pipelines.len();
         if pipeline_count != 1 {
+            // SAFETY: an unexpected result count is rejected before publication;
+            // every returned handle is exclusively owned and unused.
             unsafe {
                 for pipeline in pipelines.drain(..) {
                     if pipeline != vk::Pipeline::null() {
@@ -369,6 +377,8 @@ impl VulkanDevice {
                     // The vector is still local, so roll back every
                     // framebuffer created before the failing swapchain view.
                     for fb in fbs.drain(..) {
+                        // SAFETY: each framebuffer was created by `d` earlier in
+                        // this transaction and no render submission references it.
                         unsafe {
                             d.destroy_framebuffer(fb, None);
                         }

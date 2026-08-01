@@ -63,5 +63,5 @@ Expected output:
 - Stubs compile after Vulkan work lands
 
 Validation:
-- `cargo check --workspace --features backend-opengl`
-- Windows: `cargo check --workspace --features backend-dx12`
+- `cargo check -p render-opengl`
+- `cargo check -p render-dx12 --all-features`

@@ -1,0 +1,18 @@
+[package]
+name = "engine-workspace-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+engine-nav = { path = "../../crates/engine-nav" }
+engine-terrain = { path = "../../crates/engine-terrain" }
+glam.workspace = true
+
+[lib]
+path = "src/lib.rs"

@@ -94,10 +94,34 @@ impl engine_renderer::BackendRenderer for RecordingBackend {
 
 static FFI_WORLD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub(crate) fn serial_ffi_world_test() -> std::sync::MutexGuard<'static, ()> {
-    FFI_WORLD_TEST_LOCK
+std::thread_local! {
+    static FFI_WORLD_TEST_SCOPE_ACTIVE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+pub(crate) struct SerialFfiWorldTestGuard {
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for SerialFfiWorldTestGuard {
+    fn drop(&mut self) {
+        FFI_WORLD_TEST_SCOPE_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+pub(crate) fn serial_ffi_world_test() -> SerialFfiWorldTestGuard {
+    let exclusive = FFI_WORLD_TEST_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    FFI_WORLD_TEST_SCOPE_ACTIVE.with(|active| active.set(true));
+    SerialFfiWorldTestGuard {
+        _exclusive: exclusive,
+    }
+}
+
+pub(crate) fn ffi_world_test_scope_active() -> bool {
+    FFI_WORLD_TEST_SCOPE_ACTIVE.with(std::cell::Cell::get)
 }
 
 fn one_pixel_texture(id: &str, hash: u8) -> TextureUpload {

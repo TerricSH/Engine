@@ -50,6 +50,8 @@ impl VulkanDevice {
                 Err(error) => {
                     // The image has not reached `self` yet, so this function
                     // owns the rollback for every failure after creation.
+                    // SAFETY: the image is unbound, unused, and exclusively
+                    // owned after allocator locking failed.
                     unsafe { d.destroy_image(image, None) };
                     return Err(VulkanError::Loader(format!("allocator lock: {error}")));
                 }
@@ -61,6 +63,8 @@ impl VulkanDevice {
             }) {
                 Ok(allocation) => allocation,
                 Err(error) => {
+                    // SAFETY: allocation failed before binding/submission, so
+                    // the device-created image remains exclusively owned here.
                     unsafe { d.destroy_image(image, None) };
                     return Err(VulkanError::Allocation(error.to_string()));
                 }
@@ -69,8 +73,12 @@ impl VulkanDevice {
         // SAFETY: `image` was created by this device; `allocation` was created
         // for this image's memory requirements.
         if let Err(result) =
+            // SAFETY: same contract as above; this is adjacent to the unsafe
+            // conditional expression.
             unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
         {
+            // SAFETY: binding failed before GPU use; destroy the unbound image
+            // before releasing the associated allocation.
             unsafe { d.destroy_image(image, None) };
             free_hdr_target_allocation(&allocator, &mut allocation);
             return Err(VulkanError::vk("bind_hdr_image", result));
@@ -93,6 +101,8 @@ impl VulkanDevice {
         let image_view = match unsafe { d.create_image_view(&view_info, None) } {
             Ok(view) => view,
             Err(result) => {
+                // SAFETY: no view was created and the bound image has not been
+                // submitted; destroy it before freeing bound memory.
                 unsafe { d.destroy_image(image, None) };
                 free_hdr_target_allocation(&allocator, &mut allocation);
                 return Err(VulkanError::vk("create_hdr_image_view", result));
@@ -116,6 +126,8 @@ impl VulkanDevice {
         let sampler = match unsafe { d.create_sampler(&sampler_info, None) } {
             Ok(sampler) => sampler,
             Err(result) => {
+                // SAFETY: sampler creation failed before exposure/submission;
+                // the device-created view and image are exclusively owned here.
                 unsafe {
                     d.destroy_image_view(image_view, None);
                     d.destroy_image(image, None);
@@ -153,15 +165,24 @@ impl VulkanDevice {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `d` is live and this complete create-info describes a
+        // single-sample RGBA16F attachment matching the current extent.
         let image = unsafe { d.create_image(&image_info, None) }
             .map_err(|result| VulkanError::vk("create_oit_image", result))?;
+        // SAFETY: the image was just created by `d` and remains live.
         let requirements = unsafe { d.get_image_memory_requirements(image) };
         let allocator = self.logical_device.allocator();
         let mut allocation =
             allocate_hdr_target_memory(d, &allocator, image, allocation_name, requirements)?;
+        // SAFETY: the allocation satisfies the queried requirements and belongs
+        // to the same device; no use begins until binding succeeds.
         if let Err(result) =
+            // SAFETY: same contract as above; this is adjacent to the unsafe
+            // conditional expression.
             unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
         {
+            // SAFETY: binding failed before GPU use, leaving the image
+            // exclusively owned and safe to destroy before memory release.
             unsafe { d.destroy_image(image, None) };
             free_hdr_target_allocation(&allocator, &mut allocation);
             return Err(VulkanError::vk("bind_oit_image", result));
@@ -177,9 +198,13 @@ impl VulkanDevice {
                 base_array_layer: 0,
                 layer_count: 1,
             });
+        // SAFETY: the bound RGBA16F image is live and the view selects its only
+        // color mip/layer using a matching format.
         let image_view = match unsafe { d.create_image_view(&view_info, None) } {
             Ok(view) => view,
             Err(result) => {
+                // SAFETY: view creation failed before submission; destroy the
+                // exclusively-owned image before freeing its memory.
                 unsafe { d.destroy_image(image, None) };
                 free_hdr_target_allocation(&allocator, &mut allocation);
                 return Err(VulkanError::vk("create_oit_image_view", result));
@@ -208,15 +233,24 @@ impl VulkanDevice {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `d` is live and `image_info` describes a valid multisampled
+        // RGBA16F color attachment at the current extent/sample count.
         let image = unsafe { d.create_image(&image_info, None) }
             .map_err(|result| VulkanError::vk("create_hdr_msaa_image", result))?;
+        // SAFETY: `image` was just created by `d` and remains live.
         let requirements = unsafe { d.get_image_memory_requirements(image) };
         let allocator = self.logical_device.allocator();
         let mut allocation =
             allocate_hdr_target_memory(d, &allocator, image, allocation_name, requirements)?;
+        // SAFETY: the device allocation meets the queried image requirements;
+        // no command references either handle before binding succeeds.
         if let Err(result) =
+            // SAFETY: same contract as above; this is adjacent to the unsafe
+            // conditional expression.
             unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
         {
+            // SAFETY: failed binding leaves the image unused and exclusively
+            // owned; destroy it before the allocation is released.
             unsafe { d.destroy_image(image, None) };
             free_hdr_target_allocation(&allocator, &mut allocation);
             return Err(VulkanError::vk("bind_hdr_msaa_image", result));
@@ -232,9 +266,13 @@ impl VulkanDevice {
                 base_array_layer: 0,
                 layer_count: 1,
             });
+        // SAFETY: the live multisample image and view have matching format,
+        // color aspect, and a single valid mip/layer range.
         let image_view = match unsafe { d.create_image_view(&view_info, None) } {
             Ok(view) => view,
             Err(result) => {
+                // SAFETY: the view was not created and no GPU work was
+                // submitted; destroy the image before freeing its memory.
                 unsafe { d.destroy_image(image, None) };
                 free_hdr_target_allocation(&allocator, &mut allocation);
                 return Err(VulkanError::vk("create_hdr_msaa_image_view", result));
@@ -262,15 +300,24 @@ impl VulkanDevice {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `d` is live and `image_info` describes a valid multisampled
+        // D32 depth attachment matching the HDR extent/sample count.
         let image = unsafe { d.create_image(&image_info, None) }
             .map_err(|result| VulkanError::vk("create_hdr_msaa_depth_image", result))?;
+        // SAFETY: the depth image was just created by `d` and remains live.
         let requirements = unsafe { d.get_image_memory_requirements(image) };
         let allocator = self.logical_device.allocator();
         let mut allocation =
             allocate_hdr_target_memory(d, &allocator, image, "hdr-msaa-depth", requirements)?;
+        // SAFETY: allocation was chosen from this image's requirements, both
+        // handles belong to `d`, and no command can use the image before binding.
         if let Err(result) =
+            // SAFETY: same contract as above; this is adjacent to the unsafe
+            // conditional expression.
             unsafe { d.bind_image_memory(image, allocation.memory(), allocation.offset()) }
         {
+            // SAFETY: binding failed before GPU use; destroy the exclusively
+            // owned image before freeing its allocation.
             unsafe { d.destroy_image(image, None) };
             free_hdr_target_allocation(&allocator, &mut allocation);
             return Err(VulkanError::vk("bind_hdr_msaa_depth_image", result));
@@ -286,9 +333,13 @@ impl VulkanDevice {
                 base_array_layer: 0,
                 layer_count: 1,
             });
+        // SAFETY: the live D32 image and view use matching depth aspect/format
+        // and select the only valid mip/layer.
         let image_view = match unsafe { d.create_image_view(&view_info, None) } {
             Ok(view) => view,
             Err(result) => {
+                // SAFETY: view creation failed before submission; destroy the
+                // image before releasing its bound allocation.
                 unsafe { d.destroy_image(image, None) };
                 free_hdr_target_allocation(&allocator, &mut allocation);
                 return Err(VulkanError::vk("create_hdr_msaa_depth_view", result));
@@ -321,6 +372,8 @@ fn allocate_hdr_target_memory(
     let mut allocator_guard = match allocator.lock() {
         Ok(guard) => guard,
         Err(error) => {
+            // SAFETY: locking failed before allocation/binding; `image` is an
+            // unused device-created handle exclusively transferred to this helper.
             unsafe { device.destroy_image(image, None) };
             return Err(VulkanError::Loader(format!("allocator lock: {error}")));
         }
@@ -332,6 +385,8 @@ fn allocate_hdr_target_memory(
     }) {
         Ok(allocation) => Ok(allocation),
         Err(error) => {
+            // SAFETY: allocation failed before binding or GPU submission; the
+            // helper still exclusively owns the unbound image.
             unsafe { device.destroy_image(image, None) };
             Err(VulkanError::Allocation(error.to_string()))
         }

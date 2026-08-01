@@ -206,6 +206,8 @@ fn destroy_environment_resources(
     allocator: &SharedAllocator,
     mut resources: EnvironmentResources,
 ) {
+    // SAFETY: `resources` exclusively owns these idle, device-created handles.
+    // The sampler/view/image are destroyed before the bound memory below.
     unsafe {
         device.destroy_sampler(resources.sampler, None);
         device.destroy_image_view(resources.image_view, None);
@@ -472,9 +474,11 @@ impl VulkanDevice {
             .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE);
+        // SAFETY: the live device receives a validated cube-image description.
         pending.image = unsafe { device.create_image(&image_info, None) }
             .map_err(|result| VulkanError::vk("create_env_image", result))?;
 
+        // SAFETY: `pending.image` was just created by `device` and remains live.
         let requirements = unsafe { device.get_image_memory_requirements(pending.image) };
         pending.image_allocation = Some(
             allocator
@@ -490,11 +494,13 @@ impl VulkanDevice {
         let allocation = pending.image_allocation.as_ref().ok_or_else(|| {
             VulkanError::Loader("environment image allocation disappeared".into())
         })?;
+        // SAFETY: matching device allocation/image are unused before this bind.
         unsafe {
             device.bind_image_memory(pending.image, allocation.memory(), allocation.offset())
         }
         .map_err(|result| VulkanError::vk("bind_env_image", result))?;
 
+        // SAFETY: the live six-layer cube image matches this view and its ranges.
         pending.image_view = unsafe {
             device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
@@ -513,6 +519,7 @@ impl VulkanDevice {
         }
         .map_err(|result| VulkanError::vk("create_env_image_view", result))?;
 
+        // SAFETY: the live device receives a pointer-free valid sampler description.
         pending.sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -777,6 +784,7 @@ impl VulkanDevice {
         // Mark this conservatively before the call: even an error such as
         // device loss is not proof that no implementation-owned work began.
         pending.submitted = true;
+        // SAFETY: live queue, ended command buffer, submit slices, and fence are valid.
         unsafe { d.queue_submit(pending.queue, &submit_info, pending.fence) }
             .map_err(|r| VulkanError::vk("submit_env_upload", r))?;
 

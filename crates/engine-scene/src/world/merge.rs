@@ -177,7 +177,10 @@ impl World {
             let Some(parent) = self.persistent_to_entity.get(parent_id).copied() else {
                 continue;
             };
-            let Some(child) = self.entities.live_entity_at(idx as u32) else {
+            let Ok(entity_index) = u32::try_from(idx) else {
+                continue;
+            };
+            let Some(child) = self.entities.live_entity_at(entity_index) else {
                 continue;
             };
             children_of.entry(parent).or_default().push(child);
@@ -231,8 +234,8 @@ impl World {
             transform.parent = None;
         }
         let idx = entity.index() as usize;
-        if idx < self.entity_parents.len() {
-            self.entity_parents[idx] = None;
+        if let Some(parent) = self.entity_parents.get_mut(idx) {
+            *parent = None;
         }
         true
     }
@@ -926,5 +929,15 @@ mod tests {
             entity
         };
         assert!(!world.detach_from_parent(stale));
+    }
+
+    #[test]
+    fn world_merge_runtime_has_no_unwrap_or_expect_calls() {
+        let source = include_str!("merge.rs");
+        let runtime = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(runtime, _)| runtime);
+        assert!(!runtime.contains(".unwrap()"), "runtime unwrap found");
+        assert!(!runtime.contains(".expect("), "runtime expect found");
     }
 }

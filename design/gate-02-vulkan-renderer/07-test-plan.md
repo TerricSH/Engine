@@ -4,6 +4,8 @@
 
 Gate 2 tests prove that Vulkan works as the first real backend and that the frame lifecycle is stable under normal window operations. GPU tests are required; compile tests alone are not sufficient.
 
+`sandbox` wires only the Vulkan backend. OpenGL and DirectX 12 regressions are package-scoped contract checks and do not require sandbox backend features.
+
 ## Feature Test Cases
 
 | Feature | Test Case | Type | Expected Result |
@@ -36,11 +38,11 @@ Gate 2 tests prove that Vulkan works as the first real backend and that the fram
 ## Required Commands
 
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan`
+- `cargo check -p sandbox --features backend-vulkan`
 - `cargo run -p sandbox --features backend-vulkan -- triangle`
 - `cargo run -p sandbox --features backend-vulkan -- textured-object`
-- `cargo check --workspace --features backend-opengl`
-- Windows: `cargo check --workspace --features backend-dx12`
+- `cargo check -p render-opengl`
+- `cargo check -p render-dx12 --all-features`
 
 ## Required Evidence
 
@@ -121,8 +123,8 @@ Evidence:
 ### IT-G2-04 Backend Stub Regression
 
 Steps:
-1. Run `cargo check --workspace --features backend-opengl`.
-2. On Windows, run `cargo check --workspace --features backend-dx12`.
+1. Run `cargo check -p render-opengl`.
+2. Run `cargo check -p render-dx12 --all-features`; platform-specific code remains cfg-gated on non-Windows hosts.
 
 Expected:
 - Backend stubs remain compatible with `render-core`.

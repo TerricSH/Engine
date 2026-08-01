@@ -40,6 +40,9 @@ impl HdrForwardBuildGuard {
         {
             self.shader_modules.swap_remove(index);
         }
+        // SAFETY: removal from the guard's tracking list transfers exclusive
+        // ownership; the module was created by `self.device` and is not needed
+        // after pipeline compilation.
         unsafe {
             self.device.destroy_shader_module(module, None);
         }
@@ -59,6 +62,9 @@ impl Drop for HdrForwardBuildGuard {
         if !self.armed {
             return;
         }
+        // SAFETY: the armed transaction exclusively owns every tracked handle,
+        // all were created by `self.device`, and none were published/submitted;
+        // destruction follows dependency order.
         unsafe {
             if let Some(framebuffer) = self.framebuffer.take() {
                 self.device.destroy_framebuffer(framebuffer, None);
@@ -335,6 +341,8 @@ impl VulkanDevice {
         // SAFETY: `d` is a valid AshDevice; `vert`/`frag` are valid SPIR-V.
         let vm = unsafe { mk_sm(d, &vert)? };
         build.track_shader_module(vm);
+        // SAFETY: `d` is live and `mk_sm` validates/converts the embedded SPIR-V
+        // while the borrowed fragment bytes remain alive.
         let fm = unsafe { mk_sm(d, &frag)? };
         build.track_shader_module(fm);
 
@@ -424,6 +432,8 @@ impl VulkanDevice {
                 .layout(pll)
                 .render_pass(rp)
                 .subpass(0);
+            // SAFETY: every referenced shader/state/layout/render-pass object is
+            // live and compatible; all local slices outlive the Vulkan call.
             let pipeline_result = unsafe {
                 d.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
             };
@@ -455,8 +465,12 @@ impl VulkanDevice {
         // shader generates a cube from gl_VertexIndex, so no vertex input is
         // required. Rendering happens before opaque geometry without depth
         // writes, allowing scene geometry to replace the background normally.
+        // SAFETY: `d` is live and `mk_sm` validates the embedded skybox vertex
+        // SPIR-V; its borrowed bytes remain alive through creation.
         let sky_vm = unsafe { mk_sm(d, &skybox_vert)? };
         build.track_shader_module(sky_vm);
+        // SAFETY: the same device/lifetime invariant holds for the embedded
+        // skybox fragment SPIR-V.
         let sky_fm = unsafe { mk_sm(d, &skybox_frag)? };
         build.track_shader_module(sky_fm);
         let sky_stages = [
@@ -495,6 +509,8 @@ impl VulkanDevice {
             .layout(pll)
             .render_pass(rp)
             .subpass(0);
+        // SAFETY: shader modules, fixed-function state, pipeline layout, and
+        // render pass are live/compatible and all borrowed arrays outlive call.
         let sky_pipeline_result = unsafe {
             d.create_graphics_pipelines(vk::PipelineCache::null(), &[sky_pipeline_info], None)
         };
@@ -515,10 +531,16 @@ impl VulkanDevice {
         // ---- Instanced particle billboard pipeline ----
         // Binding zero retains the authored quad mesh; binding one advances
         // once per particle and carries position/size plus rotation/age.
+        // SAFETY: `d` is live and `mk_sm` validates the embedded VFX vertex
+        // SPIR-V while its source bytes remain borrowed.
         let vfx_vm = unsafe { mk_sm(d, &vfx_billboard_vert)? };
         build.track_shader_module(vfx_vm);
+        // SAFETY: `d` is live and the embedded VFX fragment module follows the
+        // same validated SPIR-V/lifetime contract.
         let vfx_fm = unsafe { mk_sm(d, &vfx_billboard_frag)? };
         build.track_shader_module(vfx_fm);
+        // SAFETY: `d` is live and the GPU-VFX vertex SPIR-V is validated by
+        // `mk_sm`; the source slice outlives module creation.
         let gpu_vfx_vm = unsafe { mk_sm(d, &gpu_vfx_billboard_vert)? };
         build.track_shader_module(gpu_vfx_vm);
         let vfx_stages = [
@@ -614,6 +636,8 @@ impl VulkanDevice {
             vfx_pipeline_base.color_blend_state(&vfx_additive_blend),
             vfx_pipeline_base.color_blend_state(&vfx_oit_blend),
         ];
+        // SAFETY: the three pipeline infos reference live compatible objects;
+        // their state arrays remain alive for the batch creation call.
         let vfx_pipeline_result = unsafe {
             d.create_graphics_pipelines(vk::PipelineCache::null(), &vfx_pipeline_infos, None)
         };
@@ -685,6 +709,8 @@ impl VulkanDevice {
             gpu_vfx_pipeline_base.color_blend_state(&vfx_additive_blend),
             gpu_vfx_pipeline_base.color_blend_state(&vfx_oit_blend),
         ];
+        // SAFETY: all GPU-VFX pipeline infos, shaders, layouts, render pass and
+        // borrowed state slices are live and mutually compatible.
         let gpu_vfx_pipeline_result = unsafe {
             d.create_graphics_pipelines(vk::PipelineCache::null(), &gpu_vfx_pipeline_infos, None)
         };
@@ -706,8 +732,12 @@ impl VulkanDevice {
         let gpu_vfx_billboard_oit_pipeline = gpu_vfx_billboard_pipelines[2];
 
         // ---- Instanced opaque/masked surface pipelines ----
+        // SAFETY: `d` is live and `mk_sm` validates the embedded instanced
+        // vertex SPIR-V while its source bytes remain borrowed.
         let instanced_vm = unsafe { mk_sm(d, &instanced_vert)? };
         build.track_shader_module(instanced_vm);
+        // SAFETY: `d` is live and the shared fragment SPIR-V satisfies the same
+        // checked bytecode/lifetime contract.
         let instanced_fm = unsafe { mk_sm(d, &frag)? };
         build.track_shader_module(instanced_fm);
         let instanced_stages = [
@@ -805,6 +835,8 @@ impl VulkanDevice {
                 .layout(pll)
                 .render_pass(rp)
                 .subpass(0);
+            // SAFETY: each instanced pipeline description references live
+            // compatible shaders/state/layout/pass and call-scoped slices.
             let result = unsafe {
                 d.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
             };

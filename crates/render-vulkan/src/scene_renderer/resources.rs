@@ -1,5 +1,23 @@
 use super::*;
 
+fn read_material_f32(bytes: &[u8], offset: usize) -> Option<f32> {
+    let end = offset.checked_add(std::mem::size_of::<f32>())?;
+    let encoded: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
+    let value = f32::from_ne_bytes(encoded);
+    value.is_finite().then_some(value)
+}
+
+fn read_material_vec4(bytes: &[u8], offset: usize) -> Option<[f32; 4]> {
+    // Keep vector reads transactional: a truncated or non-finite component
+    // rejects the whole value instead of mixing authored data with defaults.
+    let mut value = [0.0; 4];
+    for (component, destination) in value.iter_mut().enumerate() {
+        let component_offset = offset.checked_add(component * std::mem::size_of::<f32>())?;
+        *destination = read_material_f32(bytes, component_offset)?;
+    }
+    Some(value)
+}
+
 impl SceneRenderer {
     pub(super) fn validate_uploaded_meshes(
         &self,
@@ -324,41 +342,17 @@ impl SceneRenderer {
     ///
     /// If `bytes` is empty or too short, sane defaults are used.
     pub(super) fn parse_material_ubo(bytes: &[u8]) -> MaterialUBO {
-        let read_f32 = |offset: usize, fallback: f32| -> f32 {
-            if offset + 4 <= bytes.len() {
-                let value = f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-                if value.is_finite() {
-                    value
-                } else {
-                    fallback
-                }
-            } else {
-                fallback
-            }
-        };
-        let read_vec4 = |offset: usize, fallback: [f32; 4]| -> [f32; 4] {
-            if offset + 16 <= bytes.len() {
-                [
-                    f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap()),
-                    f32::from_ne_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()),
-                    f32::from_ne_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()),
-                    f32::from_ne_bytes(bytes[offset + 12..offset + 16].try_into().unwrap()),
-                ]
-            } else {
-                fallback
-            }
-        };
         MaterialUBO {
-            base_color: read_vec4(0, [0.8, 0.6, 0.4, 1.0]),
-            metallic: read_f32(16, 0.0).clamp(0.0, 1.0),
-            roughness: read_f32(20, 1.0).clamp(0.04, 1.0),
-            ao: read_f32(24, 1.0).clamp(0.0, 1.0),
-            alpha_cutoff: read_f32(28, -1.0),
-            emissive: read_vec4(32, [0.0; 4]),
-            advanced0: read_vec4(48, [0.0, 0.2, 0.0, 0.0]),
-            subsurface_color: read_vec4(64, [1.0, 0.35, 0.25, 0.0]),
-            sheen_color: read_vec4(80, [0.0; 4]),
-            rim_color_power: read_vec4(96, [0.0, 0.0, 0.0, 3.0]),
+            base_color: read_material_vec4(bytes, 0).unwrap_or([0.8, 0.6, 0.4, 1.0]),
+            metallic: read_material_f32(bytes, 16).unwrap_or(0.0).clamp(0.0, 1.0),
+            roughness: read_material_f32(bytes, 20).unwrap_or(1.0).clamp(0.04, 1.0),
+            ao: read_material_f32(bytes, 24).unwrap_or(1.0).clamp(0.0, 1.0),
+            alpha_cutoff: read_material_f32(bytes, 28).unwrap_or(-1.0),
+            emissive: read_material_vec4(bytes, 32).unwrap_or([0.0; 4]),
+            advanced0: read_material_vec4(bytes, 48).unwrap_or([0.0, 0.2, 0.0, 0.0]),
+            subsurface_color: read_material_vec4(bytes, 64).unwrap_or([1.0, 0.35, 0.25, 0.0]),
+            sheen_color: read_material_vec4(bytes, 80).unwrap_or([0.0; 4]),
+            rim_color_power: read_material_vec4(bytes, 96).unwrap_or([0.0, 0.0, 0.0, 3.0]),
         }
     }
 
@@ -772,4 +766,41 @@ impl SceneRenderer {
     // ------------------------------------------------------------------
     // Frame lifecycle helpers
     // ------------------------------------------------------------------
+}
+
+#[cfg(test)]
+mod material_ubo_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_vector_uses_its_complete_fallback() {
+        let mut truncated = Vec::new();
+        for component in [0.1_f32, 0.2, 0.3] {
+            truncated.extend_from_slice(&component.to_ne_bytes());
+        }
+
+        let parsed = SceneRenderer::parse_material_ubo(&truncated);
+
+        assert_eq!(parsed.base_color, [0.8, 0.6, 0.4, 1.0]);
+        assert_eq!(parsed.metallic, 0.0);
+        assert_eq!(parsed.roughness, 1.0);
+    }
+
+    #[test]
+    fn non_finite_vector_and_scalar_values_fail_closed() {
+        let mut encoded = vec![0_u8; MATERIAL_UBO_SIZE];
+        encoded[0..4].copy_from_slice(&f32::NAN.to_ne_bytes());
+        encoded[16..20].copy_from_slice(&f32::INFINITY.to_ne_bytes());
+
+        let parsed = SceneRenderer::parse_material_ubo(&encoded);
+
+        assert_eq!(parsed.base_color, [0.8, 0.6, 0.4, 1.0]);
+        assert_eq!(parsed.metallic, 0.0);
+    }
+
+    #[test]
+    fn checked_reader_rejects_offset_overflow() {
+        assert_eq!(read_material_f32(&[], usize::MAX), None);
+        assert_eq!(read_material_vec4(&[], usize::MAX), None);
+    }
 }

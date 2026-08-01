@@ -423,10 +423,14 @@ fn try_merge(p1: &[u32], p2: &[u32], verts: &[Vec3], nvp: u32) -> Option<Vec<u32
         return None;
     }
 
-    let p1_s0 = p1.iter().position(|&v| v == s0).unwrap();
-    let p1_s1 = p1.iter().position(|&v| v == s1).unwrap();
-    let p2_s0 = p2.iter().position(|&v| v == s0).unwrap();
-    let p2_s1 = p2.iter().position(|&v| v == s1).unwrap();
+    let (Some(p1_s0), Some(p1_s1), Some(p2_s0), Some(p2_s1)) = (
+        p1.iter().position(|&v| v == s0),
+        p1.iter().position(|&v| v == s1),
+        p2.iter().position(|&v| v == s0),
+        p2.iter().position(|&v| v == s1),
+    ) else {
+        return None;
+    };
 
     // Try both orientations.
     let ma = build_merged_ring(p1, p2, p1_s0, p1_s1, p2_s1, p2_s0);
@@ -535,7 +539,7 @@ fn clean_duplicates_u32(poly: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(poly.len());
     out.push(poly[0]);
     for &v in &poly[1..] {
-        if v != *out.last().unwrap() {
+        if out.last().copied() != Some(v) {
             out.push(v);
         }
     }

@@ -79,12 +79,16 @@ impl SceneRenderer {
         const SHADOW_SIZE: u32 = 2048;
         const CASCADE_COUNT: usize = 3;
 
+        // SAFETY: `[f32; 4]` is fully initialized contiguous scalar storage and
+        // this 16-byte view cannot outlive `cascade_splits`.
         let splits_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(&cascade_splits as *const _ as *const u8, 16) };
         self.device.write_ubo_current(splits_bytes, 176);
 
         for (i, lvp) in light_vps.iter().enumerate() {
             let arr: [[f32; 4]; 4] = lvp.to_cols_array_2d();
+            // SAFETY: the initialized nested f32 array is contiguous/no-padding
+            // scalar storage and this 64-byte view remains locally bounded.
             let vp_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(&arr as *const _ as *const u8, 64) };
             self.device
@@ -121,6 +125,8 @@ impl SceneRenderer {
                     },
                 })
                 .clear_values(&clear_values);
+            // SAFETY: `cmd` is recording outside a pass; this live shadow pass,
+            // framebuffer, render area and clear values are compatible.
             unsafe {
                 d.cmd_begin_render_pass(cmd, &rpbi, vk::SubpassContents::INLINE);
             }
@@ -133,6 +139,8 @@ impl SceneRenderer {
                 min_depth: 0.0,
                 max_depth: 1.0,
             };
+            // SAFETY: the shadow pass is active with dynamic viewport/scissor;
+            // both call-scoped rectangles match its attachment extent.
             unsafe {
                 d.cmd_set_viewport(cmd, 0, &[vp]);
                 d.cmd_set_scissor(
@@ -201,6 +209,8 @@ impl SceneRenderer {
                             // Bind VB/IB
                             let vbs = [shadow_cached_vb];
                             let offsets = [0u64];
+                            // SAFETY: generation-checked buffers are live and the
+                            // binding slices remain valid while `cmd` records.
                             unsafe {
                                 d.cmd_bind_vertex_buffers(cmd, 0, &vbs, &offsets);
                                 d.cmd_bind_index_buffer(
@@ -225,6 +235,8 @@ impl SceneRenderer {
 
                 let world = Mat4::from_cols_array(&drawable.world_transform);
                 let mvp = light_vp * world;
+                // SAFETY: the initialized 128-byte payload fits `pll`'s declared
+                // vertex push range; compatible pipeline/index buffers are bound.
                 unsafe {
                     let mut pc_bytes = [0u8; 128];
                     for (index, value) in mvp.to_cols_array().into_iter().enumerate() {
@@ -257,6 +269,7 @@ impl SceneRenderer {
                 stats.triangles += shadow_cached_index_count as u64 / 3;
             }
 
+            // SAFETY: the still-active shadow pass was begun on this recording command buffer.
             unsafe {
                 d.cmd_end_render_pass(cmd);
             }
@@ -277,6 +290,8 @@ impl SceneRenderer {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .old_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL)
                 .new_layout(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+            // SAFETY: `cmd` records outside a pass; the live image/range and
+            // access-stage masks establish depth-write to shader-read ordering.
             unsafe {
                 d.cmd_pipeline_barrier(
                     cmd,

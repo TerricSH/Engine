@@ -45,6 +45,10 @@ pub struct EngineRuntime {
     pub(crate) stream_budget: usize,
     pub(crate) scene: Option<Scene>,
     pub(crate) world_slot: WorldSlot,
+    /// Unit tests opt into the process-wide FFI binding explicitly so
+    /// unrelated parallel runtime tests cannot replace another test's world.
+    #[cfg(test)]
+    pub(crate) ffi_world_test_scope_active: bool,
     /// Per-pass CPU/GPU frame timing recorder and rolling statistics (ENG-04).
     pub(crate) frame_timing: engine_renderer::FrameTimingTracker,
     pub(crate) component_registry: Arc<ComponentRegistry>,
@@ -113,6 +117,8 @@ impl EngineRuntime {
             stream_budget: asset_stream::DEFAULT_STREAM_COMMIT_BUDGET,
             scene: None,
             world_slot: WorldSlot::new(),
+            #[cfg(test)]
+            ffi_world_test_scope_active: crate::tests::ffi_world_test_scope_active(),
             frame_timing: engine_renderer::FrameTimingTracker::new(),
             component_registry,
             asset_type_registry,
@@ -128,6 +134,30 @@ impl EngineRuntime {
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    pub(crate) fn uses_process_ffi_binding(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.ffi_world_test_scope_active
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    fn activate_ffi_world(&self, component_registry: &ComponentRegistry) {
+        if self.uses_process_ffi_binding() {
+            engine_ffi::world_bridge::activate_world(&self.world_slot, component_registry);
+        }
+    }
+
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub(crate) fn activate_ffi_coroutine_runtime(&self) {
+        if self.uses_process_ffi_binding() {
+            engine_ffi::world_bridge::activate_coroutine_runtime(&self.world_slot);
+        }
     }
 
     /// Shared registry used by strict scene loading and registry-less worlds.
@@ -231,7 +261,7 @@ impl EngineRuntime {
         self.clear_scene_script_instances();
 
         self.world_slot.replace(world);
-        engine_ffi::world_bridge::activate_world(&self.world_slot, &self.component_registry);
+        self.activate_ffi_world(&self.component_registry);
 
         // Attach scripts only after activating the new world so managed
         // OnCreate callbacks cannot observe the previous scene.
@@ -286,7 +316,7 @@ impl EngineRuntime {
         self.clear_scene_script_instances();
 
         self.world_slot.replace(world);
-        engine_ffi::world_bridge::activate_world(&self.world_slot, &effective_registry);
+        self.activate_ffi_world(&effective_registry);
 
         #[cfg(feature = "subsystem-scripting-csharp")]
         {
@@ -341,8 +371,10 @@ impl Drop for EngineRuntime {
     fn drop(&mut self) {
         // Only clear the process-wide binding when this runtime is still the
         // active one. A newer runtime must remain connected.
-        engine_ffi::world_bridge::deactivate_world(&self.world_slot);
-        engine_ffi::world_bridge::deactivate_coroutine_runtime(&self.world_slot);
+        if self.uses_process_ffi_binding() {
+            engine_ffi::world_bridge::deactivate_world(&self.world_slot);
+            engine_ffi::world_bridge::deactivate_coroutine_runtime(&self.world_slot);
+        }
         self.world_slot.clear();
     }
 }

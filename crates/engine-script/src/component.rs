@@ -139,8 +139,8 @@ impl ScriptManager {
 
     /// Load an assembly through the host and cache the handle.
     pub fn load_assembly(&mut self, id: &str, data: &[u8]) -> Result<ScriptHandle, ScriptError> {
-        if self.assemblies.contains_key(id) {
-            return Ok(self.assemblies[id].clone());
+        if let Some(handle) = self.assemblies.get(id) {
+            return Ok(handle.clone());
         }
         let handle = self.host.load_assembly(id, data)?;
         self.assemblies.insert(id.to_string(), handle.clone());
@@ -675,5 +675,15 @@ mod tests {
         // Should NOT have started since it's disabled
         let (_, _, state) = m.iter_instances().next().unwrap();
         assert!(!state.started);
+    }
+
+    #[test]
+    fn script_component_runtime_has_no_unwrap_or_expect_calls() {
+        let source = include_str!("component.rs");
+        let runtime = source
+            .split_once("\n#[cfg(test)]")
+            .map_or(source, |(runtime, _)| runtime);
+        assert!(!runtime.contains(".unwrap()"), "runtime unwrap found");
+        assert!(!runtime.contains(".expect("), "runtime expect found");
     }
 }

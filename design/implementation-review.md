@@ -1,5 +1,7 @@
 # Implementation Review - 2026-05-26
 
+> This review records historical Gate 1 implementation evidence. Backend command spellings below use the current package-scoped topology: `sandbox` wires only Vulkan, while OpenGL and DirectX 12 are checked directly.
+
 ## Current Implementation State
 
 - Gate 1 is implemented as a compile-validated Rust workspace with the 20 crates frozen by `FD-029`.
@@ -14,9 +16,9 @@
 - `cargo metadata --no-deps --format-version=1`: 20 packages.
 - `cargo fmt --all --check`: pass.
 - `cargo check --workspace`: pass.
-- `cargo check --workspace --features backend-vulkan`: pass.
-- `cargo check --workspace --features backend-opengl`: pass.
-- `cargo check --workspace --features backend-dx12`: pass on Windows without native SDK dependency.
+- Vulkan composition (current equivalent: `cargo check -p sandbox --features backend-vulkan`): pass.
+- OpenGL contract (current equivalent: `cargo check -p render-opengl`): pass.
+- DirectX 12 contract (current equivalent: `cargo check -p render-dx12 --all-features`): pass on Windows without native SDK dependency.
 - `cargo test --workspace`: pass.
 - `cargo run -p sandbox -- gate04-scene`: pass.
 

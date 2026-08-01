@@ -1,6 +1,17 @@
 use super::*;
 
 #[cfg(all(target_os = "windows", feature = "backend-dx12"))]
+fn read_vec3(source: &[u8], offset: usize) -> Option<glam::Vec3> {
+    let end = offset.checked_add(12)?;
+    let bytes: [u8; 12] = source.get(offset..end)?.try_into().ok()?;
+    Some(glam::Vec3::new(
+        f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        f32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        f32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+    ))
+}
+
+#[cfg(all(target_os = "windows", feature = "backend-dx12"))]
 impl Dx12SceneRenderer {
     pub(super) fn prepare_vertex_draw_arena(
         &mut self,
@@ -278,20 +289,37 @@ impl Dx12SceneRenderer {
         }
         let stride = mesh.vertex_format.stride_bytes() as usize;
         let mut bytes = mesh.vertex_bytes.clone();
+        let invalid_vertex_data = || {
+            vec![Diagnostic::new(
+                "DX1291",
+                DiagnosticSeverity::Error,
+                "scene_renderer",
+                format!(
+                    "DX12 mesh '{}' or morph target data is shorter than its declared vertex count",
+                    cache_key
+                ),
+            )]
+        };
         for vertex_index in 0..mesh.vertex_count as usize {
-            let base = vertex_index * stride;
-            let read_vec3 = |source: &[u8], offset: usize| {
-                glam::Vec3::new(
-                    f32::from_ne_bytes(source[offset..offset + 4].try_into().unwrap()),
-                    f32::from_ne_bytes(source[offset + 4..offset + 8].try_into().unwrap()),
-                    f32::from_ne_bytes(source[offset + 8..offset + 12].try_into().unwrap()),
-                )
-            };
-            let mut position = read_vec3(&mesh.vertex_bytes, base);
-            let mut normal = read_vec3(&mesh.vertex_bytes, base + 12);
+            let base = vertex_index
+                .checked_mul(stride)
+                .ok_or_else(&invalid_vertex_data)?;
+            let normal_offset = base.checked_add(12).ok_or_else(&invalid_vertex_data)?;
+            let mut position =
+                read_vec3(&mesh.vertex_bytes, base).ok_or_else(&invalid_vertex_data)?;
+            let mut normal =
+                read_vec3(&mesh.vertex_bytes, normal_offset).ok_or_else(&invalid_vertex_data)?;
             for (target, weight) in target_set.targets.iter().zip(weights.iter().copied()) {
-                position += glam::Vec3::from_array(target.position_deltas[vertex_index]) * weight;
-                normal += glam::Vec3::from_array(target.normal_deltas[vertex_index]) * weight;
+                let position_delta = target
+                    .position_deltas
+                    .get(vertex_index)
+                    .ok_or_else(&invalid_vertex_data)?;
+                let normal_delta = target
+                    .normal_deltas
+                    .get(vertex_index)
+                    .ok_or_else(&invalid_vertex_data)?;
+                position += glam::Vec3::from_array(*position_delta) * weight;
+                normal += glam::Vec3::from_array(*normal_delta) * weight;
             }
             if normal.length_squared() > 1.0e-12 {
                 normal = normal.normalize();

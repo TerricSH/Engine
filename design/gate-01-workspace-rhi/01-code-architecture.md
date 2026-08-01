@@ -4,6 +4,8 @@
 
 This diagram shows the whole engine structure at the end of Gate 1. Gate 1 does not implement gameplay systems yet; it creates the workspace, crate boundaries, feature flags, and the first `RHI-v0` contract that every later rendering backend consumes.
 
+> **Current topology note (2026-08-01):** the diagram and Gate 1 narrative below record the original scaffold. Backend crates are now validated by package selection: `render-opengl` and `render-dx12` are not features of the workspace composition root. `sandbox` exposes only `backend-vulkan`; DirectX 12 retains its crate-local `backend-dx12` feature.
+
 ## Whole-System Architecture At Gate Exit
 
 ```mermaid
@@ -49,7 +51,7 @@ Gate 1 implements the following frozen decisions:
 | `FD-002` Engine threading model | Workspace defines the four-thread topology (main / render / audio / IO pool) and ownership rules; even though Gate 1 only stands up the workspace, the thread roles are documented here so later gates can target them. |
 | `FD-003` iOS graphics backend | `BackendCapabilities` must enumerate MoltenVK's feature subset for iOS; no separate `MetalRHI`. |
 | `FD-008` IO and async runtime model | Root `Cargo.toml` forbids `tokio`, `async-std`, `smol`; CI grep enforces this from Gate 1 onward. |
-| `FD-010` Cargo feature flag taxonomy | All workspace features use the `backend-*` / `subsystem-*` / `tooling-*` / `target-*` scheme. Backend stubs are gated by `backend-vulkan`, `backend-opengl`, `backend-dx12`. |
+| `FD-010` Cargo feature flag taxonomy | Workspace composition features use the `backend-*` / `subsystem-*` / `tooling-*` / `target-*` scheme. The historical Gate 1 scaffold named all three backend features; the current composition root exposes only `sandbox/backend-vulkan`, while OpenGL is package-selected and DirectX 12 keeps `render-dx12/backend-dx12` crate-local. |
 | `FD-012` Determinism policy | Workspace-wide lint or CI grep bans `std::collections::HashMap`/`HashSet` outside whitelisted module paths; replace with `IndexMap` / `FxHashMap` + explicit sort. |
 | `FD-013` Platform layer scope | `platform` crate ships winit-only in Gate 1; the `PlatformAdapter` trait is added later in Gate 7. |
 | `FD-014` Logging and tracing | Workspace adopts `tracing` + `tracing-subscriber`; no `log` crate or `println!` for diagnostics. |
@@ -70,7 +72,7 @@ Gate 1 implements the following frozen decisions:
 
 ## Frozen Contracts
 
-- `RHI-v0` naming, crate ownership, and backend feature flags.
+- `RHI-v0` naming, crate ownership, and backend package boundaries; composition-root features are defined only for backends actually wired into that root.
 - Root workspace files are integration-owner only.
 
 ## Architectural Notes
@@ -98,7 +100,7 @@ Each question below has an **owner**, a **decision deadline**, an **option list*
 
 - **Owner:** Gate 1 Workspace Integration Owner (Session 1A).
 - **Decision deadline:** Before root `Cargo.toml` is committed.
-- **Status:** RESOLVED by `FD-010`. Backend features are `backend-vulkan`, `backend-opengl`, `backend-dx12` (kebab-case, `backend-*` prefix). Subsystem/tooling/target features follow the same three-segment taxonomy.
+- **Status:** RESOLVED by `FD-010`. The historical Gate 1 scaffold used `backend-vulkan`, `backend-opengl`, and `backend-dx12` (kebab-case, `backend-*` prefix). In the current topology, `sandbox` keeps only `backend-vulkan`; OpenGL is selected as the `render-opengl` package and `backend-dx12` is local to `render-dx12`. Subsystem/tooling/target features continue to follow the same taxonomy.
 
 ### Q3: `engine-core` re-export policy for RHI types
 
@@ -393,14 +395,14 @@ Use the common `RhiError` enum shown in the skeleton above. Variants are exhaust
 
 Backend-specific detail can be attached as strings in `Backend { detail }`, but must not leak backend types into the public API.
 
-### Implementation Order
+### Historical Implementation Order
 
 1. Create workspace and placeholder crates.
-2. Add feature flags and platform cfg rules.
+2. Add the original backend feature flags and platform cfg rules.
 3. Define `render-core` descriptors, handles, capability structs, and errors.
 4. Add compile stubs for Vulkan/OpenGL/DX12.
 5. Add a sandbox placeholder that can later select a backend.
-6. Run all feature-gated checks.
+6. Run the then-current feature-gated checks. Current validation uses package-scoped backend checks as described above.
 
 ### Design Risks
 

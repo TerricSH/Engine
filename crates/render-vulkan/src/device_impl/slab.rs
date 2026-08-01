@@ -50,6 +50,9 @@ impl TexEntry {
     }
 
     pub(crate) fn destroy(mut self, device: &AshDevice) {
+        // SAFETY: this entry exclusively owns all three handles, each was
+        // created by `device`, and callers remove the entry only after its GPU
+        // uses have completed; Vulkan memory outlives the image destruction.
         unsafe {
             if let Some(sampler) = self.sampler.take() {
                 device.destroy_sampler(sampler, None);

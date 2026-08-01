@@ -103,6 +103,8 @@ macro_rules! vulkan_device_render_target_methods {
                 // render pass with color + depth attachments; `None` means no
                 // custom allocator.
                 (
+                    // SAFETY: the validated create-info and referenced local
+                    // arrays remain alive for this device call.
                     unsafe { d.create_render_pass(&rp_info, None) }.map_err(|r| {
                         render_core::RhiError::Backend {
                             detail: format!("{r:?}"),
@@ -144,7 +146,11 @@ macro_rules! vulkan_device_render_target_methods {
                     .attachments(&attachments)
                     .subpasses(&subpasses)
                     .dependencies(&dependencies);
+                // SAFETY: `d` is live; every attachment/subpass reference is
+                // within the local arrays and those arrays outlive the call.
                 (
+                    // SAFETY: the validated create-info and referenced local
+                    // arrays remain alive for this device call.
                     unsafe { d.create_render_pass(&info, None) }.map_err(|result| {
                         render_core::RhiError::Backend {
                             detail: format!("create depth-only render pass: {result:?}"),
@@ -183,6 +189,8 @@ macro_rules! vulkan_device_render_target_methods {
                 // render pass with color attachment only; `None` means no custom
                 // allocator.
                 (
+                    // SAFETY: the validated create-info and referenced local
+                    // arrays remain alive for this device call.
                     unsafe { d.create_render_pass(&rp_info, None) }.map_err(|r| {
                         render_core::RhiError::Backend {
                             detail: format!("{r:?}"),
@@ -214,6 +222,9 @@ macro_rules! vulkan_device_render_target_methods {
                 self.rp_color_formats.remove(&pass.index);
                 self.rp_depth_formats.remove(&pass.index);
                 self.rp_sample_counts.remove(&pass.index);
+                // SAFETY: slab removal transfers exclusive ownership of a pass
+                // created by this device; dependent framebuffers/pipelines are
+                // required by the RHI lifecycle to be destroyed first.
                 unsafe {
                     self.logical_device
                         .device
@@ -322,6 +333,9 @@ macro_rules! vulkan_device_render_target_methods {
                 .width(desc.width)
                 .height(desc.height)
                 .layers(1);
+            // SAFETY: `render_pass` and every attachment view are live handles
+            // from `d`; the attachment slice remains valid for this call and
+            // dimensions were validated against the RHI descriptor.
             let framebuffer = unsafe { d.create_framebuffer(&info, None) }.map_err(|result| {
                 render_core::RhiError::Backend {
                     detail: format!("create framebuffer: {result:?}"),
@@ -340,6 +354,8 @@ macro_rules! vulkan_device_render_target_methods {
                 .framebuffers
                 .remove(framebuffer.index, framebuffer.generation)
             {
+                // SAFETY: slab removal gives exclusive ownership of this
+                // device-created framebuffer after its render work completed.
                 unsafe {
                     self.logical_device
                         .device
@@ -420,6 +436,8 @@ macro_rules! vulkan_device_render_target_methods {
                         Ok(layout) => layout,
                         Err(result) => {
                             for layout in owned_set_layouts.drain(..) {
+                                // SAFETY: each layout was created by `d` in this
+                                // transaction and no pipeline layout owns it yet.
                                 unsafe { d.destroy_descriptor_set_layout(layout, None) };
                             }
                             return Err(render_core::RhiError::Backend {
@@ -442,6 +460,8 @@ macro_rules! vulkan_device_render_target_methods {
                 Ok(layout) => layout,
                 Err(result) => {
                     for layout in owned_set_layouts.drain(..) {
+                        // SAFETY: pipeline-layout creation failed, leaving each
+                        // just-created descriptor layout exclusively owned here.
                         unsafe { d.destroy_descriptor_set_layout(layout, None) };
                     }
                     return Err(render_core::RhiError::Backend {
@@ -463,12 +483,16 @@ macro_rules! vulkan_device_render_target_methods {
                 .remove(layout.index, layout.generation)
             {
                 for set_layout in layout.set_layouts {
+                    // SAFETY: the slab entry exclusively owns these layouts;
+                    // dependent descriptor sets/pipelines have been retired.
                     unsafe {
                         self.logical_device
                             .device
                             .destroy_descriptor_set_layout(set_layout, None);
                     }
                 }
+                // SAFETY: the pipeline-layout handle was created by this device,
+                // removed from the slab, and has no surviving pipeline users.
                 unsafe {
                     self.logical_device
                         .device

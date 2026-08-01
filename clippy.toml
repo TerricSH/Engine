@@ -1,0 +1,18 @@
+# Keep Clippy's interpretation of APIs aligned with the workspace toolchain.
+msrv = "1.94"
+
+# Unit tests intentionally use unwrap/expect as assertions. CI enforces
+# `unwrap_used` on library and binary targets; these settings keep ad-hoc
+# all-target lint runs from reclassifying ordinary test assertions as runtime
+# failures. `expect_used` remains available for focused maintainer audits.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Keep public API lint suggestions non-breaking. Intentional API migrations are
+# reviewed explicitly instead of appearing as unrelated `-D warnings` noise.
+avoid-breaking-exported-api = true
+
+# Keep architecture-scale functions visible without making ordinary adapters
+# fail on Clippy's more subjective default thresholds.
+too-many-lines-threshold = 500
+cognitive-complexity-threshold = 40

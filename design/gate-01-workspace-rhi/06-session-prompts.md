@@ -2,6 +2,8 @@
 
 Use these prompts to launch isolated coding sessions for Gate 1. Every session must read `README.md`, `01-code-architecture.md`, `02-validation-acceptance.md`, `03-best-practices.md`, and `05-feature-requirements.md` before editing.
 
+Current backend validation is package-scoped: `sandbox` wires only Vulkan, while `render-opengl` and `render-dx12` are checked directly.
+
 ## Session 1A: Workspace Integration Owner
 
 Goal: Create the workspace skeleton and shared configuration.
@@ -17,14 +19,14 @@ Must not edit:
 
 Expected output:
 - All planned crates registered
-- Additive feature flags created
+- Composition features remain additive; only the Vulkan backend is wired into `sandbox`
 - Workspace compiles with placeholder crates
 
 Validation:
 - `cargo fmt --check`
-- `cargo check --workspace --features backend-vulkan`
-- `cargo check --workspace --features backend-opengl`
-- Windows: `cargo check --workspace --features backend-dx12`
+- `cargo check -p sandbox --features backend-vulkan`
+- `cargo check -p render-opengl`
+- `cargo check -p render-dx12 --all-features`
 
 Merge checklist:
 - Root ownership rules documented
@@ -73,7 +75,7 @@ Expected output:
 - Windows cfg for DirectX 12
 
 Validation:
-- Feature-gated backend compile checks
+- Package-scoped backend compile checks
 
 Merge checklist:
 - Stubs do not evolve RHI independently

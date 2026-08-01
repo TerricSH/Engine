@@ -4,6 +4,8 @@ Architecture boundaries and feature-gating rules are documented in
 [`docs/ENGINE_CORE_ARCHITECTURE.md`](docs/ENGINE_CORE_ARCHITECTURE.md).
 The JRPG rendering baseline and backend parity limits are documented in
 [`docs/RENDERING_ARCHITECTURE.md`](docs/RENDERING_ARCHITECTURE.md).
+Runtime panic, unsafe-contract, integration-test, and performance gates are
+documented in [`docs/QUALITY_GATES.md`](docs/QUALITY_GATES.md).
 
 This repository contains a Rust game engine, project player, editor, asset
 cooker, and Windows release pipeline. The product boundary is an installed
@@ -158,6 +160,7 @@ See [`docs/GAME_PROJECTS.md`](docs/GAME_PROJECTS.md),
 [`docs/JRPG_GAME_PLATFORM.md`](docs/JRPG_GAME_PLATFORM.md),
 [`docs/RENDERING_ARCHITECTURE.md`](docs/RENDERING_ARCHITECTURE.md),
 [`docs/HL2_READINESS.md`](docs/HL2_READINESS.md),
+[`docs/QUALITY_GATES.md`](docs/QUALITY_GATES.md),
 [`docs/CI_RELEASE_GATES.md`](docs/CI_RELEASE_GATES.md),
 [`docs/ENGINE_INSTALLATION.md`](docs/ENGINE_INSTALLATION.md), and
 [`docs/RELEASE_PACKAGING.md`](docs/RELEASE_PACKAGING.md) for details.

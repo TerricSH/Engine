@@ -540,4 +540,24 @@ mod tests {
         assert_eq!(std::fs::read(victim).unwrap(), b"keep");
         assert!(!tmp.path().join("active_pointer.txt").exists());
     }
+
+    #[test]
+    fn cache_and_apply_runtime_have_no_unwrap_or_expect_calls() {
+        for (name, source) in [
+            ("cache", include_str!("cache.rs")),
+            ("apply", include_str!("apply.rs")),
+        ] {
+            let runtime = source
+                .split_once("\n#[cfg(test)]")
+                .map_or(source, |(runtime, _)| runtime);
+            assert!(
+                !runtime.contains(".unwrap()"),
+                "runtime unwrap found in {name}.rs"
+            );
+            assert!(
+                !runtime.contains(".expect("),
+                "runtime expect found in {name}.rs"
+            );
+        }
+    }
 }

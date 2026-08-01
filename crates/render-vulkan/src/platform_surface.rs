@@ -11,7 +11,7 @@ use raw_window_handle::{
     WindowsDisplayHandle, XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
 };
 
-use crate::{create_backend_renderer, VulkanError};
+use crate::{scene_renderer::SceneRenderer, VulkanBackend, VulkanError};
 
 pub(crate) fn create_renderer(
     surface: PlatformSurface,
@@ -40,14 +40,19 @@ impl PlatformSurfaceFactory for VulkanSurfaceFactory<'_> {
 
     fn create_for_platform_surface(self, surface: PlatformSurfaceSnapshot) -> Self::Output {
         let (display, window) = raw_handles(surface)?;
-        create_backend_renderer(
+        let device = VulkanBackend::new().create_device_for_surface(
             display,
             window,
             self.width,
             self.height,
             self.enable_validation,
             self.cache_dir,
-        )
+        )?;
+        Ok(Box::new(SceneRenderer::new(
+            device,
+            self.width,
+            self.height,
+        )))
     }
 }
 

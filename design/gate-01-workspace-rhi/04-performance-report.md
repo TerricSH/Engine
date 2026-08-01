@@ -2,7 +2,7 @@
 
 ## Status
 
-Partially measured during the Gate 1 implementation pass. Compile/feature checks passed and the release sandbox startup smoke is within budget. Peak memory still needs a reliable harness before the performance row can be considered fully closed.
+Partially measured during the historical Gate 1 implementation pass. Compile checks passed and the release sandbox startup smoke is within budget. Current backend validation is package-scoped; peak memory still needs a reliable harness before the performance row can be considered fully closed.
 
 ## Test Environment
 
@@ -20,7 +20,7 @@ Partially measured during the Gate 1 implementation pass. Compile/feature checks
 | Empty sandbox startup | <= 300 ms | 267.4109 ms | Measured with `.\target\release\sandbox.exe workspace` via `System.Diagnostics.Stopwatch`, output redirected |
 | Frame CPU/GPU | N/A | N/A | Gate 1 has no renderer frame budget |
 | Memory usage | <= 64 MiB | Not captured | `Start-Process` / `System.Diagnostics.Process` peak working set returned `0`; needs a better Windows harness |
-| Backend-disabled workspace check | No optional native SDK required | Pass | `cargo check --workspace` and backend feature checks passed with stub backends |
+| Backend-disabled workspace check | No optional native SDK required | Pass | `cargo check --workspace` and the historical backend stub checks passed; current equivalents select `render-opengl` and `render-dx12` by package |
 
 ## Findings
 

@@ -81,10 +81,14 @@ jobs:
       # feature set remain covered by the Windows gates.
       - name: Clippy (core crates, warnings are errors)
         run: cargo clippy --workspace --exclude engine-editor-host --all-targets --locked -- -D warnings
+      - name: Production crates deny unwrap
+        run: cargo clippy --workspace --exclude engine-editor-host --lib --bins --locked -- -D warnings -D clippy::unwrap_used
       - name: Core workspace tests
         run: cargo test --workspace --exclude engine-editor-host --locked
       - name: Terrain/gameplay feature tests
         run: cargo test -p engine-core --features terrain,gameplay --locked
+      - name: Terrain/gameplay panic-safety Clippy
+        run: cargo clippy -p engine-core --features terrain,gameplay --lib --locked -- -D warnings -D clippy::unwrap_used
       - name: Archive soak report
         if: always()
         uses: actions/upload-artifact@v4

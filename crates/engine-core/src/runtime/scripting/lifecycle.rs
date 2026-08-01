@@ -301,7 +301,7 @@ impl EngineRuntime {
         >,
     ) {
         self.scripting.input_actions.clone_from(input_actions);
-        engine_ffi::world_bridge::activate_coroutine_runtime(&self.world_slot);
+        self.activate_ffi_coroutine_runtime();
         engine_ffi::r#async::dispatch_main_thread_callbacks();
         engine_ffi::coroutine::tick_managed_coroutines(dt);
         let contexts = self.script_gameplay_contexts(

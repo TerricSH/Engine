@@ -89,6 +89,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
                     },
                 })
                 .clear_values(&clear_values);
+            // SAFETY: `self.cmd` is recording outside a render pass; the pass,
+            // framebuffer, render area, and clear-value slice remain valid.
             unsafe {
                 self.device
                     .cmd_begin_render_pass(self.cmd, &rpbi, vk::SubpassContents::INLINE);
@@ -102,6 +104,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
                 .filter(|(g, _)| *g == p.generation)
                 .map(|(_, v)| v)
         }) {
+            // SAFETY: the slab generation check proves `pipeline` is a live
+            // graphics pipeline from this device and `self.cmd` is recording.
             unsafe {
                 self.device
                     .cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -120,6 +124,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
             })
             .collect();
         if !v.is_empty() {
+            // SAFETY: generation checks produced live device buffers, offsets
+            // has the same length, and the command buffer is recording.
             unsafe {
                 self.device.cmd_bind_vertex_buffers(self.cmd, 0, &v, offs);
             }
@@ -131,6 +137,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
                 .filter(|(g, _)| *g == buf.generation)
                 .map(|(_, b)| b)
         }) {
+            // SAFETY: the generation-checked index buffer is live, its format
+            // and offset came from the validated RHI call, and recording is active.
             unsafe {
                 self.device.cmd_bind_index_buffer(
                     self.cmd,
@@ -175,6 +183,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
             });
         }
         let frame_sets = [set];
+        // SAFETY: `layout` and `set` are generation-checked live handles from
+        // this device; the command buffer records a compatible graphics bind.
         unsafe {
             self.device.cmd_bind_descriptor_sets(
                 self.cmd,
@@ -188,6 +198,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
         Ok(())
     }
     fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, md: f32, mxd: f32) {
+        // SAFETY: `self.cmd` is recording, dynamic viewport state is enabled by
+        // engine pipelines, and the one-element slice lives through the call.
         unsafe {
             self.device.cmd_set_viewport(
                 self.cmd,
@@ -204,6 +216,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
         }
     }
     fn set_scissor(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        // SAFETY: `self.cmd` is recording with dynamic scissor state enabled;
+        // the supplied rectangle is value-owned for the duration of the call.
         unsafe {
             self.device.cmd_set_scissor(
                 self.cmd,
@@ -219,11 +233,15 @@ impl CmdEncoderTrait for VkCmdEncoder {
         }
     }
     fn draw(&mut self, vc: u32, ic: u32, fv: u32, fi: u32) {
+        // SAFETY: the encoder contract requires an active compatible render pass
+        // and bound pipeline before a draw; `self.cmd` is recording.
         unsafe {
             self.device.cmd_draw(self.cmd, vc, ic, fv, fi);
         }
     }
     fn draw_indexed(&mut self, ic: u32, ins: u32, fi: u32, vo: i32, fii: u32) {
+        // SAFETY: the encoder contract requires an active render pass plus live
+        // pipeline, vertex, and index bindings before this recorded draw.
         unsafe {
             self.device.cmd_draw_indexed(self.cmd, ic, ins, fi, vo, fii);
         }
@@ -263,6 +281,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
                     .map(|(_, l)| l)
             })
         {
+            // SAFETY: the generation check proves `layout` is live; the byte
+            // range/stage mask are validated by the pipeline-layout RHI contract.
             unsafe {
                 self.device.cmd_push_constants(
                     self.cmd,
@@ -276,6 +296,8 @@ impl CmdEncoderTrait for VkCmdEncoder {
     }
     fn end_render_pass(&mut self) {
         if self.render_pass_active {
+            // SAFETY: the tracked flag is set only after a successful begin on
+            // this recording command buffer, so a matching end is required.
             unsafe {
                 self.device.cmd_end_render_pass(self.cmd);
             }

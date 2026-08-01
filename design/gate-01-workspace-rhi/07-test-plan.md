@@ -2,7 +2,7 @@
 
 ## Test Strategy
 
-Gate 1 tests prove that the workspace, feature flags, RHI contract, and backend stubs are usable by parallel sessions. Most tests are compile-time, contract, and documentation checks.
+Gate 1 tests prove that the workspace, backend package boundaries, RHI contract, and backend stubs are usable by parallel sessions. Most tests are compile-time, contract, and documentation checks. In the current topology, `sandbox` wires only Vulkan; OpenGL and DirectX 12 are validated directly as backend packages.
 
 ## Feature Test Cases
 
@@ -10,8 +10,8 @@ Gate 1 tests prove that the workspace, feature flags, RHI contract, and backend 
 |---|---|---|---|
 | G1-F01 Workspace Skeleton | `cargo metadata --no-deps` membership check | Contract | `packages[].name` set equals the 20-crate list in IT-G1-01 exactly |
 | G1-F01 Workspace Skeleton | `cargo check --workspace` with default features | Compile | Exit code 0, no `error:` lines in stderr |
-| G1-F02 Feature Flag Baseline | Independent `--features backend-{vulkan,opengl,dx12}` checks | Compile | Each: exit 0; `backend-dx12` builds only on Windows or behind cfg gate |
-| G1-F02 Feature Flag Baseline | Multi-feature `--features backend-vulkan,backend-opengl` | Compile | Exit 0; package set identical (modulo feature flags) to union of singles |
+| G1-F02 Backend Package Baseline | Independent checks of `sandbox/backend-vulkan`, `render-opengl`, and `render-dx12 --all-features` | Compile | Each exits 0; non-Vulkan backends do not have to be dependencies of `sandbox` |
+| G1-F02 Backend Package Baseline | `cargo check -p render-vulkan -p render-opengl` | Compile | Exit 0; both backend crates consume the same `render-core` contract |
 | G1-F03 RHI-v0 Core Contract | Dummy backend implementation under `crates/render-core/tests/` | Contract | Test compiles and runs; uses no `ash::`, `gl::`, `d3d12::` paths |
 | G1-F03 RHI-v0 Core Contract | Public API scan via `rg` patterns in IT-G1-03 | Review | `0 matches` for every leak pattern |
 | G1-F03 RHI-v0 Core Contract | `RhiError → Diagnostic.code` mapping table | Doc-test | Every variant in the skeleton's error table is reachable from a `code()` or const map |
@@ -25,9 +25,9 @@ Gate 1 tests prove that the workspace, feature flags, RHI contract, and backend 
    - Run formatting and workspace compile checks.
    - Confirm all placeholder crates compile together.
 2. Backend contract integration test
-   - Compile Vulkan, OpenGL, and DirectX 12 features independently.
-   - Compile Vulkan + OpenGL together.
-   - On Windows, compile Vulkan + DirectX 12 together.
+   - Compile the Vulkan sandbox composition and each backend package independently.
+   - Compile the Vulkan and OpenGL packages together.
+   - Compile the Vulkan and DirectX 12 packages together with DirectX 12 features enabled.
 3. Parallel-session safety test
    - Simulate a backend session editing only its backend crate.
    - Confirm root files and `render-core` are untouched.
@@ -36,13 +36,13 @@ Gate 1 tests prove that the workspace, feature flags, RHI contract, and backend 
 
 - `cargo fmt --check`
 - `cargo check --workspace`
-- `cargo check --workspace --features backend-vulkan`
-- `cargo check --workspace --features backend-opengl`
-- Windows: `cargo check --workspace --features backend-dx12`
+- `cargo check -p sandbox --features backend-vulkan`
+- `cargo check -p render-opengl`
+- `cargo check -p render-dx12 --all-features`
 
 ## Failure Criteria
 
-- Any backend feature requires unrelated platform SDKs without cfg gates.
+- Any package-scoped backend check requires an unrelated backend SDK without cfg gates.
 - Any public RHI type exposes backend-native objects.
 - Any placeholder crate contains speculative subsystem implementation.
 
@@ -82,30 +82,29 @@ Evidence:
 - `target/test-evidence/gate-01/workspace-metadata.json`.
 - `target/test-evidence/gate-01/cargo-check-default.log`.
 
-### IT-G1-02 Backend Feature Matrix
+### IT-G1-02 Backend Package Matrix
 
 Setup:
 - Use the same clean workspace.
 
 Steps:
-1. Run, capturing logs to `target/test-evidence/gate-01/feature-<feature>.log`:
-   - `cargo check --workspace --features backend-vulkan`
-   - `cargo check --workspace --features backend-opengl`
-   - `cargo check --workspace --features backend-vulkan,backend-opengl`
-2. On Windows additionally run:
-   - `cargo check --workspace --features backend-dx12`
-   - `cargo check --workspace --features backend-vulkan,backend-dx12`
-3. On non-Windows additionally run `cargo check --workspace --features backend-dx12` and confirm it either compiles as a no-op stub OR fails *only* with a clear cfg gate diagnostic (no missing-SDK error).
+1. Run, capturing logs to `target/test-evidence/gate-01/backend-<package>.log`:
+   - `cargo check -p sandbox --features backend-vulkan`
+   - `cargo check -p render-opengl`
+   - `cargo check -p render-vulkan -p render-opengl`
+2. Run the DirectX 12 package checks (on every host; platform-specific code remains cfg-gated):
+   - `cargo check -p render-dx12 --all-features`
+   - `cargo check -p render-vulkan -p render-dx12 --all-features`
 
 Expected (concrete assertions):
-- Every command on its target OS: exit code = `0`.
+- Every command exits with code `0` on its target host.
 - No stderr line matches `error(\[E\d+\])?:`.
-- No stderr line contains `vulkan-sdk`, `directx-sdk`, `LIBCLANG`, or any SDK-not-found pattern when only `backend-opengl` is enabled (i.e. disabling a backend must disable its SDK requirement).
-- Multi-feature combination produces identical crate graph as the union of individual features (verified by `cargo metadata --features ...` returning the same package set, minus feature flags).
+- The `render-opengl` check does not select Vulkan or DirectX 12 SDK dependencies through `sandbox`.
+- Combined checks compile the exact named backend packages against one `render-core` contract; they do not depend on workspace-level backend feature unification.
 
 Evidence:
-- All `feature-*.log` files under `target/test-evidence/gate-01/`.
-- A short `target/test-evidence/gate-01/feature-matrix-summary.md` listing per-row exit code + duration.
+- All `backend-*.log` files under `target/test-evidence/gate-01/`.
+- A short `target/test-evidence/gate-01/backend-matrix-summary.md` listing per-row exit code + duration.
 
 ### IT-G1-03 RHI Leakage Review
 

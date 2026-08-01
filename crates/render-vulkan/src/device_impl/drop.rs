@@ -53,10 +53,14 @@ impl Drop for VulkanDevice {
             // SAFETY: `e.layout` and `e.set_layouts` were created by
             // this device.
             for sl in e.set_layouts {
+                // SAFETY: device teardown is idle and the drained pipeline-layout
+                // entry exclusively owns this descriptor-set layout.
                 unsafe {
                     d.destroy_descriptor_set_layout(sl, None);
                 }
             }
+            // SAFETY: all pipelines referencing `e.layout` were destroyed above;
+            // the drained entry gives this idle device exclusive ownership.
             unsafe {
                 d.destroy_pipeline_layout(e.layout, None);
             }

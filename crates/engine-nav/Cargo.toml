@@ -18,3 +18,7 @@ glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[[bench]]
+name = "spatial_navigation"
+harness = false

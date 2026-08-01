@@ -28,6 +28,7 @@ members = [
     "crates/engine-vfx",
     "crates/engine-ffi",
     "crates/sandbox",
+    "tests/workspace-contracts",
 ]
 resolver = "2"
 
