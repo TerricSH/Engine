@@ -4,7 +4,7 @@ pub fn print_global_help() {
          Game project workflow:\n\
            sandbox project new <directory> [--name NAME] [--with-csharp]\n\
            sandbox project check <project> [--report PATH]\n\
-           sandbox project import <project> <source-file> --id ID [--type TYPE]\n\
+           sandbox project import <project> <source-file> --id ID [--type TYPE] [--separate-primitives] [--no-bake-node-transforms]\n\
            sandbox project scene list <project>\n\
            sandbox project scene new <project> <scene-id> [--name NAME]\n\
            sandbox project scene rename <project> <old-id> <new-id>\n\

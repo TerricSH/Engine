@@ -43,6 +43,10 @@ pub(crate) struct ProjectImportRequest {
     asset_id: String,
     asset_type: Option<AssetType>,
     folder: PathBuf,
+    /// glTF imports produce one complete mesh by default.
+    merge_primitives: bool,
+    /// Static glTF node transforms are preserved in the cooked vertex data.
+    bake_node_transforms: Option<bool>,
 }
 
 pub fn dispatch(args: &[String]) -> Result<ProjectAction, String> {

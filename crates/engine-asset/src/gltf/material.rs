@@ -1,5 +1,6 @@
 use super::image::decode_gltf_image;
 use super::*;
+use ::image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
 
 pub(super) fn extract_material(material: &gltf::Material<'_>) -> GltfMaterial {
     let pbr = material.pbr_metallic_roughness();
@@ -68,6 +69,45 @@ pub(super) fn load_textures(
         ));
     }
     Ok(textures)
+}
+
+/// Encode the importer's normalized RGBA8 texture as a self-contained PNG
+/// source that can be registered by the normal project texture cooker. This
+/// also covers GLB buffer-view and data-URI images that have no copyable file.
+pub fn encode_texture_png(texture: &GltfTexture) -> Result<Vec<u8>, GltfImportError> {
+    let expected_len = u64::from(texture.width)
+        .checked_mul(u64::from(texture.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| GltfImportError::TextureEncode {
+            texture_index: texture.texture_index,
+            detail: "texture dimensions overflow the host address space".into(),
+        })?;
+    if texture.width == 0 || texture.height == 0 || texture.data.len() != expected_len {
+        return Err(GltfImportError::TextureEncode {
+            texture_index: texture.texture_index,
+            detail: format!(
+                "expected {expected_len} RGBA8 bytes for {}x{}, found {}",
+                texture.width,
+                texture.height,
+                texture.data.len()
+            ),
+        });
+    }
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(
+            &texture.data,
+            texture.width,
+            texture.height,
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| GltfImportError::TextureEncode {
+            texture_index: texture.texture_index,
+            detail: error.to_string(),
+        })?;
+    Ok(png)
 }
 
 fn image_source_label(source: &gltf::image::Source<'_>, base: &Path) -> String {

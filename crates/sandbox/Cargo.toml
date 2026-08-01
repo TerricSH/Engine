@@ -84,6 +84,7 @@ engine-nav = { path = "../engine-nav" }
 engine-terrain = { path = "../engine-terrain" }
 engine-ui = { path = "../engine-ui" }
 engine-vfx = { path = "../engine-vfx" }
+image.workspace = true
 
 # Soak harness working-set sampling (ENG-71): process memory counters for the
 # memory-plateau assertion. Windows-only, test-only.

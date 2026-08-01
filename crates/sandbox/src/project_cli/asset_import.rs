@@ -45,94 +45,15 @@ pub(crate) fn import_project_asset(request: &ProjectImportRequest) -> Result<(),
     let mut prepared_assets = Vec::<SourceAssetEntry>::new();
     let mut generated_sources = Vec::<(PathBuf, Vec<u8>)>::new();
     if asset_type == AssetType::Mesh {
-        let scene = engine_asset::gltf::load_gltf_scene(&source_file)
-            .map_err(|error| format!("could not inspect glTF import: {error}"))?;
-        if scene.primitives.is_empty() {
-            return Err("glTF import contains no mesh primitives".into());
-        }
-        for primitive_index in 0..scene.primitives.len() {
-            let id = if primitive_index == 0 {
-                request.asset_id.clone()
-            } else {
-                format!("{}.mesh.{primitive_index}", request.asset_id)
-            };
-            validate_import_asset_id(&id)?;
-            let mut cook_rules = CookRules::default();
-            if scene.primitives.len() > 1 {
-                cook_rules.gltf_primitive_index = Some(primitive_index as u32);
-            }
-            prepared_assets.push(SourceAssetEntry {
-                id: AssetId::new(&id),
-                asset_type: AssetType::Mesh,
-                source_path: manifest_source_path(&relative_source),
-                cook_rules: cook_rules.clone(),
-            });
-            if !scene.primitives[primitive_index].morph_targets.is_empty() {
-                let morph_id = format!("{id}.morphs");
-                validate_import_asset_id(&morph_id)?;
-                prepared_assets.push(SourceAssetEntry {
-                    id: AssetId::new(morph_id),
-                    asset_type: AssetType::MorphTargetSet,
-                    source_path: manifest_source_path(&relative_source),
-                    cook_rules,
-                });
-            }
-        }
-
-        let imported_skins = engine_animation::import_gltf_animation_assets(&scene)?;
-        for imported_skin in imported_skins {
-            let skeleton_id = format!(
-                "{}.skeleton.{}",
-                request.asset_id, imported_skin.source_skin_index
-            );
-            validate_import_asset_id(&skeleton_id)?;
-            let skeleton_name = format!(
-                "{}.skin{}.skel",
-                request.asset_id, imported_skin.source_skin_index
-            );
-            let skeleton_relative = import_folder.join(&skeleton_name);
-            let skeleton_bytes = bincode::serialize(&imported_skin.skeleton)
-                .map_err(|error| format!("could not serialize imported skeleton: {error}"))?;
-            generated_sources.push((
-                project.asset_source.join(&skeleton_relative),
-                skeleton_bytes,
-            ));
-            prepared_assets.push(SourceAssetEntry {
-                id: AssetId::new(skeleton_id),
-                asset_type: AssetType::Skeleton,
-                source_path: manifest_source_path(&skeleton_relative),
-                cook_rules: CookRules::default(),
-            });
-
-            for (animation_index, animation) in imported_skin.animations.iter().enumerate() {
-                let animation_id = format!(
-                    "{}.animation.{}.{}",
-                    request.asset_id, imported_skin.source_skin_index, animation_index
-                );
-                validate_import_asset_id(&animation_id)?;
-                let animation_name = format!(
-                    "{}.skin{}.animation{}.anim",
-                    request.asset_id, imported_skin.source_skin_index, animation_index
-                );
-                let animation_relative = import_folder.join(&animation_name);
-                let animation_bytes = bincode::serialize(animation).map_err(|error| {
-                    format!(
-                        "could not serialize imported animation '{}': {error}",
-                        animation.name
-                    )
-                })?;
-                generated_sources.push((
-                    project.asset_source.join(&animation_relative),
-                    animation_bytes,
-                ));
-                prepared_assets.push(SourceAssetEntry {
-                    id: AssetId::new(animation_id),
-                    asset_type: AssetType::Animation,
-                    source_path: manifest_source_path(&animation_relative),
-                    cook_rules: CookRules::default(),
-                });
-            }
-        }
+        let prepared = prepare_gltf_import(
+            request,
+            &source_file,
+            &relative_source,
+            &project,
+            &import_folder,
+        )?;
+        prepared_assets = prepared.assets;
+        generated_sources = prepared.generated_sources;
     } else {
         prepared_assets.push(SourceAssetEntry {
             id: AssetId::new(request.asset_id.clone()),
@@ -385,7 +306,9 @@ pub(crate) fn import_project_asset(request: &ProjectImportRequest) -> Result<(),
 }
 
 mod filesystem;
+mod gltf;
 mod manifest;
 
 pub(crate) use filesystem::*;
+use gltf::*;
 pub(crate) use manifest::*;

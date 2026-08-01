@@ -118,6 +118,13 @@ pub struct CookRules {
     /// Selects one primitive when multiple mesh primitives share a glTF source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gltf_primitive_index: Option<u32>,
+    /// Merge every primitive into the one mesh artifact named by this entry.
+    /// This is mutually exclusive with `gltf_primitive_index`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gltf_merge_primitives: bool,
+    /// Bake selected-scene node world transforms into static mesh vertices.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gltf_bake_node_transforms: bool,
 }
 
 #[cfg(test)]
@@ -187,6 +194,8 @@ mod tests {
         assert!(rules.platform_overrides.is_empty());
         assert!(rules.compression.is_none());
         assert!(rules.gltf_primitive_index.is_none());
+        assert!(!rules.gltf_merge_primitives);
+        assert!(!rules.gltf_bake_node_transforms);
     }
 
     #[test]
@@ -196,6 +205,8 @@ mod tests {
             platform_overrides: vec!["mobile".into()],
             compression: Some("zstd".into()),
             gltf_primitive_index: Some(3),
+            gltf_merge_primitives: false,
+            gltf_bake_node_transforms: true,
         };
         let json = serde_json::to_string(&rules).unwrap();
         let restored: CookRules = serde_json::from_str(&json).unwrap();
@@ -203,5 +214,7 @@ mod tests {
         assert_eq!(restored.platform_overrides.len(), 1);
         assert_eq!(restored.compression, Some("zstd".into()));
         assert_eq!(restored.gltf_primitive_index, Some(3));
+        assert!(!restored.gltf_merge_primitives);
+        assert!(restored.gltf_bake_node_transforms);
     }
 }

@@ -91,6 +91,71 @@ fn write_skinned_gltf_fixture(directory: &Path) -> PathBuf {
     gltf_path
 }
 
+fn write_static_material_gltf_fixture(directory: &Path) -> PathBuf {
+    std::fs::create_dir_all(directory).unwrap();
+    let gltf_path = directory.join("drill.gltf");
+    let mut bytes = Vec::new();
+    for position in [
+        [0.0f32, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [-0.1, 0.0, 0.0],
+        [0.1, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ] {
+        for value in position {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    std::fs::write(directory.join("drill.bin"), bytes).unwrap();
+    image::RgbaImage::from_pixel(2, 1, image::Rgba([32, 96, 192, 224]))
+        .save(directory.join("albedo.png"))
+        .unwrap();
+    std::fs::write(
+        &gltf_path,
+        r#"{
+            "asset": { "version": "2.0" },
+            "buffers": [{ "uri": "drill.bin", "byteLength": 72 }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+                { "buffer": 0, "byteOffset": 36, "byteLength": 36 }
+            ],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0] },
+                { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3", "min": [-0.1, 0, 0], "max": [0.1, 1, 0] }
+            ],
+            "images": [{ "uri": "albedo.png" }],
+            "textures": [{ "source": 0 }],
+            "materials": [{
+                "name": "Paint",
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [0.2, 0.4, 0.6, 0.8],
+                    "baseColorTexture": { "index": 0 },
+                    "metallicFactor": 0.7,
+                    "roughnessFactor": 0.3
+                },
+                "normalTexture": { "index": 0 },
+                "emissiveFactor": [0.1, 0.2, 0.3],
+                "alphaMode": "MASK",
+                "alphaCutoff": 0.25,
+                "doubleSided": true
+            }],
+            "meshes": [
+                { "name": "Base", "primitives": [{ "attributes": { "POSITION": 0 }, "material": 0 }] },
+                { "name": "Drill", "primitives": [{ "attributes": { "POSITION": 1 }, "material": 0 }] }
+            ],
+            "nodes": [
+                { "name": "Base", "mesh": 0 },
+                { "name": "Drill", "mesh": 1, "translation": [0, 2, 0] }
+            ],
+            "scenes": [{ "nodes": [0, 1] }],
+            "scene": 0
+        }"#,
+    )
+    .unwrap();
+    gltf_path
+}
+
 #[test]
 fn parses_headless_project_run() {
     let request =
@@ -122,6 +187,8 @@ fn gltf_project_import_generates_mesh_skeleton_animation_and_copies_dependencies
         asset_id: "hero".into(),
         asset_type: None,
         folder: PathBuf::new(),
+        merge_primitives: true,
+        bake_node_transforms: Some(false),
     })
     .unwrap();
 
@@ -142,7 +209,6 @@ fn gltf_project_import_generates_mesh_skeleton_animation_and_copies_dependencies
         ids,
         BTreeSet::from([
             "hero",
-            "hero.mesh.1",
             "hero.skeleton.0",
             "hero.animation.0.0",
         ])
@@ -151,8 +217,9 @@ fn gltf_project_import_generates_mesh_skeleton_animation_and_copies_dependencies
     let cooked_root = project_root.join("build/cooked");
     let mesh = read_cooked_artifact(&cooked_root.join("hero.cooked")).unwrap();
     assert_eq!(mesh.header.asset_kind, AssetType::Mesh.kind_code());
-    let second_mesh = read_cooked_artifact(&cooked_root.join("hero.mesh.1.cooked")).unwrap();
-    assert_eq!(second_mesh.header.asset_kind, AssetType::Mesh.kind_code());
+    let merged_mesh = engine_asset::cook::decode_cooked_mesh(&mesh).unwrap();
+    assert_eq!(merged_mesh.positions.len(), 6);
+    assert_eq!(merged_mesh.indices.len(), 6);
     let skeleton = read_cooked_artifact(&cooked_root.join("hero.skeleton.0.cooked")).unwrap();
     assert_eq!(skeleton.header.asset_kind, AssetType::Skeleton.kind_code());
     assert_eq!(
@@ -172,6 +239,107 @@ fn gltf_project_import_generates_mesh_skeleton_animation_and_copies_dependencies
             .name(),
         "Raise"
     );
+    check_project(&project_root, None).unwrap();
+    cook_project(&project_root).unwrap();
+    check_project(&project_root, None).unwrap();
+}
+
+#[test]
+fn gltf_project_import_merges_primitives_bakes_nodes_and_generates_material_assets() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path().join("drill-project");
+    create_project(&project_root, Some("Drill Project"), false).unwrap();
+    let gltf_path = write_static_material_gltf_fixture(&temp.path().join("external-drill"));
+
+    import_project_asset(&ProjectImportRequest {
+        project: project_root.clone(),
+        source_file: gltf_path,
+        asset_id: "drill-structure".into(),
+        asset_type: None,
+        folder: PathBuf::new(),
+        merge_primitives: true,
+        bake_node_transforms: Some(true),
+    })
+    .unwrap();
+
+    let source_root = project_root.join("assets/source");
+    for source in [
+        "drill.gltf",
+        "drill.bin",
+        "albedo.png",
+        "drill-structure.texture.0.png",
+        "drill-structure.material.0.material.json",
+    ] {
+        assert!(source_root.join(source).is_file(), "missing {source}");
+    }
+    let manifest: SourceManifest =
+        serde_json::from_slice(&std::fs::read(source_root.join("game.manifest")).unwrap()).unwrap();
+    let ids = manifest
+        .assets
+        .iter()
+        .map(|entry| entry.id.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        ids,
+        BTreeSet::from([
+            "drill-structure",
+            "drill-structure.material.0",
+            "drill-structure.texture.0",
+        ])
+    );
+    let mesh_entry = manifest
+        .assets
+        .iter()
+        .find(|entry| entry.id.id == "drill-structure")
+        .unwrap();
+    assert!(mesh_entry.cook_rules.gltf_merge_primitives);
+    assert!(mesh_entry.cook_rules.gltf_bake_node_transforms);
+
+    let cooked_root = project_root.join("build/cooked");
+    let mesh_artifact =
+        read_cooked_artifact(&cooked_root.join("drill-structure.cooked")).unwrap();
+    let mesh = engine_asset::cook::decode_cooked_mesh(&mesh_artifact).unwrap();
+    assert_eq!(mesh.positions.len(), 6);
+    assert_eq!(mesh.indices.len(), 6);
+    assert_eq!(mesh.bounds.0.y, 0.0);
+    assert_eq!(mesh.bounds.1.y, 3.0);
+    assert!(mesh
+        .positions
+        .iter()
+        .any(|position| (position.y - 2.0).abs() < 1.0e-6));
+
+    let material_source: engine_asset::cook::MaterialSource = serde_json::from_slice(
+        &std::fs::read(source_root.join("drill-structure.material.0.material.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(material_source.base_color, [0.2, 0.4, 0.6, 0.8]);
+    assert_eq!(material_source.metallic, 0.7);
+    assert_eq!(material_source.roughness, 0.3);
+    assert_eq!(material_source.emissive, [0.1, 0.2, 0.3]);
+    assert_eq!(material_source.transparency, "Masked");
+    assert_eq!(material_source.alpha_cutoff, 0.25);
+    assert!(material_source.double_sided);
+    assert_eq!(
+        material_source.base_color_texture.as_deref(),
+        Some("drill-structure.texture.0")
+    );
+    assert_eq!(
+        material_source.normal_texture.as_deref(),
+        Some("drill-structure.texture.0")
+    );
+
+    let material_artifact =
+        read_cooked_artifact(&cooked_root.join("drill-structure.material.0.cooked")).unwrap();
+    let material = engine_asset::cook::decode_cooked_material(&material_artifact).unwrap();
+    assert_eq!(
+        material.base_color_texture.as_ref().map(|id| id.id.as_str()),
+        Some("drill-structure.texture.0")
+    );
+    let texture_artifact =
+        read_cooked_artifact(&cooked_root.join("drill-structure.texture.0.cooked")).unwrap();
+    let texture = engine_asset::cook::decode_cooked_texture(&texture_artifact).unwrap();
+    assert_eq!((texture.width, texture.height), (2, 1));
+
     check_project(&project_root, None).unwrap();
     cook_project(&project_root).unwrap();
     check_project(&project_root, None).unwrap();
@@ -274,6 +442,8 @@ fn parses_project_import_options() {
     assert_eq!(request.asset_id, "checker-main");
     assert_eq!(request.asset_type, Some(AssetType::Texture));
     assert_eq!(request.folder, PathBuf::from("Textures/UI"));
+    assert!(request.merge_primitives);
+    assert_eq!(request.bake_node_transforms, None);
 
     let audio = parse_import_args(&[
         "game".into(),
@@ -284,6 +454,17 @@ fn parses_project_import_options() {
     .unwrap();
     assert_eq!(audio.asset_type, Some(AssetType::Audio));
     assert!(audio.folder.as_os_str().is_empty());
+
+    let separate = parse_import_args(&[
+        "game".into(),
+        "model.glb".into(),
+        "--id=model".into(),
+        "--separate-primitives".into(),
+        "--no-bake-node-transforms".into(),
+    ])
+    .unwrap();
+    assert!(!separate.merge_primitives);
+    assert_eq!(separate.bake_node_transforms, Some(false));
 }
 
 #[test]

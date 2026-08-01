@@ -8,6 +8,7 @@ pub mod cooked_shader;
 pub mod dependency;
 pub mod environment;
 pub mod error;
+pub mod gltf_material;
 pub mod hlod;
 pub mod logic_asset;
 pub mod manifest;
@@ -38,6 +39,7 @@ pub use environment::{
     CookedEnvironmentMip, COOKED_ENVIRONMENT_SCHEMA_VERSION,
 };
 pub use error::{AssetCookError, CookError};
+pub use gltf_material::material_source_from_gltf;
 pub use hlod::{
     apply_hlod_bake_to_scene, bake_hlod_proxies, bake_hlod_scene, write_hlod_proxy_artifacts,
     HlodBakeOutput, HlodBakeSettings, HlodBakeSource, HlodProxyBake, HLOD_PROXY_PREFIX,
@@ -56,7 +58,7 @@ pub use material::{
     cook_material, decode_cooked_material, AdvancedMaterialSource, CookedMaterial, MaterialSource,
     MaterialTransparency, COOKED_MATERIAL_SCHEMA_VERSION, MATERIAL_SOURCE_SCHEMA,
 };
-pub use mesh::cook_mesh;
+pub use mesh::{cook_mesh, cook_mesh_with_options, GltfMeshCookOptions};
 pub use morph_target::{
     cook_morph_target_set, decode_cooked_morph_target_set, CookedMorphTarget, CookedMorphTargetSet,
     COOKED_MORPH_TARGET_SCHEMA_VERSION,
@@ -693,9 +695,15 @@ fn dispatch_source_entry(
     asset_type_registry: &AssetTypeRegistry,
 ) -> Result<CookResult, CookError> {
     match asset_type {
-        AssetType::Mesh => {
-            mesh::cook_mesh_primitive(source_path, output_path, cook_rules.gltf_primitive_index)
-        }
+        AssetType::Mesh => mesh::cook_mesh_with_options(
+            source_path,
+            output_path,
+            mesh::GltfMeshCookOptions {
+                primitive_index: cook_rules.gltf_primitive_index,
+                merge_primitives: cook_rules.gltf_merge_primitives,
+                bake_node_transforms: cook_rules.gltf_bake_node_transforms,
+            },
+        ),
         AssetType::Texture => texture::cook_texture(source_path, output_path),
         AssetType::EnvironmentMap => environment::cook_environment_map(source_path, output_path),
         AssetType::Material => material::cook_material(source_path, output_path),

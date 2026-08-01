@@ -200,6 +200,12 @@ pub enum GltfImportError {
         detail: String,
     },
 
+    #[error("failed to encode imported glTF texture {texture_index} as project PNG: {detail}")]
+    TextureEncode {
+        texture_index: usize,
+        detail: String,
+    },
+
     #[error(
         "glTF mesh {mesh_index} primitive {primitive_index} uses unsupported topology {topology:?}; only triangle-list is supported"
     )]

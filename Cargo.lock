@@ -4293,6 +4293,7 @@ dependencies = [
  "engine-xr",
  "glam",
  "gltf",
+ "image",
  "platform",
  "render-vulkan",
  "ron",

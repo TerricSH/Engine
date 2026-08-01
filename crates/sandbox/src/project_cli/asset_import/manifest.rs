@@ -10,7 +10,7 @@ pub(crate) fn manifest_source_path(path: &Path) -> String {
 pub(crate) fn gltf_external_source_files(
     source_file: &Path,
 ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let document = gltf::Gltf::open(source_file)
+    let document = ::gltf::Gltf::open(source_file)
         .map_err(|error| format!("could not inspect glTF dependencies: {error}"))?;
     let source_directory = source_file.parent().ok_or_else(|| {
         format!(
@@ -27,12 +27,12 @@ pub(crate) fn gltf_external_source_files(
 
     let mut uris = Vec::new();
     for buffer in document.buffers() {
-        if let gltf::buffer::Source::Uri(uri) = buffer.source() {
+        if let ::gltf::buffer::Source::Uri(uri) = buffer.source() {
             uris.push(uri.to_string());
         }
     }
     for image in document.images() {
-        if let gltf::image::Source::Uri { uri, .. } = image.source() {
+        if let ::gltf::image::Source::Uri { uri, .. } = image.source() {
             uris.push(uri.to_string());
         }
     }
@@ -101,6 +101,8 @@ pub(crate) fn import_project_asset_from(
         asset_id,
         asset_type,
         folder,
+        merge_primitives: true,
+        bake_node_transforms: None,
     })
 }
 

@@ -28,6 +28,7 @@ mod model;
 mod node;
 
 pub use load::load_gltf_scene;
+pub use material::encode_texture_png;
 pub use model::*;
 
 #[cfg(test)]

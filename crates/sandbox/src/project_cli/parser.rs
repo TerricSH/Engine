@@ -320,6 +320,8 @@ pub(super) fn parse_import_args(args: &[String]) -> Result<ProjectImportRequest,
     let mut asset_id = None;
     let mut asset_type = None;
     let mut folder = None;
+    let mut merge_primitives = true;
+    let mut bake_node_transforms = None;
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
@@ -354,6 +356,10 @@ pub(super) fn parse_import_args(args: &[String]) -> Result<ProjectImportRequest,
                     "--folder requires a project-relative path".to_string()
                 })?));
             }
+            "--separate-primitives" => merge_primitives = false,
+            "--merge-primitives" => merge_primitives = true,
+            "--no-bake-node-transforms" => bake_node_transforms = Some(false),
+            "--bake-node-transforms" => bake_node_transforms = Some(true),
             _ if argument.starts_with("--id=") => {
                 if asset_id.is_some() {
                     return Err("project import received --id more than once".into());
@@ -403,6 +409,8 @@ pub(super) fn parse_import_args(args: &[String]) -> Result<ProjectImportRequest,
         asset_id: asset_id.ok_or_else(|| "project import requires --id <asset-id>".to_string())?,
         asset_type,
         folder: folder.unwrap_or_default(),
+        merge_primitives,
+        bake_node_transforms,
     })
 }
 
@@ -424,7 +432,7 @@ pub(super) fn parse_import_asset_type(value: &str) -> Result<AssetType, String> 
 }
 
 pub(super) fn import_usage() -> String {
-    "usage: sandbox project import <project> <source-file> --id <asset-id> [--type mesh|texture|material|environment|audio|animation|skeleton|navmesh|prefab] [--folder <path-below-assets/source>]".into()
+    "usage: sandbox project import <project> <source-file> --id <asset-id> [--type mesh|texture|material|environment|audio|animation|skeleton|navmesh|prefab] [--folder <path-below-assets/source>] [--separate-primitives] [--no-bake-node-transforms]".into()
 }
 
 pub(super) fn parse_single_project_path(command: &str, args: &[String]) -> Result<PathBuf, String> {
