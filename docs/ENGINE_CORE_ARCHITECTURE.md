@@ -51,6 +51,8 @@ Leaf features are the supported unit of conditional compilation:
 | `subsystem-physics` | physics world, queries, and character collision |
 | `subsystem-gameplay` | gameplay state/input orchestration |
 | `subsystem-terrain` | terrain streaming and rendering |
+| `subsystem-network` | authoritative sessions, replication, RPC and lobby contracts |
+| `subsystem-xr` | stereo frame, tracking/action and compositor lifecycle |
 | `subsystem-scripting-csharp` | managed-script host and command contract |
 `runtime-subsystems`, `gameplay`, and `terrain` remain compatibility aliases for
 existing applications. New `#[cfg]` expressions inside `engine-core` must use
@@ -89,6 +91,7 @@ engine-core/src/
     physics.rs              physics integration
     ...                     one module per optional subsystem
   terrain.rs                terrain integration facade
+  terrain/editable.rs       density edit render/physics/navigation adapter
   tests.rs                  crate-root tests
 ```
 

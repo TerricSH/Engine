@@ -107,6 +107,42 @@ fn sync_from_ecs_creates_collider_with_material() {
 }
 
 #[test]
+fn sync_from_ecs_incrementally_replaces_changed_collider_shape() {
+    let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
+    let mut ecs = World::new();
+    let entity = ecs.create_entity();
+    ecs.add_component(entity, Transform::default());
+    ecs.add_component(
+        entity,
+        RigidBody {
+            body_type: BodyType::Static,
+            ..RigidBody::default()
+        },
+    );
+    ecs.add_component(
+        entity,
+        Collider {
+            shape: ColliderShape::Ball { radius: 1.0 },
+            ..Collider::default()
+        },
+    );
+    world.sync_from_ecs(&ecs);
+    let body_handle = world.backend.body_map[&entity];
+
+    ecs.get_mut::<Collider>(entity).unwrap().shape = ColliderShape::TriMesh {
+        vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        indices: vec![[0, 1, 2]],
+    };
+    world.sync_from_ecs(&ecs);
+
+    assert_eq!(world.backend.body_map[&entity], body_handle);
+    assert!(matches!(
+        &world.backend.collider_map[&entity].1,
+        ColliderShape::TriMesh { indices, .. } if indices == &vec![[0, 1, 2]]
+    ));
+}
+
+#[test]
 fn ecs_sync_roundtrip_preserves_entity_count() {
     let mut world = PhysicsWorld::new(glam::Vec3::ZERO);
     let mut ecs = World::new();

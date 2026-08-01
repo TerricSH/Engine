@@ -18,7 +18,12 @@ use super::snapshots::{
 };
 use super::ui::GameplayUiCommand;
 use super::validation::{
-    validate_entity_id, validate_prefab_id, validate_scene_id, validate_script_transform,
+    validate_entity_id, validate_prefab_id, validate_save_slot, validate_scene_id,
+    validate_script_transform,
+};
+use super::{
+    validate_runtime_asset_id, GameplayRuntimeMaterial, GameplayRuntimeMesh, GameplayRuntimePrefab,
+    GameplayTerrainBrush,
 };
 /// Mutations a script may request after running a lifecycle method.
 ///
@@ -188,6 +193,26 @@ pub enum GameplayCommand {
     QueryLogicAsset {
         query_id: u32,
         asset_id: String,
+    },
+    RegisterRuntimeMesh {
+        request_id: u32,
+        asset_id: String,
+        mesh: GameplayRuntimeMesh,
+    },
+    RegisterRuntimeMaterial {
+        request_id: u32,
+        asset_id: String,
+        material: GameplayRuntimeMaterial,
+    },
+    RegisterRuntimePrefab {
+        request_id: u32,
+        asset_id: String,
+        prefab: GameplayRuntimePrefab,
+    },
+    TerrainApplyBrush {
+        request_id: u32,
+        terrain_entity_id: String,
+        brush: GameplayTerrainBrush,
     },
 }
 
@@ -377,6 +402,30 @@ impl GameplayCommand {
             }
             Self::LoadCheckpoint { slot } => validate_save_slot(slot),
             Self::QueryLogicAsset { asset_id, .. } => validate_entity_id(asset_id),
+            Self::RegisterRuntimeMesh { asset_id, mesh, .. } => {
+                validate_runtime_asset_id(asset_id)?;
+                mesh.validate()
+            }
+            Self::RegisterRuntimeMaterial {
+                asset_id, material, ..
+            } => {
+                validate_runtime_asset_id(asset_id)?;
+                material.validate()
+            }
+            Self::RegisterRuntimePrefab {
+                asset_id, prefab, ..
+            } => {
+                validate_runtime_asset_id(asset_id)?;
+                prefab.validate()
+            }
+            Self::TerrainApplyBrush {
+                terrain_entity_id,
+                brush,
+                ..
+            } => {
+                validate_entity_id(terrain_entity_id)?;
+                brush.validate()
+            }
         }
     }
 }
@@ -387,24 +436,6 @@ fn default_animation_speed() -> f32 {
 
 fn default_true() -> bool {
     true
-}
-
-pub fn validate_save_slot(slot: &str) -> Result<(), String> {
-    let valid = !slot.is_empty()
-        && slot.len() <= 64
-        && slot != "."
-        && slot != ".."
-        && slot
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
-    if valid {
-        Ok(())
-    } else {
-        Err(
-            "save slots must contain 1 to 64 ASCII letters, digits, underscores, hyphens, or dots"
-                .into(),
-        )
-    }
 }
 
 /// A validated command paired with the entity that owns the script instance.

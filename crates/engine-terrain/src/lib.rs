@@ -10,6 +10,7 @@
 
 mod chunk;
 mod component;
+mod edit;
 mod generator;
 mod lod;
 mod placement;
@@ -23,6 +24,7 @@ pub use component::{
     register_terrain_extensions, serialize_terrain_fields, TerrainMaterialProjection,
     TerrainTopology, TerrainVolume,
 };
+pub use edit::*;
 pub use generator::HeightfieldGenerator;
 pub use lod::{
     chunk_span, desired_chunks, desired_chunks_for_volume, desired_chunks_for_volume_hysteretic,

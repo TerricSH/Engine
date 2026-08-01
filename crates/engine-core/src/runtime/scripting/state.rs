@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 
 use engine_script::{
     GameplayCameraSnapshot, GameplayComponentQueryResult, GameplayDamageEvent, GameplayInputValue,
-    GameplayLogicAssetResult, GameplayPointerSnapshot, GameplayRagdollEvent, GameplaySaveEvent,
-    OwnedGameplayComponentQuery, OwnedGameplayDamageRequest, OwnedGameplayPhysicsMutation,
-    OwnedGameplayPhysicsQuery, OwnedGameplayRagdollRequest, OwnedGameplaySaveRequest, ScriptEngine,
+    GameplayLogicAssetResult, GameplayPointerSnapshot, GameplayRagdollEvent,
+    GameplayRuntimeAssetResult, GameplaySaveEvent, OwnedGameplayComponentQuery,
+    OwnedGameplayDamageRequest, OwnedGameplayPhysicsMutation, OwnedGameplayPhysicsQuery,
+    OwnedGameplayRagdollRequest, OwnedGameplaySaveRequest, OwnedGameplayTerrainBrushRequest,
+    ScriptEngine,
 };
 
 use crate::SceneLoadRequest;
@@ -22,6 +24,8 @@ pub(crate) struct ScriptRuntimeState {
     pub(crate) pending_save_requests: Vec<OwnedGameplaySaveRequest>,
     pub(crate) save_events: BTreeMap<String, Vec<GameplaySaveEvent>>,
     pub(crate) logic_asset_results: BTreeMap<String, Vec<GameplayLogicAssetResult>>,
+    pub(crate) runtime_asset_results: BTreeMap<String, Vec<GameplayRuntimeAssetResult>>,
+    pub(crate) pending_terrain_brushes: Vec<OwnedGameplayTerrainBrushRequest>,
     pub(crate) pending_scene_request: Option<SceneLoadRequest>,
     pub(crate) pending_physics_queries: Vec<OwnedGameplayPhysicsQuery>,
     pub(crate) pending_physics_mutations: Vec<OwnedGameplayPhysicsMutation>,
@@ -44,6 +48,8 @@ impl Default for ScriptRuntimeState {
             pending_save_requests: Vec::new(),
             save_events: BTreeMap::new(),
             logic_asset_results: BTreeMap::new(),
+            runtime_asset_results: BTreeMap::new(),
+            pending_terrain_brushes: Vec::new(),
             pending_scene_request: None,
             pending_physics_queries: Vec::new(),
             pending_physics_mutations: Vec::new(),

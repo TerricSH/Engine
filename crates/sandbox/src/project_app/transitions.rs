@@ -16,6 +16,13 @@ pub(super) fn create_game_loop(
         application_name: project.manifest.name.clone(),
         gpu_timestamps: true,
     });
+    #[cfg(feature = "subsystem-terrain")]
+    game_loop
+        .set_planet_scene_transitions_enabled(!project.manifest.world_streaming.seamless_planetary);
+    #[cfg(feature = "subsystem-terrain")]
+    game_loop
+        .terrain
+        .set_edit_store_root(project.root.join("savegames/terrain-edits"));
     #[cfg(feature = "subsystem-scripting-csharp")]
     game_loop.set_script_viewport_size(
         project.manifest.window.width,
@@ -56,22 +63,28 @@ pub(super) fn create_game_loop(
     Ok((game_loop, cooked_report))
 }
 
-/// Build the world-partition cell streaming driver when `--stream-cells` is
-/// set. The flag requires a `world.partition.json` at the project root;
-/// without the flag no driver is constructed and streaming stays off.
+/// Build the additive world-streaming driver when enabled by the project.
+/// `--stream-cells` remains a development override for legacy manifests.
 pub(super) fn create_cell_streaming_driver(
     project: &GameProject,
     stream_cells: bool,
 ) -> Result<Option<CellStreamingDriver>, String> {
-    if !stream_cells {
+    let settings = &project.manifest.world_streaming;
+    if !stream_cells && !settings.enabled {
         return Ok(None);
     }
     let partition = WorldPartition::load_for_project(project)
         .map_err(|error| format!("world partition validation failed: {error}"))?
         .ok_or_else(|| {
-            "--stream-cells requires a world.partition.json at the project root".to_string()
+            "world streaming requires a world.partition.json at the project root".to_string()
         })?;
-    CellStreamingDriver::new(&partition, project, CellStreamingConfig::default())
+    let config = CellStreamingConfig {
+        enter_factor: f32::from(settings.enter_percent) / 100.0,
+        exit_factor: f32::from(settings.exit_percent) / 100.0,
+        max_merges_per_commit: usize::from(settings.max_merges_per_frame),
+        max_unloads_per_commit: usize::from(settings.max_unloads_per_frame),
+    };
+    CellStreamingDriver::new(&partition, project, config)
         .map(Some)
         .map_err(|error| format!("world partition cell streaming setup failed: {error}"))
 }

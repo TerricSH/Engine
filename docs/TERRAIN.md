@@ -171,6 +171,44 @@ terrain-aware construction basis in native code. It samples the authored
 footprint, rejects excessive slope or support-height variation, and returns
 position, rotation, tangent axes, angular footprint, and diagnostics in `f64`.
 
+## Editable density terrain, caves, and incremental rebuilds
+
+`EditableTerrain` layers a sparse signed-density field over the exact planar
+or cube-sphere base sampler. `TerrainBrush` supports add, subtract, smooth and
+set-density modes with bounded radius, strength, falloff and optional material
+samples. Because the field is volumetric rather than a second height map,
+subtractive edits can create tunnels, caves and overhangs.
+
+Edits are partitioned by signed 64-bit density-chunk coordinates. Dirty work
+is coalesced and polygonised with marching tetrahedra and shared boundary
+samples, at most four 16-cubed chunks per frame. The engine expands the dirty
+set to cover the overlapping heightfield/CDLOD patch. It keeps that original
+patch visible and collidable until every replacement density chunk has
+committed, then atomically hides the old renderable and removes its collider;
+failed or oversized replacement work therefore retains valid terrain instead
+of opening a transient hole. New LOD patches repeat the same coverage proof.
+
+Density meshes use the normal runtime mesh registry. Static triangle collider
+changes are detected by `PhysicsWorld::sync_from_ecs` and only the changed
+Rapier collider is rebuilt; unrelated bodies retain pose, velocity, sleep and
+joint state. When navigation is enabled, the
+affected `DynamicNavTile` is cooked and atomically replaced; a failed bake
+retains the previous tile and never invalidates unrelated chunks. Hosts that
+own a different physics or navigation implementation can instead implement
+`EditableTerrainRebuildSink` and consume the same bounded rebuild stream.
+
+`TerrainEditStore` writes append-only, versioned and checksummed edit revisions
+under the project save directory. A normal terrain tick automatically restores
+the latest revisions for persistent volumes, invalidates all neighbouring mesh
+boundaries, and drains the bounded rebuild queue across later frames. The
+persisted voxel configuration must match the authored volume before edits are
+applied. Editable mesh transforms are recomputed against every floating-origin
+shift. Managed gameplay calls
+`Terrain.ApplyBrush(terrainEntityId, WorldPosition64, ...)` and observes the
+asynchronous result with `Terrain.TryGetResult`; density sampling, chunk math,
+meshing, persistence, collision and navigation rebuild remain native engine
+responsibilities.
+
 ## Surface attachment and construction occupancy
 
 `engine.planet_surface_anchor` persists a planet-relative direction, heading,
@@ -239,10 +277,11 @@ stage in ENG-04 frame timing.
 
 ## Scope
 
-This implementation covers ENG-T0, the planar heightfield path, cube-sphere
-streaming, horizon rejection, continuous geomorph, surface
-attachment/occupancy, and shared native planetary queries alongside ENG-11,
-ENG-14, ENG-15, and ENG-70. The renderer also exposes a generic
-altitude-driven planetary-lens post effect. Full volumetric atmosphere, ocean,
-biome/resource placement, and the editable voxel/marching-cubes layer (ENG-13)
+This implementation covers ENG-T0 and ENG-13: planar and cube-sphere terrain,
+f64 streaming, horizon rejection, continuous geomorph, editable volumetric
+density chunks, cave/overhang meshing, persistent brush edits, collision and
+navigation tile rebuilds, surface attachment/occupancy, and shared native
+planetary queries alongside ENG-11, ENG-14, ENG-15, and ENG-70. The renderer
+also exposes a generic altitude-driven planetary-lens post effect. Volumetric
+atmosphere, ocean simulation, and project-specific biome/resource placement
 remain separate optional systems.

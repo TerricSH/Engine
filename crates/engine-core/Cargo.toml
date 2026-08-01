@@ -15,6 +15,8 @@ subsystem-ui = ["dep:engine-ui"]
 subsystem-physics = ["dep:engine-physics"]
 subsystem-gameplay = ["dep:engine-gameplay"]
 subsystem-terrain = ["dep:engine-terrain"]
+subsystem-network = ["dep:engine-network"]
+subsystem-xr = ["dep:engine-xr"]
 # Compatibility profiles. New runtime code should gate against the leaf
 # subsystem features above instead of these aggregate aliases.
 runtime-subsystems = [
@@ -43,6 +45,8 @@ engine-gameplay = { path = "../engine-gameplay", optional = true }
 engine-vfx = { path = "../engine-vfx" }
 engine-ui = { path = "../engine-ui", optional = true }
 engine-terrain = { path = "../engine-terrain", optional = true }
+engine-network = { path = "../engine-network", optional = true }
+engine-xr = { path = "../engine-xr", optional = true }
 tracing.workspace = true
 glam.workspace = true
 bincode.workspace = true

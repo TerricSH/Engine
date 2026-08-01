@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use engine_asset::partition::CellBounds;
+use engine_asset::partition::StreamingCellBounds;
 use engine_scene::Scene;
 use engine_serialize::{AssetId, PersistentId};
 
@@ -10,7 +10,7 @@ use super::CellState;
 #[derive(Clone, Debug, Default)]
 pub struct CellStreamTickReport {
     /// Camera position used for the desired-set computation, if any.
-    pub camera: Option<[f32; 3]>,
+    pub camera: Option<[f64; 3]>,
     /// Cells the hysteresis evaluation wants live right now.
     pub desired_cells: BTreeSet<String>,
     /// Cooked assets enqueued on the background stream during this tick.
@@ -34,7 +34,7 @@ impl CellStreamTickReport {
 }
 
 pub(super) struct CellRecord {
-    pub(super) bounds: CellBounds,
+    pub(super) bounds: StreamingCellBounds,
     pub(super) scene: Scene,
     pub(super) state: CellState,
     /// Asset IDs enqueued for this cell and not yet observed as installed.

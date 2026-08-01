@@ -10,14 +10,15 @@ mod context;
 mod events;
 mod physics_mutation;
 mod physics_query;
+mod runtime_assets;
 mod snapshots;
 mod ui;
 mod validation;
 
 pub use commands::{
-    validate_save_slot, GameplayCommand, GameplaySaveOperation, OwnedGameplayCommand,
-    OwnedGameplayDamageRequest, OwnedGameplayPhysicsMutation, OwnedGameplayPhysicsQuery,
-    OwnedGameplayRagdollRequest, OwnedGameplaySaveRequest,
+    GameplayCommand, GameplaySaveOperation, OwnedGameplayCommand, OwnedGameplayDamageRequest,
+    OwnedGameplayPhysicsMutation, OwnedGameplayPhysicsQuery, OwnedGameplayRagdollRequest,
+    OwnedGameplaySaveRequest,
 };
 #[cfg(test)]
 pub use components::validate_component_field_name;
@@ -42,6 +43,7 @@ pub use physics_query::{
     GameplayInteractionSnapshot, GameplayPhysicsQuery, GameplayPhysicsQueryFilter,
     GameplayPhysicsQueryResult,
 };
+pub use runtime_assets::*;
 pub use snapshots::{
     GameplayAnimationParameterValue, GameplayCameraSnapshot, GameplayEntitySnapshot,
     GameplayInputTransitions, GameplayInputValue, GameplayLogicAssetResult,
@@ -54,7 +56,8 @@ pub use ui::{
     GameplayUiScaleMode, GameplayUiValue,
 };
 pub use validation::{
-    validate_entity_id, validate_prefab_id, validate_scene_id, validate_script_transform,
+    validate_entity_id, validate_prefab_id, validate_save_slot, validate_scene_id,
+    validate_script_transform,
 };
 
 #[cfg(test)]

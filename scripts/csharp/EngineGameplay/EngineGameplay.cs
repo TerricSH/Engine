@@ -9,14 +9,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.15.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.16.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.15.0";
+    public const string Version = "0.16.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
@@ -3005,7 +3005,7 @@ public sealed class ScriptAnimation
     }
 }
 
-public abstract class EngineBehaviour
+public abstract partial class EngineBehaviour
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -3067,6 +3067,8 @@ public abstract class EngineBehaviour
         Camera.Replace(context.Camera);
         Save.Replace(context.SaveEvents);
         LogicAssets.Replace(context.LogicAssetResults);
+        RuntimeAssets.Replace(context.RuntimeAssetResults);
+        Terrain.Replace(context.RuntimeAssetResults);
         UI.Replace(context.UiEvents);
         Physics.Replace(context.PhysicsEvents, context.PhysicsQueryResults);
         Damage.Replace(context.DamageEvents);
@@ -3099,13 +3101,15 @@ public abstract class EngineBehaviour
         Save.DrainTo(commands);
         LogicAssets.DrainTo(commands);
         Animation.DrainTo(commands);
+        RuntimeAssets.DrainTo(commands);
+        Terrain.DrainTo(commands);
         var json = JsonSerializer.Serialize(commands, JsonOptions);
         _transformDirty = false;
         return json;
     }
 }
 
-internal sealed class GameplayContextState
+internal sealed partial class GameplayContextState
 {
     [JsonPropertyName("script_api")]
     public string ScriptApi { get; set; } = "";
@@ -4138,7 +4142,7 @@ internal sealed class AnimationParameterState
     public object Value { get; }
 }
 
-internal sealed class GameplayCommandState
+internal sealed partial class GameplayCommandState
 {
     [JsonPropertyName("type")]
     public required string Type { get; init; }

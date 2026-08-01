@@ -6,6 +6,7 @@ pub mod components;
 mod cook;
 mod cooker;
 pub mod debug;
+mod dynamic;
 mod navmesh;
 mod pathfinding;
 mod space;
@@ -18,6 +19,10 @@ pub use components::{
 };
 pub use cooker::{CookError, NavMeshBakeError, NavMeshCookConfig, NavMeshCooker};
 pub use debug::NavMeshDebugDraw;
+pub use dynamic::{
+    DynamicNavBuildConfig, DynamicNavError, DynamicNavTile, DynamicNavTileKey, DynamicNavTileSet,
+    DynamicNavTileUpdate,
+};
 pub use navmesh::{NavError, NavMesh, PolygonIndex, VertexIndex};
 pub use pathfinding::{Path, PathPoint, Pathfinder};
 pub use space::{SpaceCell, SpaceNavConfig, SpaceNavError, SpaceNavGrid, SpacePath};

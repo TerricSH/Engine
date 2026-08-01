@@ -23,6 +23,10 @@ pub(crate) fn script_api_sha256() -> String {
             engine_script_api::GENERATED_CSHARP_RENDERING_FILE,
             RENDERING_SCRIPT_API_SOURCE,
         ),
+        (
+            engine_script_api::GENERATED_CSHARP_RUNTIME_ASSETS_FILE,
+            RUNTIME_ASSETS_SCRIPT_API_SOURCE,
+        ),
     ] {
         digest.update(name.as_bytes());
         digest.update([0]);
@@ -45,6 +49,7 @@ pub(crate) fn generated_script_api_manifest_json() -> Result<String, String> {
             engine_script_api::GENERATED_CSHARP_TACTICS_FILE,
             engine_script_api::GENERATED_CSHARP_JRPG_FILE,
             engine_script_api::GENERATED_CSHARP_RENDERING_FILE,
+            engine_script_api::GENERATED_CSHARP_RUNTIME_ASSETS_FILE,
         ],
         msbuild_targets: engine_script_api::GENERATED_MSBUILD_TARGETS_FILE,
         sha256: script_api_sha256(),
@@ -70,12 +75,15 @@ pub(crate) fn materialize_script_sdk_source(
     let tactics_source = sdk_source_dir.join(engine_script_api::GENERATED_CSHARP_TACTICS_FILE);
     let jrpg_source = sdk_source_dir.join(engine_script_api::GENERATED_CSHARP_JRPG_FILE);
     let rendering_source = sdk_source_dir.join(engine_script_api::GENERATED_CSHARP_RENDERING_FILE);
+    let runtime_assets_source =
+        sdk_source_dir.join(engine_script_api::GENERATED_CSHARP_RUNTIME_ASSETS_FILE);
     let project = sdk_source_dir.join("EngineGameplay.csproj");
     write_file(&source, STARTER_SCRIPT_API_SOURCE)?;
     write_file(&rules_source, RULES_SCRIPT_API_SOURCE)?;
     write_file(&tactics_source, TACTICS_SCRIPT_API_SOURCE)?;
     write_file(&jrpg_source, JRPG_SCRIPT_API_SOURCE)?;
     write_file(&rendering_source, RENDERING_SCRIPT_API_SOURCE)?;
+    write_file(&runtime_assets_source, RUNTIME_ASSETS_SCRIPT_API_SOURCE)?;
     write_file(&project, SCRIPT_SDK_PROJECT)?;
     Ok((source, project))
 }
@@ -142,6 +150,7 @@ pub(crate) fn write_generated_script_api(
         engine_script_api::GENERATED_CSHARP_TACTICS_FILE,
         engine_script_api::GENERATED_CSHARP_JRPG_FILE,
         engine_script_api::GENERATED_CSHARP_RENDERING_FILE,
+        engine_script_api::GENERATED_CSHARP_RUNTIME_ASSETS_FILE,
     ] {
         let legacy_source = source_dir.join(generated_file);
         if legacy_source.is_file() {
@@ -227,6 +236,7 @@ pub(crate) fn validate_generated_script_api(
         engine_script_api::GENERATED_CSHARP_TACTICS_FILE,
         engine_script_api::GENERATED_CSHARP_JRPG_FILE,
         engine_script_api::GENERATED_CSHARP_RENDERING_FILE,
+        engine_script_api::GENERATED_CSHARP_RUNTIME_ASSETS_FILE,
     ]
     .into_iter()
     .any(|generated_file| source_dir.join(generated_file).exists());

@@ -88,6 +88,7 @@ fn stream_fixture(
                     PartitionCell {
                         scene: scene_id.to_string(),
                         bounds: cell_bounds,
+                        planetary_bounds: None,
                     },
                 )
             })
@@ -270,6 +271,7 @@ fn partition_of(cells: &[(&str, &str)]) -> WorldPartition {
                     PartitionCell {
                         scene: scene_id.to_string(),
                         bounds: origin_bounds(),
+                        planetary_bounds: None,
                     },
                 )
             })

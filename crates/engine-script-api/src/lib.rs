@@ -10,7 +10,7 @@
 pub const GAMEPLAY_SCRIPT_API_SCHEMA: &str = "ScriptAPI-v0";
 
 /// Concrete SDK contract emitted for newly created game projects.
-pub const GAMEPLAY_SCRIPT_API_VERSION: &str = "0.15.0";
+pub const GAMEPLAY_SCRIPT_API_VERSION: &str = "0.16.0";
 
 /// Managed SDK assembly referenced by game-authored C# projects.
 pub const MANAGED_SDK_ASSEMBLY_NAME: &str = "EngineGameplay";
@@ -30,6 +30,10 @@ pub const GENERATED_CSHARP_JRPG_FILE: &str = "EngineJrpg.cs";
 /// Rendering, LOD, and VFX toolkit compiled alongside the core managed API.
 pub const GENERATED_CSHARP_RENDERING_FILE: &str = "EngineRendering.cs";
 
+/// Runtime asset generation and terrain editing API, split from the core
+/// gameplay source to keep the managed SDK modular.
+pub const GENERATED_CSHARP_RUNTIME_ASSETS_FILE: &str = "EngineRuntimeAssets.cs";
+
 /// Sidecar that records ownership, version, and the canonical source hash.
 pub const GENERATED_CONTRACT_FILE: &str = "EngineGameplay.contract.json";
 
@@ -47,6 +51,7 @@ pub struct GameplayScriptApiContract {
     pub generated_csharp_tactics_file: &'static str,
     pub generated_csharp_jrpg_file: &'static str,
     pub generated_csharp_rendering_file: &'static str,
+    pub generated_csharp_runtime_assets_file: &'static str,
     pub generated_contract_file: &'static str,
     pub generated_msbuild_targets_file: &'static str,
 }
@@ -60,6 +65,7 @@ pub const GAMEPLAY_SCRIPT_API: GameplayScriptApiContract = GameplayScriptApiCont
     generated_csharp_tactics_file: GENERATED_CSHARP_TACTICS_FILE,
     generated_csharp_jrpg_file: GENERATED_CSHARP_JRPG_FILE,
     generated_csharp_rendering_file: GENERATED_CSHARP_RENDERING_FILE,
+    generated_csharp_runtime_assets_file: GENERATED_CSHARP_RUNTIME_ASSETS_FILE,
     generated_contract_file: GENERATED_CONTRACT_FILE,
     generated_msbuild_targets_file: GENERATED_MSBUILD_TARGETS_FILE,
 };
@@ -71,7 +77,7 @@ mod tests {
     #[test]
     fn gameplay_contract_is_explicit_and_versioned() {
         assert_eq!(GAMEPLAY_SCRIPT_API.schema, "ScriptAPI-v0");
-        assert_eq!(GAMEPLAY_SCRIPT_API.version, "0.15.0");
+        assert_eq!(GAMEPLAY_SCRIPT_API.version, "0.16.0");
         assert_eq!(GAMEPLAY_SCRIPT_API.managed_sdk_assembly, "EngineGameplay");
         assert!(GAMEPLAY_SCRIPT_API.generated_csharp_file.ends_with(".cs"));
         assert!(GAMEPLAY_SCRIPT_API
@@ -85,6 +91,9 @@ mod tests {
             .ends_with(".cs"));
         assert!(GAMEPLAY_SCRIPT_API
             .generated_csharp_rendering_file
+            .ends_with(".cs"));
+        assert!(GAMEPLAY_SCRIPT_API
+            .generated_csharp_runtime_assets_file
             .ends_with(".cs"));
         assert!(GAMEPLAY_SCRIPT_API
             .generated_contract_file

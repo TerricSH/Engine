@@ -97,6 +97,14 @@ pub struct GameLoop {
     #[cfg(feature = "subsystem-terrain")]
     planet_scene_transitions: planet_scene_transition::PlanetSceneTransitionRuntime,
 
+    #[cfg(feature = "subsystem-network")]
+    pub network: engine_network::NetworkRuntime,
+    #[cfg(feature = "subsystem-network")]
+    network_time_seconds: f64,
+
+    #[cfg(feature = "subsystem-xr")]
+    pub xr: engine_xr::XrSystem,
+
     /// Cumulative count and details of executed world-origin shifts.
     world_origin_shift_count: u64,
     last_world_origin_shift: Option<WorldOriginShift>,
@@ -163,6 +171,12 @@ impl GameLoop {
             #[cfg(feature = "subsystem-terrain")]
             planet_scene_transitions:
                 planet_scene_transition::PlanetSceneTransitionRuntime::default(),
+            #[cfg(feature = "subsystem-network")]
+            network: engine_network::NetworkRuntime::default(),
+            #[cfg(feature = "subsystem-network")]
+            network_time_seconds: 0.0,
+            #[cfg(feature = "subsystem-xr")]
+            xr: engine_xr::XrSystem::default(),
             world_origin_shift_count: 0,
             last_world_origin_shift: None,
             #[cfg(feature = "subsystem-physics")]

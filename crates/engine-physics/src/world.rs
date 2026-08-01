@@ -98,6 +98,12 @@ struct SyncedSceneJoint {
     handle: JointHandle,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct SyncedCollider {
+    component: Collider,
+    material: Option<PhysicsMaterial>,
+}
+
 // ── PhysicsWorld ────────────────────────────────────────────────────────────
 
 /// The main physics simulation world.
@@ -118,6 +124,7 @@ pub struct PhysicsWorld {
     pending_triggers: Vec<TriggerEvent>,
     pending_joint_breaks: Vec<JointBreakEvent>,
     scene_joints: HashMap<Entity, SyncedSceneJoint>,
+    synced_colliders: HashMap<Entity, SyncedCollider>,
     debug_colliders: Arc<Mutex<Vec<ColliderDebugInfo>>>,
     /// Accumulated queries waiting for batched execution.
     query_batcher: QueryBatcher,
@@ -141,6 +148,7 @@ impl PhysicsWorld {
             pending_triggers: Vec::new(),
             pending_joint_breaks: Vec::new(),
             scene_joints: HashMap::new(),
+            synced_colliders: HashMap::new(),
             debug_colliders: Arc::new(Mutex::new(Vec::new())),
             query_batcher: QueryBatcher::new(),
             gravity_overridden: HashSet::new(),
@@ -412,7 +420,18 @@ impl PhysicsWorld {
 
         for (entity, collider) in world.query::<Collider>() {
             seen_colliders.insert(entity);
-
+            let material = world.get::<PhysicsMaterial>(entity).cloned();
+            let desired = SyncedCollider {
+                component: collider.clone(),
+                material: material.clone(),
+            };
+            let changed = self
+                .synced_colliders
+                .get(&entity)
+                .is_none_or(|synced| synced != &desired);
+            if changed && self.backend.has_collider(entity) {
+                self.backend.remove_collider(entity);
+            }
             if !self.backend.has_collider(entity) {
                 debug_assert!(world.is_alive(entity));
                 // Find the parent body entity. A collider should be attached
@@ -426,13 +445,17 @@ impl PhysicsWorld {
                     entity
                 };
 
-                let material = world.get::<PhysicsMaterial>(entity);
                 self.backend.replace_collider_for_current_entity(
                     entity,
                     collider,
                     body_entity,
-                    material,
+                    material.as_ref(),
                 );
+            }
+            if self.backend.has_collider(entity) {
+                self.synced_colliders.insert(entity, desired);
+            } else {
+                self.synced_colliders.remove(&entity);
             }
         }
 
@@ -446,7 +469,10 @@ impl PhysicsWorld {
             .collect();
         for entity in to_remove_colliders {
             self.backend.remove_collider(entity);
+            self.synced_colliders.remove(&entity);
         }
+        self.synced_colliders
+            .retain(|entity, _| seen_colliders.contains(entity));
 
         self.sync_joints_from_ecs(world);
     }

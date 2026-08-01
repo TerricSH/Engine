@@ -17,6 +17,10 @@ pub(crate) use runtime::{
 pub use runtime::{EngineConfig, EngineRuntime, EngineRuntimeBuilder, SceneLoadRequest};
 pub mod cell_stream;
 pub use cell_stream::{CellStreamingConfig, CellStreamingDriver};
+#[cfg(feature = "subsystem-network")]
+pub use engine_network;
+#[cfg(feature = "subsystem-xr")]
+pub use engine_xr;
 pub mod savegame;
 pub use savegame::*;
 #[cfg(feature = "subsystem-terrain")]

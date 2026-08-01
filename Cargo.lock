@@ -182,7 +182,7 @@ version = "0.38.0+1.3.281"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -562,7 +562,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -986,7 +986,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -1165,6 +1165,7 @@ dependencies = [
  "engine-ffi",
  "engine-gameplay",
  "engine-nav",
+ "engine-network",
  "engine-physics",
  "engine-renderer",
  "engine-scene",
@@ -1173,6 +1174,7 @@ dependencies = [
  "engine-terrain",
  "engine-ui",
  "engine-vfx",
+ "engine-xr",
  "glam",
  "serde",
  "serde_json",
@@ -1233,7 +1235,7 @@ dependencies = [
  "engine-ui",
  "glam",
  "image",
- "libloading",
+ "libloading 0.8.9",
  "serde_json",
  "tracing",
  "ureq",
@@ -1291,6 +1293,15 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "tracing",
+]
+
+[[package]]
+name = "engine-network"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1352,7 +1363,7 @@ dependencies = [
  "base64 0.22.1",
  "engine-script-api",
  "engine-serialize",
- "libloading",
+ "libloading 0.8.9",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1422,6 +1433,16 @@ dependencies = [
  "engine-nav",
  "engine-terrain",
  "glam",
+]
+
+[[package]]
+name = "engine-xr"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "openxr",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2516,6 +2537,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3380,6 +3411,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "openxr"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c2f814a47d257c79c762bc64042859661b6aa2f57cfa1f0ad4d778f419aeb0e"
+dependencies = [
+ "libc",
+ "libloading 0.9.0",
+ "ndk-context",
+ "openxr-sys",
+]
+
+[[package]]
+name = "openxr-sys"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b8d66081de28c2fa40216182a37292fe38aeea20bc184612504d5e64daf5359"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4228,6 +4280,7 @@ dependencies = [
  "engine-editor-host",
  "engine-gameplay",
  "engine-nav",
+ "engine-network",
  "engine-physics",
  "engine-renderer",
  "engine-scene",
@@ -4237,6 +4290,7 @@ dependencies = [
  "engine-terrain",
  "engine-ui",
  "engine-vfx",
+ "engine-xr",
  "glam",
  "gltf",
  "platform",
@@ -6193,7 +6247,7 @@ dependencies = [
  "as-raw-xcb-connection",
  "gethostname",
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "once_cell",
  "rustix 1.1.4",
  "x11rb-protocol",

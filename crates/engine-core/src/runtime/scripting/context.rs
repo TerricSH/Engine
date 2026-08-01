@@ -54,6 +54,12 @@ impl EngineRuntime {
                         .get(&entity_id)
                         .cloned()
                         .unwrap_or_default(),
+                    runtime_asset_results: self
+                        .scripting
+                        .runtime_asset_results
+                        .get(&entity_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     physics_events: physics_events.get(&entity_id).cloned().unwrap_or_default(),
                     damage_events: self
                         .scripting

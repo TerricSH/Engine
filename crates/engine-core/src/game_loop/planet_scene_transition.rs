@@ -47,6 +47,7 @@ impl TrackedTransition {
 
 #[derive(Debug)]
 pub(super) struct PlanetSceneTransitionRuntime {
+    enabled: bool,
     entries: BTreeMap<String, TrackedTransition>,
     pending: Option<PlanetSceneTransitionTicket>,
     pending_delivered: bool,
@@ -58,6 +59,7 @@ pub(super) struct PlanetSceneTransitionRuntime {
 impl Default for PlanetSceneTransitionRuntime {
     fn default() -> Self {
         Self {
+            enabled: true,
             entries: BTreeMap::new(),
             pending: None,
             pending_delivered: false,
@@ -69,11 +71,24 @@ impl Default for PlanetSceneTransitionRuntime {
 }
 
 impl PlanetSceneTransitionRuntime {
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.entries.clear();
+            self.pending = None;
+            self.pending_delivered = false;
+            self.sticky_controller = None;
+        }
+    }
+
     fn is_waiting_for_ack(&self) -> bool {
-        self.pending.is_some()
+        self.enabled && self.pending.is_some()
     }
 
     fn tick(&mut self, mut frame: PlanetTransitionFrame, delta_seconds: f64) -> Vec<Diagnostic> {
+        if !self.enabled {
+            return Vec::new();
+        }
         let mut issues = std::mem::take(&mut frame.issues);
         if self.pending.is_some() {
             return self.new_diagnostics(issues);
@@ -252,6 +267,9 @@ impl PlanetSceneTransitionRuntime {
     }
 
     fn take_pending(&mut self) -> Option<PlanetSceneTransitionTicket> {
+        if !self.enabled {
+            return None;
+        }
         if self.pending_delivered {
             return None;
         }
@@ -315,6 +333,13 @@ impl PlanetSceneTransitionRuntime {
 }
 
 impl GameLoop {
+    /// Enable legacy orbit/surface scene replacement. Seamless additive
+    /// planetary projects disable it and retain one continuously streamed
+    /// world instead.
+    pub fn set_planet_scene_transitions_enabled(&mut self, enabled: bool) {
+        self.planet_scene_transitions.set_enabled(enabled);
+    }
+
     /// Evaluate authored planet scene transitions using the active camera's
     /// logical f64 position. Ordinary [`Self::update`] calls this once per
     /// frame after terrain streaming.

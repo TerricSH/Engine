@@ -303,6 +303,7 @@ fn build_fixture(seed: u64) -> SoakFixture {
                     center: [center, 0.0, 0.0],
                     half_extents: [CELL_HALF_EXTENT, 10.0, 10.0],
                 },
+                planetary_bounds: None,
             },
         );
         material_ids.push(AssetId::new(&material_id));

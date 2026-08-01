@@ -12,6 +12,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod world_streaming;
+
+pub use world_streaming::ProjectWorldStreaming;
+
 /// Project manifest contract understood by this engine version.
 pub const GAME_PROJECT_SCHEMA: &str = "GameProject-v0";
 /// Conventional project manifest file name.
@@ -71,6 +75,8 @@ pub struct ProjectManifest {
     pub backend: ProjectBackend,
     #[serde(default)]
     pub window: ProjectWindow,
+    #[serde(default)]
+    pub world_streaming: ProjectWorldStreaming,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_project: Option<PathBuf>,
     /// Compiled managed game assembly used by runtime players.
@@ -102,6 +108,7 @@ impl ProjectManifest {
             asset_source: default_asset_source(),
             cooked_assets: default_cooked_assets(),
             backend: ProjectBackend::Vulkan,
+            world_streaming: ProjectWorldStreaming::default(),
             script_project: None,
             script_assembly: None,
             input_actions: Some(PathBuf::from("config/input.actions.json")),
@@ -127,6 +134,20 @@ impl ProjectManifest {
         {
             return Err(ProjectError::InvalidWindow(
                 "window dimensions must be within 1..=16384".into(),
+            ));
+        }
+        if self.world_streaming.enter_percent == 0
+            || self.world_streaming.exit_percent < self.world_streaming.enter_percent
+            || self.world_streaming.max_merges_per_frame == 0
+            || self.world_streaming.max_unloads_per_frame == 0
+        {
+            return Err(ProjectError::InvalidWorldStreaming(
+                "enter_percent must be positive, exit_percent must not be smaller, and per-frame budgets must be positive".into(),
+            ));
+        }
+        if self.world_streaming.seamless_planetary && !self.world_streaming.enabled {
+            return Err(ProjectError::InvalidWorldStreaming(
+                "seamless_planetary requires world_streaming.enabled".into(),
             ));
         }
 
@@ -434,6 +455,8 @@ pub enum ProjectError {
     InvalidSceneId(String),
     #[error("invalid project window: {0}")]
     InvalidWindow(String),
+    #[error("invalid project world streaming: {0}")]
+    InvalidWorldStreaming(String),
     #[error("invalid project path in {field}: {path:?} ({reason})")]
     InvalidPath {
         field: String,
@@ -613,6 +636,37 @@ mod tests {
         ProjectManifest::new("Test Game")
             .write_to_root(root)
             .expect("manifest")
+    }
+
+    #[test]
+    fn world_streaming_defaults_and_seamless_validation_are_stable() {
+        let manifest = ProjectManifest::new("Streaming");
+        assert_eq!(
+            manifest.world_streaming,
+            ProjectWorldStreaming {
+                enabled: false,
+                enter_percent: 100,
+                exit_percent: 115,
+                max_merges_per_frame: 1,
+                max_unloads_per_frame: 4,
+                seamless_planetary: false,
+            }
+        );
+
+        let mut invalid = manifest.clone();
+        invalid.world_streaming.seamless_planetary = true;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProjectError::InvalidWorldStreaming(_))
+        ));
+
+        let mut enabled = manifest;
+        enabled.world_streaming.enabled = true;
+        enabled.world_streaming.seamless_planetary = true;
+        enabled.validate().unwrap();
+        let roundtrip: ProjectManifest =
+            serde_json::from_str(&serde_json::to_string(&enabled).unwrap()).unwrap();
+        assert_eq!(roundtrip.world_streaming, enabled.world_streaming);
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub enum BodyType {
 ///
 /// Serialisable — does NOT contain backend handles.
 /// Backend handles are managed internally by `RapierBackend`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RigidBody {
     /// Whether the body is static, dynamic, or kinematic.
     pub body_type: BodyType,
@@ -96,7 +96,7 @@ pub enum ColliderShape {
 /// Physics collider component.
 ///
 /// Serialisable — does NOT contain backend handles.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Collider {
     /// The geometric shape of the collider.
     pub shape: ColliderShape,
@@ -142,7 +142,7 @@ impl Component for Collider {
 ///
 /// When attached to an entity alongside a [`Collider`], these values
 /// override the collider's default friction / restitution / density.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PhysicsMaterial {
     pub friction: f32,
     pub restitution: f32,

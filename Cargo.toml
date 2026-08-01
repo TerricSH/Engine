@@ -23,6 +23,8 @@ members = [
     "crates/engine-nav",
     "crates/engine-procgen",
     "crates/engine-terrain",
+    "crates/engine-network",
+    "crates/engine-xr",
     "crates/engine-character",
     "crates/engine-gameplay",
     "crates/engine-vfx",
@@ -71,6 +73,7 @@ tao = "0.35"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
+openxr = { version = "0.21.1", default-features = false, features = ["loaded"] }
 urlencoding = "2.1"
 windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D12",

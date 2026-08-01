@@ -48,6 +48,7 @@ fn context_json_contract_roundtrips_typed_input() {
             json: Some("{\"nodes\":[]}".into()),
             error: None,
         }],
+        runtime_asset_results: Vec::new(),
         physics_events: vec![GameplayPhysicsEvent {
             kind: GameplayPhysicsEventKind::CollisionEntered,
             other_entity_id: "floor".into(),

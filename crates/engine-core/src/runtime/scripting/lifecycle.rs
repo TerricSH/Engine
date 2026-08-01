@@ -82,6 +82,8 @@ impl EngineRuntime {
         self.scripting.pending_save_requests.clear();
         self.scripting.save_events.clear();
         self.scripting.logic_asset_results.clear();
+        self.scripting.runtime_asset_results.clear();
+        self.scripting.pending_terrain_brushes.clear();
         Ok(())
     }
 
@@ -316,6 +318,7 @@ impl EngineRuntime {
         self.scripting.ragdoll_events.clear();
         self.scripting.save_events.clear();
         self.scripting.logic_asset_results.clear();
+        self.scripting.runtime_asset_results.clear();
         diagnostics.extend(self.scripting.engine.update(dt));
         let (commands, command_diagnostics) = self.scripting.engine.drain_gameplay_commands();
         diagnostics.extend(command_diagnostics);

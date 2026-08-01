@@ -78,3 +78,21 @@ pub fn validate_prefab_id(prefab_id: &str) -> Result<(), String> {
         )
     })
 }
+
+pub fn validate_save_slot(slot: &str) -> Result<(), String> {
+    let valid = !slot.is_empty()
+        && slot.len() <= 64
+        && slot != "."
+        && slot != ".."
+        && slot
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(
+            "save slots must contain 1 to 64 ASCII letters, digits, underscores, hyphens, or dots"
+                .into(),
+        )
+    }
+}

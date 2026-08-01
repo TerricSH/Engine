@@ -11,6 +11,7 @@ use super::snapshots::{
     GameplayLogicAssetResult, GameplayPointerSnapshot, GameplaySaveEvent, ScriptTransform,
 };
 use super::ui::GameplayUiEvent;
+use super::GameplayRuntimeAssetResult;
 
 fn default_gameplay_script_api_schema() -> String {
     GAMEPLAY_SCRIPT_API_SCHEMA.to_owned()
@@ -51,6 +52,10 @@ pub struct GameplayContext {
     /// Deferred data-driven logic graph query results.
     #[serde(default)]
     pub logic_asset_results: Vec<GameplayLogicAssetResult>,
+    /// Completion of deferred runtime mesh/material/prefab registration and
+    /// terrain edit requests issued by this script.
+    #[serde(default)]
+    pub runtime_asset_results: Vec<GameplayRuntimeAssetResult>,
     /// Collision and trigger events involving the owning entity this frame.
     #[serde(default)]
     pub physics_events: Vec<GameplayPhysicsEvent>,

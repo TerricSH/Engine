@@ -1,8 +1,8 @@
     #[test]
-    fn cell_streaming_is_opt_in_and_requires_a_partition_manifest() {
+    fn cell_streaming_uses_cli_override_or_project_configuration() {
         let (_temp, project) = cell_streaming_project_fixture();
-        // Without the flag no driver is constructed even when a partition
-        // manifest exists; with the flag the partition builds a driver.
+        // Legacy projects remain disabled without an override; the CLI flag
+        // still builds a driver for development runs.
         assert!(create_cell_streaming_driver(&project, false)
             .unwrap()
             .is_none());
@@ -16,6 +16,12 @@
             .err()
             .expect("streaming without a partition manifest must fail");
         assert!(error.contains("world.partition.json"), "{error}");
+
+        let (_temp3, mut configured) = cell_streaming_project_fixture();
+        configured.manifest.world_streaming.enabled = true;
+        assert!(create_cell_streaming_driver(&configured, false)
+            .unwrap()
+            .is_some());
     }
 
     #[test]

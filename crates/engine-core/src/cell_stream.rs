@@ -69,15 +69,15 @@
 //! - Save/rollback semantics are whole-scene only; a failed scene transition
 //!   rolls back to the retained scene snapshot exactly as without streaming.
 
-use glam::Vec3;
+use glam::DVec3;
 
 /// The f32 origin-relative offset corresponding to a world origin.
 ///
 /// Streaming decisions run in logical (authored) space, so origin-relative
 /// positions from the world are lifted by this offset before they are
 /// compared against partition bounds.
-fn origin_offset(origin: [f64; 3]) -> Vec3 {
-    Vec3::new(origin[0] as f32, origin[1] as f32, origin[2] as f32)
+fn origin_offset(origin: [f64; 3]) -> DVec3 {
+    DVec3::from_array(origin)
 }
 
 mod config;

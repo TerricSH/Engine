@@ -1,10 +1,9 @@
 //! Optional world partition manifest (`world.partition.json`).
 //!
 //! World partition foundations (ENG-02, Phase 2): a declarative cell → scene
-//! mapping with axis-aligned world-space bounds, validated by
-//! `sandbox project check`. Runtime streaming of cells is **not yet active**;
-//! this module is the shared parse/validate layer that later streaming phases
-//! (cell load/unload on top of `World::merge_scene`) will reuse.
+//! mapping with Cartesian or f64 planetary bounds, validated by
+//! `sandbox project check`. Runtime additive streaming is active;
+//! this module is the shared parse/validate layer consumed by the cell driver.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -30,6 +29,55 @@ pub struct CellBounds {
     pub half_extents: [f32; 3],
 }
 
+/// Precision-preserving region on or above a spherical planet. This avoids
+/// representing planet centres and interplanetary camera positions as f32.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlanetaryCellBounds {
+    pub planet_center: [f64; 3],
+    /// Unit direction from the planet centre to the region centre.
+    pub direction: [f64; 3],
+    /// Half-angle of the region's surface cap, in radians.
+    pub angular_radius: f64,
+    /// Inclusive altitude interval relative to the base planet radius.
+    pub min_altitude: f64,
+    pub max_altitude: f64,
+    pub planet_radius: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StreamingCellBounds {
+    Cartesian(CellBounds),
+    Planetary(PlanetaryCellBounds),
+}
+
+impl StreamingCellBounds {
+    pub fn contains(self, factor: f64, point: [f64; 3]) -> bool {
+        let point = glam::DVec3::from_array(point);
+        match self {
+            Self::Cartesian(bounds) => (0..3).all(|axis| {
+                let half_extent = f64::from(bounds.half_extents[axis]) * factor;
+                (point[axis] - f64::from(bounds.center[axis])).abs() <= half_extent
+            }),
+            Self::Planetary(bounds) => {
+                let radial = point - glam::DVec3::from_array(bounds.planet_center);
+                let distance = radial.length();
+                if distance <= f64::EPSILON {
+                    return false;
+                }
+                let altitude = distance - bounds.planet_radius;
+                let altitude_middle = (bounds.min_altitude + bounds.max_altitude) * 0.5;
+                let altitude_half = (bounds.max_altitude - bounds.min_altitude) * 0.5 * factor;
+                if (altitude - altitude_middle).abs() > altitude_half {
+                    return false;
+                }
+                let target = glam::DVec3::from_array(bounds.direction).normalize_or_zero();
+                radial.normalize().dot(target).clamp(-1.0, 1.0).acos()
+                    <= bounds.angular_radius * factor
+            }
+        }
+    }
+}
+
 /// One world partition cell: a cataloged scene plus its world-space bounds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PartitionCell {
@@ -37,6 +85,19 @@ pub struct PartitionCell {
     /// entry of the project's scene catalog.
     pub scene: String,
     pub bounds: CellBounds,
+    /// When present, runtime streaming uses this f64 spherical region instead
+    /// of the legacy Cartesian AABB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planetary_bounds: Option<PlanetaryCellBounds>,
+}
+
+impl PartitionCell {
+    pub fn streaming_bounds(&self) -> StreamingCellBounds {
+        self.planetary_bounds.map_or(
+            StreamingCellBounds::Cartesian(self.bounds),
+            StreamingCellBounds::Planetary,
+        )
+    }
 }
 
 /// Versioned world partition manifest stored at the project root.
@@ -121,6 +182,33 @@ impl WorldPartition {
                     reason: "half extents must be non-negative".into(),
                 });
             }
+            if let Some(bounds) = cell.planetary_bounds {
+                let direction_length_squared = bounds
+                    .direction
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>();
+                let valid = bounds
+                    .planet_center
+                    .iter()
+                    .chain(bounds.direction.iter())
+                    .all(|value| value.is_finite())
+                    && direction_length_squared.is_finite()
+                    && direction_length_squared > f64::EPSILON
+                    && bounds.angular_radius.is_finite()
+                    && (0.0..=std::f64::consts::PI).contains(&bounds.angular_radius)
+                    && bounds.min_altitude.is_finite()
+                    && bounds.max_altitude.is_finite()
+                    && bounds.min_altitude <= bounds.max_altitude
+                    && bounds.planet_radius.is_finite()
+                    && bounds.planet_radius > 0.0;
+                if !valid {
+                    return Err(PartitionError::InvalidBounds {
+                        cell_id: cell_id.clone(),
+                        reason: "planetary bounds require finite centre/direction, positive radius, an ordered altitude interval, and angular_radius in [0, pi]".into(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -177,6 +265,7 @@ mod tests {
                 center,
                 half_extents,
             },
+            planetary_bounds: None,
         }
     }
 
@@ -242,6 +331,21 @@ mod tests {
             partition.validate(),
             Err(PartitionError::UnsupportedSchema(schema)) if schema == "WorldPartition-v9"
         ));
+    }
+
+    #[test]
+    fn planetary_bounds_preserve_large_centres_and_altitude_bands() {
+        let bounds = StreamingCellBounds::Planetary(PlanetaryCellBounds {
+            planet_center: [9.0e12, -4.0e12, 2.0e12],
+            direction: [1.0, 0.0, 0.0],
+            angular_radius: 0.1,
+            min_altitude: -100.0,
+            max_altitude: 1_000.0,
+            planet_radius: 6_000.0,
+        });
+        assert!(bounds.contains(1.0, [9.0e12 + 6_500.0, -4.0e12, 2.0e12]));
+        assert!(!bounds.contains(1.0, [9.0e12, -4.0e12 + 6_500.0, 2.0e12]));
+        assert!(!bounds.contains(1.0, [9.0e12 + 9_000.0, -4.0e12, 2.0e12]));
     }
 
     #[test]

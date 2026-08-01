@@ -825,7 +825,11 @@ impl EngineRuntime {
                 | GameplayCommand::SetMorphWeights { .. }
                 | GameplayCommand::SaveCheckpoint { .. }
                 | GameplayCommand::LoadCheckpoint { .. }
-                | GameplayCommand::QueryLogicAsset { .. }) => {
+                | GameplayCommand::QueryLogicAsset { .. }
+                | GameplayCommand::RegisterRuntimeMesh { .. }
+                | GameplayCommand::RegisterRuntimeMaterial { .. }
+                | GameplayCommand::RegisterRuntimePrefab { .. }
+                | GameplayCommand::TerrainApplyBrush { .. }) => {
                     self.apply_script_extended_command(entity_id, command, &mut diagnostics);
                 }
             }

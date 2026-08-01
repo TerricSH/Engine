@@ -1,6 +1,7 @@
 //! Host bridge from `engine-terrain` CPU output to runtime meshes and ECS.
 
 mod anchors;
+mod editable;
 mod material_mapping;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +18,7 @@ use engine_terrain::{TerrainCollisionData, TerrainTriangleCollisionData};
 use glam::{Vec2, Vec3};
 
 use crate::{EngineRuntime, RuntimeMeshDescriptor, RuntimeMeshHandle};
+use editable::{EditableChunkBinding, EditableChunkKey, EditableVolume};
 use material_mapping::projected_material_mapping;
 
 pub(crate) fn runtime_entity_identity_label(entity: engine_scene::Entity) -> String {
@@ -34,17 +36,7 @@ struct ChunkBinding {
     #[cfg(feature = "subsystem-physics")]
     triangle_collision: Option<TerrainTriangleCollisionData>,
     active: bool,
-}
-
-impl ChunkBinding {
-    #[cfg(feature = "subsystem-physics")]
-    fn release_staged_collision(&mut self) {
-        self.collision = None;
-        self.triangle_collision = None;
-    }
-
-    #[cfg(not(feature = "subsystem-physics"))]
-    fn release_staged_collision(&mut self) {}
+    edit_suppressed: bool,
 }
 
 type ChunkKey = (TerrainChunkId, u64);
@@ -179,6 +171,12 @@ pub struct TerrainSystem {
     surface_occupancy: PlanetSurfaceOccupancy,
     stats: TerrainBindingStats,
     regeneration_epoch: u64,
+    editable_volumes: BTreeMap<TerrainVolumeId, EditableVolume>,
+    editable_chunks: BTreeMap<EditableChunkKey, EditableChunkBinding>,
+    editable_coverage: BTreeMap<EditableChunkKey, ChunkRegion>,
+    edit_store_root: Option<std::path::PathBuf>,
+    #[cfg(feature = "subsystem-navigation")]
+    editable_navigation: engine_nav::DynamicNavTileSet,
 }
 
 impl Default for TerrainSystem {
@@ -196,6 +194,12 @@ impl TerrainSystem {
             surface_occupancy: PlanetSurfaceOccupancy::default(),
             stats: TerrainBindingStats::default(),
             regeneration_epoch: 0,
+            editable_volumes: BTreeMap::new(),
+            editable_chunks: BTreeMap::new(),
+            editable_coverage: BTreeMap::new(),
+            edit_store_root: None,
+            #[cfg(feature = "subsystem-navigation")]
+            editable_navigation: engine_nav::DynamicNavTileSet::default(),
         }
     }
 
@@ -435,6 +439,7 @@ impl TerrainSystem {
         for key in activating {
             physics_changed |= self.activate_chunk(engine, key);
         }
+        physics_changed |= self.tick_editable_terrain(engine, &active_volumes, world_origin);
         self.update_chunk_geomorph(engine, &active_volumes, focus);
         physics_changed |= self.update_surface_anchors(engine, &active_volumes, world_origin);
         self.stats.live_chunks = self.chunks.len();
@@ -470,6 +475,12 @@ impl TerrainSystem {
         for key in keys {
             self.unload_chunk(engine, key);
         }
+        let editable_keys = self.editable_chunks.keys().copied().collect::<Vec<_>>();
+        for key in editable_keys {
+            self.remove_editable_binding(engine, key);
+        }
+        self.editable_coverage.clear();
+        self.editable_volumes.clear();
         let _ = self.runtime.set_desired(std::iter::empty());
         self.previous_desired.clear();
         self.surface_occupancy = PlanetSurfaceOccupancy::default();
@@ -645,25 +656,25 @@ impl TerrainSystem {
                 }),
             },
             #[cfg(feature = "subsystem-physics")]
-            collision: if active { None } else { data.collision.clone() },
+            // Retain CPU collision recipes after activation. Editable density
+            // coverage may temporarily suppress this patch and later restore
+            // it after an LOD transition or edit reset.
+            collision: data.collision.clone(),
             #[cfg(feature = "subsystem-physics")]
             collision_span,
             #[cfg(feature = "subsystem-physics")]
-            triangle_collision: if active {
-                None
-            } else {
-                data.triangle_collision
-                    .as_ref()
-                    .map(|collision| TerrainTriangleCollisionData {
-                        positions: collision
-                            .positions
-                            .iter()
-                            .map(|position| (Vec3::from_array(*position) - local_center).to_array())
-                            .collect(),
-                        triangles: collision.triangles.clone(),
-                    })
-            },
+            triangle_collision: data.triangle_collision.as_ref().map(|collision| {
+                TerrainTriangleCollisionData {
+                    positions: collision
+                        .positions
+                        .iter()
+                        .map(|position| (Vec3::from_array(*position) - local_center).to_array())
+                        .collect(),
+                    triangles: collision.triangles.clone(),
+                }
+            }),
             active,
+            edit_suppressed: false,
         })
     }
 
@@ -732,60 +743,62 @@ impl TerrainSystem {
         let collision_span = binding.collision_span;
         #[cfg(feature = "subsystem-physics")]
         let triangle_collision = binding.triangle_collision.clone();
+        let edit_suppressed = binding.edit_suppressed;
         let activated = engine
             .with_world_mut(|world| {
                 let Some(renderable) = world.get_mut::<Renderable>(entity) else {
                     return false;
                 };
-                renderable.visible = true;
+                renderable.visible = !edit_suppressed;
                 #[cfg(feature = "subsystem-physics")]
-                if let Some(collision) = collision {
-                    world.add_component(
-                        entity,
-                        engine_physics::RigidBody {
-                            body_type: engine_physics::BodyType::Static,
-                            gravity_scale: 0.0,
-                            ..engine_physics::RigidBody::default()
-                        },
-                    );
-                    world.add_component(
-                        entity,
-                        engine_physics::Collider {
-                            shape: engine_physics::ColliderShape::HeightField {
-                                rows: collision.rows,
-                                columns: collision.columns,
-                                heights: collision.heights,
-                                scale: [collision_span, 1.0, collision_span],
+                if !edit_suppressed {
+                    if let Some(collision) = collision {
+                        world.add_component(
+                            entity,
+                            engine_physics::RigidBody {
+                                body_type: engine_physics::BodyType::Static,
+                                gravity_scale: 0.0,
+                                ..engine_physics::RigidBody::default()
                             },
-                            ..engine_physics::Collider::default()
-                        },
-                    );
-                } else if let Some(collision) = triangle_collision {
-                    world.add_component(
-                        entity,
-                        engine_physics::RigidBody {
-                            body_type: engine_physics::BodyType::Static,
-                            gravity_scale: 0.0,
-                            ..engine_physics::RigidBody::default()
-                        },
-                    );
-                    world.add_component(
-                        entity,
-                        engine_physics::Collider {
-                            shape: engine_physics::ColliderShape::TriMesh {
-                                vertices: collision.positions,
-                                indices: collision.triangles,
+                        );
+                        world.add_component(
+                            entity,
+                            engine_physics::Collider {
+                                shape: engine_physics::ColliderShape::HeightField {
+                                    rows: collision.rows,
+                                    columns: collision.columns,
+                                    heights: collision.heights,
+                                    scale: [collision_span, 1.0, collision_span],
+                                },
+                                ..engine_physics::Collider::default()
                             },
-                            ..engine_physics::Collider::default()
-                        },
-                    );
+                        );
+                    } else if let Some(collision) = triangle_collision {
+                        world.add_component(
+                            entity,
+                            engine_physics::RigidBody {
+                                body_type: engine_physics::BodyType::Static,
+                                gravity_scale: 0.0,
+                                ..engine_physics::RigidBody::default()
+                            },
+                        );
+                        world.add_component(
+                            entity,
+                            engine_physics::Collider {
+                                shape: engine_physics::ColliderShape::TriMesh {
+                                    vertices: collision.positions,
+                                    indices: collision.triangles,
+                                },
+                                ..engine_physics::Collider::default()
+                            },
+                        );
+                    }
                 }
                 true
             })
             .unwrap_or(false);
         if activated {
             binding.active = true;
-            binding.release_staged_collision();
         } else {
             self.stats.last_error = Some(format!(
                 "cannot activate staged terrain binding for {:?}",

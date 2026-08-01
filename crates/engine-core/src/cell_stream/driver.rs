@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use engine_asset::partition::{CellBounds, WorldPartition};
+use engine_asset::partition::{StreamingCellBounds, WorldPartition};
 use engine_asset::project::GameProject;
 use engine_scene::components::Transform;
 use engine_scene::{
     active_camera_world_position, validate_scene, Scene, SCENE_ONLY_COMPONENT_TYPES,
 };
 use engine_serialize::{AssetId, Diagnostic, DiagnosticSeverity, PersistentId};
-use glam::Vec3;
+use glam::DVec3;
 
 use crate::EngineRuntime;
 
@@ -108,7 +108,7 @@ impl CellStreamingDriver {
                     .expect("every cell scene was loaded above")
                     .clone();
                 let record = CellRecord {
-                    bounds: cell.bounds,
+                    bounds: cell.streaming_bounds(),
                     root_ids: cell_root_ids(&scene),
                     scene,
                     state: CellState::Unloaded,
@@ -250,7 +250,7 @@ impl CellStreamingDriver {
                 // are authored logical coordinates, while world positions are
                 // origin-relative after a world-origin shift (ENG-01).
                 active_camera_world_position(world)
-                    .map(|camera| camera + origin_offset(world.world_origin()))
+                    .map(|camera| camera.as_dvec3() + origin_offset(world.world_origin()))
             })
             .flatten();
         let Some(camera) = camera else {
@@ -323,16 +323,13 @@ impl CellStreamingDriver {
     }
 
     /// Whether `point` lies inside `bounds` scaled by `factor` per axis.
-    fn inside_bounds(bounds: &CellBounds, factor: f32, point: Vec3) -> bool {
-        (0..3).all(|axis| {
-            let half_extent = bounds.half_extents[axis] * factor;
-            (point[axis] - bounds.center[axis]).abs() <= half_extent
-        })
+    fn inside_bounds(bounds: &StreamingCellBounds, factor: f32, point: DVec3) -> bool {
+        bounds.contains(f64::from(factor), point.to_array())
     }
 
     /// Cells the camera wants live: unloaded cells enter at
     /// `enter_factor`, every in-flight/live cell leaves at `exit_factor`.
-    fn compute_desired(&self, camera: Vec3) -> BTreeSet<String> {
+    fn compute_desired(&self, camera: DVec3) -> BTreeSet<String> {
         self.cells
             .iter()
             .filter(|(_, record)| {
@@ -382,7 +379,7 @@ impl CellStreamingDriver {
                     // Compare in logical space: bounds are authored logical
                     // coordinates, positions from the world are
                     // origin-relative after a world-origin shift.
-                    let position = position + origin;
+                    let position = position.as_dvec3() + origin;
                     if !Self::inside_bounds(&record.bounds, self.config.exit_factor, position) {
                         moved_out.push(id.clone());
                     }
@@ -669,7 +666,7 @@ impl CellStreamingDriver {
         if origin == [0.0; 3] {
             return;
         }
-        let offset = origin_offset(origin);
+        let offset = glam::Vec3::new(origin[0] as f32, origin[1] as f32, origin[2] as f32);
         runtime.with_world_mut(|world| {
             for record in &scene.entities {
                 let Some(entity) = world.entity_by_persistent_id(&record.persistent_id) else {

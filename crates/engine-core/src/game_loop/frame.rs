@@ -20,6 +20,21 @@ impl GameLoop {
     }
 
     pub(super) fn update_inner(&mut self, dt: f32) {
+        #[cfg(feature = "subsystem-network")]
+        {
+            self.network_time_seconds += f64::from(dt.max(0.0));
+            if let Err(error) = self.network.tick(self.network_time_seconds) {
+                tracing::warn!(%error, "network session tick failed");
+            }
+            if let Err(error) = self.network.flush_replication(256) {
+                tracing::warn!(%error, "network replication flush failed");
+            }
+            for (_, result) in self.network.rpc.dispatch(256) {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "network RPC handler failed");
+                }
+            }
+        }
         #[cfg(feature = "subsystem-terrain")]
         self.tick_terrain(None);
         #[cfg(feature = "subsystem-terrain")]
@@ -133,6 +148,8 @@ impl GameLoop {
         }
         #[cfg(feature = "subsystem-scripting-csharp")]
         self.process_script_save_requests();
+        #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-terrain"))]
+        self.process_script_terrain_brushes();
         #[cfg(feature = "subsystem-scripting-csharp")]
         self.refresh_primary_character_from_world();
         #[cfg(feature = "subsystem-scripting-csharp")]
@@ -162,6 +179,33 @@ impl GameLoop {
             self.resync_physics_from_world();
         }
         self.runtime.frame_timing_end_stage("terrain_stream");
+    }
+
+    /// Begin one predicted XR frame and acquire the native stereo targets.
+    /// Rendering hosts use [`engine_xr::XrFrameState`] to replace their two
+    /// camera views, render the returned images, then call
+    /// [`Self::submit_xr_frame`]. Ordinary desktop frames return `Ok(None)`.
+    #[cfg(feature = "subsystem-xr")]
+    pub fn begin_xr_frame(
+        &mut self,
+    ) -> Result<Option<Vec<engine_xr::XrSwapchainImage>>, engine_xr::XrError> {
+        self.xr.tick()
+    }
+
+    /// Release the acquired eye targets and submit their OpenXR projection
+    /// layer. A frame cannot be begun again until this succeeds or reports an
+    /// explicit lifecycle error.
+    #[cfg(feature = "subsystem-xr")]
+    pub fn submit_xr_frame(
+        &mut self,
+        images: &[engine_xr::XrSwapchainImage],
+    ) -> Result<(), engine_xr::XrError> {
+        self.xr.submit(images)
+    }
+
+    #[cfg(feature = "subsystem-xr")]
+    pub fn xr_actions(&self) -> &engine_xr::XrActionSnapshot {
+        self.xr.actions()
     }
 
     /// Snapshot used by the ENG-70 editor panel and headless diagnostics.

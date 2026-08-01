@@ -94,6 +94,14 @@ installed build path. It is not game-authored source.
     "title": "My Game",
     "width": 1280,
     "height": 720
+  },
+  "world_streaming": {
+    "enabled": true,
+    "enter_percent": 100,
+    "exit_percent": 115,
+    "max_merges_per_frame": 1,
+    "max_unloads_per_frame": 4,
+    "seamless_planetary": true
   }
 }
 ```
@@ -130,6 +138,18 @@ scene-based world streaming:
     "cell_town": {
       "scene": "town",
       "bounds": { "center": [128.0, 0.0, 0.0], "half_extents": [32.0, 8.0, 32.0] }
+    },
+    "planet_surface_north": {
+      "scene": "planet_surface_north",
+      "bounds": { "center": [0.0, 0.0, 0.0], "half_extents": [0.0, 0.0, 0.0] },
+      "planetary_bounds": {
+        "planet_center": [1000000000000.0, 0.0, 0.0],
+        "direction": [0.0, 1.0, 0.0],
+        "angular_radius": 0.35,
+        "min_altitude": -1000.0,
+        "max_altitude": 50000.0,
+        "planet_radius": 6000000.0
+      }
     }
   }
 }
@@ -140,7 +160,11 @@ scene IDs (1–128 ASCII letters, digits, hyphens, underscores, or dots, except
 `.` and `..`, case-insensitively unique). `scene` must reference an ID from the
 project scene catalog. `bounds` is an axis-aligned box: `center` and
 `half_extents` must be finite, and half extents must be non-negative. Cells
-**may overlap** — overlapping bounds are a legitimate way to layer content,
+may also define `planetary_bounds`; when present, runtime selection uses its
+f64 planet centre, unit surface direction, angular cap and altitude band in
+place of the AABB. This keeps cell identity stable at interplanetary coordinate
+scales.
+Cells **may overlap** — overlapping bounds are a legitimate way to layer content,
 such as a dense gameplay cell over a large background cell.
 
 `project check` validates the partition file when it is present (schema, cell
@@ -154,20 +178,25 @@ scene must not share entity IDs with it (a cell that intentionally reuses the
 startup scene's content must reference the startup scene itself — the driver
 then adopts the already-live entities instead of merging duplicates).
 
-### Runtime cell streaming (`--stream-cells`)
+### Runtime cell streaming
 
-Cell streaming is opt-in per run: `sandbox project run --stream-cells` (or
-`sandbox game --stream-cells`) activates it for both headless and windowed
-players, requiring a `world.partition.json` at the project root. Without the
-flag the runtime loads only the startup scene, exactly as before.
+Set `world_streaming.enabled` in `game.project.json` to activate additive cell
+streaming for ordinary headless and windowed players. A
+`world.partition.json` is then required. `--stream-cells` remains an explicit
+development override for legacy projects. `enter_percent`, `exit_percent`,
+`max_merges_per_frame`, and `max_unloads_per_frame` configure hysteresis and
+frame-boundary work budgets. With `seamless_planetary = true`, the host keeps
+orbit, atmosphere, and surface content in one additive world and disables the
+legacy altitude-triggered scene-replacement policy.
 
 Each frame, at the existing frame boundary (after `update()` and scene
 transition processing, before `render()`), the streaming driver resolves the
 active camera's world position and computes the desired cell set with
-hysteresis: an unloaded cell becomes desired when the camera enters
-`bounds * 1.0`, while an already loading or loaded cell stays desired until
-the camera leaves `bounds * 1.15`. The exit margin prevents boundary
-ping-ponging.
+hysteresis: an unloaded cell becomes desired at `enter_percent`, while an
+already loading or loaded cell stays desired until `exit_percent`. The exit
+margin prevents boundary ping-ponging. Selection consumes the camera's f64
+logical position; planetary cells test altitude and angular distance without
+round-tripping the planet centre through f32.
 
 Every cell moves through a small state machine: `Unloaded → LoadingAssets →
 Merging → Loaded`, and `Loaded → Unloading → Unloaded`. A cell's cooked asset
@@ -448,7 +477,16 @@ Namespace safety is enforced in both directions: cooked-batch validation rejects
 
 GPU frame safety: destruction unregisters the typed mesh immediately. At the next rendered frame (a frames-in-flight boundary), the canonical render-asset synchronizer observes the missing registry entry and removes the backend resource; Vulkan's `remove_resource` performs its own `wait_idle` before freeing buffers, so a mesh referenced by an in-flight frame is never freed mid-frame. Re-creating a mesh under the same name before synchronization leaves one live registry entry, and the next upload replaces the old buffers without a conflicting removal.
 
-Diagnostics: `runtime_mesh_memory()` (also surfaced as `RuntimeDiagnostics.runtime_meshes`) reports live mesh/vertex/index counts plus vertex and index payload bytes. Upload and removal both ride the standard per-frame registry sync (backends dedupe unchanged content by hash), and failed removals remain tracked for retry; there is no separate runtime-mesh GPU scheduler. Per-frame streaming cost stays governed by the cooked-asset stream budget above. C# script exposure of mesh creation is intentionally not part of this API; it arrives with the game-side binding work, and terrain (ENG-T0) is the first consumer.
+Diagnostics: `runtime_mesh_memory()` (also surfaced as `RuntimeDiagnostics.runtime_meshes`) reports live mesh/vertex/index counts plus vertex and index payload bytes. Upload and removal both ride the standard per-frame registry sync (backends dedupe unchanged content by hash), and failed removals remain tracked for retry; there is no separate runtime-mesh GPU scheduler. Per-frame streaming cost stays governed by the cooked-asset stream budget above.
+
+Managed gameplay code receives the same engine-owned registration path through
+`RuntimeAssets.RegisterMesh`, `RegisterMaterial`, and `RegisterPrefab`. Each
+call returns a `RuntimeAssetRequest`; `RuntimeAssets.TryGetResult` reports the
+validated native registration result on a later script tick. Payload size,
+finite-number, topology, index, identifier, and prefab-structure limits are
+validated before the engine mutates the live registry. Generated assets use
+stable runtime namespaces and can immediately be referenced by renderables or
+spawned prefabs; scripts do not upload Vulkan/DX12 resources directly.
 
 ## Runtime UI, animation, and navigation
 

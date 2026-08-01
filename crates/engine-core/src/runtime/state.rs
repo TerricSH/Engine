@@ -279,6 +279,8 @@ impl EngineRuntime {
             self.scripting.pending_save_requests.clear();
             self.scripting.save_events.clear();
             self.scripting.logic_asset_results.clear();
+            self.scripting.runtime_asset_results.clear();
+            self.scripting.pending_terrain_brushes.clear();
             self.attach_scene_scripts(&scene);
         }
 
@@ -332,6 +334,8 @@ impl EngineRuntime {
             self.scripting.pending_save_requests.clear();
             self.scripting.save_events.clear();
             self.scripting.logic_asset_results.clear();
+            self.scripting.runtime_asset_results.clear();
+            self.scripting.pending_terrain_brushes.clear();
             self.attach_scene_scripts(&scene);
         }
 
