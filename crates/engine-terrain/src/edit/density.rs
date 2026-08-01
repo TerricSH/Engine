@@ -10,6 +10,12 @@ use crate::{PlanetTerrainQuery, TerrainTopology, TerrainVolume};
 /// Maximum number of lattice samples a single untrusted brush may inspect.
 pub const MAX_TERRAIN_BRUSH_SAMPLES: u64 = 2_000_000;
 
+// `i64::MAX as f64` rounds to 2^63, so it is the exclusive upper bound,
+// not a representable i64 value. Spell out both lattice bounds to keep the
+// float-to-int cast exact and reject infinities/NaN through `Range::contains`.
+const I64_MIN_INCLUSIVE_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+const I64_MAX_EXCLUSIVE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+
 /// Exact unedited solid/empty field corresponding to a [`TerrainVolume`].
 /// Positive density is below the generated surface and negative density is
 /// outside it, for both planar and cube-sphere terrain.
@@ -345,7 +351,7 @@ impl EditableTerrain {
                             normalized * normalized * (3.0 - 2.0 * normalized)
                         }
                     };
-                    let current = self.sample_with(point, &base_density).0;
+                    let (current, current_material) = self.sample_with(point, &base_density);
                     let next = match brush.mode {
                         TerrainBrushMode::Add => current + brush.strength * weight,
                         TerrainBrushMode::Subtract => current - brush.strength * weight,
@@ -364,7 +370,6 @@ impl EditableTerrain {
                             current + (average - current) * brush.strength * weight
                         }
                     };
-                    let current_material = self.sample_with(point, &base_density).1;
                     let next_material = brush.material.unwrap_or(current_material);
                     if (next - current).abs() > f32::EPSILON || next_material != current_material {
                         changes.push((point, next, next_material));
@@ -416,7 +421,7 @@ impl EditableTerrain {
             .dirty_meshes
             .iter()
             .copied()
-            .take(limit.max(1))
+            .take(limit)
             .collect::<Vec<_>>();
         for key in &selected {
             self.dirty_meshes.remove(key);
@@ -496,7 +501,7 @@ impl EditableTerrain {
         let mut lattice = [0_i64; 3];
         for axis in 0..3 {
             let value = (point[axis] / self.config.voxel_size).floor();
-            if value < i64::MIN as f64 || value > i64::MAX as f64 {
+            if !(I64_MIN_INCLUSIVE_AS_F64..I64_MAX_EXCLUSIVE_AS_F64).contains(&value) {
                 return Err(TerrainEditError::CoordinateOverflow);
             }
             lattice[axis] = value as i64;
@@ -606,6 +611,7 @@ fn squared_distance(left: [f64; 3], right: [f64; 3]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn solid_below(point: [f64; 3]) -> f32 {
         (2.0 - point[1]) as f32
@@ -674,6 +680,67 @@ mod tests {
             Err(TerrainEditError::BrushBudgetExceeded { .. })
         ));
         assert_eq!(terrain.materialized_chunk_count(), 0);
+    }
+
+    #[test]
+    fn brush_reuses_the_center_density_and_material_sample() {
+        let mut terrain = EditableTerrain::new(DensityTerrainConfig {
+            chunk_cells: 2,
+            ..DensityTerrainConfig::default()
+        })
+        .unwrap();
+        let calls = AtomicUsize::new(0);
+        let delta = terrain
+            .apply_brush(
+                &TerrainBrush {
+                    center: [0.0; 3],
+                    radius: 0.25,
+                    strength: 1.0,
+                    falloff: TerrainBrushFalloff::Constant,
+                    mode: TerrainBrushMode::Add,
+                    material: Some(2),
+                },
+                |_| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    -1.0
+                },
+            )
+            .unwrap();
+
+        assert_eq!(delta.changed_samples, 1);
+        // One inspection plus the 2^3 samples used to materialise its owner.
+        assert_eq!(calls.load(Ordering::Relaxed), 9);
+    }
+
+    #[test]
+    fn zero_rebuild_budget_leaves_the_dirty_queue_untouched() {
+        let mut terrain = EditableTerrain::new(DensityTerrainConfig::default()).unwrap();
+        let key = DensityChunkKey::new(2, 3, 4);
+        terrain.request_mesh_rebuild(key);
+
+        assert!(terrain.take_dirty_mesh_chunks(0).is_empty());
+        assert_eq!(terrain.pending_mesh_rebuilds(), 1);
+        assert_eq!(terrain.take_dirty_mesh_chunks(1), vec![key]);
+    }
+
+    #[test]
+    fn world_to_lattice_uses_an_exclusive_positive_i64_bound() {
+        let terrain = EditableTerrain::new(DensityTerrainConfig::default()).unwrap();
+
+        assert_eq!(
+            terrain
+                .world_to_lattice([I64_MIN_INCLUSIVE_AS_F64, 0.0, 0.0])
+                .unwrap()[0],
+            i64::MIN
+        );
+        assert_eq!(
+            terrain.world_to_lattice([I64_MAX_EXCLUSIVE_AS_F64, 0.0, 0.0]),
+            Err(TerrainEditError::CoordinateOverflow)
+        );
+        assert_eq!(
+            terrain.world_to_lattice([f64::NAN, 0.0, 0.0]),
+            Err(TerrainEditError::CoordinateOverflow)
+        );
     }
 
     #[test]
