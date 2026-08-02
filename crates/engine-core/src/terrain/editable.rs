@@ -170,18 +170,34 @@ impl TerrainSystem {
             .edit_store_root
             .as_ref()
             .map(|root| TerrainEditStore::new(root.join(format!("{:016x}", volume_id.get()))));
-        let terrain = match store.as_ref().map(TerrainEditStore::load_latest) {
-            Some(Ok(Some(restored))) if restored.config() == &config => restored,
-            Some(Ok(Some(_))) => {
+        let loaded = store
+            .as_ref()
+            .map(TerrainEditStore::load_latest_report)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        if let Some(issue) = loaded
+            .as_ref()
+            .and_then(|report| report.skipped_revisions.first())
+        {
+            tracing::warn!(
+                terrain_volume = volume_id.get(),
+                skipped_revisions = loaded
+                    .as_ref()
+                    .map_or(0, |report| report.skipped_revisions.len()),
+                first_path = %issue.path.display(),
+                first_error = %issue.error,
+                "recovered editable terrain by ignoring corrupt revision files"
+            );
+        }
+        let terrain = match loaded.and_then(|report| report.terrain) {
+            Some(restored) if restored.config() == &config => restored,
+            Some(_) => {
                 return Err(
                     "persisted terrain edit voxel configuration no longer matches the volume"
                         .into(),
                 );
             }
-            Some(Err(error)) => return Err(error.to_string()),
-            Some(Ok(None)) | None => {
-                EditableTerrain::new(config).map_err(|error| error.to_string())?
-            }
+            None => EditableTerrain::new(config).map_err(|error| error.to_string())?,
         };
         let material = if volume.material_asset.is_empty() {
             "mat-default".to_string()

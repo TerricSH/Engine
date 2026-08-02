@@ -453,14 +453,24 @@ impl EditableTerrain {
         self.dirty_meshes.len()
     }
 
-    pub(crate) fn take_unsaved_chunks(&mut self) -> Vec<DensityChunkKey> {
-        std::mem::take(&mut self.unsaved_chunks)
-            .into_iter()
-            .collect()
+    /// Number of materialised chunks whose current revision has not yet been
+    /// acknowledged by a persistence backend.
+    pub fn pending_persistence(&self) -> usize {
+        self.unsaved_chunks.len()
     }
 
-    pub(crate) fn restore_unsaved(&mut self, keys: impl IntoIterator<Item = DensityChunkKey>) {
-        self.unsaved_chunks.extend(keys);
+    pub(crate) fn unsaved_chunk_keys(&self) -> Vec<DensityChunkKey> {
+        self.unsaved_chunks.iter().copied().collect()
+    }
+
+    pub(crate) fn acknowledge_saved_chunk(&mut self, key: DensityChunkKey, revision: u64) {
+        if self
+            .chunks
+            .get(&key)
+            .is_some_and(|chunk| chunk.revision == revision)
+        {
+            self.unsaved_chunks.remove(&key);
+        }
     }
 
     pub(crate) fn install_chunk(&mut self, chunk: DensityChunk) {

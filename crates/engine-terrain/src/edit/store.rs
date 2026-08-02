@@ -33,6 +33,23 @@ pub struct TerrainEditStore {
     root: PathBuf,
 }
 
+/// One revision file that was ignored while recovering the latest valid
+/// state. Filesystem access failures remain fatal; only corrupt payloads are
+/// skipped so permission and device errors cannot silently erase terrain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerrainEditLoadIssue {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+/// Result of tolerant terrain recovery, including every ignored corrupt
+/// revision for diagnostics and telemetry.
+#[derive(Clone, Debug)]
+pub struct TerrainEditLoadReport {
+    pub terrain: Option<EditableTerrain>,
+    pub skipped_revisions: Vec<TerrainEditLoadIssue>,
+}
+
 impl TerrainEditStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -42,34 +59,62 @@ impl TerrainEditStore {
         &self.root
     }
 
+    /// Persist every currently modified chunk.
+    ///
+    /// A chunk remains pending until its immutable revision file has been
+    /// flushed and atomically renamed. Successfully committed chunks are
+    /// acknowledged individually, so a later write error never drops them or
+    /// the unprocessed tail from retry state. This operation is not a
+    /// multi-chunk transaction: callers must invoke it before reporting an
+    /// edit as durable, because a process failure before a chunk is committed
+    /// cannot recover that in-memory change.
     pub fn save_modified(&self, terrain: &mut EditableTerrain) -> Result<usize, TerrainEditError> {
         fs::create_dir_all(&self.root).map_err(storage_error)?;
-        let keys = terrain.take_unsaved_chunks();
+        let keys = terrain.unsaved_chunk_keys();
         let mut saved = 0;
-        for (offset, key) in keys.iter().copied().enumerate() {
+        for key in keys {
             let Some(chunk) = terrain.chunks.get(&key) else {
-                continue;
+                return Err(TerrainEditError::Storage(format!(
+                    "pending density chunk {key:?} is missing"
+                )));
             };
-            if let Err(error) = self.write_chunk(terrain.config(), chunk) {
-                terrain.restore_unsaved(keys[offset..].iter().copied());
-                return Err(error);
-            }
+            let revision = chunk.revision;
+            self.write_chunk(terrain.config(), chunk)?;
+            terrain.acknowledge_saved_chunk(key, revision);
             saved += 1;
         }
         Ok(saved)
     }
 
     pub fn load_latest(&self) -> Result<Option<EditableTerrain>, TerrainEditError> {
+        Ok(self.load_latest_report()?.terrain)
+    }
+
+    /// Load the highest valid revision of every chunk. A damaged newest file
+    /// does not hide an older valid revision of the same chunk.
+    pub fn load_latest_report(&self) -> Result<TerrainEditLoadReport, TerrainEditError> {
         if !self.root.exists() {
-            return Ok(None);
+            return Ok(TerrainEditLoadReport {
+                terrain: None,
+                skipped_revisions: Vec::new(),
+            });
         }
         let mut latest = BTreeMap::<DensityChunkKey, StoredDensityChunk>::new();
+        let mut skipped_revisions = Vec::new();
         for entry in fs::read_dir(&self.root).map_err(storage_error)? {
             let entry = entry.map_err(storage_error)?;
             if entry.path().extension().and_then(|value| value.to_str()) != Some("ted") {
                 continue;
             }
-            let stored = read_chunk(&entry.path())?;
+            let path = entry.path();
+            let stored = match read_chunk(&path) {
+                Ok(stored) => stored,
+                Err(TerrainEditError::Corrupt(error)) => {
+                    skipped_revisions.push(TerrainEditLoadIssue { path, error });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let replace = latest
                 .get(&stored.chunk.key)
                 .is_none_or(|current| stored.chunk.revision > current.chunk.revision);
@@ -78,7 +123,10 @@ impl TerrainEditStore {
             }
         }
         let Some(config) = latest.values().next().map(|stored| stored.config.clone()) else {
-            return Ok(None);
+            return Ok(TerrainEditLoadReport {
+                terrain: None,
+                skipped_revisions,
+            });
         };
         let mut terrain = EditableTerrain::new(config.clone())?;
         for stored in latest.into_values() {
@@ -89,7 +137,10 @@ impl TerrainEditStore {
             }
             terrain.install_chunk(stored.chunk);
         }
-        Ok(Some(terrain))
+        Ok(TerrainEditLoadReport {
+            terrain: Some(terrain),
+            skipped_revisions,
+        })
     }
 
     fn write_chunk(
@@ -120,7 +171,14 @@ impl TerrainEditStore {
             chunk.key.x, chunk.key.y, chunk.key.z, chunk.revision
         ));
         if path.exists() {
-            return Ok(());
+            let existing = read_chunk(&path)?;
+            if existing.config == *config && existing.chunk == *chunk {
+                return Ok(());
+            }
+            return Err(TerrainEditError::Corrupt(format!(
+                "{} conflicts with the pending density chunk revision",
+                path.display()
+            )));
         }
         let temporary = path.with_extension("ted.tmp");
         let mut file = File::create(&temporary).map_err(storage_error)?;
@@ -187,6 +245,22 @@ mod tests {
     use super::*;
     use crate::{TerrainBrush, TerrainBrushFalloff, TerrainBrushMode};
 
+    fn edit_point(terrain: &mut EditableTerrain, center: [f64; 3]) {
+        terrain
+            .apply_brush(
+                &TerrainBrush {
+                    center,
+                    radius: 0.25,
+                    strength: 1.0,
+                    falloff: TerrainBrushFalloff::Constant,
+                    mode: TerrainBrushMode::Subtract,
+                    material: None,
+                },
+                |_| 1.0,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn latest_chunk_revisions_round_trip() {
         let root = std::env::temp_dir().join(format!(
@@ -215,6 +289,65 @@ mod tests {
         assert_eq!(restored.density_at_lattice([1, 1, 1]), -2.0);
         assert_eq!(restored.material_at_lattice([1, 1, 1]), 9);
         assert!(restored.pending_mesh_rebuilds() >= 27);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_newest_revision_falls_back_to_latest_valid_chunk() {
+        let root = std::env::temp_dir().join(format!(
+            "engine-terrain-edit-{}-{}",
+            std::process::id(),
+            fnv1a(b"corrupt_newest_revision_falls_back_to_latest_valid_chunk")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let store = TerrainEditStore::new(&root);
+        let mut terrain = EditableTerrain::new(DensityTerrainConfig {
+            chunk_cells: 4,
+            ..DensityTerrainConfig::default()
+        })
+        .unwrap();
+
+        edit_point(&mut terrain, [1.0; 3]);
+        assert_eq!(store.save_modified(&mut terrain).unwrap(), 1);
+        edit_point(&mut terrain, [1.0; 3]);
+        assert_eq!(store.save_modified(&mut terrain).unwrap(), 1);
+        fs::write(root.join("chunk_0_0_0_2.ted"), b"corrupt").unwrap();
+
+        let report = store.load_latest_report().unwrap();
+        assert_eq!(report.skipped_revisions.len(), 1);
+        let restored = report.terrain.unwrap();
+        assert_eq!(restored.density_at_lattice([1, 1, 1]), 0.0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_error_only_acknowledges_committed_chunk_revisions() {
+        let root = std::env::temp_dir().join(format!(
+            "engine-terrain-edit-{}-{}",
+            std::process::id(),
+            fnv1a(b"save_error_only_acknowledges_committed_chunk_revisions")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = TerrainEditStore::new(&root);
+        let mut terrain = EditableTerrain::new(DensityTerrainConfig {
+            chunk_cells: 2,
+            ..DensityTerrainConfig::default()
+        })
+        .unwrap();
+        edit_point(&mut terrain, [1.0; 3]);
+        edit_point(&mut terrain, [3.0, 1.0, 1.0]);
+        assert_eq!(terrain.pending_persistence(), 2);
+
+        let rejected = root.join("chunk_1_0_0_1.ted");
+        fs::write(&rejected, b"corrupt").unwrap();
+        assert!(store.save_modified(&mut terrain).is_err());
+        assert_eq!(terrain.pending_persistence(), 1);
+        assert!(root.join("chunk_0_0_0_1.ted").is_file());
+
+        fs::remove_file(rejected).unwrap();
+        assert_eq!(store.save_modified(&mut terrain).unwrap(), 1);
+        assert_eq!(terrain.pending_persistence(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 }
