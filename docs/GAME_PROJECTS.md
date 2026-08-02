@@ -170,13 +170,14 @@ such as a dense gameplay cell over a large background cell.
 `project check` validates the partition file when it is present (schema, cell
 IDs, scene references, and bounds) and reports the cell count as
 `partition_cells` in its JSON report. It also enforces the streaming
-compatibility rules the runtime driver relies on: cell scenes must not contain
-`engine.script` components (scripts in cells are not supported in this
-version; attach scripts in the startup scene instead), persistent entity IDs
-must be unique across cells, and a cell that does not reference the startup
-scene must not share entity IDs with it (a cell that intentionally reuses the
+compatibility rules the runtime driver relies on: persistent entity IDs must
+be unique across cells, and a cell that does not reference the startup scene
+must not share entity IDs with it (a cell that intentionally reuses the
 startup scene's content must reference the startup scene itself — the driver
 then adopts the already-live entities instead of merging duplicates).
+`engine.script` metadata is supported in cells: managed instances attach after
+the ECS merge and receive `OnDestroy` before non-resident cell entities unload.
+Scripts on entities promoted to the resident set remain attached.
 
 ### Runtime cell streaming
 
@@ -188,6 +189,12 @@ development override for legacy projects. `enter_percent`, `exit_percent`,
 frame-boundary work budgets. With `seamless_planetary = true`, the host keeps
 orbit, atmosphere, and surface content in one additive world and disables the
 legacy altitude-triggered scene-replacement policy.
+
+The `project check` report includes a structured `world_streaming` object with
+the project switch, seamless mode, partition-manifest presence, cell count,
+hysteresis percentages, and frame budgets. Enabling streaming without a
+partition manifest is a validation error instead of being reported as the
+ambiguous legacy value `partition_cells: 0`.
 
 Each frame, at the existing frame boundary (after `update()` and scene
 transition processing, before `render()`), the streaming driver resolves the
@@ -298,8 +305,9 @@ strict ECS restoration, and declared asset dependencies; it also validates the
 project input map, source manifests, duplicate IDs, and source files, plus the
 optional `world.partition.json` when present. Its JSON
 report also records validated cooked render/extension counts. Its other fields
-include `startup_scene_id`, the scene count, an entity count per scene, and
-`partition_cells`.
+include `startup_scene_id`, the scene count, an entity count per scene, the
+legacy top-level `partition_cells`, and a structured `world_streaming` status
+that distinguishes a disabled feature from a missing or empty partition.
 `game --headless` runs the normal GameLoop update/render path and fails
 if the active scene produces no visible draw calls.
 

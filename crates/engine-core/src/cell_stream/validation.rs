@@ -11,7 +11,6 @@ use super::CellStreamError;
 /// [`crate::cell_stream::CellStreamingDriver::new`]:
 ///
 /// - every cell's scene must be present in `scenes` (keyed by scene ID),
-/// - cell scenes must not contain `engine.script` components,
 /// - persistent entity IDs must be unique **across** cells (a load-time
 ///   merge would fail otherwise), and
 /// - a cell that does not reference the startup scene must not share
@@ -33,12 +32,6 @@ pub fn validate_partition_cell_scenes(
             });
         };
         for entity in &scene.entities {
-            if entity.components.contains_key("engine.script") {
-                return Err(CellStreamError::ScriptComponentInCell {
-                    cell_id: cell_id.clone(),
-                    entity_id: entity.persistent_id.clone(),
-                });
-            }
             let persistent_id = entity.persistent_id.as_str();
             if let Some(first_cell) = owner_of.insert(persistent_id, cell_id) {
                 if first_cell != cell_id {

@@ -351,6 +351,10 @@ impl EngineRuntime {
     }
 
     /// Iterate scene entities and attach any `"engine.script"` components.
+    ///
+    /// Whole-scene loading and additive partition-cell loading share this
+    /// path. Callers must first materialise all owning entities in the active
+    /// World so OnCreate receives a complete gameplay context.
     #[cfg(feature = "subsystem-scripting-csharp")]
     pub(crate) fn attach_scene_scripts(&mut self, scene: &Scene) {
         let scripts = collect_scene_scripts(scene);
@@ -404,5 +408,27 @@ impl EngineRuntime {
         // OnUpdate snapshot instead of waiting for a full extra frame.
         command_diags.extend(self.execute_script_component_queries());
         self.collector.push_script_diags(command_diags);
+    }
+
+    /// Run `OnDestroy` and detach scripts owned by streamed entities while
+    /// their ECS records are still live. Resident entity IDs must be filtered
+    /// by the cell driver before calling this method.
+    #[cfg(feature = "subsystem-scripting-csharp")]
+    pub(crate) fn destroy_streamed_script_instances(
+        &mut self,
+        entity_ids: &[engine_serialize::PersistentId],
+    ) {
+        let mut diagnostics = Vec::new();
+        // Children conventionally appear after parents in authored scenes.
+        // Destroy in reverse order so dependent child behaviours tear down
+        // before their owning hierarchy roots.
+        for entity_id in entity_ids.iter().rev() {
+            diagnostics.extend(
+                self.scripting
+                    .engine
+                    .destroy_entity_instances(entity_id.as_str()),
+            );
+        }
+        self.collector.push_script_diags(diagnostics);
     }
 }

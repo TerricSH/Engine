@@ -34,13 +34,12 @@
 //!   its cell hierarchy instead of destroyed.
 //! - Everything else authored in a cell scene unloads with its cell.
 //!
-//! Scripts in cells are **forbidden** in this version: cell scenes must not
-//! contain `engine.script` components. The rule is enforced by
-//! [`validate_partition_cell_scenes`] — called from both this driver and
-//! `sandbox project check` — because the per-entity attach/teardown script
-//! lifecycle is tied to whole-scene loads. The driver still strips
-//! scene-only component records defensively before merging, mirroring
-//! [`crate::EngineRuntime::load_scene`].
+//! Script metadata in cells participates in the same lifecycle as scripts in
+//! a whole-scene load. `engine.script` remains scene-only metadata: the driver
+//! strips it from the ECS merge, attaches its managed instance after the
+//! entity hierarchy is live, and calls `OnDestroy` before unloading every
+//! non-resident entity. Scripts on entities promoted to the resident set stay
+//! attached across cell unload/reload cycles.
 //!
 //! Physics is *not* touched by the driver itself; after a tick that reports
 //! [`CellStreamTickReport::world_changed`] the host calls

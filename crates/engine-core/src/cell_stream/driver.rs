@@ -542,6 +542,16 @@ impl CellStreamingDriver {
             (record.root_ids.clone(), record.merged_ids.clone())
         };
 
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        {
+            let unloading_ids = merged_ids
+                .iter()
+                .filter(|id| !self.resident.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            runtime.destroy_streamed_script_instances(&unloading_ids);
+        }
+
         runtime.with_world_mut(|world| {
             for id in &merged_ids {
                 if !self.resident.contains(id) {
@@ -606,18 +616,22 @@ impl CellStreamingDriver {
         scene
             .entities
             .retain(|entity| !self.resident.contains(&entity.persistent_id));
-        for entity in &mut scene.entities {
-            // Defensive: validation forbids engine.script in cell scenes,
-            // but scene-only records are never mergeable regardless.
+        // Scene-only metadata must survive until after the entity hierarchy
+        // has merged so the script runtime can attach instances with valid
+        // gameplay contexts. The ECS receives a stripped clone.
+        let mut world_scene = scene.clone();
+        for entity in &mut world_scene.entities {
             entity
                 .components
                 .retain(|type_id, _| !SCENE_ONLY_COMPONENT_TYPES.contains(&type_id.as_str()));
         }
 
-        let merged = runtime.with_world_mut(|world| world.merge_scene(&scene));
+        let merged = runtime.with_world_mut(|world| world.merge_scene(&world_scene));
         match merged {
             Some(Ok(_)) => {
-                Self::rebase_merged_roots(runtime, &scene);
+                Self::rebase_merged_roots(runtime, &world_scene);
+                #[cfg(feature = "subsystem-scripting-csharp")]
+                runtime.attach_scene_scripts(&scene);
                 let record = self.cells.get_mut(cell_id).expect("cell exists");
                 record.merged_ids = scene
                     .entities

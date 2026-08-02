@@ -101,7 +101,9 @@ pub enum CellStreamError {
         scene_id: String,
         messages: Vec<String>,
     },
-    /// A cell scene contains an `engine.script` component (forbidden in v1).
+    /// Legacy compatibility variant retained for downstream exhaustive
+    /// matches. Current validation accepts scripts in partition cells and no
+    /// longer emits this error.
     ScriptComponentInCell { cell_id: String, entity_id: String },
     /// Two cells contain the same persistent entity ID.
     DuplicatePersistentIdAcrossCells {
@@ -147,7 +149,7 @@ impl std::fmt::Display for CellStreamError {
             ),
             Self::ScriptComponentInCell { cell_id, entity_id } => write!(
                 f,
-                "world partition cell \"{cell_id}\" entity \"{entity_id}\" has an engine.script component; scripts in partition cells are not supported (attach scripts in the startup scene instead)"
+                "legacy world partition validation rejected engine.script on cell \"{cell_id}\" entity \"{entity_id}\"; current runtimes support streamed script lifecycle"
             ),
             Self::DuplicatePersistentIdAcrossCells {
                 first_cell,

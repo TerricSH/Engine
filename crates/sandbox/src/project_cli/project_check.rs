@@ -52,11 +52,17 @@ pub(crate) fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(
 
     // The optional world partition manifest is validated against the scene
     // catalog when present, including the streaming compatibility rules the
-    // runtime driver enforces (no scripts in cells, persistent entity IDs
-    // unique across cells, no ID overlap with the startup scene unless the
-    // cell references the startup scene itself).
+    // runtime driver enforces (persistent entity IDs unique across cells and
+    // no ID overlap with the startup scene unless the cell references the
+    // startup scene itself). Script metadata is valid in additive cells and
+    // participates in the runtime attach/teardown lifecycle.
     let partition = engine_asset::partition::WorldPartition::load_for_project(&project)
         .map_err(|error| format!("world partition validation failed: {error}"))?;
+    if project.manifest.world_streaming.enabled && partition.is_none() {
+        return Err(
+            "world_streaming.enabled requires world.partition.json at the project root".into(),
+        );
+    }
     if let Some(partition) = &partition {
         let scene_refs = loaded_scenes
             .iter()
@@ -69,9 +75,12 @@ pub(crate) fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(
         )
         .map_err(|error| format!("world partition validation failed: {error}"))?;
     }
+    let partition_manifest_present = partition.is_some();
     let partition_cells = partition
+        .as_ref()
         .map(|partition| partition.cells.len())
         .unwrap_or(0);
+    let streaming = &project.manifest.world_streaming;
 
     for (scene_id, _, scene) in &loaded_scenes {
         let inspection = crate::project_scripts::inspect_project_scripts(&project, scene)
@@ -190,6 +199,16 @@ pub(crate) fn check_project(path: &Path, report_path: Option<&Path>) -> Result<(
         "scene_entities": scene_entities,
         "entities": total_entities,
         "partition_cells": partition_cells,
+        "world_streaming": {
+            "enabled": streaming.enabled,
+            "seamless_planetary": streaming.seamless_planetary,
+            "partition_manifest_present": partition_manifest_present,
+            "partition_cells": partition_cells,
+            "enter_percent": streaming.enter_percent,
+            "exit_percent": streaming.exit_percent,
+            "max_merges_per_frame": streaming.max_merges_per_frame,
+            "max_unloads_per_frame": streaming.max_unloads_per_frame
+        },
         "source_manifests": manifest_paths.len(),
         "declared_assets": declared_asset_count,
         "prefabs": prefab_count,

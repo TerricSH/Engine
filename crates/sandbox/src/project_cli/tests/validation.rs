@@ -40,6 +40,19 @@ fn write_world_partition(root: &Path, cells_json: &str) {
     .unwrap();
 }
 
+fn configure_world_streaming(root: &Path, seamless_planetary: bool) {
+    let manifest_path = root.join(engine_asset::project::GAME_PROJECT_FILE_NAME);
+    let mut manifest: engine_asset::project::ProjectManifest = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).expect("read project manifest"),
+    )
+    .expect("parse project manifest");
+    manifest.world_streaming.enabled = true;
+    manifest.world_streaming.seamless_planetary = seamless_planetary;
+    manifest
+        .write_to_root(root)
+        .expect("write streaming project manifest");
+}
+
 #[test]
 fn check_project_validates_world_partition_and_reports_cell_count() {
     let temp = tempfile::tempdir().unwrap();
@@ -71,6 +84,12 @@ fn check_project_validates_world_partition_and_reports_cell_count() {
         serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
     assert_eq!(report["passed"], true);
     assert_eq!(report["partition_cells"], 2);
+    assert_eq!(report["world_streaming"]["enabled"], false);
+    assert_eq!(
+        report["world_streaming"]["partition_manifest_present"],
+        true
+    );
+    assert_eq!(report["world_streaming"]["partition_cells"], 2);
 }
 
 #[test]
@@ -94,10 +113,10 @@ fn check_project_rejects_partition_cells_sharing_entity_ids() {
 }
 
 #[test]
-fn check_project_rejects_script_components_in_partition_cells() {
+fn check_project_accepts_script_components_in_partition_cells() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("partition-script-cell");
-    create_project(&root, Some("Partition Script Cell"), false).unwrap();
+    create_project(&root, Some("Partition Script Cell"), true).unwrap();
     let level_path = create_project_scene(&root, "level_two", None).unwrap();
     let mut level_two = Scene::load_from_file(&level_path).unwrap();
     for entity in &mut level_two.entities {
@@ -117,10 +136,16 @@ fn check_project_rejects_script_components_in_partition_cells() {
             engine_scene::ComponentRecord {
                 schema_version: engine_serialize::SchemaVersion::new(0, 1, 0),
                 enabled: true,
-                fields: BTreeMap::from([(
-                    "script".to_string(),
-                    engine_serialize::Value::Str("Game.Enemy".to_string()),
-                )]),
+                fields: BTreeMap::from([
+                    (
+                        "assembly_id".to_string(),
+                        engine_serialize::Value::Str("GameScripts".to_string()),
+                    ),
+                    (
+                        "class_name".to_string(),
+                        engine_serialize::Value::Str("Game.Enemy".to_string()),
+                    ),
+                ]),
             },
         )]),
     });
@@ -130,11 +155,7 @@ fn check_project_rejects_script_components_in_partition_cells() {
             "\"cell_two\": { \"scene\": \"level_two\", \"bounds\": { \"center\": [128.0, 0.0, 0.0], \"half_extents\": [32.0, 8.0, 32.0] } }",
         );
 
-    let error = check_project(&root, None).unwrap_err();
-    assert!(
-        error.contains("scripts in partition cells are not supported"),
-        "{error}"
-    );
+    check_project(&root, None).expect("scripted partition cells are supported");
 }
 
 #[test]
@@ -150,6 +171,49 @@ fn check_project_reports_zero_partition_cells_without_manifest() {
         serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
     assert_eq!(report["passed"], true);
     assert_eq!(report["partition_cells"], 0);
+    assert_eq!(report["world_streaming"]["enabled"], false);
+    assert_eq!(
+        report["world_streaming"]["partition_manifest_present"],
+        false
+    );
+}
+
+#[test]
+fn check_project_rejects_enabled_streaming_without_partition_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("streaming-without-partition");
+    create_project(&root, Some("Missing Partition"), false).unwrap();
+    configure_world_streaming(&root, true);
+
+    let error = check_project(&root, None).unwrap_err();
+    assert!(
+        error.contains("world_streaming.enabled requires world.partition.json"),
+        "{error}"
+    );
+}
+
+#[test]
+fn check_project_reports_project_owned_seamless_streaming_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("seamless-streaming-report");
+    create_project(&root, Some("Seamless Streaming"), false).unwrap();
+    write_world_partition(
+        &root,
+        "\"cell_main\": { \"scene\": \"main\", \"bounds\": { \"center\": [0.0, 0.0, 0.0], \"half_extents\": [64.0, 16.0, 64.0] } }",
+    );
+    configure_world_streaming(&root, true);
+
+    let report_path = root.join("build/check.json");
+    check_project(&root, Some(&report_path)).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(report["world_streaming"]["enabled"], true);
+    assert_eq!(report["world_streaming"]["seamless_planetary"], true);
+    assert_eq!(
+        report["world_streaming"]["partition_manifest_present"],
+        true
+    );
+    assert_eq!(report["world_streaming"]["partition_cells"], 1);
 }
 
 #[test]

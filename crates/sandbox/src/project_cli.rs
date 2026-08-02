@@ -24,8 +24,9 @@ pub struct ProjectRunRequest {
     /// Internal hand-off from the editor after its build task has already
     /// compiled the managed project. Normal CLI runs keep this false.
     pub scripts_already_built: bool,
-    /// Opt in to world-partition cell streaming (`--stream-cells`). Requires a
-    /// `world.partition.json` at the project root.
+    /// Legacy CLI override for world-partition cell streaming
+    /// (`--stream-cells`). Projects normally enable it in `world_streaming`;
+    /// either path requires `world.partition.json` at the project root.
     pub stream_cells: bool,
 }
 
