@@ -323,7 +323,7 @@ internal sealed partial class GameplayCommandState
 {
     [JsonPropertyName("request_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public uint? RuntimeRequestId { get; init; }
+    public uint? RequestId { get; init; }
     [JsonPropertyName("mesh")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public RuntimeMeshState? RuntimeMesh { get; init; }
@@ -344,7 +344,7 @@ internal sealed partial class GameplayCommandState
         uint requestId, string assetId, RuntimeMeshState mesh) => new()
     {
         Type = "register_runtime_mesh",
-        RuntimeRequestId = requestId,
+        RequestId = requestId,
         AssetId = assetId,
         RuntimeMesh = mesh
     };
@@ -353,7 +353,7 @@ internal sealed partial class GameplayCommandState
         uint requestId, string assetId, RuntimeMaterialState material) => new()
     {
         Type = "register_runtime_material",
-        RuntimeRequestId = requestId,
+        RequestId = requestId,
         AssetId = assetId,
         RuntimeMaterial = material
     };
@@ -362,7 +362,7 @@ internal sealed partial class GameplayCommandState
         uint requestId, string assetId, RuntimePrefabState prefab) => new()
     {
         Type = "register_runtime_prefab",
-        RuntimeRequestId = requestId,
+        RequestId = requestId,
         AssetId = assetId,
         RuntimePrefab = prefab
     };
@@ -371,7 +371,7 @@ internal sealed partial class GameplayCommandState
         uint requestId, string terrainEntityId, TerrainBrushState brush) => new()
     {
         Type = "terrain_apply_brush",
-        RuntimeRequestId = requestId,
+        RequestId = requestId,
         TerrainEntityId = terrainEntityId,
         TerrainBrush = brush
     };

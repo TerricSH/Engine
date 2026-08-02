@@ -8,11 +8,15 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
     private ComponentQuery _audioQuery;
     private ComponentQuery _lightQuery;
     private ComponentQuery _cameraQuery;
+    private ComponentQuery _renderableQuery;
     private ComponentQuery _missingQuery;
     private ComponentQuery _gravityQuery;
     private ComponentQuery _updatedAudioQuery;
     private ComponentQuery _updatedLightQuery;
     private ComponentQuery _updatedGravityQuery;
+    private ComponentQuery _updatedCameraQuery;
+    private ComponentQuery _updatedRenderableQuery;
+    private NetworkRequest _networkRequest;
     public int UpdateCount = 0;
 
     public void OnCreate()
@@ -35,8 +39,10 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
             _audioQuery = cube.QueryComponent("engine.audio_source");
             _lightQuery = Components.Query("light-directional", "engine.light");
             _cameraQuery = Components.Query("camera-main", "engine.camera");
+            _renderableQuery = cube.QueryComponent("engine.renderable");
             _missingQuery = Components.Query("cube-01", "engine.light");
             _gravityQuery = Components.Query("planet-01", "engine.gravity_source");
+            _networkRequest = Network.Host(0xC0FFEEUL);
             return;
         }
         if (UpdateCount == 2)
@@ -66,6 +72,9 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
                 throw new InvalidOperationException("unexpected camera near plane");
             if (camera.GetEnum("projection") != "Perspective")
                 throw new InvalidOperationException("unexpected camera projection");
+            if (!Components.TryGet(_renderableQuery, out var renderable) ||
+                renderable.GetAsset("mesh") != "mesh-cube")
+                throw new InvalidOperationException("renderable snapshot missing or invalid");
             var clearColor = camera.GetColor("clear_color");
             if (Math.Abs(clearColor.B - 0.06f) > 1e-3f || Math.Abs(clearColor.A - 1.0f) > 1e-6f)
                 throw new InvalidOperationException("unexpected camera clear color");
@@ -86,6 +95,15 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
                 throw new InvalidOperationException("unexpected gravity falloff");
             if (Math.Abs(gravity.GetFloat("max_radius") - 500.0f) > 1e-3f)
                 throw new InvalidOperationException("unexpected gravity max radius");
+            if (!Network.TryGetResult(_networkRequest, out var networkResult))
+                throw new InvalidOperationException("network command result missing");
+            if (networkResult.Success && !Network.Active)
+                throw new InvalidOperationException("network host succeeded without an active session");
+            if (!networkResult.Success &&
+                !(networkResult.Error?.Contains("subsystem-network", StringComparison.Ordinal) ?? false))
+                throw new InvalidOperationException("network bridge failed without a feature diagnostic");
+            if (XR.Active && XR.Frame is null)
+                throw new InvalidOperationException("active XR bridge did not publish a stereo frame");
 
             // Merge writes: only the provided fields change on the target.
             var cube = Scene.GetEntity("cube-01");
@@ -95,9 +113,20 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
                 .SetComponentField("engine.light", "intensity", 9.0f);
             Scene.GetEntity("planet-01")
                 .SetComponentField("engine.gravity_source", "strength", 12.5f);
+            Scene.GetEntity("camera-main")
+                .SetComponentField("engine.camera", "msaa_samples", ComponentValue.FromUInt(1));
+            RuntimeAssets.RegisterMaterial("material.live-paint", new RuntimeMaterialData
+            {
+                BaseColor = [0.1f, 0.7f, 0.9f, 1.0f],
+                Metallic = 0.4f,
+                Roughness = 0.25f
+            });
+            cube.SetComponentField("engine.renderable", "material", ComponentValue.FromAsset("material.live-paint"));
             _updatedAudioQuery = Components.Query("cube-01", "engine.audio_source");
             _updatedLightQuery = Components.Query("light-directional", "engine.light");
             _updatedGravityQuery = Components.Query("planet-01", "engine.gravity_source");
+            _updatedCameraQuery = Components.Query("camera-main", "engine.camera");
+            _updatedRenderableQuery = Components.Query("cube-01", "engine.renderable");
             return;
         }
         if (UpdateCount >= 3)
@@ -125,6 +154,13 @@ public sealed class ComponentProbeBehaviour : EngineBehaviour
             // Fields the write did not mention survive the merge.
             if (Math.Abs(gravity.GetFloat("max_radius") - 500.0f) > 1e-3f)
                 throw new InvalidOperationException("gravity write dropped unwritten fields");
+            if (!Components.TryGet(_updatedCameraQuery, out var camera) ||
+                camera.GetUInt("msaa_samples") != 1UL)
+                throw new InvalidOperationException("uint component wire value did not round-trip");
+            if (!Components.TryGet(_updatedRenderableQuery, out var renderable) ||
+                renderable.GetAsset("material") != "material.live-paint" ||
+                renderable.GetAsset("mesh") != "mesh-cube")
+                throw new InvalidOperationException("live renderable material write did not preserve mesh");
         }
     }
 }

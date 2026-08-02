@@ -259,7 +259,19 @@ impl ComponentRegistry {
 
         core_ext!(Name, "Name", true, ScriptAccess::None);
         core_ext!(Transform, "Transform", true, ScriptAccess::DedicatedApi);
-        core_ext!(Renderable, "Renderable", true, ScriptAccess::None);
+        core_ext!(
+            Renderable,
+            "Renderable",
+            true,
+            ScriptAccess::ReadWrite,
+            crate::components::serialize_renderable,
+            crate::components::deserialize_renderable
+        );
+        self.register_fields_validator(
+            Renderable::TYPE_ID,
+            crate::components::validate_renderable_fields,
+        )
+        .ok();
         core_ext!(
             Camera,
             "Camera",

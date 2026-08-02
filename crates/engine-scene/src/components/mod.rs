@@ -34,7 +34,10 @@ pub use lod_group::{
     serialize_lod_group_fields, validate_lod_group_fields, LodGroup, LodLevel,
 };
 pub use name::Name;
-pub use renderable::Renderable;
+pub use renderable::{
+    deserialize_renderable, deserialize_renderable_fields, serialize_renderable,
+    serialize_renderable_fields, validate_renderable_fields, Renderable,
+};
 pub use transform::Transform;
 pub use triplanar_material_mapping::TriplanarMaterialMapping;
 pub use vertex_geomorph::VertexGeomorph;

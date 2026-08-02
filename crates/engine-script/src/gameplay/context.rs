@@ -12,6 +12,7 @@ use super::snapshots::{
 };
 use super::ui::GameplayUiEvent;
 use super::GameplayRuntimeAssetResult;
+use super::{GameplayNetworkSnapshot, GameplayXrSnapshot};
 
 fn default_gameplay_script_api_schema() -> String {
     GAMEPLAY_SCRIPT_API_SCHEMA.to_owned()
@@ -85,6 +86,14 @@ pub struct GameplayContext {
     /// compatible with the current script hosts.
     #[serde(default)]
     pub component_query_results: Vec<GameplayComponentQueryResult>,
+    /// Engine-owned multiplayer/session snapshot and one-shot operation/RPC
+    /// results. The default keeps desktop/offline and older hosts compatible.
+    #[serde(default)]
+    pub network: GameplayNetworkSnapshot,
+    /// Latest predicted stereo/tracking/action state. Rendering owns XR frame
+    /// acquisition/submission; gameplay receives a read-only snapshot.
+    #[serde(default)]
+    pub xr: GameplayXrSnapshot,
     /// Runtime UI clicks delivered during this frame.
     ///
     /// `default` keeps contexts produced before gameplay UI events were added

@@ -49,6 +49,7 @@ pub struct XrSystem {
     runtime: Option<Box<dyn XrRuntime>>,
     compositor: Option<Box<dyn XrCompositor>>,
     current_frame: Option<XrFrameState>,
+    last_frame: Option<XrFrameState>,
     actions: XrActionSnapshot,
 }
 
@@ -57,6 +58,7 @@ impl XrSystem {
         self.runtime = Some(runtime);
         self.compositor = Some(compositor);
         self.current_frame = None;
+        self.last_frame = None;
     }
 
     pub fn is_active(&self) -> bool {
@@ -69,6 +71,13 @@ impl XrSystem {
 
     pub fn frame(&self) -> Option<&XrFrameState> {
         self.current_frame.as_ref()
+    }
+
+    /// Most recently predicted frame, retained after compositor submission so
+    /// the simulation/script phase can consume tracking without owning XR
+    /// swapchain lifetime.
+    pub fn latest_frame(&self) -> Option<&XrFrameState> {
+        self.current_frame.as_ref().or(self.last_frame.as_ref())
     }
 
     pub fn tick(&mut self) -> Result<Option<Vec<XrSwapchainImage>>, XrError> {
@@ -109,6 +118,7 @@ impl XrSystem {
         } else {
             Vec::new()
         };
+        self.last_frame = Some(frame.clone());
         self.current_frame = Some(frame);
         Ok(Some(images))
     }
@@ -267,5 +277,34 @@ mod tests {
             XrSystem::default().submit(&[]),
             Err(XrError::FrameLifecycle("submit called without tick"))
         ));
+    }
+
+    #[test]
+    fn latest_predicted_frame_survives_compositor_submission() {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let mut system = XrSystem::default();
+        system.install(
+            Box::new(FakeRuntime {
+                trace: Arc::clone(&trace),
+            }),
+            Box::new(FakeCompositor { trace }),
+        );
+        let images = system.tick().unwrap().unwrap();
+        assert_eq!(
+            system
+                .latest_frame()
+                .unwrap()
+                .predicted_display_time_nanoseconds,
+            42
+        );
+        system.submit(&images).unwrap();
+        assert!(system.frame().is_none());
+        assert_eq!(
+            system
+                .latest_frame()
+                .unwrap()
+                .predicted_display_time_nanoseconds,
+            42
+        );
     }
 }

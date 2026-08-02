@@ -25,6 +25,8 @@ mod character;
 mod frame;
 #[cfg(feature = "subsystem-navigation")]
 mod navigation;
+#[cfg(feature = "subsystem-scripting-csharp")]
+mod online;
 mod physics;
 #[cfg(all(feature = "subsystem-navigation", feature = "subsystem-terrain"))]
 mod planet_navigation;

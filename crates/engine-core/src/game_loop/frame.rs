@@ -29,10 +29,24 @@ impl GameLoop {
             if let Err(error) = self.network.flush_replication(256) {
                 tracing::warn!(%error, "network replication flush failed");
             }
-            for (_, result) in self.network.rpc.dispatch(256) {
+        }
+        #[cfg(all(feature = "subsystem-network", feature = "subsystem-scripting-csharp"))]
+        let script_rpc_events = {
+            let (results, unhandled) = self.network.rpc.dispatch_registered(256);
+            for (_, result) in results {
                 if let Err(error) = result {
                     tracing::warn!(%error, "network RPC handler failed");
                 }
+            }
+            unhandled
+        };
+        #[cfg(all(
+            feature = "subsystem-network",
+            not(feature = "subsystem-scripting-csharp")
+        ))]
+        for (_, result) in self.network.rpc.dispatch(256) {
+            if let Err(error) = result {
+                tracing::warn!(%error, "network RPC handler failed");
             }
         }
         #[cfg(feature = "subsystem-terrain")]
@@ -91,6 +105,15 @@ impl GameLoop {
 
         #[cfg(feature = "subsystem-scripting-csharp")]
         self.refresh_script_view_context();
+        #[cfg(all(feature = "subsystem-scripting-csharp", feature = "subsystem-network"))]
+        self.refresh_script_network_context(script_rpc_events);
+        #[cfg(all(
+            feature = "subsystem-scripting-csharp",
+            not(feature = "subsystem-network")
+        ))]
+        self.refresh_script_network_context();
+        #[cfg(feature = "subsystem-scripting-csharp")]
+        self.refresh_script_xr_context();
 
         // Build each optional input independently so scripting no longer
         // drags the gameplay, physics, animation, or UI subsystems with it.
@@ -123,6 +146,7 @@ impl GameLoop {
                     &script_ui_events,
                     &physics_query_results,
                 );
+            self.process_script_network_commands();
 
             #[cfg(feature = "subsystem-gameplay")]
             {

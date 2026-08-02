@@ -41,6 +41,9 @@ pub const MAX_PENDING_COMPONENT_QUERIES: usize = 256;
 pub enum GameplayComponentValue {
     Bool(bool),
     Int(i64),
+    /// Unsigned integer. `uint` is the canonical managed/wire spelling;
+    /// `u_int` remains accepted for contexts emitted by older Rust builds.
+    #[serde(rename = "uint", alias = "u_int")]
     UInt(u64),
     Float(f32),
     Str(String),

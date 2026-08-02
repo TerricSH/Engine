@@ -30,3 +30,17 @@ and compositor remain injectable behind traits, so headless tests use a
 deterministic fake. Calling `submit` without an active frame, re-acquiring an
 unsubmitted image, submitting the wrong native target, or crossing predicted
 frame identities is rejected instead of silently desynchronising OpenXR.
+
+The versioned C# gameplay SDK publishes this state through
+`EngineBehaviour.XR`. `XR.Frame` contains both asymmetric eye views plus
+predicted head and left/right-hand poses, while `TryGetBoolean`,
+`TryGetFloat`, `TryGetVector2`, and `TryGetPose` expose the native action
+snapshot without asking project scripts to perform projection or tracking
+math. The most recently predicted frame is retained after compositor
+submission so the following simulation update can consume it safely.
+
+`sandbox/target-desktop` includes the portable `subsystem-xr` bridge but does
+not load an OpenXR loader merely because a desktop game starts. A Vulkan/OpenXR
+render host opts into `engine-xr/openxr-runtime`, installs the paired native
+runtime/compositor in `GameLoop::xr`, drives `begin_xr_frame`/stereo rendering/
+`submit_xr_frame`, and the ordinary project-script context then becomes active.

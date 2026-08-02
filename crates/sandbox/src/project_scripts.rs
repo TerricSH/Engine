@@ -40,9 +40,9 @@ const SCRIPT_SDK_PROJECT: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
     <Nullable>enable</Nullable>
     <AssemblyName>EngineGameplay</AssemblyName>
     <RootNamespace>Engine</RootNamespace>
-    <Version>0.16.0</Version>
-    <AssemblyVersion>0.16.0.0</AssemblyVersion>
-    <FileVersion>0.16.0.0</FileVersion>
+    <Version>0.17.0</Version>
+    <AssemblyVersion>0.17.0.0</AssemblyVersion>
+    <FileVersion>0.17.0.0</FileVersion>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
@@ -59,6 +59,7 @@ const SCRIPT_SDK_TARGETS: &str = r#"<Project>
     <Compile Remove="EngineJrpg.cs" />
     <Compile Remove="EngineRendering.cs" />
     <Compile Remove="EngineRuntimeAssets.cs" />
+    <Compile Remove="EngineOnlineXr.cs" />
     <Reference Include="EngineGameplay">
       <HintPath>$(EngineGameplaySdkPath)</HintPath>
       <Private>true</Private>
@@ -95,6 +96,8 @@ const RENDERING_SCRIPT_API_SOURCE: &str =
     include_str!("../../../scripts/csharp/EngineGameplay/EngineRendering.cs");
 const RUNTIME_ASSETS_SCRIPT_API_SOURCE: &str =
     include_str!("../../../scripts/csharp/EngineGameplay/EngineRuntimeAssets.cs");
+const ONLINE_XR_SCRIPT_API_SOURCE: &str =
+    include_str!("../../../scripts/csharp/EngineGameplay/EngineOnlineXr.cs");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScriptProjectInspection {
@@ -144,7 +147,7 @@ struct GeneratedScriptApiManifest {
     version: &'static str,
     owner: &'static str,
     managed_sdk_assembly: &'static str,
-    generated_sources: [&'static str; 6],
+    generated_sources: [&'static str; 7],
     msbuild_targets: &'static str,
     sha256: String,
 }

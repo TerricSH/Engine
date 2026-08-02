@@ -36,6 +36,8 @@ terrain = ["subsystem-terrain"]
 target-desktop = [
     "subsystem-physics",
     "subsystem-gameplay",
+    "subsystem-network",
+    "subsystem-xr",
     "runtime-subsystems",
     "runtime-audio-output",
 ]

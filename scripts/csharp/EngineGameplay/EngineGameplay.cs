@@ -9,14 +9,14 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 
 [assembly: AssemblyMetadata("EngineGameplay.ScriptApiSchema", "ScriptAPI-v0")]
-[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.16.0")]
+[assembly: AssemblyMetadata("EngineGameplay.ScriptApiVersion", "0.17.0")]
 
 namespace Engine;
 
 public static class ScriptApiContract
 {
     public const string Schema = "ScriptAPI-v0";
-    public const string Version = "0.16.0";
+    public const string Version = "0.17.0";
 }
 
 public readonly record struct Vector2(float X, float Y);
@@ -3074,6 +3074,8 @@ public abstract partial class EngineBehaviour
         Damage.Replace(context.DamageEvents);
         Ragdoll.Replace(context.RagdollEvents);
         Components.Replace(context.ComponentQueryResults);
+        Network.Replace(context.Network);
+        XR.Replace(context.Xr);
         WorldOrigin = context.WorldOrigin is { Length: 3 } origin
             ? new ScriptWorldOrigin(origin[0], origin[1], origin[2])
             : new ScriptWorldOrigin(0.0, 0.0, 0.0);
@@ -3103,6 +3105,7 @@ public abstract partial class EngineBehaviour
         Animation.DrainTo(commands);
         RuntimeAssets.DrainTo(commands);
         Terrain.DrainTo(commands);
+        Network.DrainTo(commands);
         var json = JsonSerializer.Serialize(commands, JsonOptions);
         _transformDirty = false;
         return json;

@@ -38,3 +38,20 @@ The protocol intentionally transports opaque component/RPC bytes. Schema,
 prediction, reconciliation, interest management and persistence policies are
 registered by the game or a higher-level engine subsystem rather than being
 hard-coded into UDP transport.
+
+## Managed gameplay bridge
+
+The versioned C# gameplay SDK exposes the same runtime through
+`EngineBehaviour.Network`. `Host` and `Connect` control the engine-owned UDP
+session; ownership assignment, replicated component writes, targeted RPCs,
+lobby operations, and friend presence are deferred to the native frame
+boundary. Every call returns a `NetworkRequest`, and
+`Network.TryGetResult` delivers its bounded result in the next frame. The
+current peer/ownership/replication/lobby/friend snapshots and unhandled native
+RPC envelopes are published with each gameplay context; scripts never receive
+transport handles or forge sender identities.
+
+`sandbox/target-desktop` includes `subsystem-network`, so normal desktop game
+and editor-player builds carry the bridge. Builds that intentionally omit the
+subsystem preserve the wire contract and return an explicit failed operation
+result instead of terminating the script host.

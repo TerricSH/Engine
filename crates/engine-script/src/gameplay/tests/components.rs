@@ -62,6 +62,20 @@ fn component_value_has_a_stable_tagged_json_contract() {
 }
 
 #[test]
+fn unsigned_component_value_uses_managed_uint_spelling_and_accepts_legacy_alias() {
+    let value = GameplayComponentValue::UInt(u64::from(u32::MAX));
+    assert_eq!(
+        serde_json::to_string(&value).unwrap(),
+        r#"{"type":"uint","value":4294967295}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<GameplayComponentValue>(r#"{"type":"u_int","value":4294967295}"#)
+            .unwrap(),
+        value
+    );
+}
+
+#[test]
 fn untrusted_component_values_reject_non_finite_oversized_and_deep_payloads() {
     assert!(GameplayComponentValue::Float(f32::NAN).validate(0).is_err());
     assert!(GameplayComponentValue::Vec3([0.0, f32::INFINITY, 0.0])

@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use engine_script::{
     GameplayCameraSnapshot, GameplayComponentQueryResult, GameplayDamageEvent, GameplayInputValue,
-    GameplayLogicAssetResult, GameplayPointerSnapshot, GameplayRagdollEvent,
-    GameplayRuntimeAssetResult, GameplaySaveEvent, OwnedGameplayComponentQuery,
-    OwnedGameplayDamageRequest, OwnedGameplayPhysicsMutation, OwnedGameplayPhysicsQuery,
+    GameplayLogicAssetResult, GameplayNetworkOperationResult, GameplayNetworkSnapshot,
+    GameplayPointerSnapshot, GameplayRagdollEvent, GameplayRuntimeAssetResult, GameplaySaveEvent,
+    GameplayXrSnapshot, OwnedGameplayComponentQuery, OwnedGameplayDamageRequest,
+    OwnedGameplayNetworkCommand, OwnedGameplayPhysicsMutation, OwnedGameplayPhysicsQuery,
     OwnedGameplayRagdollRequest, OwnedGameplaySaveRequest, OwnedGameplayTerrainBrushRequest,
     ScriptEngine,
 };
@@ -35,6 +36,10 @@ pub(crate) struct ScriptRuntimeState {
     pub(crate) ragdoll_events: BTreeMap<String, Vec<GameplayRagdollEvent>>,
     pub(crate) pending_component_queries: Vec<OwnedGameplayComponentQuery>,
     pub(crate) component_query_results: BTreeMap<String, Vec<GameplayComponentQueryResult>>,
+    pub(crate) network_snapshot: GameplayNetworkSnapshot,
+    pub(crate) pending_network_commands: Vec<OwnedGameplayNetworkCommand>,
+    pub(crate) network_operation_results: BTreeMap<String, Vec<GameplayNetworkOperationResult>>,
+    pub(crate) xr_snapshot: GameplayXrSnapshot,
 }
 
 impl Default for ScriptRuntimeState {
@@ -59,6 +64,10 @@ impl Default for ScriptRuntimeState {
             ragdoll_events: BTreeMap::new(),
             pending_component_queries: Vec::new(),
             component_query_results: BTreeMap::new(),
+            network_snapshot: GameplayNetworkSnapshot::default(),
+            pending_network_commands: Vec::new(),
+            network_operation_results: BTreeMap::new(),
+            xr_snapshot: GameplayXrSnapshot::default(),
         }
     }
 }

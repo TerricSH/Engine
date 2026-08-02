@@ -105,6 +105,8 @@ fn context_json_contract_roundtrips_typed_input() {
                 component_type: "engine.light".into(),
             },
         ],
+        network: GameplayNetworkSnapshot::default(),
+        xr: GameplayXrSnapshot::default(),
         ui_events: vec![GameplayUiEvent {
             canvas_id: "main-menu".into(),
             element_id: 17,
@@ -158,6 +160,8 @@ fn context_from_older_runtime_defaults_the_entity_snapshot_map() {
     assert!(context.ragdoll_events.is_empty());
     assert!(context.physics_query_results.is_empty());
     assert!(context.component_query_results.is_empty());
+    assert_eq!(context.network, GameplayNetworkSnapshot::default());
+    assert_eq!(context.xr, GameplayXrSnapshot::default());
     assert!(context.ui_events.is_empty());
     assert_eq!(
         context.input_transitions,

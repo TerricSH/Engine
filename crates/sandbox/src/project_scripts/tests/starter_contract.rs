@@ -23,6 +23,7 @@ fn starter_project_and_source_have_stable_contract() {
     assert!(SCRIPT_SDK_TARGETS.contains("<Compile Remove=\"EngineJrpg.cs\" />"));
     assert!(SCRIPT_SDK_TARGETS.contains("<Compile Remove=\"EngineRendering.cs\" />"));
     assert!(SCRIPT_SDK_TARGETS.contains("<Compile Remove=\"EngineRuntimeAssets.cs\" />"));
+    assert!(SCRIPT_SDK_TARGETS.contains("<Compile Remove=\"EngineOnlineXr.cs\" />"));
     assert!(STARTER_SCRIPT_API_SOURCE.contains(&format!(
         "public const string Schema = \"{}\"",
         engine_script_api::GAMEPLAY_SCRIPT_API_SCHEMA
@@ -37,6 +38,8 @@ fn starter_project_and_source_have_stable_contract() {
     assert!(RUNTIME_ASSETS_SCRIPT_API_SOURCE.contains("public sealed class ScriptTerrain"));
     assert!(RUNTIME_ASSETS_SCRIPT_API_SOURCE.contains("public RuntimeAssetRequest RegisterMesh("));
     assert!(RUNTIME_ASSETS_SCRIPT_API_SOURCE.contains("public RuntimeAssetRequest ApplyBrush("));
+    assert!(ONLINE_XR_SCRIPT_API_SOURCE.contains("public sealed class ScriptNetwork"));
+    assert!(ONLINE_XR_SCRIPT_API_SOURCE.contains("public sealed class ScriptXR"));
     assert!(STARTER_SCRIPT_API_SOURCE.contains("public ScriptInput Input"));
     assert!(STARTER_SCRIPT_API_SOURCE.contains("public ScriptUI UI"));
     assert!(STARTER_SCRIPT_API_SOURCE.contains("public sealed class UICanvas"));

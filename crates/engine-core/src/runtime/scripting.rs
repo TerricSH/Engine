@@ -7,6 +7,8 @@ mod extended_commands;
 #[cfg(feature = "subsystem-scripting-csharp")]
 mod lifecycle;
 #[cfg(feature = "subsystem-scripting-csharp")]
+mod online;
+#[cfg(feature = "subsystem-scripting-csharp")]
 mod queries;
 #[cfg(feature = "subsystem-scripting-csharp")]
 mod state;

@@ -51,8 +51,8 @@ const AUDIT_ANNOTATIONS: &[(&str, AuditAnnotation)] = &[
         "engine.renderable",
         AuditAnnotation {
             reconciler: "per frame (render extraction)",
-            caveat: "n/a — not script-accessible",
-            decision: "None — no scene serde hooks registered; renderer-driven, not a v1 script surface",
+            caveat: "write takes effect live on the next render extraction",
+            decision: "ReadWrite — validated mesh/material/visibility/layer fields support live equipment and paint changes",
         },
     ),
     (

@@ -8,12 +8,14 @@ mod commands;
 mod components;
 mod context;
 mod events;
+mod online;
 mod physics_mutation;
 mod physics_query;
 mod runtime_assets;
 mod snapshots;
 mod ui;
 mod validation;
+mod xr;
 
 pub use commands::{
     GameplayCommand, GameplaySaveOperation, OwnedGameplayCommand, OwnedGameplayDamageRequest,
@@ -34,6 +36,7 @@ pub use events::{
     GameplayRagdollEvent, MAX_CHARACTER_CONTROL_SPEED, MAX_DAMAGE_AMOUNT,
     MAX_PENDING_DAMAGE_REQUESTS, MAX_PENDING_RAGDOLL_REQUESTS, MAX_RAGDOLL_RECOVERY_SECONDS,
 };
+pub use online::*;
 pub use physics_mutation::{
     GameplayJointLimits, GameplayJointMotor, GameplayJointType, GameplayPhysicsMutation,
     MAX_PENDING_PHYSICS_MUTATIONS, MAX_PENDING_PHYSICS_QUERIES, MAX_PHYSICS_MUTATION_COMPONENT,
@@ -59,6 +62,7 @@ pub use validation::{
     validate_entity_id, validate_prefab_id, validate_save_slot, validate_scene_id,
     validate_script_transform,
 };
+pub use xr::*;
 
 #[cfg(test)]
 mod tests;

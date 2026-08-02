@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::{NetworkError, PeerId, RpcEnvelope, RpcTarget, MAX_RPC_PAYLOAD_BYTES};
 
 pub type RpcHandler = Box<dyn FnMut(&RpcEnvelope) -> Result<(), String> + Send>;
+pub type RpcDispatchResults = Vec<(u64, Result<(), String>)>;
 
 #[derive(Default)]
 pub struct RpcRouter {
@@ -59,7 +60,7 @@ impl RpcRouter {
         Ok(())
     }
 
-    pub fn dispatch(&mut self, limit: usize) -> Vec<(u64, Result<(), String>)> {
+    pub fn dispatch(&mut self, limit: usize) -> RpcDispatchResults {
         let mut results = Vec::new();
         for _ in 0..limit.max(1) {
             let Some(envelope) = self.incoming.pop_front() else {
@@ -73,6 +74,24 @@ impl RpcRouter {
         }
         results
     }
+
+    /// Dispatch native handlers and return unregistered envelopes intact so
+    /// the gameplay bridge can deliver them as frame-local script events.
+    pub fn dispatch_registered(&mut self, limit: usize) -> (RpcDispatchResults, Vec<RpcEnvelope>) {
+        let mut results = Vec::new();
+        let mut unhandled = Vec::new();
+        for _ in 0..limit.max(1) {
+            let Some(envelope) = self.incoming.pop_front() else {
+                break;
+            };
+            if let Some(handler) = self.handlers.get_mut(&envelope.method) {
+                results.push((envelope.rpc_id, handler(&envelope)));
+            } else {
+                unhandled.push(envelope);
+            }
+        }
+        (results, unhandled)
+    }
 }
 
 fn validate_method(method: &str) -> Result<(), NetworkError> {
@@ -85,4 +104,53 @@ fn validate_method(method: &str) -> Result<(), NetworkError> {
         return Err(NetworkError::LimitExceeded("RPC method name"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_handlers_run_while_unhandled_envelopes_remain_for_scripts() {
+        let mut router = RpcRouter::default();
+        router
+            .register("native.call", Box::new(|_| Ok(())))
+            .unwrap();
+        let native = router
+            .envelope(PeerId(2), RpcTarget::Server, "native.call", true, vec![])
+            .unwrap();
+        let scripted = router
+            .envelope(PeerId(3), RpcTarget::All, "game.event", false, vec![7])
+            .unwrap();
+        router.enqueue(native).unwrap();
+        router.enqueue(scripted.clone()).unwrap();
+
+        let (results, unhandled) = router.dispatch_registered(8);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_ok());
+        assert_eq!(unhandled, vec![scripted]);
+    }
+
+    #[test]
+    fn legacy_dispatch_preserves_mixed_envelope_order() {
+        let mut router = RpcRouter::default();
+        router
+            .register("native.call", Box::new(|_| Ok(())))
+            .unwrap();
+        let missing = router
+            .envelope(PeerId(3), RpcTarget::All, "game.event", false, vec![])
+            .unwrap();
+        let native = router
+            .envelope(PeerId(2), RpcTarget::Server, "native.call", true, vec![])
+            .unwrap();
+        router.enqueue(missing.clone()).unwrap();
+        router.enqueue(native.clone()).unwrap();
+
+        let results = router.dispatch(8);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, missing.rpc_id);
+        assert!(results[0].1.is_err());
+        assert_eq!(results[1].0, native.rpc_id);
+        assert!(results[1].1.is_ok());
+    }
 }

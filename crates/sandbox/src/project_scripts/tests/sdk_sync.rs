@@ -62,6 +62,14 @@ fn generated_script_api_is_engine_owned_versioned_and_drift_checked() {
         .unwrap(),
         RUNTIME_ASSETS_SCRIPT_API_SOURCE
     );
+    assert_eq!(
+        std::fs::read_to_string(
+            root.join("build/script-sdk-source")
+                .join(engine_script_api::GENERATED_CSHARP_ONLINE_XR_FILE)
+        )
+        .unwrap(),
+        ONLINE_XR_SCRIPT_API_SOURCE
+    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&contract).unwrap()).unwrap();
     assert_eq!(manifest["schema"], "EngineGameplaySdkContract-v1");
@@ -84,6 +92,10 @@ fn generated_script_api_is_engine_owned_versioned_and_drift_checked() {
     assert_eq!(
         manifest["generated_sources"][5],
         engine_script_api::GENERATED_CSHARP_RUNTIME_ASSETS_FILE
+    );
+    assert_eq!(
+        manifest["generated_sources"][6],
+        engine_script_api::GENERATED_CSHARP_ONLINE_XR_FILE
     );
     assert_eq!(
         manifest["script_api"],

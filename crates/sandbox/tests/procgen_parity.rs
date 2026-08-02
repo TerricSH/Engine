@@ -88,6 +88,13 @@ fn csharp_procgen_port_matches_rust_golden_vectors() {
         runtime_assets_source.is_file(),
         "runtime asset SDK source materialized by sync"
     );
+    let online_xr_source = root
+        .join("build/script-sdk-source")
+        .join(engine_script_api::GENERATED_CSHARP_ONLINE_XR_FILE);
+    assert!(
+        online_xr_source.is_file(),
+        "online/XR SDK source materialized by sync"
+    );
     let harness_source = workspace_root().join("scripts/csharp/ProcGenParity/Program.cs");
     assert!(
         harness_source.is_file(),
@@ -99,9 +106,10 @@ fn csharp_procgen_port_matches_rust_golden_vectors() {
     let harness_dir = root.join("build/procgen-parity");
     std::fs::create_dir_all(&harness_dir).expect("create parity harness directory");
     let project = format!(
-        "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <TargetFramework>net8.0</TargetFramework>\n    <ImplicitUsings>enable</ImplicitUsings>\n    <Nullable>enable</Nullable>\n    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>\n  </PropertyGroup>\n  <ItemGroup>\n    <Compile Include=\"{}\" />\n    <Compile Include=\"{}\" />\n    <Compile Include=\"{}\" />\n  </ItemGroup>\n</Project>\n",
+        "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <OutputType>Exe</OutputType>\n    <TargetFramework>net8.0</TargetFramework>\n    <ImplicitUsings>enable</ImplicitUsings>\n    <Nullable>enable</Nullable>\n    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>\n  </PropertyGroup>\n  <ItemGroup>\n    <Compile Include=\"{}\" />\n    <Compile Include=\"{}\" />\n    <Compile Include=\"{}\" />\n    <Compile Include=\"{}\" />\n  </ItemGroup>\n</Project>\n",
         sdk_source.display(),
         runtime_assets_source.display(),
+        online_xr_source.display(),
         harness_source.display()
     );
     let project_path = harness_dir.join("ProcGenParity.csproj");

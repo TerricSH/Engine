@@ -31,6 +31,13 @@ impl EngineRuntime {
         entity_ids
             .into_iter()
             .map(|entity_id| {
+                let mut network = self.scripting.network_snapshot.clone();
+                network.operation_results = self
+                    .scripting
+                    .network_operation_results
+                    .get(&entity_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let context = GameplayContext {
                     script_api: engine_script::GAMEPLAY_SCRIPT_API_SCHEMA.to_owned(),
                     transform: entities
@@ -83,6 +90,8 @@ impl EngineRuntime {
                         .get(&entity_id)
                         .cloned()
                         .unwrap_or_default(),
+                    network,
+                    xr: self.scripting.xr_snapshot.clone(),
                     ui_events: ui_events.to_vec(),
                     entities: entities.clone(),
                 };

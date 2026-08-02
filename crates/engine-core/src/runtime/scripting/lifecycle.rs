@@ -84,6 +84,10 @@ impl EngineRuntime {
         self.scripting.logic_asset_results.clear();
         self.scripting.runtime_asset_results.clear();
         self.scripting.pending_terrain_brushes.clear();
+        self.scripting.pending_network_commands.clear();
+        self.scripting.network_operation_results.clear();
+        self.scripting.network_snapshot = engine_script::GameplayNetworkSnapshot::default();
+        self.scripting.xr_snapshot = engine_script::GameplayXrSnapshot::default();
         Ok(())
     }
 
@@ -319,6 +323,7 @@ impl EngineRuntime {
         self.scripting.save_events.clear();
         self.scripting.logic_asset_results.clear();
         self.scripting.runtime_asset_results.clear();
+        self.scripting.network_operation_results.clear();
         diagnostics.extend(self.scripting.engine.update(dt));
         let (commands, command_diagnostics) = self.scripting.engine.drain_gameplay_commands();
         diagnostics.extend(command_diagnostics);

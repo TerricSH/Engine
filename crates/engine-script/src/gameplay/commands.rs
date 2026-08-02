@@ -22,8 +22,8 @@ use super::validation::{
     validate_script_transform,
 };
 use super::{
-    validate_runtime_asset_id, GameplayRuntimeMaterial, GameplayRuntimeMesh, GameplayRuntimePrefab,
-    GameplayTerrainBrush,
+    validate_runtime_asset_id, GameplayNetworkCommand, GameplayRuntimeMaterial,
+    GameplayRuntimeMesh, GameplayRuntimePrefab, GameplayTerrainBrush,
 };
 /// Mutations a script may request after running a lifecycle method.
 ///
@@ -213,6 +213,10 @@ pub enum GameplayCommand {
         request_id: u32,
         terrain_entity_id: String,
         brush: GameplayTerrainBrush,
+    },
+    Network {
+        request_id: u32,
+        network: GameplayNetworkCommand,
     },
 }
 
@@ -426,6 +430,7 @@ impl GameplayCommand {
                 validate_entity_id(terrain_entity_id)?;
                 brush.validate()
             }
+            Self::Network { network, .. } => network.validate(),
         }
     }
 }

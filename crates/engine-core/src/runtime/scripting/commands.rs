@@ -818,6 +818,38 @@ impl EngineRuntime {
                         }
                     }
                 }
+                GameplayCommand::Network {
+                    request_id,
+                    network,
+                } => {
+                    if !script_command_owner_exists(&self.world_slot, &entity_id) {
+                        diagnostics.push(script_owner_missing_diagnostic(
+                            &entity_id,
+                            "use the network runtime",
+                        ));
+                        continue;
+                    }
+                    if self.scripting.pending_network_commands.len()
+                        >= engine_script::MAX_PENDING_NETWORK_COMMANDS
+                    {
+                        diagnostics.push(script_component_diagnostic(
+                            "SCRIPT_NETWORK_OVERFLOW",
+                            &entity_id,
+                            format!(
+                                "script entity '{entity_id}' exceeded the pending network operation budget of {} per frame",
+                                engine_script::MAX_PENDING_NETWORK_COMMANDS
+                            ),
+                        ));
+                        continue;
+                    }
+                    self.scripting.pending_network_commands.push(
+                        engine_script::OwnedGameplayNetworkCommand {
+                            owner_entity_id: entity_id,
+                            request_id,
+                            command: network,
+                        },
+                    );
+                }
                 command @ (GameplayCommand::PlayAnimation { .. }
                 | GameplayCommand::SetAnimationParameter { .. }
                 | GameplayCommand::TransitionAnimationState { .. }
